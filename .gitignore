@@ -1,0 +1,51 @@
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local IDE/editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Runtime outputs
+output/
+logs/
+traces/
+traces_test/
+sessions/
+sessions_test/
+
+# Local model/vector/cache data
+.hf_cache/
+qdrant_storage/
+rag_chunks_store/
+*.sqlite
+*.sqlite3
+sqlite_probe.db*
+*.db-journal
+
+# Temporary artifacts
+*.log
+*.tmp
+*.bak
+*.zip
+*.tar
+*.tar.gz
+

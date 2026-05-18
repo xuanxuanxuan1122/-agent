@@ -1,0 +1,115 @@
+{
+  "cases": [
+    {
+      "case_id": "industry_entry_agri_robot",
+      "query": "中国农业机器人行业是否值得进入，优先切入哪个细分场景？",
+      "report_type": "market_entry",
+      "must_cover": ["需求刚性", "客户预算", "进入窗口", "竞争格局", "单位经济", "风险"],
+      "required_evidence_types": ["official_data", "market_research", "customer_case", "technology_product"],
+      "ideal_structure": ["一句话结论", "核心观点", "关键数据", "需求侧", "供给侧", "商业模式", "风险与反证", "行动建议"],
+      "forbidden_phrases": ["已有可核验证据", "继续补证", "证据不足", "无法判断"],
+      "scoring_notes": "重点看是否能把市场数据、客户 ROI、产品交付和进入策略连成可证伪判断。"
+    },
+    {
+      "case_id": "company_dd_saas",
+      "query": "评估一家企业级 SaaS 公司的投资价值，重点关注续费、毛利和渠道效率。",
+      "report_type": "investment_due_diligence",
+      "must_cover": ["续费率", "毛利率", "获客成本", "回款", "客户集中度", "反证"],
+      "required_evidence_types": ["filing_company", "market_research", "customer_case", "news_event"],
+      "ideal_structure": ["一句话结论", "核心观点", "关键数据", "商业模式", "竞争格局", "风险与反证", "估值含义"],
+      "forbidden_phrases": ["已有可核验证据", "建议后续调研", "低置信"],
+      "scoring_notes": "重点看是否区分收入增长质量、留存质量、渠道效率和现金流风险。"
+    },
+    {
+      "case_id": "policy_to_order_ev_charging",
+      "query": "新能源汽车充电基础设施政策是否会传导为设备订单增长？",
+      "report_type": "policy_impact",
+      "must_cover": ["政策预算", "审批机制", "招投标", "设备订单", "地区差异", "传导风险"],
+      "required_evidence_types": ["official_data", "news_event", "filing_company", "market_research"],
+      "ideal_structure": ["一句话结论", "核心观点", "政策变量", "订单传导机制", "竞争格局", "风险与反证", "观察指标"],
+      "forbidden_phrases": ["已有可核验证据", "仍需复核", "证据不足"],
+      "scoring_notes": "重点看是否解释政策从预算、审批、目录、招标到订单的实际传导链。"
+    },
+    {
+      "case_id": "industry_profit_pool_low_altitude",
+      "query": "低空经济产业链中利润池会集中在哪些环节，新进入者应该避开哪里？",
+      "report_type": "industry_deep_report",
+      "must_cover": ["产业链", "利润池", "准入壁垒", "订单传导", "竞争格局", "风险"],
+      "required_evidence_types": ["official_data", "filing_company", "market_research", "news_event"],
+      "ideal_structure": ["一句话结论", "核心观点", "产业链", "利润池", "进入窗口", "风险与反证", "行动建议"],
+      "forbidden_phrases": ["已有可核验证据", "证据不足", "建议后续调研"],
+      "scoring_notes": "重点看是否区分整机、运营、空域服务、基础设施和监管准入的利润与风险。"
+    },
+    {
+      "case_id": "product_roi_strawberry_robot",
+      "query": "草莓采摘机器人是否能形成商业闭环，客户 ROI 的关键变量是什么？",
+      "report_type": "product_research",
+      "must_cover": ["客户痛点", "ROI", "替代成本", "作业效率", "产品瓶颈", "放弃条件"],
+      "required_evidence_types": ["customer_case", "technology_product", "market_research", "news_event"],
+      "ideal_structure": ["一句话结论", "核心观点", "需求侧", "产品能力", "单位经济", "风险与反证", "验证清单"],
+      "forbidden_phrases": ["已有可核验证据", "低置信", "无法判断"],
+      "scoring_notes": "重点看是否把采摘效率、损耗率、人工成本、设备折旧和维护成本纳入 ROI。"
+    },
+    {
+      "case_id": "market_size_humanoid_robot_components",
+      "query": "人形机器人核心零部件市场规模是否足够支撑创业公司进入？",
+      "report_type": "market_entry",
+      "must_cover": ["市场规模", "出货量", "价格", "成本下降", "客户集中度", "进入壁垒"],
+      "required_evidence_types": ["filing_company", "market_research", "technology_product", "news_event"],
+      "ideal_structure": ["一句话结论", "核心观点", "关键数据", "供给侧", "竞争格局", "进入窗口", "风险与反证"],
+      "forbidden_phrases": ["已有可核验证据", "继续补证", "证据不足"],
+      "scoring_notes": "重点看是否区分总市场、可服务市场、量产时间和价格下降路径。"
+    },
+    {
+      "case_id": "consumer_brand_channel_entry",
+      "query": "一个新消费品牌进入即饮咖啡市场，应该优先走便利店还是线上渠道？",
+      "report_type": "consumer_market",
+      "must_cover": ["用户需求", "渠道成本", "复购", "毛利", "竞品", "验证指标"],
+      "required_evidence_types": ["market_research", "news_event", "customer_case", "filing_company"],
+      "ideal_structure": ["一句话结论", "核心观点", "关键数据", "需求侧", "渠道比较", "竞争格局", "行动建议"],
+      "forbidden_phrases": ["已有可核验证据", "建议后续调研", "无法判断"],
+      "scoring_notes": "重点看是否比较便利店进场费、动销、毛利和线上获客成本。"
+    },
+    {
+      "case_id": "company_risk_cross_border_ecommerce",
+      "query": "跨境电商公司的最大风险是平台流量、库存还是合规？",
+      "report_type": "company_due_diligence",
+      "must_cover": ["收入结构", "平台依赖", "库存周转", "合规风险", "现金流", "反证"],
+      "required_evidence_types": ["filing_company", "news_event", "market_research", "official_data"],
+      "ideal_structure": ["一句话结论", "核心观点", "关键数据", "商业模式", "风险与反证", "观察指标", "投资结论"],
+      "forbidden_phrases": ["已有可核验证据", "低置信", "证据不足"],
+      "scoring_notes": "重点看是否把增长质量、库存风险、平台规则变化和现金转换效率拆开。"
+    },
+    {
+      "case_id": "policy_healthcare_ai_procurement",
+      "query": "医疗 AI 政策能否传导为医院采购预算，哪些场景最可能先落地？",
+      "report_type": "policy_impact",
+      "must_cover": ["政策预算", "医院采购", "支付方", "审批", "场景优先级", "风险"],
+      "required_evidence_types": ["official_data", "customer_case", "technology_product", "news_event"],
+      "ideal_structure": ["一句话结论", "核心观点", "政策变量", "需求侧", "采购机制", "落地场景", "风险与反证"],
+      "forbidden_phrases": ["已有可核验证据", "仍需复核", "无法判断"],
+      "scoring_notes": "重点看是否说明政策从医保/院内预算/审批目录到采购动作的传导路径。"
+    },
+    {
+      "case_id": "technology_route_solid_state_battery",
+      "query": "固态电池技术路线中哪类方案最可能先商业化？",
+      "report_type": "technology_research",
+      "must_cover": ["技术路线", "量产难点", "成本", "性能", "客户验证", "时间窗口"],
+      "required_evidence_types": ["technology_product", "filing_company", "market_research", "news_event"],
+      "ideal_structure": ["一句话结论", "核心观点", "技术路线", "供给侧", "商业化窗口", "风险与反证", "观察指标"],
+      "forbidden_phrases": ["已有可核验证据", "继续补证", "证据不足"],
+      "scoring_notes": "重点看是否区分材料体系、制造工艺、良率、成本和车企验证节点。"
+    }
+    ,
+    {
+      "case_id": "macro_export_chain_southeast_asia",
+      "query": "东南亚制造转移会给中国出口产业链带来哪些结构性机会？",
+      "report_type": "macro_topic",
+      "must_cover": ["出口结构", "产业转移", "订单迁移", "供应链角色", "利润变化", "风险"],
+      "required_evidence_types": ["official_data", "market_research", "filing_company", "news_event"],
+      "ideal_structure": ["一句话结论", "核心观点", "关键数据", "产业链", "受益环节", "风险与反证", "行动建议"],
+      "forbidden_phrases": ["已有可核验证据", "无法判断", "建议后续调研"],
+      "scoring_notes": "重点看是否区分产能迁出、设备/材料出口、品牌订单和本地化替代风险。"
+    }
+  ]
+}

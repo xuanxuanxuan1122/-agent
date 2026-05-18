@@ -1,0 +1,536 @@
+{
+  "version": "0.1.0",
+  "status": "draft_offline_asset",
+  "default_policy": {
+    "body_first": true,
+    "source_appendix": "forbidden_by_default",
+    "max_body_chapters": 6,
+    "chapter_style": "question_driven",
+    "citation_style": "inline_fact_citation",
+    "forbidden_sections": [
+      "数据来源",
+      "参考来源",
+      "研究口径与来源",
+      "附录",
+      "补充分析",
+      "把证据转成可判断的问题链"
+    ],
+    "forbidden_template_titles": [
+      "市场规模与增速",
+      "竞争格局",
+      "政策与监管环境",
+      "技术路线与产业链",
+      "投融资与资本动态",
+      "哪些变量真正改变判断"
+    ]
+  },
+  "templates": [
+    {
+      "id": "multi_sector_policy_impact",
+      "name": "多行业政策冲击与受益者识别报告",
+      "use_when": [
+        "同一政策变量影响多个行业",
+        "需要比较承压环节、受益环节和反向触发器",
+        "典型场景：关税、出口管制、市场准入、产业政策、地缘政治"
+      ],
+      "reader_goal": "让读者快速判断每个行业为什么分化、谁受益、谁承压、哪些证据还不够。",
+      "front_matter": [
+        {
+          "block": "opening_thesis",
+          "title_policy": "用一句可验证主判断开场，不写执行摘要卡片",
+          "must_answer": [
+            "核心外部变量是什么",
+            "它通过什么机制改变行业分化",
+            "结论的证据强弱边界在哪里"
+          ]
+        }
+      ],
+      "body_structure": [
+        {
+          "chapter_role": "policy_mechanism",
+          "title_pattern": "{政策变量}如何从宏观表态传导到企业预算、采购和市场准入",
+          "purpose": "先解释共同机制，避免各行业重复铺背景。",
+          "sections": [
+            "政策原文或官方动作的时间线",
+            "传导链：关税/管制/准入 -> 成本/供给/客户 -> 企业动作",
+            "哪些证据能证明传导已经发生，哪些只是预期"
+          ],
+          "evidence_required": [
+            "official_policy",
+            "company_action",
+            "market_metric",
+            "counter_signal"
+          ]
+        },
+        {
+          "chapter_role": "industry_split",
+          "repeat_for_each_industry": true,
+          "title_pattern": "{行业名}：{最重要承压点}与{最可兑现受益点}",
+          "purpose": "每章只回答一个行业的分化逻辑。",
+          "sections": [
+            "承压链条：哪些环节直接受冲击",
+            "受益链条：哪些环节获得替代、转单或定价权",
+            "兑现条件：订单、产能、客户认证、利润质量",
+            "反向触发器：什么信号会推翻本章判断"
+          ],
+          "evidence_required": [
+            "policy_or_rule",
+            "industry_metric",
+            "company_case",
+            "profit_or_order_signal",
+            "counter_signal"
+          ]
+        },
+        {
+          "chapter_role": "cross_sector_comparison",
+          "title_pattern": "跨行业比较：压力、对冲能力和兑现周期为什么不同",
+          "purpose": "把行业之间的差异放在同一框架里比较。",
+          "sections": [
+            "压力来源比较",
+            "对冲能力比较",
+            "兑现周期比较",
+            "证据质量比较"
+          ],
+          "evidence_required": [
+            "comparable_metric",
+            "company_case",
+            "counter_signal"
+          ]
+        },
+        {
+          "chapter_role": "decision_framework",
+          "title_pattern": "最终受益者的筛选框架和后续监测指标",
+          "purpose": "把报告从叙述收束到可执行判断。",
+          "sections": [
+            "受益者筛选条件",
+            "需要持续跟踪的领先指标",
+            "降级条件和复核节奏"
+          ],
+          "evidence_required": [
+            "indicator",
+            "company_case",
+            "counter_signal"
+          ]
+        }
+      ],
+      "quality_bar": {
+        "minimum_body_chars": 16000,
+        "minimum_unique_sources_when_available": 16,
+        "max_uncited_substantive_paragraph_ratio": 0.35,
+        "requires_counter_signal_per_core_chapter": true,
+        "requires_source_quality_mix": [
+          "official_or_primary",
+          "industry_or_research",
+          "company_or_case"
+        ]
+      },
+      "repair_policy": {
+        "if_sources_too_few": "do_evidence_refinement_before_rewrite",
+        "if_body_too_short_with_enough_sources": "rewrite_with_more_chapter_depth",
+        "if_body_too_short_without_sources": "degrade_and_show_evidence_gap",
+        "if_template_repetition_detected": "rewrite_not_expand"
+      }
+    },
+    {
+      "id": "industry_deep_report",
+      "name": "行业深度研究报告",
+      "use_when": [
+        "研究单一行业或产业链",
+        "需要判断市场空间、供需结构、竞争格局和进入机会"
+      ],
+      "reader_goal": "让读者理解行业为什么值得研究、机会是否真实、哪些环节最有价值。",
+      "front_matter": [
+        {
+          "block": "opening_thesis",
+          "title_policy": "直接给出行业主判断和证据边界"
+        }
+      ],
+      "body_structure": [
+        {
+          "chapter_role": "scope_and_definition",
+          "title_pattern": "{研究对象}到底包含哪些环节，边界应该如何划分",
+          "sections": [
+            "定义和分类",
+            "价值链边界",
+            "本报告不覆盖的范围"
+          ],
+          "evidence_required": [
+            "official_definition",
+            "industry_standard"
+          ]
+        },
+        {
+          "chapter_role": "demand_validation",
+          "title_pattern": "真实需求来自哪里，增长能否持续兑现",
+          "sections": [
+            "需求来源",
+            "规模和增速口径",
+            "价格、订单或渗透率验证",
+            "反向样本"
+          ],
+          "evidence_required": [
+            "market_metric",
+            "customer_case",
+            "counter_signal"
+          ]
+        },
+        {
+          "chapter_role": "supply_chain_and_profit_pool",
+          "title_pattern": "产业链上哪些环节有议价权，利润池为什么会迁移",
+          "sections": [
+            "上游瓶颈",
+            "中游能力差异",
+            "下游客户和渠道",
+            "利润质量"
+          ],
+          "evidence_required": [
+            "capacity_metric",
+            "cost_metric",
+            "company_case"
+          ]
+        },
+        {
+          "chapter_role": "competition_and_winners",
+          "title_pattern": "竞争格局如何决定最终受益者",
+          "sections": [
+            "主要玩家",
+            "壁垒和替代难度",
+            "受益者筛选条件",
+            "失败样本"
+          ],
+          "evidence_required": [
+            "company_case",
+            "share_metric",
+            "counter_signal"
+          ]
+        },
+        {
+          "chapter_role": "decision_and_monitoring",
+          "title_pattern": "下一步应该跟踪哪些指标，什么时候修正结论",
+          "sections": [
+            "领先指标",
+            "反向触发器",
+            "行动优先级"
+          ],
+          "evidence_required": [
+            "indicator",
+            "counter_signal"
+          ]
+        }
+      ],
+      "quality_bar": {
+        "minimum_body_chars": 14000,
+        "minimum_unique_sources_when_available": 12,
+        "requires_counter_signal_per_core_chapter": true
+      },
+      "repair_policy": {
+        "if_market_size_weak": "do_not_open_with_market_size",
+        "if_cases_weak": "write_as_industry_mechanism_not_company_ranking"
+      }
+    },
+    {
+      "id": "company_due_diligence",
+      "name": "公司尽调与投资判断报告",
+      "use_when": [
+        "研究单家公司",
+        "需要判断是否值得投资、合作、采购或进入"
+      ],
+      "reader_goal": "让读者知道这家公司好在哪里、风险在哪里、哪些事实还不能确认。",
+      "front_matter": [
+        {
+          "block": "investment_conclusion",
+          "title_policy": "先给结论等级、关键假设和不可忽视风险"
+        }
+      ],
+      "body_structure": [
+        {
+          "chapter_role": "business_model",
+          "title_pattern": "{公司名}的商业模式是否可持续",
+          "sections": [
+            "收入来源",
+            "客户结构",
+            "毛利和现金流质量",
+            "依赖项"
+          ],
+          "evidence_required": [
+            "filing",
+            "financial_metric",
+            "customer_case"
+          ]
+        },
+        {
+          "chapter_role": "market_position",
+          "title_pattern": "它在行业中的位置是真优势还是阶段性窗口",
+          "sections": [
+            "市场位置",
+            "竞争对手",
+            "壁垒和替代风险"
+          ],
+          "evidence_required": [
+            "share_metric",
+            "company_case",
+            "counter_signal"
+          ]
+        },
+        {
+          "chapter_role": "growth_quality",
+          "title_pattern": "增长质量能否穿越周期和政策变化",
+          "sections": [
+            "增长来源",
+            "利润留存",
+            "资本开支",
+            "情景敏感性"
+          ],
+          "evidence_required": [
+            "financial_metric",
+            "order_signal",
+            "counter_signal"
+          ]
+        },
+        {
+          "chapter_role": "red_flags",
+          "title_pattern": "哪些红旗会改变结论",
+          "sections": [
+            "财务红旗",
+            "客户红旗",
+            "合规红旗",
+            "估值或交易红旗"
+          ],
+          "evidence_required": [
+            "counter_signal",
+            "filing"
+          ]
+        }
+      ],
+      "quality_bar": {
+        "minimum_body_chars": 12000,
+        "minimum_unique_sources_when_available": 10,
+        "requires_primary_company_sources": true
+      },
+      "repair_policy": {
+        "if_no_filing": "degrade_to_preliminary_profile",
+        "if_no_financials": "do_not_make_investment_conclusion"
+      }
+    },
+    {
+      "id": "market_entry",
+      "name": "市场进入与立项判断报告",
+      "use_when": [
+        "判断是否进入某市场、某品类、某区域或某客户群",
+        "需要输出进入路径、优先级和风险边界"
+      ],
+      "reader_goal": "帮助读者判断是否进入、怎么进入、先验证什么。",
+      "front_matter": [
+        {
+          "block": "entry_decision_snapshot",
+          "title_policy": "先给进入建议和证据等级"
+        }
+      ],
+      "body_structure": [
+        {
+          "chapter_role": "opportunity_validation",
+          "title_pattern": "这个市场机会是否足够真实",
+          "sections": [
+            "需求场景",
+            "规模和增速",
+            "预算主体",
+            "付费意愿"
+          ],
+          "evidence_required": [
+            "market_metric",
+            "customer_case",
+            "budget_signal"
+          ]
+        },
+        {
+          "chapter_role": "entry_barrier",
+          "title_pattern": "进入门槛主要来自客户、渠道、合规还是供应链",
+          "sections": [
+            "客户门槛",
+            "渠道门槛",
+            "合规门槛",
+            "供应链门槛"
+          ],
+          "evidence_required": [
+            "customer_case",
+            "policy_or_rule",
+            "channel_case"
+          ]
+        },
+        {
+          "chapter_role": "entry_path",
+          "title_pattern": "进入路径应该如何排序",
+          "sections": [
+            "切入场景",
+            "试点路径",
+            "合作或并购选项",
+            "资源投入节奏"
+          ],
+          "evidence_required": [
+            "case",
+            "company_action",
+            "cost_metric"
+          ]
+        },
+        {
+          "chapter_role": "go_no_go",
+          "title_pattern": "什么条件下进入，什么条件下暂停",
+          "sections": [
+            "进入条件",
+            "暂停条件",
+            "补证清单"
+          ],
+          "evidence_required": [
+            "indicator",
+            "counter_signal"
+          ]
+        }
+      ],
+      "quality_bar": {
+        "minimum_body_chars": 12000,
+        "minimum_unique_sources_when_available": 10,
+        "requires_budget_or_customer_signal": true
+      },
+      "repair_policy": {
+        "if_no_customer_signal": "degrade_to_market_observation",
+        "if_no_budget_signal": "avoid_go_decision"
+      }
+    },
+    {
+      "id": "competitive_analysis",
+      "name": "竞品与竞争格局分析报告",
+      "use_when": [
+        "比较多个公司、产品、品牌或解决方案",
+        "需要判断差距、定位和行动建议"
+      ],
+      "reader_goal": "让读者看清谁在什么维度领先，差距是否可追赶。",
+      "front_matter": [
+        {
+          "block": "competitive_snapshot",
+          "title_policy": "先给竞争位置和关键差距"
+        }
+      ],
+      "body_structure": [
+        {
+          "chapter_role": "comparison_frame",
+          "title_pattern": "这场竞争应该按哪些维度比较",
+          "sections": [
+            "比较对象",
+            "比较维度",
+            "口径限制"
+          ],
+          "evidence_required": [
+            "company_source",
+            "market_metric"
+          ]
+        },
+        {
+          "chapter_role": "positioning_gap",
+          "title_pattern": "核心差距来自产品、渠道、成本还是品牌",
+          "sections": [
+            "产品差距",
+            "渠道差距",
+            "成本差距",
+            "品牌或客户心智差距"
+          ],
+          "evidence_required": [
+            "product_case",
+            "channel_case",
+            "customer_case"
+          ]
+        },
+        {
+          "chapter_role": "strategic_options",
+          "title_pattern": "哪些差距可以补，哪些差距不值得追",
+          "sections": [
+            "可追赶项",
+            "不可追赶项",
+            "差异化机会",
+            "风险触发器"
+          ],
+          "evidence_required": [
+            "case",
+            "counter_signal"
+          ]
+        }
+      ],
+      "quality_bar": {
+        "minimum_body_chars": 10000,
+        "minimum_unique_sources_when_available": 8,
+        "requires_comparable_metric": true
+      },
+      "repair_policy": {
+        "if_metrics_not_comparable": "write_metric_limitations_before_conclusion"
+      }
+    },
+    {
+      "id": "technology_trend",
+      "name": "技术趋势与产品落地报告",
+      "use_when": [
+        "研究技术路线、产品形态、成熟度或替代路径",
+        "需要判断技术是否能商业化"
+      ],
+      "reader_goal": "让读者区分概念热度、工程可行性和商业落地。",
+      "front_matter": [
+        {
+          "block": "technology_readiness_snapshot",
+          "title_policy": "先给成熟度判断和落地边界"
+        }
+      ],
+      "body_structure": [
+        {
+          "chapter_role": "technology_maturity",
+          "title_pattern": "技术成熟度到了哪一步，瓶颈在哪里",
+          "sections": [
+            "技术路线",
+            "性能指标",
+            "工程化瓶颈",
+            "替代边界"
+          ],
+          "evidence_required": [
+            "technical_metric",
+            "product_case",
+            "counter_signal"
+          ]
+        },
+        {
+          "chapter_role": "adoption_path",
+          "title_pattern": "谁会率先采用，为什么现在采用",
+          "sections": [
+            "早期采用者",
+            "场景痛点",
+            "采购或部署约束",
+            "规模化条件"
+          ],
+          "evidence_required": [
+            "customer_case",
+            "deployment_case",
+            "cost_metric"
+          ]
+        },
+        {
+          "chapter_role": "commercialization_risk",
+          "title_pattern": "哪些信号说明它还只是概念或试点",
+          "sections": [
+            "商业化不足信号",
+            "成本和生态限制",
+            "验证清单"
+          ],
+          "evidence_required": [
+            "counter_signal",
+            "cost_metric"
+          ]
+        }
+      ],
+      "quality_bar": {
+        "minimum_body_chars": 10000,
+        "minimum_unique_sources_when_available": 8,
+        "requires_technical_and_customer_evidence": true
+      },
+      "repair_policy": {
+        "if_no_deployment_case": "degrade_to_technology_watch",
+        "if_only_vendor_claims": "require_independent_validation"
+      }
+    }
+  ]
+}
