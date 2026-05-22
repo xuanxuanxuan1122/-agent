@@ -14,6 +14,7 @@ try:
         missing_mandatory_proofs,
         select_research_proof_profile,
     )
+    from rag_pipeline.contracts.evidence_quality import apply_evidence_quality_contract, infer_claim_type
 except Exception:  # pragma: no cover - direct script mode fallback
     from research_proof_registry import (  # type: ignore
         build_mandatory_proof_followups,
@@ -21,6 +22,15 @@ except Exception:  # pragma: no cover - direct script mode fallback
         missing_mandatory_proofs,
         select_research_proof_profile,
     )
+    try:
+        from evidence_quality import apply_evidence_quality_contract, infer_claim_type  # type: ignore
+    except Exception:  # pragma: no cover - minimal direct script fallback
+        def infer_claim_type(item: Dict[str, Any]) -> str:  # type: ignore
+            text = " ".join(str(value or "") for value in item.values()).lower()
+            if any(term in text for term in {"market size", "market share", "revenue", "profit", "cagr"}):
+                return "hard_metric"
+            return "industry_analysis"
+        apply_evidence_quality_contract = None  # type: ignore
 
 
 AGENT_NAME = "evidence_binder"
@@ -191,6 +201,55 @@ def _can_use_directional_c(*, level: str, confidence: float, role: str, semantic
     if role in REJECTED_ROLES or semantic_status in REJECTED_STATUSES or semantic_status in WEAK_SEMANTIC_STATUSES:
         return False
     return confidence >= _directional_c_min_confidence()
+
+
+def _evidence_source_key(item: Dict[str, Any]) -> str:
+    source = _as_dict(item.get("source"))
+    raw_url = str(source.get("url") or source.get("source_url") or item.get("source_url") or item.get("url") or "").strip()
+    domain = urlparse(raw_url).netloc.lower().removeprefix("www.")
+    if domain:
+        return f"domain:{domain}"
+    title = re.sub(r"\s+", "", str(source.get("title") or item.get("source_title") or "").strip().lower())
+    if title:
+        return f"title:{title}"
+    for value in [item.get("source_id"), source.get("id"), item.get("source_ref"), item.get("ref")]:
+        text = re.sub(r"\s+", "", str(value or "").strip().lower())
+        if text:
+            return f"id:{text}"
+    return ""
+
+
+def _distinct_source_count(items: Sequence[Dict[str, Any]]) -> int:
+    keys = {_evidence_source_key(item) for item in items if isinstance(item, dict)}
+    return len({key for key in keys if key})
+
+
+def _claim_type_for_hypothesis(hypothesis: Dict[str, Any], goals: Sequence[Dict[str, Any]]) -> str:
+    related_goal_text = " ".join(
+        str(goal.get("question") or goal.get("evidence_goal") or goal.get("dimension_name") or "")
+        for goal in goals
+        if str(goal.get("hypothesis_id") or "").strip() == str(hypothesis.get("hypothesis_id") or "").strip()
+    )
+    return infer_claim_type(
+        {
+            "claim_type": hypothesis.get("claim_type") or hypothesis.get("conclusion_type"),
+            "proof_role": hypothesis.get("proof_role"),
+            "evidence_type": hypothesis.get("evidence_type"),
+            "metric_definitions": hypothesis.get("metric_definitions"),
+            "metric": " ".join(str(_as_dict(item).get("metric") or "") for item in _as_list(hypothesis.get("metric_definitions"))),
+            "hypothesis_statement": hypothesis.get("statement") or hypothesis.get("hypothesis_statement"),
+            "evidence_goal": related_goal_text,
+            "dimension_name": hypothesis.get("dimension_name"),
+        }
+    )
+
+
+def _directional_c_threshold_for_claim(claim_type: str) -> int:
+    if claim_type == "forecast_judgment":
+        return 3
+    if claim_type in {"industry_analysis", "product_event", "case_signal"}:
+        return 2
+    return 10_000
 
 
 def _optional_int(payload: Dict[str, Any], key: str, default: int) -> int:
@@ -437,11 +496,11 @@ def _source_family_from_item(item: Dict[str, Any]) -> str:
     )
     if source_type in {"official", "government", "financial_report", "annual_report", "prospectus", "exchange"}:
         return "official/filing"
-    if source_type in {"research", "academic", "industry_report", "association"}:
+    if source_type in {"research", "academic", "industry_report", "association", "consulting", "market_research", "brokerage", "whitepaper", "authoritative_secondary"}:
         return "research/association"
     if any(term in text for term in ["customer", "case", "procurement", "order", "contract", "client", "tender"]):
         return "company/case"
-    if source_type in {"media", "news", "consulting"}:
+    if source_type in {"media", "news"}:
         return "news/secondary"
     return "unknown"
 
@@ -807,51 +866,59 @@ def normalize_and_register_sources(raw_items: Sequence[Dict[str, Any]], registry
             "period": _compact(item.get("period") or item.get("date") or _as_dict(source).get("date"), 80),
             "allowed_use": allowed_use,
         }
-        normalized.append(
-            {
-                "evidence_id": evidence_id,
-                "ref": evidence_id,
-                "source_refs": [source_ref] if source_ref else [],
-                "source_ref": source_ref,
-                "source": source,
-                "source_text": _source_text(source) if source else "",
-                "source_level": level,
-                "source_family": evidence_card.get("source_family"),
-                "source_type": source_score.get("source_type"),
-                "source_score": source_score.get("source_score"),
-                "source_reason": source_score.get("source_reason"),
-                "can_support_core_claim": source_score.get("can_support_core_claim"),
-                "confidence": confidence,
-                "evidence_quality_score": quality_score,
-                "dimension": _dimension_text(item),
-                "evidence_goal": _compact(item.get("evidence_goal") or item.get("question"), 220),
-                "chapter_id": str(item.get("chapter_id") or _as_dict(item.get("search_task")).get("chapter_id") or "").strip(),
-                "chapter_title": _compact(item.get("chapter_title") or _as_dict(item.get("search_task")).get("chapter_title"), 160),
-                "chapter_question": _compact(item.get("chapter_question") or _as_dict(item.get("search_task")).get("chapter_question"), 220),
-                "evidence_goal_id": str(item.get("evidence_goal_id") or _as_dict(item.get("search_task")).get("evidence_goal_id") or "").strip(),
-                "task_id": str(item.get("task_id") or "").strip(),
-                "hypothesis_id": str(item.get("hypothesis_id") or "").strip(),
-                "hypothesis_statement": _compact(item.get("hypothesis_statement") or item.get("hypothesis"), 260),
-                "proof_role": str(item.get("proof_role") or "").strip().lower(),
-                "evidence_type": str(item.get("evidence_type") or item.get("intent") or "").strip().lower(),
-                "fact": fact,
-                "metric": "" if metric_issue else metric_raw,
-                "value": "" if metric_issue else value_raw,
-                "metric_validation_status": "invalid" if metric_issue else "valid",
-                "metric_validation_issue": metric_issue,
-                "period": _compact(item.get("period") or item.get("date") or _as_dict(source).get("date"), 80),
-                "evidence_role": role,
-                "allowed_use": allowed_use,
-                "evidence_card": evidence_card,
-                "source_hint": str(item.get("source_hint") or "").strip(),
-                "appendix_only": appendix_only,
-                "followup_seed": bool(item.get("followup_seed")) or role == "clue" or level == "D",
-                "can_support_claim_if_corrobated": (bool(item.get("can_support_claim_if_corrobated")) or level == "C") and not _strict_quality_mode(),
-                "usage_tier": str(item.get("usage_tier") or ("directional_signal" if directional_c else "")).strip(),
-                "excluded": excluded,
-                "raw": item,
-            }
-        )
+        normalized_item = {
+            "evidence_id": evidence_id,
+            "ref": evidence_id,
+            "source_refs": [source_ref] if source_ref else [],
+            "source_ref": source_ref,
+            "source": source,
+            "source_text": _source_text(source) if source else "",
+            "source_level": level,
+            "source_family": evidence_card.get("source_family"),
+            "source_type": source_score.get("source_type"),
+            "source_score": source_score.get("source_score"),
+            "source_reason": source_score.get("source_reason"),
+            "can_support_core_claim": source_score.get("can_support_core_claim"),
+            "confidence": confidence,
+            "evidence_quality_score": quality_score,
+            "dimension": _dimension_text(item),
+            "evidence_goal": _compact(item.get("evidence_goal") or item.get("question"), 220),
+            "chapter_id": str(item.get("chapter_id") or _as_dict(item.get("search_task")).get("chapter_id") or "").strip(),
+            "chapter_title": _compact(item.get("chapter_title") or _as_dict(item.get("search_task")).get("chapter_title"), 160),
+            "chapter_question": _compact(item.get("chapter_question") or _as_dict(item.get("search_task")).get("chapter_question"), 220),
+            "evidence_goal_id": str(item.get("evidence_goal_id") or _as_dict(item.get("search_task")).get("evidence_goal_id") or "").strip(),
+            "task_id": str(item.get("task_id") or "").strip(),
+            "hypothesis_id": str(item.get("hypothesis_id") or "").strip(),
+            "hypothesis_statement": _compact(item.get("hypothesis_statement") or item.get("hypothesis"), 260),
+            "proof_role": str(item.get("proof_role") or "").strip().lower(),
+            "claim_type": str(item.get("claim_type") or item.get("conclusion_type") or "").strip().lower(),
+            "evidence_type": str(item.get("evidence_type") or item.get("intent") or "").strip().lower(),
+            "fact": fact,
+            "metric": "" if metric_issue else metric_raw,
+            "value": "" if metric_issue else value_raw,
+            "metric_validation_status": "invalid" if metric_issue else "valid",
+            "metric_validation_issue": metric_issue,
+            "period": _compact(item.get("period") or item.get("date") or _as_dict(source).get("date"), 80),
+            "evidence_role": role,
+            "allowed_use": allowed_use,
+            "evidence_card": evidence_card,
+            "source_hint": str(item.get("source_hint") or "").strip(),
+            "appendix_only": appendix_only,
+            "followup_seed": bool(item.get("followup_seed")) or role == "clue" or level == "D",
+            "can_support_claim_if_corrobated": (bool(item.get("can_support_claim_if_corrobated")) or level == "C") and not _strict_quality_mode(),
+            "usage_tier": str(item.get("usage_tier") or ("directional_signal" if directional_c else "")).strip(),
+            "excluded": excluded,
+            "raw": item,
+        }
+        if apply_evidence_quality_contract is not None:
+            normalized_item = apply_evidence_quality_contract(
+                normalized_item,
+                strict_quality=_strict_quality_mode(),
+                directional_c_min_confidence=_directional_c_min_confidence(),
+            )
+            normalized_item["excluded"] = excluded
+            normalized_item["raw"] = item
+        normalized.append(normalized_item)
     normalized.sort(key=lambda item: (item.get("excluded"), item.get("appendix_only"), -float(item.get("confidence") or 0.0)))
     return normalized
 
@@ -1227,9 +1294,12 @@ def _report_proof_mode(research_plan: Dict[str, Any], hypothesis: Dict[str, Any]
         or os.getenv("REPORT_PROOF_MODE")
         or ""
     ).strip().lower()
-    if explicit in PROOF_STANDARD_BY_REPORT_MODE:
-        return explicit
     family = str(research_plan.get("report_family") or research_plan.get("report_type") or "").strip().lower()
+    deep_family = "deep" in family or "industry_deep_report" in family
+    if explicit in PROOF_STANDARD_BY_REPORT_MODE:
+        if explicit == "quick_market_scan" and deep_family and not _env_flag("REPORT_ALLOW_QUICK_PROOF_FOR_DEEP", False):
+            return "deep_industry_report"
+        return explicit
     if any(term in family for term in ["due", "dd", "尽调", "投资"]):
         return "investment_due_diligence"
     if any(term in family for term in ["deep", "深度"]):
@@ -1287,6 +1357,7 @@ def build_coverage_matrix(
             if not item.get("appendix_only")
             and str(item.get("source_level") or "").strip().upper() in {"A", "B"}
             and str(item.get("allowed_use") or "").strip() in {"core_claim", "supporting", ""}
+            and str(item.get("analysis_readiness") or "").strip() in {"", "decision_ready"}
         ]
         profile = _coverage_profile(research_plan, hypothesis)
         directional = [
@@ -1301,6 +1372,10 @@ def build_coverage_matrix(
         usable_levels = _level_distribution(usable)
         ab_count = usable_levels.get("A", 0) + usable_levels.get("B", 0)
         directional_count = len(directional)
+        directional_distinct_count = _distinct_source_count(directional)
+        claim_type = _claim_type_for_hypothesis(hypothesis, goals)
+        hard_metric_claim = claim_type == "hard_metric"
+        strict_mode = _strict_quality_mode()
         counter_count = len(
             [
                 item
@@ -1325,6 +1400,11 @@ def build_coverage_matrix(
                 or bool(item.get("metric") or item.get("value"))
             ]
         )
+        metric_gap_items = [
+            item
+            for item in usable_for_direction
+            if _as_list(item.get("metric_proof_gaps") or _as_dict(item.get("evidence_card")).get("metric_proof_gaps"))
+        ]
         case_source_count = len(
             [
                 item
@@ -1358,13 +1438,37 @@ def build_coverage_matrix(
             if _report_proof_mode(research_plan, hypothesis) != "quick_market_scan":
                 required_sources = max(required_sources, goal_min_sources)
         missing: List[str] = []
-        if ab_count < required_sources:
+        degradation_notes: List[str] = []
+        ab_requirement_satisfied = ab_count >= required_sources
+        directional_ready = False
+        if not ab_requirement_satisfied and not strict_mode and not hard_metric_claim:
+            c_threshold = _directional_c_threshold_for_claim(claim_type)
+            if ab_count >= 1:
+                ab_requirement_satisfied = True
+                degradation_notes.append("a_absent_or_ab_shortfall_b_substituted")
+            elif directional_distinct_count >= c_threshold:
+                ab_requirement_satisfied = True
+                directional_ready = True
+                degradation_notes.append("directional_corroborated_from_independent_c_sources")
+        if not ab_requirement_satisfied:
             missing.append("insufficient_ab_sources")
         counter_required = bool(hypothesis.get("counter_evidence_required", profile.get("require_counter", False)))
         if counter_required and required_counter > 0 and counter_count < required_counter:
-            missing.append("counter_evidence_missing")
+            if not strict_mode and not hard_metric_claim and not bool(hypothesis.get("counter_evidence_required")) and (ab_count or directional_distinct_count >= 2):
+                degradation_notes.append("counter_evidence_missing_advisory")
+            else:
+                missing.append("counter_evidence_missing")
         if required_metric > 0 and metric_source_count < required_metric:
-            missing.append("metric_evidence_missing")
+            if not strict_mode and not hard_metric_claim and (ab_count or directional_distinct_count >= 2):
+                degradation_notes.append("metric_evidence_degraded_for_non_hard_claim")
+            else:
+                missing.append("metric_evidence_missing")
+        if metric_gap_items:
+            if hard_metric_claim or strict_mode:
+                if "metric_scope_period_unit_incomplete" not in missing:
+                    missing.append("metric_scope_period_unit_incomplete")
+            else:
+                degradation_notes.append("metric_scope_period_unit_incomplete_advisory")
         if required_case > 0 and case_source_count < required_case:
             missing.append("case_evidence_missing")
         if required_diversity and not set(required_diversity).issubset(set(source_families)):
@@ -1381,10 +1485,16 @@ def build_coverage_matrix(
             )
         ]
         if not hypothesis_metrics and _as_list(hypothesis.get("metric_definitions")):
-            missing.append("metric_definition_unfilled")
+            if not strict_mode and not hard_metric_claim and (ab_count or directional_distinct_count >= 2):
+                degradation_notes.append("metric_definition_unfilled_advisory")
+            else:
+                missing.append("metric_definition_unfilled")
         incomplete_metrics = [metric for metric in hypothesis_metrics if _as_list(metric.get("missing_fields"))]
         if incomplete_metrics:
-            missing.append("metric_scope_period_unit_incomplete")
+            if not strict_mode and not hard_metric_claim and (ab_count or directional_distinct_count >= 2):
+                degradation_notes.append("metric_scope_period_unit_incomplete_advisory")
+            else:
+                missing.append("metric_scope_period_unit_incomplete")
         proof_checks = mandatory_proof_checks(
             proof_profile,
             relevant,
@@ -1393,13 +1503,26 @@ def build_coverage_matrix(
         )
         missing_proofs = missing_mandatory_proofs(proof_checks)
         if missing_proofs and "mandatory_proof_missing" not in missing:
-            missing.append("mandatory_proof_missing")
-        if not missing:
+            if not strict_mode and not hard_metric_claim and (ab_count or directional_distinct_count >= _directional_c_threshold_for_claim(claim_type)):
+                degradation_notes.append("mandatory_proof_missing_advisory")
+            else:
+                missing.append("mandatory_proof_missing")
+        if not missing and directional_ready:
+            claim_status = "directional_ready"
+        elif not missing:
             claim_status = "decision_ready"
         elif ab_count or directional_count:
             claim_status = "directional"
         else:
             claim_status = "context_only"
+        if claim_status == "decision_ready":
+            readiness_level = "decision_ready"
+        elif claim_status == "directional_ready":
+            readiness_level = "directional_ready"
+        elif missing and not (ab_count or directional_count):
+            readiness_level = "blocked"
+        else:
+            readiness_level = "context_only"
         matrix.append(
             {
                 "hypothesis_id": hypothesis_id,
@@ -1407,9 +1530,12 @@ def build_coverage_matrix(
                 "proof_standard": hypothesis.get("proof_standard") or "medium",
                 "report_proof_mode": _report_proof_mode(research_plan, hypothesis),
                 "required_source_levels": required_levels,
+                "claim_type": claim_type,
                 "required_ab_sources": required_sources,
                 "actual_ab_sources": ab_count,
                 "directional_c_sources": directional_count,
+                "directional_c_distinct_sources": directional_distinct_count,
+                "evidence_degradation_notes": degradation_notes,
                 "counter_evidence_count": counter_count,
                 "counter_clue_count": counter_clue_count,
                 "metric_source_count": metric_source_count,
@@ -1418,13 +1544,24 @@ def build_coverage_matrix(
                 "required_source_diversity": required_diversity,
                 "metric_count": len(hypothesis_metrics),
                 "complete_metric_count": len([metric for metric in hypothesis_metrics if not _as_list(metric.get("missing_fields"))]),
+                "metric_proof_gap_count": len(metric_gap_items),
+                "metric_proof_gaps": sorted(
+                    {
+                        str(gap)
+                        for item in metric_gap_items
+                        for gap in _as_list(item.get("metric_proof_gaps") or _as_dict(item.get("evidence_card")).get("metric_proof_gaps"))
+                        if str(gap or "").strip()
+                    }
+                ),
                 "proof_profile_id": proof_profile.get("profile_id"),
                 "mandatory_proof_checks": proof_checks,
                 "missing_mandatory_proofs": missing_proofs,
                 "evidence_refs": [item.get("ref") or item.get("evidence_id") for item in usable_for_direction[:12] if item.get("ref") or item.get("evidence_id")],
                 "source_level_distribution": levels,
                 "usable_source_level_distribution": usable_levels,
+                "usable_with_directional_source_level_distribution": _level_distribution(usable_for_direction),
                 "claim_status": claim_status,
+                "readiness_level": readiness_level,
                 "decision_ready": not missing,
                 "blocking_gaps": missing,
             }
@@ -1693,7 +1830,7 @@ def bind_evidence_to_chapters(
             )
         min_ab_core_sources = max(
             int(chapter.get("min_ab_sources") or 0),
-            int(os.getenv("REPORT_MIN_AB_SOURCES_PER_CHAPTER", "4")),
+            _env_int("REPORT_MIN_AB_SOURCES_PER_CHAPTER", 4 if _strict_quality_mode() else 2),
         )
         if int(quality_summary.get("core_ab_source_count") or 0) < min_ab_core_sources:
             missing.append(

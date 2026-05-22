@@ -11,10 +11,22 @@ from typing import Any, Dict, Iterable, List, Optional
 from uuid import uuid4
 
 from ..config.search_config import DEFAULT_EXTERNAL_API_TRUST_ENV, DEFAULT_LLM_DISABLE_THINKING
+from ..telemetry.token_usage import record_llm_usage
 from .models import Turn
 
 
 _PRONOUN_RE = re.compile(r"(?:^|\b)(it|they|them|that|this|he|she|its|their)\b|[它那个这该其他们她们该公司该行业该技术]", re.I)
+
+
+_UNAVAILABLE_LLM_KEYS: set[str] = set()
+
+
+class LLMCallError(RuntimeError):
+    """RuntimeError with non-secret call diagnostics attached."""
+
+    def __init__(self, message: str, *, diagnostic: Optional[Dict[str, Any]] = None):
+        super().__init__(message)
+        self.diagnostic = dict(diagnostic or {})
 
 
 def generate_turn_id() -> str:
@@ -43,6 +55,11 @@ def _build_url_opener(*, trust_env: bool) -> urllib.request.OpenerDirector:
 
 def normalize_llm_config(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     config = dict(config or {})
+    max_output_tokens = 0
+    try:
+        max_output_tokens = max(0, int(config.get("max_output_tokens") or 0))
+    except (TypeError, ValueError):
+        max_output_tokens = 0
     return {
         "provider": str(config.get("provider") or "openai_compatible").strip().lower() or "openai_compatible",
         "url": str(config.get("url") or "").strip(),
@@ -51,6 +68,11 @@ def normalize_llm_config(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "timeout": float(config.get("timeout") or 30.0),
         "trust_env": _normalize_bool_flag(config.get("trust_env"), DEFAULT_EXTERNAL_API_TRUST_ENV),
         "disable_thinking": _normalize_bool_flag(config.get("disable_thinking"), DEFAULT_LLM_DISABLE_THINKING),
+        "reasoning_effort": str(config.get("reasoning_effort") or "").strip().lower(),
+        "max_output_tokens": max_output_tokens,
+        "api_mode": str(config.get("api_mode") or "").strip().lower(),
+        "task_name": str(config.get("task_name") or config.get("task") or "").strip(),
+        "profile": str(config.get("profile") or "").strip(),
     }
 
 
@@ -70,32 +92,217 @@ def normalize_openai_compatible_chat_url(url: str) -> str:
     return cleaned
 
 
-def call_openai_compatible_json(
-    *,
-    config: Dict[str, Any],
-    system_prompt: str,
-    user_payload: Dict[str, Any],
-) -> Dict[str, Any]:
-    normalized = normalize_llm_config(config)
-    if normalized["provider"] != "openai_compatible":
-        raise RuntimeError(f"Unsupported LLM provider: {normalized['provider']}")
-    if not llm_config_is_ready(normalized):
-        raise RuntimeError("LLM config is incomplete.")
+def normalize_openai_responses_url(url: str) -> str:
+    cleaned = str(url or "").strip().rstrip("/")
+    if not cleaned:
+        return ""
+    if cleaned.endswith("/responses"):
+        return cleaned
+    if cleaned.endswith("/chat/completions"):
+        return f"{cleaned[: -len('/chat/completions')]}/responses"
+    if cleaned.endswith("/v1"):
+        return f"{cleaned}/responses"
+    return cleaned
 
-    payload = {
-        "model": normalized["model"],
-        "temperature": 0.1,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
-        ],
-        "response_format": {"type": "json_object"},
+
+def model_uses_default_temperature_only(model: str) -> bool:
+    return str(model or "").strip().lower().startswith("gpt-5")
+
+
+def _model_uses_default_temperature_only(model: str) -> bool:
+    return model_uses_default_temperature_only(model)
+
+
+def should_use_openai_responses_api(normalized: Dict[str, Any]) -> bool:
+    mode = str(normalized.get("api_mode") or "").strip().lower()
+    if mode in {"responses", "openai_responses"}:
+        return True
+    model = str(normalized.get("model") or "").strip().lower()
+    return model.startswith("gpt-5.5")
+
+
+def _llm_circuit_key(normalized: Dict[str, Any]) -> str:
+    return "|".join(
+        [
+            str(normalized.get("provider") or ""),
+            str(normalized.get("url") or "").rstrip("/"),
+            str(normalized.get("model") or ""),
+            str(normalized.get("profile") or ""),
+        ]
+    )
+
+
+def _is_gpt55_config(normalized: Dict[str, Any]) -> bool:
+    model = str(normalized.get("model") or "").strip().lower()
+    profile = str(normalized.get("profile") or "").strip().lower()
+    return model.startswith("gpt-5.5") or profile == "gpt-5.5"
+
+
+def _fallback_config_for(config: Dict[str, Any], normalized: Dict[str, Any]) -> Dict[str, Any]:
+    if not _is_gpt55_config(normalized):
+        return {}
+    fallback = config.get("fallback_config") if isinstance(config, dict) else None
+    if not isinstance(fallback, dict):
+        return {}
+    fallback_normalized = normalize_llm_config(fallback)
+    if not llm_config_is_ready(fallback_normalized):
+        return {}
+    if _llm_circuit_key(fallback_normalized) == _llm_circuit_key(normalized):
+        return {}
+    return dict(fallback)
+
+
+def _llm_error_summary(exc: Exception) -> str:
+    diagnostic = getattr(exc, "diagnostic", None)
+    if isinstance(diagnostic, dict) and diagnostic.get("error"):
+        return str(diagnostic.get("error") or "")[:1200]
+    return str(exc)[:1200]
+
+
+def _mark_primary_unavailable(normalized: Dict[str, Any], exc: Exception) -> None:
+    del exc
+    if _is_gpt55_config(normalized):
+        _UNAVAILABLE_LLM_KEYS.add(_llm_circuit_key(normalized))
+
+
+def _annotate_fallback_result(
+    result: Dict[str, Any],
+    *,
+    primary: Dict[str, Any],
+    fallback: Dict[str, Any],
+    primary_error: str,
+    primary_skipped: bool = False,
+) -> Dict[str, Any]:
+    if not isinstance(result, dict):
+        return result
+    llm_call = dict(result.get("llm_call") or {})
+    llm_call.update(
+        {
+            "fallback_used": True,
+            "primary_skipped": bool(primary_skipped),
+            "primary_profile": str(primary.get("profile") or ""),
+            "primary_model": str(primary.get("model") or ""),
+            "fallback_profile": str(fallback.get("profile") or ""),
+            "fallback_model": str(fallback.get("model") or ""),
+            "primary_error": str(primary_error or "")[:1200],
+        }
+    )
+    result["llm_call"] = llm_call
+    result["fallback_used"] = True
+    return result
+
+
+def _raise_fallback_error(primary_exc: Exception, fallback_exc: Exception, *, primary: Dict[str, Any], fallback: Dict[str, Any]) -> None:
+    primary_error = _llm_error_summary(primary_exc)
+    fallback_error = _llm_error_summary(fallback_exc)
+    diagnostic = {
+        "status": "failed",
+        "fallback_used": True,
+        "primary_profile": str(primary.get("profile") or ""),
+        "primary_model": str(primary.get("model") or ""),
+        "primary_error": primary_error,
+        "fallback_profile": str(fallback.get("profile") or ""),
+        "fallback_model": str(fallback.get("model") or ""),
+        "fallback_error": fallback_error,
+        "error": f"primary={primary_error}; fallback={fallback_error}",
     }
-    if normalized.get("disable_thinking"):
-        payload["enable_thinking"] = False
+    raise LLMCallError(
+        f"Primary LLM failed and fallback LLM failed. primary={primary_error}; fallback={fallback_error}",
+        diagnostic=diagnostic,
+    ) from fallback_exc
+
+
+def apply_openai_compatible_reasoning_flags(payload: Dict[str, Any], normalized: Dict[str, Any]) -> None:
+    if not normalized.get("disable_thinking"):
+        return
+    model = str(normalized.get("model") or "").strip().lower()
+    if model.startswith("deepseek-v4"):
+        payload["thinking"] = {"type": "disabled"}
+        return
+    payload["enable_thinking"] = False
+
+
+def _apply_openai_compatible_reasoning_flags(payload: Dict[str, Any], normalized: Dict[str, Any]) -> None:
+    apply_openai_compatible_reasoning_flags(payload, normalized)
+
+
+def _apply_openai_responses_reasoning(payload: Dict[str, Any], normalized: Dict[str, Any]) -> None:
+    effort = str(normalized.get("reasoning_effort") or "").strip().lower()
+    if effort:
+        payload["reasoning"] = {"effort": effort}
+
+
+def _record_llm_usage_event(
+    *,
+    normalized: Dict[str, Any],
+    usage: Any,
+    api: str,
+    started_at: float,
+) -> None:
+    try:
+        record_llm_usage(
+            usage=usage,
+            provider=str(normalized.get("provider") or ""),
+            model=str(normalized.get("model") or ""),
+            task=str(normalized.get("task_name") or ""),
+            profile=str(normalized.get("profile") or ""),
+            api=api,
+            elapsed_ms=max(0, int((time.perf_counter() - started_at) * 1000)),
+        )
+    except Exception:
+        return
+
+
+def _llm_call_diagnostic(
+    *,
+    normalized: Dict[str, Any],
+    api: str,
+    started_at: float,
+    status: str,
+    usage: Any = None,
+    error: str = "",
+) -> Dict[str, Any]:
+    return {
+        "task": str(normalized.get("task_name") or ""),
+        "profile": str(normalized.get("profile") or ""),
+        "model": str(normalized.get("model") or ""),
+        "api": str(api or ""),
+        "status": str(status or ""),
+        "error": str(error or "")[:1200],
+        "usage": usage if isinstance(usage, dict) else {},
+        "elapsed_ms": max(0, int((time.perf_counter() - started_at) * 1000)),
+    }
+
+
+def _raise_llm_call_error(
+    exc: Exception,
+    *,
+    normalized: Dict[str, Any],
+    api: str,
+    started_at: float,
+) -> None:
+    if isinstance(exc, LLMCallError):
+        raise exc
+    diagnostic = _llm_call_diagnostic(
+        normalized=normalized,
+        api=api,
+        started_at=started_at,
+        status="failed",
+        error=str(exc),
+    )
+    raise LLMCallError(str(exc), diagnostic=diagnostic) from exc
+
+
+def _post_llm_json(
+    *,
+    normalized: Dict[str, Any],
+    url: str,
+    payload: Dict[str, Any],
+    error_prefix: str,
+) -> Dict[str, Any]:
     request = urllib.request.Request(
-        normalize_openai_compatible_chat_url(normalized["url"]),
-        data=json.dumps(payload).encode("utf-8"),
+        url,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers={
             "Authorization": f"Bearer {normalized['api_key']}",
             "Content-Type": "application/json",
@@ -108,11 +315,309 @@ def call_openai_compatible_json(
             raw = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"LLM request failed with HTTP {exc.code}: {detail}") from exc
+        raise RuntimeError(f"{error_prefix} failed with HTTP {exc.code}: {detail}") from exc
     except urllib.error.URLError as exc:
-        raise RuntimeError(f"LLM request failed: {exc}") from exc
+        raise RuntimeError(f"{error_prefix} failed: {exc}") from exc
+    return json.loads(raw)
 
-    data = json.loads(raw)
+
+def collect_openai_response_text(response: Dict[str, Any]) -> str:
+    if str(response.get("output_text") or "").strip():
+        return str(response.get("output_text") or "").strip()
+    parts: List[str] = []
+    for output in response.get("output") or []:
+        if not isinstance(output, dict):
+            continue
+        for content in output.get("content") or []:
+            if isinstance(content, dict):
+                text = content.get("text") or content.get("output_text")
+                if text:
+                    parts.append(str(text))
+        if output.get("type") == "message" and isinstance(output.get("text"), str):
+            parts.append(str(output.get("text")))
+    return "\n".join(part.strip() for part in parts if str(part or "").strip()).strip()
+
+
+def call_openai_responses_json(
+    *,
+    normalized: Dict[str, Any],
+    system_prompt: str,
+    user_payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    api = "openai_responses_json"
+    input_payload = {
+        "response_format_instruction": "Return a valid JSON object. The response must be json.",
+        "payload": user_payload,
+    }
+    payload: Dict[str, Any] = {
+        "model": normalized["model"],
+        "instructions": system_prompt,
+        "input": json.dumps(input_payload, ensure_ascii=False),
+        "text": {"format": {"type": "json_object"}},
+    }
+    if int(normalized.get("max_output_tokens") or 0) > 0:
+        payload["max_output_tokens"] = int(normalized["max_output_tokens"])
+    _apply_openai_responses_reasoning(payload, normalized)
+    started_at = time.perf_counter()
+    try:
+        data = _post_llm_json(
+            normalized=normalized,
+            url=normalize_openai_responses_url(normalized["url"]),
+            payload=payload,
+            error_prefix="OpenAI Responses request",
+        )
+    except Exception as exc:
+        _raise_llm_call_error(exc, normalized=normalized, api=api, started_at=started_at)
+    _record_llm_usage_event(
+        normalized=normalized,
+        usage=data.get("usage", {}),
+        api=api,
+        started_at=started_at,
+    )
+    llm_call = _llm_call_diagnostic(
+        normalized=normalized,
+        api=api,
+        started_at=started_at,
+        status="success",
+        usage=data.get("usage", {}),
+    )
+    content = collect_openai_response_text(data)
+    if not content:
+        diagnostic = {**llm_call, "status": "failed", "error": "OpenAI Responses content is empty."}
+        raise LLMCallError("OpenAI Responses content is empty.", diagnostic=diagnostic)
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError as exc:
+        diagnostic = {**llm_call, "status": "failed", "error": f"OpenAI Responses output is not valid JSON: {content[:400]}"}
+        raise LLMCallError(diagnostic["error"], diagnostic=diagnostic) from exc
+    if not isinstance(parsed, dict):
+        diagnostic = {**llm_call, "status": "failed", "error": "OpenAI Responses JSON root must be an object."}
+        raise LLMCallError("OpenAI Responses JSON root must be an object.", diagnostic=diagnostic)
+    return {
+        "payload": parsed,
+        "usage": data.get("usage", {}),
+        "raw_response": data,
+        "request_payload": user_payload,
+        "llm_call": llm_call,
+    }
+
+
+def _call_openai_compatible_text_once(
+    *,
+    config: Dict[str, Any],
+    system_prompt: str,
+    user_content: str,
+    temperature: float = 0.2,
+    max_tokens: int = 16000,
+) -> Dict[str, Any]:
+    normalized = normalize_llm_config(config)
+    if normalized["provider"] != "openai_compatible":
+        raise RuntimeError(f"Unsupported LLM provider: {normalized['provider']}")
+    if not llm_config_is_ready(normalized):
+        raise RuntimeError("LLM config is incomplete.")
+
+    max_output_tokens = int(normalized.get("max_output_tokens") or 0) or int(max_tokens or 0)
+    if should_use_openai_responses_api(normalized):
+        api = "openai_responses_text"
+        payload: Dict[str, Any] = {
+            "model": normalized["model"],
+            "instructions": system_prompt,
+            "input": user_content,
+        }
+        if max_output_tokens > 0:
+            payload["max_output_tokens"] = max_output_tokens
+        _apply_openai_responses_reasoning(payload, normalized)
+        started_at = time.perf_counter()
+        try:
+            data = _post_llm_json(
+                normalized=normalized,
+                url=normalize_openai_responses_url(normalized["url"]),
+                payload=payload,
+                error_prefix="OpenAI Responses request",
+            )
+        except Exception as exc:
+            _raise_llm_call_error(exc, normalized=normalized, api=api, started_at=started_at)
+        _record_llm_usage_event(
+            normalized=normalized,
+            usage=data.get("usage", {}),
+            api=api,
+            started_at=started_at,
+        )
+        llm_call = _llm_call_diagnostic(
+            normalized=normalized,
+            api=api,
+            started_at=started_at,
+            status="success",
+            usage=data.get("usage", {}),
+        )
+        text = collect_openai_response_text(data)
+        if not text:
+            diagnostic = {**llm_call, "status": "failed", "error": "OpenAI Responses content is empty."}
+            raise LLMCallError("OpenAI Responses content is empty.", diagnostic=diagnostic)
+        return {"text": text, "usage": data.get("usage", {}), "raw_response": data, "llm_call": llm_call}
+
+    payload = {
+        "model": normalized["model"],
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+    }
+    if max_output_tokens > 0:
+        payload["max_tokens"] = max_output_tokens
+    if not model_uses_default_temperature_only(normalized["model"]):
+        payload["temperature"] = temperature
+    apply_openai_compatible_reasoning_flags(payload, normalized)
+    api = "openai_compatible_chat_text"
+    started_at = time.perf_counter()
+    try:
+        data = _post_llm_json(
+            normalized=normalized,
+            url=normalize_openai_compatible_chat_url(normalized["url"]),
+            payload=payload,
+            error_prefix="LLM request",
+        )
+    except Exception as exc:
+        _raise_llm_call_error(exc, normalized=normalized, api=api, started_at=started_at)
+    _record_llm_usage_event(
+        normalized=normalized,
+        usage=data.get("usage", {}),
+        api=api,
+        started_at=started_at,
+    )
+    llm_call = _llm_call_diagnostic(
+        normalized=normalized,
+        api=api,
+        started_at=started_at,
+        status="success",
+        usage=data.get("usage", {}),
+    )
+    choices = data.get("choices") or []
+    if not choices:
+        raise RuntimeError("LLM response did not include choices.")
+    message = choices[0].get("message") or {}
+    content = message.get("content", "")
+    if isinstance(content, list):
+        content = "\n".join(str(item.get("text", item)) if isinstance(item, dict) else str(item) for item in content)
+    text = str(content or "").strip()
+    if not text:
+        diagnostic = {**llm_call, "status": "failed", "error": "LLM response content is empty."}
+        raise LLMCallError("LLM response content is empty.", diagnostic=diagnostic)
+    return {"text": text, "usage": data.get("usage", {}), "raw_response": data, "llm_call": llm_call}
+
+
+def call_openai_compatible_text(
+    *,
+    config: Dict[str, Any],
+    system_prompt: str,
+    user_content: str,
+    temperature: float = 0.2,
+    max_tokens: int = 16000,
+) -> Dict[str, Any]:
+    normalized = normalize_llm_config(config)
+    fallback_config = _fallback_config_for(config, normalized)
+    fallback_normalized = normalize_llm_config(fallback_config) if fallback_config else {}
+    circuit_key = _llm_circuit_key(normalized)
+    if fallback_config and circuit_key in _UNAVAILABLE_LLM_KEYS:
+        result = _call_openai_compatible_text_once(
+            config=fallback_config,
+            system_prompt=system_prompt,
+            user_content=user_content,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return _annotate_fallback_result(
+            result,
+            primary=normalized,
+            fallback=fallback_normalized,
+            primary_error="primary_model_marked_unavailable",
+            primary_skipped=True,
+        )
+    try:
+        return _call_openai_compatible_text_once(
+            config=config,
+            system_prompt=system_prompt,
+            user_content=user_content,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+    except Exception as primary_exc:
+        if not fallback_config:
+            raise
+        _mark_primary_unavailable(normalized, primary_exc)
+        try:
+            result = _call_openai_compatible_text_once(
+                config=fallback_config,
+                system_prompt=system_prompt,
+                user_content=user_content,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        except Exception as fallback_exc:
+            _raise_fallback_error(primary_exc, fallback_exc, primary=normalized, fallback=fallback_normalized)
+        return _annotate_fallback_result(
+            result,
+            primary=normalized,
+            fallback=fallback_normalized,
+            primary_error=_llm_error_summary(primary_exc),
+        )
+
+
+def _call_openai_compatible_json_once(
+    *,
+    config: Dict[str, Any],
+    system_prompt: str,
+    user_payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    normalized = normalize_llm_config(config)
+    if normalized["provider"] != "openai_compatible":
+        raise RuntimeError(f"Unsupported LLM provider: {normalized['provider']}")
+    if not llm_config_is_ready(normalized):
+        raise RuntimeError("LLM config is incomplete.")
+    if should_use_openai_responses_api(normalized):
+        return call_openai_responses_json(
+            normalized=normalized,
+            system_prompt=system_prompt,
+            user_payload=user_payload,
+        )
+
+    payload = {
+        "model": normalized["model"],
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+        ],
+        "response_format": {"type": "json_object"},
+    }
+    if int(normalized.get("max_output_tokens") or 0) > 0:
+        payload["max_tokens"] = int(normalized["max_output_tokens"])
+    if not model_uses_default_temperature_only(normalized["model"]):
+        payload["temperature"] = 0.1
+    apply_openai_compatible_reasoning_flags(payload, normalized)
+    api = "openai_compatible_chat_json"
+    started_at = time.perf_counter()
+    try:
+        data = _post_llm_json(
+            normalized=normalized,
+            url=normalize_openai_compatible_chat_url(normalized["url"]),
+            payload=payload,
+            error_prefix="LLM request",
+        )
+    except Exception as exc:
+        _raise_llm_call_error(exc, normalized=normalized, api=api, started_at=started_at)
+    _record_llm_usage_event(
+        normalized=normalized,
+        usage=data.get("usage", {}),
+        api=api,
+        started_at=started_at,
+    )
+    llm_call = _llm_call_diagnostic(
+        normalized=normalized,
+        api=api,
+        started_at=started_at,
+        status="success",
+        usage=data.get("usage", {}),
+    )
     choices = data.get("choices") or []
     if not choices:
         raise RuntimeError("LLM response did not include choices.")
@@ -122,19 +627,72 @@ def call_openai_compatible_json(
         content = "\n".join(str(item.get("text", item)) if isinstance(item, dict) else str(item) for item in content)
     content = str(content or "").strip()
     if not content:
-        raise RuntimeError("LLM response content is empty.")
+        diagnostic = {**llm_call, "status": "failed", "error": "LLM response content is empty."}
+        raise LLMCallError("LLM response content is empty.", diagnostic=diagnostic)
     try:
         payload = json.loads(content)
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"LLM response is not valid JSON: {content[:400]}") from exc
+        diagnostic = {**llm_call, "status": "failed", "error": f"LLM response is not valid JSON: {content[:400]}"}
+        raise LLMCallError(diagnostic["error"], diagnostic=diagnostic) from exc
     if not isinstance(payload, dict):
-        raise RuntimeError("LLM response JSON root must be an object.")
+        diagnostic = {**llm_call, "status": "failed", "error": "LLM response JSON root must be an object."}
+        raise LLMCallError("LLM response JSON root must be an object.", diagnostic=diagnostic)
     return {
         "payload": payload,
         "usage": data.get("usage", {}),
         "raw_response": data,
         "request_payload": user_payload,
+        "llm_call": llm_call,
     }
+
+
+def call_openai_compatible_json(
+    *,
+    config: Dict[str, Any],
+    system_prompt: str,
+    user_payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    normalized = normalize_llm_config(config)
+    fallback_config = _fallback_config_for(config, normalized)
+    fallback_normalized = normalize_llm_config(fallback_config) if fallback_config else {}
+    circuit_key = _llm_circuit_key(normalized)
+    if fallback_config and circuit_key in _UNAVAILABLE_LLM_KEYS:
+        result = _call_openai_compatible_json_once(
+            config=fallback_config,
+            system_prompt=system_prompt,
+            user_payload=user_payload,
+        )
+        return _annotate_fallback_result(
+            result,
+            primary=normalized,
+            fallback=fallback_normalized,
+            primary_error="primary_model_marked_unavailable",
+            primary_skipped=True,
+        )
+    try:
+        return _call_openai_compatible_json_once(
+            config=config,
+            system_prompt=system_prompt,
+            user_payload=user_payload,
+        )
+    except Exception as primary_exc:
+        if not fallback_config:
+            raise
+        _mark_primary_unavailable(normalized, primary_exc)
+        try:
+            result = _call_openai_compatible_json_once(
+                config=fallback_config,
+                system_prompt=system_prompt,
+                user_payload=user_payload,
+            )
+        except Exception as fallback_exc:
+            _raise_fallback_error(primary_exc, fallback_exc, primary=normalized, fallback=fallback_normalized)
+        return _annotate_fallback_result(
+            result,
+            primary=normalized,
+            fallback=fallback_normalized,
+            primary_error=_llm_error_summary(primary_exc),
+        )
 
 
 class ConversationMemory:

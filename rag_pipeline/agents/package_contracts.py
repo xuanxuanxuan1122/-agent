@@ -8,10 +8,19 @@ try:
     from .block_schema import valid_block_types
     from .report_profile_registry import quality_contract_for_profile
     from .table_validator import validate_table_package
+    from rag_pipeline.contracts.evidence_quality import infer_claim_type
 except Exception:  # pragma: no cover - direct script mode fallback
     from block_schema import valid_block_types  # type: ignore
     from report_profile_registry import quality_contract_for_profile  # type: ignore
     from table_validator import validate_table_package  # type: ignore
+    try:
+        from evidence_quality import infer_claim_type  # type: ignore
+    except Exception:  # pragma: no cover - minimal direct script fallback
+        def infer_claim_type(item: Dict[str, Any]) -> str:  # type: ignore
+            text = " ".join(str(value or "") for value in item.values()).lower()
+            if any(term in text for term in {"market size", "market share", "revenue", "profit", "cagr"}):
+                return "hard_metric"
+            return "industry_analysis"
 
 
 FIXED_FIVE_DIMENSIONS = {
@@ -33,6 +42,12 @@ BAD_CLAIM_PATTERNS = [
     r"已有可核验证据",
     r"已有可验证证据",
     r"证据不足",
+    r"正文\s*只能\s*写成",
+    r"本章\s*只能\s*写成",
+    r"本章\s*可\s*写成",
+    r"本章\s*仍需\s*连续观察",
+    r"建议避免",
+    r"建议在后续版本中补充",
     r"可作为判断输入",
     r"需结合来源等级",
     r"需结合.*时间范围",
@@ -67,6 +82,20 @@ def _as_dict(value: Any) -> Dict[str, Any]:
 
 def _as_list(value: Any) -> List[Any]:
     return list(value) if isinstance(value, list) else []
+
+
+def _strict_quality_mode() -> bool:
+    mode = str(os.getenv("REPORT_QUALITY_MODE") or os.getenv("QUALITY_MODE") or "balanced").strip().lower()
+    if mode in {"strict", "hard", "deep_strict", "due_diligence", "investment_due_diligence"}:
+        return True
+    return str(os.getenv("STRICT_EVIDENCE_MODE") or "").strip().lower() in {"1", "true", "yes", "on", "strict"}
+
+
+def _claim_type_for_unit(unit: Dict[str, Any]) -> str:
+    explicit = str(unit.get("claim_type") or unit.get("conclusion_type") or "").strip().lower()
+    if explicit:
+        return explicit
+    return str(infer_claim_type(unit) or "industry_analysis")
 
 
 def _compact(value: Any, max_chars: int = 220) -> str:
@@ -109,7 +138,7 @@ def _score(blocking_errors: Sequence[Dict[str, Any]], warnings: Sequence[Dict[st
 
 
 def _contract_result(package: str, issues: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
-    blocking_errors, warnings = _split_issues(issues)
+    blocking_errors, warnings = _split_issues(dedupe_package_issues(issues))
     score = _score(blocking_errors, warnings)
     return {
         "package": package,
@@ -122,11 +151,84 @@ def _contract_result(package: str, issues: Sequence[Dict[str, Any]]) -> Dict[str
     }
 
 
+def _issue_key(issue: Dict[str, Any]) -> tuple[str, str, str, str, str]:
+    payload = _as_dict(issue)
+    detail = _as_dict(payload.get("detail"))
+    detail_type = str(detail.get("type") or "")
+    return (
+        str(payload.get("package") or ""),
+        str(payload.get("type") or ""),
+        str(payload.get("path") or ""),
+        str(payload.get("severity") or "error"),
+        str(payload.get("message") or detail_type or ""),
+    )
+
+
+def dedupe_package_issues(issues: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    result: List[Dict[str, Any]] = []
+    seen = set()
+    for issue in list(issues or []):
+        if not isinstance(issue, dict):
+            continue
+        key = _issue_key(issue)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(issue)
+    return result
+
+
+def package_issue_summary(issues: Sequence[Dict[str, Any]], *, limit: int = 12) -> Dict[str, Any]:
+    normalized = dedupe_package_issues(issues)
+    by_package: Dict[str, int] = {}
+    by_type: Dict[str, int] = {}
+    samples: List[Dict[str, Any]] = []
+    for issue in normalized:
+        package = str(issue.get("package") or "unknown")
+        issue_type = str(issue.get("type") or "unknown")
+        by_package[package] = by_package.get(package, 0) + 1
+        by_type[issue_type] = by_type.get(issue_type, 0) + 1
+        if len(samples) < limit:
+            samples.append(
+                {
+                    "package": package,
+                    "type": issue_type,
+                    "path": issue.get("path"),
+                    "message": _compact(issue.get("message"), 180),
+                    "severity": issue.get("severity") or "error",
+                }
+            )
+    return {
+        "count": len(normalized),
+        "by_package": by_package,
+        "by_type": by_type,
+        "samples": samples,
+    }
+
+
 def _has_source_ref(item: Dict[str, Any]) -> bool:
     if item.get("source_ref") or _as_list(item.get("source_refs")):
         return True
     source = _as_dict(item.get("source"))
-    return bool(source.get("title") or source.get("url") or source.get("source"))
+    url = str(item.get("url") or item.get("source_url") or source.get("url") or source.get("source_url") or "").strip()
+    document_ref = str(
+        item.get("document_id")
+        or item.get("doc_id")
+        or item.get("page_ref")
+        or source.get("document_id")
+        or source.get("doc_id")
+        or source.get("page_ref")
+        or ""
+    ).strip()
+    metadata_count = sum(
+        bool(str(value or "").strip())
+        for value in [
+            item.get("title") or source.get("title") or source.get("name"),
+            item.get("publisher") or source.get("publisher") or source.get("source"),
+            item.get("date") or item.get("published_at") or source.get("date") or source.get("published_at"),
+        ]
+    )
+    return bool(url or (document_ref and metadata_count >= 2))
 
 
 def _evidence_ref(item: Dict[str, Any]) -> str:
@@ -144,7 +246,7 @@ def validate_report_blueprint(report_blueprint: Dict[str, Any]) -> Dict[str, Any
     blueprint = _as_dict(report_blueprint)
     chapters = [chapter for chapter in _as_list(blueprint.get("chapters")) if isinstance(chapter, dict)]
     if not blueprint.get("report_family"):
-        _issue(issues, package="report_blueprint", issue_type="missing_report_family", message="report_family is required.")
+        _issue(issues, package="report_blueprint", issue_type="missing_report_family", message="report_family is recommended.", severity="warning")
     if not blueprint.get("research_object"):
         _issue(issues, package="report_blueprint", issue_type="missing_research_object", message="research_object is required.", severity="warning")
     if not blueprint.get("narrative"):
@@ -159,6 +261,23 @@ def validate_report_blueprint(report_blueprint: Dict[str, Any]) -> Dict[str, Any
             _issue(issues, package="report_blueprint", issue_type="missing_front_blocks", message="report_shell.front_blocks should not be empty.", severity="warning")
         if not _as_list(shell.get("back_blocks")):
             _issue(issues, package="report_blueprint", issue_type="missing_back_blocks", message="report_shell.back_blocks should not be empty.", severity="warning")
+
+    layout_validation = _as_dict(blueprint.get("layout_validation"))
+    try:
+        blocking_count = int(float(layout_validation.get("blocking_count") or 0))
+    except (TypeError, ValueError):
+        blocking_count = 0
+    blocking_issues = _as_list(layout_validation.get("blocking_issues")) or _as_list(layout_validation.get("errors"))
+    if blocking_count > 0 or blocking_issues:
+        _issue(
+            issues,
+            package="report_blueprint",
+            issue_type="layout_validation_blocking",
+            message="layout_validation has blocking issues; writer must not publish a clean report.",
+            severity="error",
+            blocking_count=blocking_count or len(blocking_issues),
+            detail=blocking_issues[:8],
+        )
 
     seen_ids = set()
     titles = set()
@@ -176,7 +295,7 @@ def validate_report_blueprint(report_blueprint: Dict[str, Any]) -> Dict[str, Any
         if not title:
             _issue(issues, package="report_blueprint", issue_type="missing_chapter_title", message="chapter_title is required.", path=path)
         elif title in FIXED_FIVE_DIMENSIONS:
-            _issue(issues, package="report_blueprint", issue_type="legacy_fixed_chapter_title", message="Legacy fixed five-dimension title is forbidden.", path=path)
+            _issue(issues, package="report_blueprint", issue_type="legacy_fixed_chapter_title", message="Legacy fixed five-dimension title should be normalized before Clean publication.", path=path, severity="warning")
         elif re.fullmatch(r"(?:第[一二三四五六七八九十0-9]+章|chapter\s*\d+|章节\s*\d+)", title, flags=re.I):
             _issue(issues, package="report_blueprint", issue_type="empty_chapter_title", message="chapter_title must express a research question, not just chapter order.", path=path)
         if not question:
@@ -184,24 +303,25 @@ def validate_report_blueprint(report_blueprint: Dict[str, Any]) -> Dict[str, Any
         if not str(chapter.get("core_question") or question or "").strip():
             _issue(issues, package="report_blueprint", issue_type="missing_core_question", message="Each chapter must have core_question.", path=path)
         if not _as_list(chapter.get("required_evidence_mix")):
-            _issue(issues, package="report_blueprint", issue_type="missing_required_evidence_mix", message="Each chapter must declare required_evidence_mix.", path=path)
+            _issue(issues, package="report_blueprint", issue_type="missing_required_evidence_mix", message="Each chapter should declare required_evidence_mix.", path=path, severity="warning")
         layout_policy = _as_dict(chapter.get("layout_policy"))
         if not _as_list(layout_policy.get("preferred_blocks")):
             _issue(issues, package="report_blueprint", issue_type="missing_preferred_blocks", message="Each chapter should declare layout_policy.preferred_blocks.", path=path, severity="warning")
         if int(chapter.get("min_total_sources") or 0) < 4:
-            _issue(issues, package="report_blueprint", issue_type="weak_min_total_sources", message="Each chapter should require at least four total sources.", path=path)
+            _issue(issues, package="report_blueprint", issue_type="weak_min_total_sources", message="Each chapter should require at least four total sources.", path=path, severity="warning")
         if int(chapter.get("min_ab_sources") or 0) < 1:
-            _issue(issues, package="report_blueprint", issue_type="weak_min_ab_sources", message="Each chapter should require at least one A/B source.", path=path)
+            _issue(issues, package="report_blueprint", issue_type="weak_min_ab_sources", message="Each chapter should require at least one A/B source.", path=path, severity="warning")
         if not str(chapter.get("chapter_role") or "").strip():
             _issue(issues, package="report_blueprint", issue_type="missing_chapter_role", message="chapter_role is recommended.", path=path, severity="warning")
 
     if titles and FIXED_FIVE_DIMENSIONS.issubset(titles):
-        _issue(
-            issues,
-            package="report_blueprint",
-            issue_type="fixed_five_dimension_pattern",
-            message="Blueprint matches the legacy fixed five-dimension pattern; PreLayoutAgent must use question-driven chapters.",
-        )
+            _issue(
+                issues,
+                package="report_blueprint",
+                issue_type="fixed_five_dimension_pattern",
+                message="Blueprint matches the legacy fixed five-dimension pattern; PreLayoutAgent must use question-driven chapters.",
+                severity="warning",
+            )
     return _contract_result("report_blueprint", issues)
 
 
@@ -294,13 +414,13 @@ def validate_micro_layouts(micro_layouts: Sequence[Dict[str, Any]]) -> Dict[str,
     issues: List[Dict[str, Any]] = []
     layouts = [layout for layout in list(micro_layouts or []) if isinstance(layout, dict)]
     if not layouts:
-        _issue(issues, package="micro_layouts", issue_type="empty", message="No micro layouts were produced.")
+        _issue(issues, package="micro_layouts", issue_type="empty", message="No micro layouts were produced.", severity="warning")
     for layout_index, layout in enumerate(layouts):
         base_path = f"[{layout_index}]"
         if not str(layout.get("chapter_id") or "").strip():
-            _issue(issues, package="micro_layouts", issue_type="missing_chapter_id", message="chapter_id is required.", path=base_path)
+            _issue(issues, package="micro_layouts", issue_type="missing_chapter_id", message="chapter_id is recommended.", path=base_path, severity="warning")
         if not str(layout.get("layout_type") or "").strip():
-            _issue(issues, package="micro_layouts", issue_type="missing_layout_type", message="layout_type is required.", path=base_path)
+            _issue(issues, package="micro_layouts", issue_type="missing_layout_type", message="layout_type is recommended.", path=base_path, severity="warning")
         blocks = [block for block in _as_list(layout.get("blocks")) if isinstance(block, dict)]
         valid_blocks = set(valid_block_types())
         if not blocks:
@@ -309,25 +429,39 @@ def validate_micro_layouts(micro_layouts: Sequence[Dict[str, Any]]) -> Dict[str,
             block_type = str(block.get("block_type") or "").strip()
             block_path = f"{base_path}.blocks[{block_index}]"
             if not block_type:
-                _issue(issues, package="micro_layouts", issue_type="missing_block_type", message="block_type is required.", path=block_path)
+                _issue(issues, package="micro_layouts", issue_type="missing_block_type", message="block_type is recommended.", path=block_path, severity="warning")
             elif block_type not in valid_blocks:
-                _issue(issues, package="micro_layouts", issue_type="unknown_block_type", message=f"Unknown block_type: {block_type}", path=block_path)
+                _issue(issues, package="micro_layouts", issue_type="unknown_block_type", message=f"Unknown block_type: {block_type}", path=block_path, severity="warning")
             if not _as_list(block.get("required_evidence_roles")):
                 _issue(issues, package="micro_layouts", issue_type="block_missing_required_roles", message="block should declare required_evidence_roles.", path=block_path, severity="warning")
         sections = [section for section in _as_list(layout.get("sections")) if isinstance(section, dict)]
         followups = _as_list(layout.get("follow_up_queries"))
         if not sections:
-            _issue(issues, package="micro_layouts", issue_type="sections_empty", message="At least one section is required.", path=base_path)
+            _issue(
+                issues,
+                package="micro_layouts",
+                issue_type="sections_empty",
+                message="At least one section is recommended.",
+                path=base_path,
+                severity="warning",
+            )
         for section_index, section in enumerate(sections):
             path = f"{base_path}.sections[{section_index}]"
             if not str(section.get("section_title") or "").strip():
-                _issue(issues, package="micro_layouts", issue_type="missing_section_title", message="section_title is required.", path=path)
+                _issue(issues, package="micro_layouts", issue_type="missing_section_title", message="section_title is recommended.", path=path, severity="warning")
             if not _as_list(section.get("required_evidence_refs")) and not followups:
-                _issue(issues, package="micro_layouts", issue_type="section_missing_evidence_refs", message="section must bind required_evidence_refs, or layout must provide follow_up_queries.", path=path)
+                _issue(issues, package="micro_layouts", issue_type="section_missing_evidence_refs", message="section should bind required_evidence_refs, or layout should provide follow_up_queries.", path=path, severity="warning")
         for request_index, request in enumerate(_as_list(layout.get("table_requests"))):
             request = _as_dict(request)
             if not str(request.get("purpose") or "").strip():
-                _issue(issues, package="micro_layouts", issue_type="table_request_missing_purpose", message="table_requests must have purpose.", path=f"{base_path}.table_requests[{request_index}]")
+                _issue(issues, package="micro_layouts", issue_type="table_request_missing_purpose", message="table_requests should have purpose.", path=f"{base_path}.table_requests[{request_index}]", severity="warning")
+            if request.get("need_table") is not False and not str(request.get("placement_slot") or "").strip():
+                _issue(issues, package="micro_layouts", issue_type="table_request_missing_placement", message="table_requests should declare placement_slot.", path=f"{base_path}.table_requests[{request_index}]", severity="warning")
+            if request.get("need_table") is not False and not str(request.get("anchor_section_id") or request.get("anchor_block_type") or "").strip():
+                _issue(issues, package="micro_layouts", issue_type="table_request_missing_anchor", message="table_requests should bind to a section or block.", path=f"{base_path}.table_requests[{request_index}]", severity="warning")
+        plan = _as_dict(layout.get("table_planning"))
+        if plan and plan.get("need_table") is False and not str(plan.get("why_no_table") or "").strip():
+            _issue(issues, package="micro_layouts", issue_type="table_plan_missing_no_table_reason", message="table_planning should explain why no table is needed.", path=f"{base_path}.table_planning", severity="warning")
     return _contract_result("micro_layouts", issues)
 
 
@@ -366,9 +500,9 @@ def validate_table_packages(table_packages: Sequence[Dict[str, Any]]) -> Dict[st
             rendered_by_chapter[chapter_id] = rendered_by_chapter.get(chapter_id, 0) + 1
     for chapter_id, count in rendered_by_chapter.items():
         try:
-            max_tables_per_chapter = int(os.getenv("REPORT_MAX_BODY_TABLES_PER_CHAPTER", "3") or 3)
+            max_tables_per_chapter = int(os.getenv("REPORT_MAX_BODY_TABLES_PER_CHAPTER", "1") or 1)
         except (TypeError, ValueError):
-            max_tables_per_chapter = 3
+            max_tables_per_chapter = 1
         if count > max_tables_per_chapter:
             _issue(
                 issues,
@@ -412,17 +546,37 @@ def validate_argument_units(argument_units: Sequence[Dict[str, Any]]) -> Dict[st
         elif not any(word in reasoning for word in CAUSE_WORDS):
             _issue(issues, package="argument_units", issue_type="reasoning_missing_causal_chain", message="reasoning should include a causal explanation.", path=path, severity="warning")
         if not counter:
-            _issue(issues, package="argument_units", issue_type="missing_counter_evidence", message="counter_evidence is required.", path=path)
+            _issue(issues, package="argument_units", issue_type="missing_counter_evidence", message="counter_evidence is recommended for boundary management.", path=path, severity="warning")
         elif any(re.search(pattern, counter) for pattern in BAD_CLAIM_PATTERNS):
-            _issue(issues, package="argument_units", issue_type="weak_counter_pattern", message="counter_evidence contains fallback/internal wording.", path=path)
+            _issue(issues, package="argument_units", issue_type="weak_counter_pattern", message="counter_evidence contains fallback/internal wording.", path=path, severity="warning")
         if not actionable:
-            _issue(issues, package="argument_units", issue_type="missing_actionable", message="actionable is required.", path=path)
+            _issue(issues, package="argument_units", issue_type="missing_actionable", message="actionable is recommended for decision usefulness.", path=path, severity="warning")
         elif any(re.search(pattern, actionable) for pattern in BAD_CLAIM_PATTERNS):
-            _issue(issues, package="argument_units", issue_type="weak_actionable_pattern", message="actionable contains fallback/internal wording.", path=path)
+            _issue(issues, package="argument_units", issue_type="weak_actionable_pattern", message="actionable contains fallback/internal wording.", path=path, severity="warning")
         elif not any(word in actionable for word in ACTION_WORDS):
-            _issue(issues, package="argument_units", issue_type="actionable_missing_action_word", message="actionable should contain a concrete action/verification verb.", path=path)
+            _issue(issues, package="argument_units", issue_type="actionable_missing_action_word", message="actionable should contain a concrete action/verification verb.", path=path, severity="warning")
         if not _as_list(unit.get("evidence_refs")):
             _issue(issues, package="argument_units", issue_type="missing_evidence_refs", message="evidence_refs is required.", path=path)
+        source_quality = _as_dict(unit.get("source_quality"))
+        claim_status = str(unit.get("claim_status") or "").strip().lower()
+        claim_ab_count = int(source_quality.get("claim_ab_count") or source_quality.get("ab_count") or 0)
+        allowed_uses = _as_dict(source_quality.get("allowed_use_distribution"))
+        has_core_or_support = int(allowed_uses.get("core_claim") or 0) + int(allowed_uses.get("supporting") or 0)
+        directional_c_count = int(source_quality.get("directional_c_distinct_sources") or allowed_uses.get("directional_signal") or 0)
+        claim_type = str(unit.get("claim_type") or source_quality.get("claim_type") or _claim_type_for_unit(unit)).strip().lower()
+        balanced_directional_support = bool(
+            not _strict_quality_mode()
+            and claim_type != "hard_metric"
+            and directional_c_count >= 2
+        )
+        if claim_status in {"decision_ready", "core_claim"} and claim_ab_count <= 0 and has_core_or_support <= 0 and not balanced_directional_support:
+            _issue(
+                issues,
+                package="argument_units",
+                issue_type="core_claim_without_ab_source",
+                message="decision-ready claims must bind at least one A/B source or validated supporting metric.",
+                path=path,
+            )
     return _contract_result("argument_units", issues)
 
 
@@ -435,17 +589,34 @@ def validate_chapter_packages(chapter_packages: Sequence[Dict[str, Any]]) -> Dic
         path = f"[{index}]"
         if chapter.get("omit_from_report"):
             continue
-        if not str(chapter.get("lead") or "").strip():
-            _issue(issues, package="chapter_packages", issue_type="missing_lead", message="lead is required.", path=path)
         sections = [section for section in _as_list(chapter.get("sections")) if isinstance(section, dict)]
         public_tables = [
             table
             for table in _as_list(chapter.get("table_packages"))
             if isinstance(table, dict) and table.get("should_render")
         ]
+        has_lead = bool(str(chapter.get("lead") or "").strip())
+        if not str(chapter.get("lead") or "").strip():
+            _issue(
+                issues,
+                package="chapter_packages",
+                issue_type="missing_lead",
+                message="lead is recommended when sections or tables exist.",
+                path=path,
+                severity="warning" if (sections or public_tables) else "error",
+            )
         if not sections and not public_tables:
-            _issue(issues, package="chapter_packages", issue_type="sections_empty", message="sections are required.", path=path)
+            _issue(
+                issues,
+                package="chapter_packages",
+                issue_type="sections_empty",
+                message="sections are recommended when a chapter has enough material.",
+                path=path,
+                severity="warning" if has_lead else "error",
+            )
         for section_index, section in enumerate(sections):
+            if section.get("omit_from_report") or section.get("omit_from_clean_report"):
+                continue
             section_path = f"{path}.sections[{section_index}]"
             if not str(section.get("section_title") or "").strip():
                 _issue(issues, package="chapter_packages", issue_type="missing_section_title", message="section_title is required.", path=section_path)
@@ -454,7 +625,7 @@ def validate_chapter_packages(chapter_packages: Sequence[Dict[str, Any]]) -> Dic
             elif any(re.search(pattern, str(section.get("claim") or "")) for pattern in BAD_CLAIM_PATTERNS):
                 _issue(issues, package="chapter_packages", issue_type="weak_section_claim", message="section claim contains evidence-status/fallback wording.", path=section_path)
             if not str(section.get("counter_evidence") or "").strip():
-                _issue(issues, package="chapter_packages", issue_type="missing_section_counter", message="each chapter section needs counter/boundary.", path=section_path)
+                _issue(issues, package="chapter_packages", issue_type="missing_section_counter", message="each chapter section should keep counter/boundary.", path=section_path, severity="warning")
             if not _as_list(section.get("evidence_refs")):
                 _issue(issues, package="chapter_packages", issue_type="missing_section_evidence_refs", message="section must keep evidence_refs.", path=section_path)
     return _contract_result("chapter_packages", issues)
@@ -478,8 +649,8 @@ def validate_pipeline_packages(
         validate_argument_units(list(argument_units or [])),
         validate_chapter_packages(list(chapter_packages or [])),
     ]
-    errors = [issue for result in results for issue in _as_list(result.get("blocking_errors") or result.get("errors"))]
-    warnings = [issue for result in results for issue in _as_list(result.get("warnings"))]
+    errors = dedupe_package_issues([issue for result in results for issue in _as_list(result.get("blocking_errors") or result.get("errors"))])
+    warnings = dedupe_package_issues([issue for result in results for issue in _as_list(result.get("warnings"))])
     score = max(0, 100 - min(80, len(errors) * 12) - min(20, len(warnings) * 3))
     scores = {
         "blueprint_score": int(_as_dict(results[0]).get("score") or 0),
@@ -502,5 +673,8 @@ def validate_pipeline_packages(
             "package_count": len(results),
             "error_count": len(errors),
             "warning_count": len(warnings),
+            "deduped": True,
         },
+        "package_error_summary_deduped": package_issue_summary(errors),
+        "package_warning_summary_deduped": package_issue_summary(warnings),
     }

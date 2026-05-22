@@ -4,27 +4,51 @@ import re
 from typing import Any, Dict, Iterable, List
 
 
-DEFAULT_PROFILE = "industry_scan_report"
-GENERIC_PROFILE_HINTS = {"dynamic_research_report", "dynamic_research", "topic_report", "industry_scan_report"}
+DEFAULT_PROFILE = "industry_deep_report"
+GENERIC_PROFILE_HINTS = {"dynamic_research_report", "dynamic_research", "topic_report", "industry_scan_report", "industry_deep_report"}
 
 
 REPORT_PROFILES: Dict[str, Dict[str, Any]] = {
-    "industry_scan_report": {
-        "name": "industry_scan_report",
-        "aliases": ["industry_scan", "industry_deep", "dynamic_research_report"],
+    "industry_deep_report": {
+        "name": "industry_deep_report",
+        "aliases": ["industry_scan_report", "industry_scan", "industry_deep", "dynamic_research_report"],
         "keywords": ["行业", "市场", "机会", "增长", "产业", "格局", "空间"],
         "narrative_spines": ["definition_to_opportunity", "demand_supply_risk"],
-        "candidate_modules": ["industry_definition", "market_size", "demand_driver", "industry_chain", "competition", "risk", "entry_strategy"],
-        "required_evidence_roles": ["metric", "support", "counter"],
-        "optional_evidence_roles": ["case", "technology_product", "company_filing"],
+        "candidate_modules": [
+            "industry_definition",
+            "timeline",
+            "market_size",
+            "demand_driver",
+            "customer",
+            "competition",
+            "technology",
+            "industry_chain",
+            "financial_quality",
+            "risk",
+            "entry_strategy",
+        ],
+        "required_evidence_roles": ["metric", "support", "case", "customer_case", "technology_product", "company_filing", "counter"],
+        "optional_evidence_roles": ["policy_original", "financial_metric", "market_research"],
         "front_blocks": ["executive_summary", "key_judgments", "key_data"],
         "back_blocks": ["strategic_options", "risk_triggers", "verification_checklist", "appendix"],
-        "max_body_chapters": 6,
-        "min_body_chapters": 3,
-        "module_order": ["industry_definition", "market_size", "demand_driver", "industry_chain", "competition", "technology", "risk", "entry_strategy"],
+        "max_body_chapters": 9,
+        "min_body_chapters": 8,
+        "module_order": [
+            "industry_definition",
+            "timeline",
+            "market_size",
+            "demand_driver",
+            "customer",
+            "competition",
+            "technology",
+            "industry_chain",
+            "financial_quality",
+            "risk",
+            "entry_strategy",
+        ],
         "quality_contract": {
-            "must_have_blocks": ["thesis", "evidence_matrix", "risk_trigger"],
-            "must_have_evidence_roles": ["metric", "support", "counter"],
+            "must_have_blocks": ["thesis", "evidence_matrix", "case_comparison", "technology_maturity", "risk_trigger"],
+            "must_have_evidence_roles": ["metric", "support", "case", "customer_case", "technology_product", "company_filing", "counter"],
         },
     },
     "market_entry_report": {
@@ -235,9 +259,13 @@ def select_report_profile(query: str, research_plan: Dict[str, Any] | None = Non
         or report_plan.get("report_type")
         or ""
     ).strip()
+    query_text = str(query or "")
+    explicit_policy = bool(re.search(r"政策|监管|法规|补贴|出口管制|制裁|关税|合规|policy|regulation|compliance", query_text, flags=re.I))
+    explicit_industry = bool(re.search(r"行业|产业|市场|生态|发展报告|行业报告|研究报告|行研|市场规模|竞争格局|industry|market|ecosystem", query_text, flags=re.I))
     explicit_profile = get_report_profile(explicit)
     if explicit and explicit_profile.get("name") != DEFAULT_PROFILE:
-        return explicit_profile
+        if not (explicit_profile.get("name") == "policy_impact_report" and explicit_industry and not explicit_policy):
+            return explicit_profile
 
     blob = _text_blob(
         query,
@@ -248,13 +276,16 @@ def select_report_profile(query: str, research_plan: Dict[str, Any] | None = Non
         [item.get("statement") for item in _as_list(plan.get("hypotheses")) if isinstance(item, dict)],
         [item.get("question") for item in _as_list(plan.get("evidence_goals")) if isinstance(item, dict)],
     )
-    query_text = str(query or "")
+    explicit_policy = explicit_policy or bool(re.search(r"政策|监管|法规|补贴|出口管制|制裁|关税|合规", query_text))
+    explicit_industry = explicit_industry or bool(re.search(r"行业|产业|市场|生态|发展报告|行业报告|研究报告|行研|市场规模|竞争格局", query_text))
+    if explicit_industry and not explicit_policy:
+        return dict(REPORT_PROFILES["industry_deep_report"])
     if (
         re.search(r"AI|人工智能|大模型|生成式AI|AIGC", query_text, flags=re.I)
         and re.search(r"行业|产业|市场|焦虑|机遇|机会|发展|格局", query_text)
         and not re.search(r"AI\s*Agent|技术路线|产品形态|研发|成熟度|替代路径", query_text, flags=re.I)
     ):
-        return dict(REPORT_PROFILES["industry_scan_report"])
+        return dict(REPORT_PROFILES["industry_deep_report"])
     priority_rules = [
         ("company_due_diligence_report", r"尽调|due\s*diligence|是否值得.*投|投资尽调"),
         ("policy_impact_report", r"政策|监管|法规|补贴|出口管制|制裁|关税"),

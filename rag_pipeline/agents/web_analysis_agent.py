@@ -10,7 +10,7 @@ import re
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, TypedDict
@@ -20,12 +20,6 @@ from langgraph.graph import END, START, StateGraph
 
 from ..config.search_config import (
     DEFAULT_ENABLE_API_RERANK,
-    DEFAULT_LLM_SYNTHESIS_API_KEY,
-    DEFAULT_LLM_SYNTHESIS_DISABLE_THINKING,
-    DEFAULT_LLM_SYNTHESIS_MODEL,
-    DEFAULT_LLM_SYNTHESIS_PROVIDER,
-    DEFAULT_LLM_SYNTHESIS_TIMEOUT,
-    DEFAULT_LLM_SYNTHESIS_URL,
     DEFAULT_RERANK_API_KEY,
     DEFAULT_RERANK_MAX_CHARS_PER_DOC,
     DEFAULT_RERANK_MAX_DOCS,
@@ -34,10 +28,13 @@ from ..config.search_config import (
     DEFAULT_RERANK_TIMEOUT,
     DEFAULT_RERANK_TOP_N,
     DEFAULT_RERANK_URL,
+    build_llm_config_for_task,
 )
 from ..search.engine import call_external_rerank_api
 from ..search.memory import call_openai_compatible_json, llm_config_is_ready, normalize_llm_config
 from ..runtime_cache import TTLCache, make_cache_key
+from rag_pipeline.cache.evidence_cache import lookup_search as lookup_persistent_search_cache
+from rag_pipeline.cache.evidence_cache import store_search as store_persistent_search_cache
 
 
 AGENT_NAME = "web_analysis_agent"
@@ -71,7 +68,10 @@ def _progress(stage: str, message: str, **fields: Any) -> None:
     line = f"[{datetime.now().strftime('%H:%M:%S')}] [{stage}] {message}"
     if suffix:
         line = f"{line} {suffix}"
-    print(line, file=sys.stderr, flush=True)
+    try:
+        print(line, file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        logger.debug("Progress output skipped because stderr is unavailable.", exc_info=True)
 
 _URL_RE = re.compile(r"https?://[^\s)）>]+", re.I)
 _WEB_ANALYSIS_CACHE = TTLCache(
@@ -131,7 +131,18 @@ _LOW_CREDIBILITY_HINTS = [
     "wk.baidu.com",
     "wenku.baidu.com",
     "xueqiu.com",
+    "bilibili.com",
+    "live.bilibili.com",
+    "php.cn",
+    "m.php.cn",
+    "dongaigc.com",
+    "caifuhao.eastmoney.com",
+    "guba.eastmoney.com",
     "mguba.eastmoney.com",
+    "view.inews.qq.com",
+    "m.sohu.com",
+    "sohu.com",
+    "news.futunn.com",
     "自媒体",
     "公众号",
     "百家号",
@@ -202,6 +213,118 @@ def extract_urls(text: str) -> List[str]:
             seen.add(cleaned)
             values.append(cleaned)
     return values
+
+
+def _quality_mode() -> str:
+    return str(os.getenv("REPORT_QUALITY_MODE") or os.getenv("QUALITY_MODE") or "balanced").strip().lower()
+
+
+def _strict_quality_mode() -> bool:
+    mode = _quality_mode()
+    if mode in {"strict", "hard", "deep_strict", "due_diligence", "investment_due_diligence"}:
+        return True
+    raw = os.getenv("STRICT_EVIDENCE_MODE")
+    return str(raw or "").strip().lower() in {"1", "true", "yes", "on", "strict"}
+
+
+def _low_credibility_domain(domain: str) -> bool:
+    text = str(domain or "").lower()
+    return any(hint.lower() in text for hint in _LOW_CREDIBILITY_HINTS)
+
+
+def _authoritative_readpage_score(item: Dict[str, Any], search_options: Optional[Dict[str, Any]] = None) -> float:
+    options = _as_dict(search_options)
+    url = str(item.get("url") or item.get("link") or item.get("source_url") or "").strip()
+    domain = _domain(url)
+    text = " ".join(
+        [
+            domain,
+            str(item.get("title") or ""),
+            str(item.get("snippet") or ""),
+            str(item.get("summary") or ""),
+            " ".join(str(value or "") for value in _as_list(options.get("source_priority"))),
+            str(options.get("proof_role") or options.get("evidence_type") or ""),
+            " ".join(str(value or "") for value in _as_list(options.get("lane_targets"))),
+        ]
+    ).lower()
+    score = 0.20
+    if _low_credibility_domain(domain):
+        score -= 0.75
+    if any(fragment in domain for fragment in _HIGH_CREDIBILITY_DOMAINS) or domain.endswith(".gov") or ".gov." in domain:
+        score += 1.20
+    if re.search(r"(sec\.gov|cninfo|sse\.com|szse|hkexnews|10-k|annual report|filing|公告|年报|财报|招股书|交易所)", text):
+        score += 1.05
+    if re.search(r"(idc|gartner|counterpoint|omdia|canalys|mckinsey|bcg|deloitte|pwc|whitepaper|association|协会|白皮书|研报|研究报告)", text):
+        score += 0.85
+    if re.search(r"(customer|case|procurement|client|order|tender|客户|案例|采购|中标|订单)", text):
+        score += 0.55
+    if re.search(r"(product|docs|developer|patent|standard|技术|产品|专利|标准|文档)", text):
+        score += 0.45
+    try:
+        score += min(0.35, max(0.0, float(item.get("web_final_score") or item.get("rerank_score") or 0.0)) * 0.35)
+    except (TypeError, ValueError):
+        pass
+    return round(score, 4)
+
+
+def _auto_readpage_limit(search_options: Optional[Dict[str, Any]]) -> int:
+    options = _as_dict(search_options)
+    if str(options.get("auto_readpage_required") or "").strip().lower() in {"1", "true", "yes", "on"}:
+        return _env_int("IQS_AUTO_READPAGE_REQUIRED_TOP_N", 8, min_value=1, max_value=20)
+    default = 8 if _strict_quality_mode() else 5
+    return _env_int("IQS_AUTO_READPAGE_TOP_N", default, min_value=0, max_value=20)
+
+
+def select_auto_readpage_urls(
+    search_results: Sequence[Dict[str, Any]],
+    *,
+    explicit_urls: Optional[Sequence[str]] = None,
+    search_options: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    options = _as_dict(search_options)
+    readpage_required = str(options.get("auto_readpage_required") or "").strip().lower() in {"1", "true", "yes", "on"}
+    if not _env_flag("IQS_AUTO_READPAGE_ENABLED", True) and not readpage_required:
+        return [url for url in list(explicit_urls or []) if str(url or "").strip()][:3]
+    limit = _auto_readpage_limit(options)
+    if limit <= 0:
+        return [url for url in list(explicit_urls or []) if str(url or "").strip()][:3]
+    min_score = (
+        _env_float("IQS_AUTO_READPAGE_REQUIRED_MIN_SCORE", 0.45, min_value=0.0, max_value=5.0)
+        if readpage_required
+        else _env_float("IQS_AUTO_READPAGE_MIN_SCORE", 0.65, min_value=0.0, max_value=5.0)
+    )
+    seen: set[str] = set()
+    selected: List[str] = []
+
+    def add(url: Any) -> None:
+        text = str(url or "").strip()
+        if not text or text in seen or len(selected) >= limit:
+            return
+        seen.add(text)
+        selected.append(text)
+
+    for url in list(explicit_urls or []):
+        add(url)
+    candidates: List[tuple[float, Dict[str, Any]]] = []
+    low_quality: List[tuple[float, Dict[str, Any]]] = []
+    for item in search_results:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or item.get("link") or item.get("source_url") or "").strip()
+        if not url or url in seen:
+            continue
+        score = _authoritative_readpage_score(item, options)
+        if score < min_score:
+            low_quality.append((score, item))
+            continue
+        bucket = low_quality if _low_credibility_domain(_domain(url)) else candidates
+        bucket.append((score, item))
+    for _, item in sorted(candidates, key=lambda pair: pair[0], reverse=True):
+        add(item.get("url") or item.get("link") or item.get("source_url"))
+    if not selected and _env_flag("IQS_AUTO_READPAGE_ALLOW_LOW_QUALITY_FALLBACK", False):
+        for _, item in sorted(low_quality, key=lambda pair: pair[0], reverse=True):
+            add(item.get("url") or item.get("link") or item.get("source_url"))
+    return selected
 
 
 def discover_iqs_skill_dir() -> Path:
@@ -335,6 +458,7 @@ def run_iqs_script(script_path: Path, args: Sequence[str], *, timeout_ms: int) -
 
 
 def call_iqs_search(query: str, options: Dict[str, Any]) -> List[Dict[str, Any]]:
+    options = _apply_engine_specific_limits(dict(options or {}))
     query = _clean_search_query(query, max_chars=_iqs_query_max_chars())
     skill_dir = discover_iqs_skill_dir()
     script = skill_dir / "scripts" / "search.mjs"
@@ -357,7 +481,7 @@ def call_iqs_search(query: str, options: Dict[str, Any]) -> List[Dict[str, Any]]
     payload = run_iqs_script(script, args, timeout_ms=int(options.get("timeout") or 20000))
     if not isinstance(payload, list):
         raise RuntimeError("IQS 搜索输出的根结构必须是列表。")
-    return [dict(item) for item in payload if isinstance(item, dict)]
+    return [{**dict(item), "engineType": str(options.get("engineType") or "LiteAdvanced")} for item in payload if isinstance(item, dict)]
 
 
 def call_iqs_search_batch(requests: Sequence[Dict[str, Any]], *, timeout_ms: int, concurrency: int) -> List[Dict[str, Any]]:
@@ -414,6 +538,14 @@ def _env_flag(name: str, default: bool) -> bool:
 def _env_int(name: str, default: int, *, min_value: int = 1, max_value: int = 100) -> int:
     try:
         value = int(os.getenv(name, str(default)))
+    except ValueError:
+        value = default
+    return min(max_value, max(min_value, value))
+
+
+def _env_float(name: str, default: float, *, min_value: float = 0.0, max_value: float = 10.0) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
     except ValueError:
         value = default
     return min(max_value, max(min_value, value))
@@ -507,6 +639,64 @@ def _option_text(options: Optional[Dict[str, Any]], keys: Sequence[str], env_nam
             if value:
                 return value
     return os.getenv(env_name, default).strip()
+
+
+def _is_deep_engine(engine_type: Any) -> bool:
+    return str(engine_type or "").strip().lower() == "deep"
+
+
+def _deep_repair_requested(options: Optional[Dict[str, Any]]) -> bool:
+    opts = _as_dict(options)
+    return _env_flag("IQS_DEEP_REPAIR_ENABLED", True) and str(opts.get("prefer_deep") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _deep_repair_engines(options: Optional[Dict[str, Any]] = None) -> List[str]:
+    opts = _as_dict(options)
+    raw = opts.get("engineTypes") or opts.get("engine_types") or os.getenv("IQS_DEEP_REPAIR_ENGINE_TYPES", "Deep,LiteAdvanced,GenericAdvanced,Generic")
+    if isinstance(raw, list):
+        values = [str(item).strip() for item in raw]
+    else:
+        values = _split_csv(raw)
+    engines: List[str] = []
+    for engine in values:
+        if engine and engine not in engines:
+            engines.append(engine)
+    if "Deep" not in engines:
+        engines.insert(0, "Deep")
+    return engines or ["Deep", "LiteAdvanced", "GenericAdvanced", "Generic"]
+
+
+def _deep_fallback_engines() -> List[str]:
+    engines = _env_csv("IQS_DEEP_REPAIR_FALLBACK_ENGINES", "LiteAdvanced,GenericAdvanced,Generic")
+    return [engine for engine in engines if engine and engine != "Deep"] or ["LiteAdvanced", "GenericAdvanced", "Generic"]
+
+
+def _apply_engine_specific_limits(options: Dict[str, Any]) -> Dict[str, Any]:
+    copied = dict(options or {})
+    if not _is_deep_engine(copied.get("engineType")):
+        return copied
+    copied["contents"] = copied.get("contents") or "mainText"
+    if str(copied.get("contents") or "").strip() == "summary":
+        copied["contents"] = "mainText"
+    try:
+        current_timeout = int(copied.get("timeout") or 0)
+    except (TypeError, ValueError):
+        current_timeout = 0
+    copied["timeout"] = max(current_timeout, _env_int("IQS_DEEP_REPAIR_TIMEOUT_MS", 60000, min_value=10000, max_value=180000))
+    try:
+        requested = int(copied.get("numResults") or copied.get("results_per_query") or 0)
+    except (TypeError, ValueError):
+        requested = 0
+    default_results = _env_int("IQS_DEEP_REPAIR_NUM_RESULTS", 10, min_value=1, max_value=50)
+    copied["numResults"] = max(1, min(50, requested or default_results))
+    return copied
+
+
+_IQS_PERMISSION_ERROR_RE = re.compile(r"(permission|forbidden|unauthorized|no permission|access denied|not authorized|无权限|未授权|权限)", re.I)
+
+
+def _is_iqs_permission_error(value: Any) -> bool:
+    return bool(_IQS_PERMISSION_ERROR_RE.search(str(value or "")))
 
 
 def _split_csv(value: Any) -> List[str]:
@@ -731,7 +921,10 @@ def _route_options_for_intent(intent: str, base_options: Dict[str, Any]) -> Dict
     forced_engine = str(options.get("engineType") or "").strip() if options.get("engineMode") == "forced" else ""
     route_env = _INTENT_ROUTE_ENV.get(intent, "IQS_ENGINE_ROUTE_ANALYSIS")
     route_default = _INTENT_ROUTE_DEFAULTS.get(intent, "LiteAdvanced,Generic")
-    engine_types = [forced_engine] if forced_engine else _env_csv(route_env, route_default)
+    if _deep_repair_requested(options):
+        engine_types = _deep_repair_engines(options)
+    else:
+        engine_types = [forced_engine] if forced_engine else _env_csv(route_env, route_default)
     if not engine_types:
         engine_types = ["Generic" if intent == "新闻型" else "LiteAdvanced"]
     if intent == "新闻型":
@@ -895,7 +1088,7 @@ def build_llm_query_plan(
 ) -> List[Dict[str, Any]]:
     if not _env_flag("IQS_ENABLE_LLM_QUERY_REWRITE", False):
         return []
-    llm_config = build_llm_config()
+    llm_config = build_llm_config("query_rewrite")
     if not llm_config_is_ready(llm_config):
         return []
     dynamic_mode = bool(research_plan or search_task or base_options.get("research_plan") or base_options.get("search_task"))
@@ -1011,7 +1204,7 @@ def build_llm_query_plan(
 def build_hyde_query(query: str, base_options: Dict[str, Any]) -> List[Dict[str, Any]]:
     if not _env_flag("IQS_ENABLE_HYDE", False):
         return []
-    llm_config = build_llm_config()
+    llm_config = build_llm_config("query_rewrite")
     if not llm_config_is_ready(llm_config):
         return []
     system_prompt = """
@@ -1107,6 +1300,15 @@ def _options_for_query_item(query_item: Dict[str, Any], base_options: Dict[str, 
     options["engineType"] = query_item.get("engineType") or options.get("engineType") or "LiteAdvanced"
     options["timeRange"] = query_item.get("timeRange") or options.get("timeRange") or "NoLimit"
     options["contents"] = query_item.get("contents") or options.get("contents") or "mainText"
+    if query_item.get("prefer_deep") or options.get("prefer_deep"):
+        options["prefer_deep"] = True
+        options["deep_reason"] = query_item.get("deep_reason") or options.get("deep_reason")
+        deep_engines = _deep_repair_engines(options)
+        options["engineTypes"] = deep_engines
+        if not _is_deep_engine(options.get("engineType")):
+            options["engineType"] = deep_engines[0]
+    if _is_deep_engine(options.get("engineType")):
+        options["enable_batch_search"] = False
     result_keys = ["resultsPerQuery", "results_per_query"]
     if not _search_profile(options):
         result_keys.extend(["numResults", "num_results"])
@@ -1122,11 +1324,12 @@ def _options_for_query_item(query_item: Dict[str, Any], base_options: Dict[str, 
         min_value=1,
         max_value=100,
     )
-    return options
+    return _apply_engine_specific_limits(options)
 
 
 def _search_request(text: str, options: Dict[str, Any]) -> Dict[str, Any]:
     text = _clean_search_query(text, max_chars=_iqs_query_max_chars())
+    options = _apply_engine_specific_limits(dict(options or {}))
     request = {
         "query": text,
         "engineType": str(options.get("engineType") or "LiteAdvanced"),
@@ -1137,6 +1340,9 @@ def _search_request(text: str, options: Dict[str, Any]) -> Dict[str, Any]:
     }
     if options.get("category"):
         request["category"] = str(options.get("category"))
+    if options.get("prefer_deep"):
+        request["prefer_deep"] = True
+        request["deep_reason"] = str(options.get("deep_reason") or "")
     return request
 
 
@@ -1158,6 +1364,33 @@ def _fallback_options_for_query(query_item: Dict[str, Any], primary_options: Dic
         fallback_options["timeRange"] = "OneYear"
 
     return fallback_options
+
+
+def _fallback_options_chain_for_query(query_item: Dict[str, Any], primary_options: Dict[str, Any]) -> List[Dict[str, Any]]:
+    primary_engine = str(primary_options.get("engineType") or "")
+    if _is_deep_engine(primary_engine) or primary_options.get("prefer_deep"):
+        engines = [engine for engine in _deep_fallback_engines() if engine != primary_engine]
+    else:
+        single = _fallback_options_for_query(query_item, primary_options)
+        engines = [str(single.get("engineType") or "")] if single else []
+    chain: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for engine in engines:
+        if not engine or engine in seen:
+            continue
+        seen.add(engine)
+        options = dict(primary_options)
+        options["engineType"] = engine
+        options["contents"] = primary_options.get("contents") or "mainText"
+        if not _is_deep_engine(engine):
+            options.pop("prefer_deep", None)
+        intent = str(query_item.get("intent") or "").strip().lower()
+        bounded_intents = {"新闻型", "政策型", "财报型", "news", "policy", "filing", "finance", "financial"}
+        if options.get("timeRange") == "NoLimit" and any(item in intent for item in bounded_intents):
+            options["timeRange"] = "OneYear"
+        chain.append(_apply_engine_specific_limits(options))
+    return chain
+
 
 def _should_use_fallback(results: Sequence[Dict[str, Any]], trace: Dict[str, Any], options: Dict[str, Any]) -> bool:
     if not _option_flag(options, ["enableFallback", "enable_fallback"], "IQS_ENABLE_FALLBACK", True):
@@ -1186,20 +1419,28 @@ def _should_use_fallback(results: Sequence[Dict[str, Any]], trace: Dict[str, Any
 def call_iqs_search_with_fallback(query_item: Dict[str, Any], base_options: Dict[str, Any]) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
     text = _clean_search_query(str(query_item.get("text") or "").strip(), max_chars=_iqs_query_max_chars())
     primary_options = _options_for_query_item(query_item, base_options)
+    primary_engine = str(primary_options.get("engineType") or "")
     trace = {
         "query": text,
         "intent": query_item.get("intent"),
         "source": query_item.get("source"),
         "primary_options": primary_options,
+        "primary_engine": primary_engine,
+        "prefer_deep": bool(primary_options.get("prefer_deep")),
+        "deep_reason": primary_options.get("deep_reason") or query_item.get("deep_reason"),
+        "fallback_chain": [item.get("engineType") for item in _fallback_options_chain_for_query(query_item, primary_options)],
         "fallback_used": False,
+        "fallback_errors": [],
         "errors": [],
     }
-    for key in ["task_id", "dimension_id", "dimension_name", "evidence_goal", "must_have_terms", "forbidden_terms", "source_priority", "hypothesis_id", "hypothesis_statement", "proof_role", "proof_standard", "evidence_type", "lane_targets", "scheduled_lane_type", "scheduled_lane", "counter_evidence", "decision_use", "search_task"]:
+    for key in ["task_id", "dimension_id", "dimension_name", "evidence_goal", "must_have_terms", "forbidden_terms", "source_priority", "hypothesis_id", "hypothesis_statement", "proof_role", "proof_standard", "evidence_type", "lane_targets", "scheduled_lane_type", "scheduled_lane", "counter_evidence", "decision_use", "prefer_deep", "deep_reason", "search_task"]:
         if key in query_item:
             trace[key] = query_item.get(key)
     try:
         results = call_iqs_search(text, primary_options)
         trace["primary_count"] = len(results)
+        if _is_deep_engine(primary_engine) and not results:
+            trace["deep_exhausted"] = True
         if not _should_use_fallback(results, trace, primary_options):
             return results, trace
         trace["errors"].append("主查询结果数量不足，启用降级查询")
@@ -1209,24 +1450,35 @@ def call_iqs_search_with_fallback(query_item: Dict[str, Any], base_options: Dict
         trace["primary_error"] = True
         error_text = _friendly_iqs_error(exc)
         trace["errors"].append(error_text)
-        if _is_iqs_quota_error(error_text):
+        if _is_deep_engine(primary_engine) and (_is_iqs_quota_error(error_text) or _is_iqs_permission_error(error_text)):
+            trace["deep_unavailable"] = True
+        elif _is_iqs_quota_error(error_text):
             trace["quota_exceeded"] = True
             return results, trace
 
-    fallback_options = _fallback_options_for_query(query_item, primary_options)
-    trace["fallback_used"] = True
-    trace["fallback_options"] = fallback_options
-    try:
-        fallback_results = call_iqs_search(text, fallback_options)
-        trace["fallback_count"] = len(fallback_results)
-        return results + fallback_results, trace
-    except Exception as exc:
-        logger.exception("IQS fallback search failed", extra={"query": text})
-        error_text = _friendly_iqs_error(exc)
-        trace["errors"].append(error_text)
-        if _is_iqs_quota_error(error_text):
-            trace["quota_exceeded"] = True
-        return results, trace
+    accumulated = list(results)
+    for fallback_options in _fallback_options_chain_for_query(query_item, primary_options):
+        engine = str(fallback_options.get("engineType") or "")
+        trace["fallback_used"] = True
+        trace["fallback_options"] = fallback_options
+        try:
+            fallback_results = call_iqs_search(text, fallback_options)
+            trace.setdefault("fallback_counts", {})[engine] = len(fallback_results)
+            accumulated.extend(fallback_results)
+            if fallback_results:
+                trace["fallback_count"] = len(fallback_results)
+                return accumulated, trace
+        except Exception as exc:
+            logger.exception("IQS fallback search failed", extra={"query": text, "engine": engine})
+            error_text = _friendly_iqs_error(exc)
+            trace["fallback_errors"].append({"engineType": engine, "error": error_text})
+            trace["errors"].append(error_text)
+            if _is_iqs_quota_error(error_text):
+                trace["quota_exceeded"] = True
+                break
+    if _is_deep_engine(primary_engine) and not accumulated:
+        trace["deep_exhausted"] = True
+    return accumulated, trace
 
 
 def _extend_raw_results(raw_results: List[Dict[str, Any]], results: Sequence[Dict[str, Any]], trace: Dict[str, Any]) -> None:
@@ -1236,7 +1488,7 @@ def _extend_raw_results(raw_results: List[Dict[str, Any]], results: Sequence[Dic
         copied["origin_intent"] = trace.get("intent")
         copied["origin_query_source"] = trace.get("source")
         copied["origin_rank"] = rank
-        for key in ["task_id", "dimension_id", "dimension_name", "evidence_goal", "must_have_terms", "forbidden_terms", "source_priority", "hypothesis_id", "hypothesis_statement", "proof_role", "proof_standard", "evidence_type", "lane_targets", "scheduled_lane_type", "scheduled_lane", "counter_evidence", "decision_use", "search_task"]:
+        for key in ["task_id", "dimension_id", "dimension_name", "evidence_goal", "must_have_terms", "forbidden_terms", "source_priority", "hypothesis_id", "hypothesis_statement", "proof_role", "proof_standard", "evidence_type", "lane_targets", "scheduled_lane_type", "scheduled_lane", "counter_evidence", "decision_use", "prefer_deep", "deep_reason", "primary_engine", "fallback_chain", "fallback_used", "deep_unavailable", "deep_exhausted", "search_task"]:
             if key in trace:
                 copied[key] = trace.get(key)
         raw_results.append(copied)
@@ -1261,11 +1513,14 @@ def _run_iqs_search_tasks_batch(
             "intent": query_item.get("intent"),
             "source": query_item.get("source"),
             "primary_options": primary_options,
+            "primary_engine": primary_options.get("engineType"),
+            "prefer_deep": bool(primary_options.get("prefer_deep")),
+            "deep_reason": primary_options.get("deep_reason") or query_item.get("deep_reason"),
             "fallback_used": False,
             "batch_index": index,
             "errors": [],
         }
-        for key in ["task_id", "dimension_id", "dimension_name", "evidence_goal", "must_have_terms", "forbidden_terms", "source_priority", "hypothesis_id", "hypothesis_statement", "proof_role", "proof_standard", "evidence_type", "lane_targets", "scheduled_lane_type", "scheduled_lane", "counter_evidence", "decision_use", "search_task"]:
+        for key in ["task_id", "dimension_id", "dimension_name", "evidence_goal", "must_have_terms", "forbidden_terms", "source_priority", "hypothesis_id", "hypothesis_statement", "proof_role", "proof_standard", "evidence_type", "lane_targets", "scheduled_lane_type", "scheduled_lane", "counter_evidence", "decision_use", "prefer_deep", "deep_reason", "search_task"]:
             if key in query_item:
                 trace[key] = query_item.get(key)
         prepared.append({"query_item": query_item, "options": primary_options, "trace": trace, "results": []})
@@ -1393,6 +1648,14 @@ def _task_from_context(item: Dict[str, Any], options: Optional[Dict[str, Any]]) 
 
 
 _TASK_TERM_HINTS = (
+    "AI Agent",
+    "Agentic AI",
+    "智能体",
+    "智能代理",
+    "自主智能体",
+    "工作流自动化",
+    "workflow automation",
+    "enterprise AI agents",
     "人工智能",
     "AI",
     "大模型",
@@ -1927,7 +2190,17 @@ def run_iqs_optimized_search(query: str, options: Optional[Dict[str, Any]] = Non
     started = time.perf_counter()
     incoming_options = dict(options or {})
     base_options = {**incoming_options, **infer_search_options(query, incoming_options)}
+    if _deep_repair_requested(base_options):
+        base_options["enable_batch_search"] = False
     cache_key = ""
+    persistent_cached_payload = lookup_persistent_search_cache(
+        query,
+        base_options,
+        _as_dict(base_options.get("search_task")),
+    )
+    if persistent_cached_payload:
+        _progress("iqs-search", "persistent search cache hit", query=query)
+        return persistent_cached_payload
     if _iqs_search_cache_allowed(base_options):
         cache_key = _iqs_search_cache_key(query, base_options)
         cached_payload = _IQS_SEARCH_CACHE.get(cache_key)
@@ -1959,6 +2232,8 @@ def run_iqs_optimized_search(query: str, options: Optional[Dict[str, Any]] = Non
         else:
             engine_types = _split_csv(raw_engine_types)
         engine_types = engine_types or [str(query_item.get("engineType") or "LiteAdvanced")]
+        if _deep_repair_requested(base_options) or query_item.get("prefer_deep"):
+            engine_types = [engine_types[0]]
         for engine_type in engine_types:
             task_item = dict(query_item)
             task_item["engineType"] = engine_type
@@ -2016,6 +2291,8 @@ def run_iqs_optimized_search(query: str, options: Optional[Dict[str, Any]] = Non
                 }
                 if cache_key and not errors:
                     _IQS_SEARCH_CACHE.set(cache_key, copy.deepcopy(payload))
+                if not errors or not processed_results:
+                    store_persistent_search_cache(query, base_options, _as_dict(base_options.get("search_task")), payload)
                 return payload
             except Exception as exc:
                 errors.append(f"IQS batch search failed, fallback to parallel subprocess: {exc}")
@@ -2034,7 +2311,7 @@ def run_iqs_optimized_search(query: str, options: Optional[Dict[str, Any]] = Non
                         copied["origin_intent"] = trace.get("intent")
                         copied["origin_query_source"] = trace.get("source")
                         copied["origin_rank"] = rank
-                        for key in ["task_id", "dimension_id", "dimension_name", "evidence_goal", "must_have_terms", "forbidden_terms", "source_priority", "hypothesis_id", "hypothesis_statement", "proof_role", "proof_standard", "evidence_type", "lane_targets", "scheduled_lane_type", "scheduled_lane", "counter_evidence", "decision_use", "search_task"]:
+                        for key in ["task_id", "dimension_id", "dimension_name", "evidence_goal", "must_have_terms", "forbidden_terms", "source_priority", "hypothesis_id", "hypothesis_statement", "proof_role", "proof_standard", "evidence_type", "lane_targets", "scheduled_lane_type", "scheduled_lane", "counter_evidence", "decision_use", "prefer_deep", "deep_reason", "primary_engine", "fallback_chain", "fallback_used", "deep_unavailable", "deep_exhausted", "search_task"]:
                             if key in trace:
                                 copied[key] = trace.get(key)
                         raw_results.append(copied)
@@ -2069,6 +2346,8 @@ def run_iqs_optimized_search(query: str, options: Optional[Dict[str, Any]] = Non
     }
     if cache_key and not errors:
         _IQS_SEARCH_CACHE.set(cache_key, copy.deepcopy(payload))
+    if not errors or not processed_results:
+        store_persistent_search_cache(query, base_options, _as_dict(base_options.get("search_task")), payload)
     return payload
 
 
@@ -2087,15 +2366,8 @@ def assign_source_ids(results: Sequence[Dict[str, Any]], pages: Sequence[Dict[st
     return search_items, page_items
 
 
-def build_llm_config() -> Dict[str, Any]:
-    return {
-        "provider": DEFAULT_LLM_SYNTHESIS_PROVIDER,
-        "url": DEFAULT_LLM_SYNTHESIS_URL,
-        "api_key": DEFAULT_LLM_SYNTHESIS_API_KEY,
-        "model": DEFAULT_LLM_SYNTHESIS_MODEL,
-        "timeout": DEFAULT_LLM_SYNTHESIS_TIMEOUT,
-        "disable_thinking": DEFAULT_LLM_SYNTHESIS_DISABLE_THINKING,
-    }
+def build_llm_config(task_name: str = "web_summary") -> Dict[str, Any]:
+    return dict(build_llm_config_for_task(task_name))
 
 
 def build_web_payload(
@@ -2186,7 +2458,7 @@ def synthesize_with_llm(
     page_results: Sequence[Dict[str, Any]],
     search_options: Dict[str, Any],
 ) -> tuple[str, Dict[str, Any]]:
-    llm_config = build_llm_config()
+    llm_config = build_llm_config("web_summary")
     if not llm_config_is_ready(llm_config):
         raise RuntimeError("大模型综合分析配置不完整。")
 
@@ -2392,7 +2664,7 @@ def synthesize_refined_with_llm(
     page_results: Sequence[Dict[str, Any]],
     search_options: Dict[str, Any],
 ) -> tuple[str, Dict[str, Any]]:
-    llm_config = build_llm_config()
+    llm_config = build_llm_config("web_summary")
     if not llm_config_is_ready(llm_config):
         raise RuntimeError("大模型综合分析配置不完整。")
 
@@ -2685,6 +2957,7 @@ def iqs_research_node(state: WebAnalysisAgentState) -> WebAnalysisAgentState:
     search_results: List[Dict[str, Any]] = []
     page_results: List[Dict[str, Any]] = []
     errors: List[str] = []
+    readpage_errors: List[str] = []
     optimized_search: Dict[str, Any] = {}
     started = time.perf_counter()
     _progress("web-agent", "IQS 检索阶段开始", query=query, url_count=len(urls))
@@ -2701,13 +2974,72 @@ def iqs_research_node(state: WebAnalysisAgentState) -> WebAnalysisAgentState:
         except Exception as exc:
             logger.exception("IQS optimized search failed", extra={"query": query})
             errors.append(f"搜索失败：{exc}")
-    for url in urls[:3]:
+    readpage_urls = select_auto_readpage_urls(search_results, explicit_urls=urls, search_options=search_options)
+    explicit_url_set = {str(url or "").strip() for url in urls if str(url or "").strip()}
+    readpage_timeout_ms = _env_int("IQS_READPAGE_TIMEOUT_MS", 30000, min_value=5000, max_value=120000)
+    readpage_workers = min(
+        len(readpage_urls) or 1,
+        _env_int("IQS_READPAGE_PARALLEL_WORKERS", 3, min_value=1, max_value=8),
+    )
+
+    def _readpage_one(url: str) -> Dict[str, Any]:
         try:
-            _progress("web-agent", "读取指定网页", url=url)
-            page_results.append(call_iqs_readpage(url, timeout_ms=60000))
+            _progress("web-agent", "读取网页原文", url=url)
+            page = call_iqs_readpage(url, timeout_ms=readpage_timeout_ms)
+            if isinstance(page, dict):
+                page.setdefault("origin_query", query)
+                page.setdefault("auto_readpage", url not in explicit_url_set)
+                page.setdefault("readpage_priority", "explicit" if url in explicit_url_set else "search_result")
+                return {"url": url, "page": page, "error": ""}
+            return {"url": url, "page": {}, "error": "IQS readpage returned non-dict payload"}
         except Exception as exc:
             logger.exception("IQS readpage failed", extra={"url": url})
-            errors.append(f"读取网页失败（{url}）：{exc}")
+            return {"url": url, "page": {}, "error": f"读取网页失败（{url}）：{exc}"}
+
+    if readpage_urls:
+        if readpage_workers <= 1 or len(readpage_urls) <= 1:
+            readpage_results = [_readpage_one(url) for url in readpage_urls]
+        else:
+            readpage_results = []
+            completed_futures: set[Any] = set()
+            waves = max(1, (len(readpage_urls) + readpage_workers - 1) // readpage_workers)
+            wall_timeout = max(10.0, (readpage_timeout_ms / 1000.0) * waves + 10.0)
+            executor = ThreadPoolExecutor(max_workers=readpage_workers)
+            future_map = {executor.submit(_readpage_one, url): url for url in readpage_urls}
+            try:
+                for future in as_completed(future_map, timeout=wall_timeout):
+                    completed_futures.add(future)
+                    try:
+                        readpage_results.append(future.result())
+                    except Exception as exc:
+                        url = future_map[future]
+                        logger.exception("IQS readpage worker failed", extra={"url": url})
+                        readpage_results.append({"url": url, "page": {}, "error": f"读取网页失败（{url}）：{exc}"})
+            except FutureTimeoutError:
+                pass
+            finally:
+                for future, url in future_map.items():
+                    if future in completed_futures:
+                        continue
+                    future.cancel()
+                    readpage_results.append(
+                        {
+                            "url": url,
+                            "page": {},
+                            "error": f"读取网页超时（{url}）：wall timeout after {wall_timeout:.0f}s",
+                        }
+                    )
+                executor.shutdown(wait=False, cancel_futures=True)
+        readpage_results.sort(key=lambda item: readpage_urls.index(str(item.get("url") or "")) if str(item.get("url") or "") in readpage_urls else 999)
+        for item in readpage_results:
+            page = item.get("page")
+            if isinstance(page, dict) and page:
+                page_results.append(page)
+                continue
+            message = str(item.get("error") or "").strip()
+            if message:
+                errors.append(message)
+                readpage_errors.append(message)
 
     search_results, page_results = assign_source_ids(search_results, page_results)
     output: WebAnalysisAgentState = {
@@ -2722,6 +3054,14 @@ def iqs_research_node(state: WebAnalysisAgentState) -> WebAnalysisAgentState:
             "search_tasks": optimized_search.get("search_tasks", []),
             "search_trace": optimized_search.get("search_trace", []),
             "quality_processing": optimized_search.get("quality_processing", {}),
+            "auto_readpage": {
+                "enabled": _env_flag("IQS_AUTO_READPAGE_ENABLED", True),
+                "attempted": len(readpage_urls),
+                "succeeded": len(page_results),
+                "failed": len(readpage_errors),
+                "urls": readpage_urls,
+                "errors": readpage_errors[:5],
+            },
         },
     }
     if errors and not search_results and not page_results:

@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, TypedDict
 
 try:
+    from rag_pipeline.contracts.evidence_quality import apply_evidence_quality_contract
+    from rag_pipeline.contracts.source_registry import pick_refs as _contract_pick_refs
     from .analytics import run_analytics_agents
     from .chapter_argument_agent import run_chapter_argument_agent
     from .claim_builder_agent import run_claim_builder_agent
@@ -25,7 +27,14 @@ try:
     from .rewrite_agent import run_rewrite_agent
     from .risk_agent import run_risk_agent
     from .table_agent import run_table_agent
+    from .table_validator import validate_table_package
 except Exception:  # pragma: no cover - direct script mode fallback
+    try:
+        from rag_pipeline.contracts.evidence_quality import apply_evidence_quality_contract  # type: ignore
+        from rag_pipeline.contracts.source_registry import pick_refs as _contract_pick_refs  # type: ignore
+    except Exception:  # pragma: no cover
+        apply_evidence_quality_contract = None  # type: ignore
+        _contract_pick_refs = None  # type: ignore
     from analytics import run_analytics_agents  # type: ignore
     from chapter_argument_agent import run_chapter_argument_agent  # type: ignore
     from claim_builder_agent import run_claim_builder_agent  # type: ignore
@@ -43,6 +52,7 @@ except Exception:  # pragma: no cover - direct script mode fallback
     from rewrite_agent import run_rewrite_agent  # type: ignore
     from risk_agent import run_risk_agent  # type: ignore
     from table_agent import run_table_agent  # type: ignore
+    from table_validator import validate_table_package  # type: ignore
 
 
 AGENT_NAME = "writer_agent"
@@ -75,6 +85,26 @@ INDUSTRY_DIMENSIONS = [
     "资本动态",
 ]
 
+
+PUBLIC_REBUILD_PATTERNS = [
+    r"正文\s*只能\s*写成",
+    r"本章\s*只能\s*写成",
+    r"本章\s*可\s*写成",
+    r"本章\s*应\s*写成",
+    r"建议避免",
+    r"建议在后续版本中补充",
+    r"后续版本中补充",
+    r"第\s*\d+\s*轮",
+    r"\bclaim_status\b",
+    r"\bevidence_cards?\b",
+]
+
+TABLE_INTERNAL_TRACE_PATTERNS = [
+    r"第\s*\d+\s*轮\s*[｜|:：]",
+    r"(?:竞争对比|政策监管|技术产业链|市场规模|成本|金额)\s*=\s*(?:[；;]|$)",
+    r"\bopenai_task_\d+\b",
+]
+
 ENTERPRISE_INDUSTRY_LAYOUT = ReportLayout(
     report_type="industry_deep",
     title_template="{query}研究报告",
@@ -105,6 +135,24 @@ def _env_flag(name: str, default: bool) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _count_value(value: Any) -> int:
+    try:
+        return int(float(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _evidence_health_summary_from_package(evidence_package: Dict[str, Any]) -> Dict[str, Any]:
+    package = _as_dict(evidence_package)
+    summary = _as_dict(package.get("summary"))
+    metadata = _as_dict(package.get("metadata"))
+    return (
+        _as_dict(package.get("evidence_health_summary"))
+        or _as_dict(summary.get("evidence_health_summary"))
+        or _as_dict(metadata.get("evidence_health_summary"))
+    )
+
+
 def _package_warning_types(package_quality_report: Dict[str, Any]) -> List[str]:
     warnings = [
         _as_dict(item).get("type")
@@ -112,6 +160,90 @@ def _package_warning_types(package_quality_report: Dict[str, Any]) -> List[str]:
         if isinstance(item, dict)
     ]
     return [str(item) for item in warnings if str(item or "").strip()]
+
+
+def _truthy_quality_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on", "required", "failed"}
+    return bool(value)
+
+
+def _qa_pending_repair_reasons(qa_result: Dict[str, Any]) -> List[str]:
+    qa = _as_dict(qa_result)
+    reasons: List[str] = []
+    qa_passed = bool(qa.get("passed"))
+    report_family = str(qa.get("report_family") or "").strip().lower()
+    deep_report = report_family == "industry_deep_report" or "deep" in report_family
+    repair_required = _truthy_quality_flag(qa.get("repair_required"))
+    has_followup_split = any(
+        key in qa
+        for key in (
+            "blocking_followups",
+            "advisory_followups",
+            "blocking_evidence_repair_followups",
+            "blocking_content_repair_followups",
+        )
+    )
+    if repair_required:
+        reasons.append("repair_required")
+    if deep_report and not bool(qa.get("publishable")):
+        reasons.append("deep_report_not_publishable")
+    if has_followup_split:
+        if _as_list(qa.get("blocking_followups")):
+            reasons.append("blocking_followups")
+        if _as_list(qa.get("blocking_evidence_repair_followups")):
+            reasons.append("blocking_evidence_repair_followups")
+        if _as_list(qa.get("blocking_content_repair_followups")):
+            reasons.append("blocking_content_repair_followups")
+        if deep_report:
+            high_advisory = [
+                item
+                for item in _as_list(qa.get("advisory_followups"))
+                if str(_as_dict(item).get("priority") or "").strip().lower() == "high"
+            ]
+            if high_advisory:
+                reasons.append("high_priority_advisory_followups")
+    else:
+        if _as_list(qa.get("repair_followups")):
+            reasons.append("repair_followups")
+        if _as_list(qa.get("evidence_repair_followups")):
+            reasons.append("evidence_repair_followups")
+        if _as_list(qa.get("content_repair_followups")):
+            reasons.append("content_repair_followups")
+        if _as_list(_as_dict(qa.get("deep_evaluation")).get("required_followups")) and not (qa_passed and not repair_required):
+            reasons.append("required_followups")
+    result: List[str] = []
+    seen = set()
+    for reason in reasons:
+        if reason in seen:
+            continue
+        seen.add(reason)
+        result.append(reason)
+    return result
+
+
+def _qa_has_pending_repair(qa_result: Dict[str, Any]) -> bool:
+    return bool(_qa_pending_repair_reasons(qa_result))
+
+
+def _writer_ready_for_final(
+    *,
+    markdown: str,
+    qa_result: Dict[str, Any],
+    package_passed: bool,
+    package_warning_blocked: bool,
+) -> bool:
+    return (
+        bool(_as_dict(qa_result).get("passed"))
+        and not _qa_has_pending_repair(qa_result)
+        and bool(package_passed)
+        and not bool(package_warning_blocked)
+        and not has_internal_gap_language(str(markdown or ""))
+    )
 
 
 def _compact(value: Any, max_chars: int = 260) -> str:
@@ -148,15 +280,381 @@ def _env_int(name: str, default: int, *, min_value: int = 0, max_value: int = 1_
 
 def _body_table_budget() -> int:
     if os.getenv("REPORT_MAX_BODY_TABLES") is not None:
-        requested = _env_int("REPORT_MAX_BODY_TABLES", 6, min_value=0, max_value=50)
+        requested = _env_int("REPORT_MAX_BODY_TABLES", 6, min_value=0, max_value=20)
     else:
-        requested = 8
+        requested = 6
     hard_limit = _env_int("REPORT_HARD_MAX_BODY_TABLES", 12, min_value=0, max_value=50)
     return max(0, min(requested, hard_limit))
 
 
 def _per_chapter_table_budget() -> int:
-    return _env_int("REPORT_MAX_BODY_TABLES_PER_CHAPTER", 3, min_value=0, max_value=20)
+    return _env_int("REPORT_MAX_BODY_TABLES_PER_CHAPTER", 1, min_value=0, max_value=6)
+
+
+def _refs_from_evidence_package(package: Dict[str, Any], *, limit: int = 8) -> List[str]:
+    refs: List[Any] = []
+    for collection in ("core_evidence", "supporting_evidence", "table_evidence", "evidence_items"):
+        for item in _as_list(package.get(collection)):
+            if not isinstance(item, dict):
+                continue
+            refs.extend(_pick_refs(item, limit=3))
+            for key in ("ref", "evidence_id", "source_ref"):
+                if item.get(key):
+                    refs.append(item.get(key))
+    return _dedupe(refs, limit=limit)
+
+
+def _first_public_unit_by_chapter(argument_units: Sequence[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    by_chapter: Dict[str, Dict[str, Any]] = {}
+    for unit in list(argument_units or []):
+        if not isinstance(unit, dict) or unit.get("omit_from_report"):
+            continue
+        if unit.get("public_render") is False:
+            continue
+        chapter_id = str(unit.get("chapter_id") or "").strip()
+        if not chapter_id:
+            continue
+        if chapter_id not in by_chapter:
+            by_chapter[chapter_id] = unit
+    return by_chapter
+
+
+def _unit_lookup(argument_units: Sequence[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    lookup: Dict[str, Dict[str, Any]] = {}
+    for unit in list(argument_units or []):
+        if not isinstance(unit, dict) or unit.get("omit_from_report"):
+            continue
+        if unit.get("public_render") is False:
+            continue
+        for key in (unit.get("section_id"), unit.get("section_title"), unit.get("question")):
+            text = str(key or "").strip()
+            if text and text not in lookup:
+                lookup[text] = unit
+    return lookup
+
+
+def _scan_public_rebuild_hits(value: Any, *, path: str = "", limit: int = 24) -> List[Dict[str, Any]]:
+    hits: List[Dict[str, Any]] = []
+
+    def walk(node: Any, node_path: str) -> None:
+        if len(hits) >= limit:
+            return
+        if isinstance(node, dict):
+            for key, child in node.items():
+                walk(child, f"{node_path}.{key}" if node_path else str(key))
+                if len(hits) >= limit:
+                    return
+            return
+        if isinstance(node, list):
+            for index, child in enumerate(node[:80]):
+                walk(child, f"{node_path}[{index}]")
+                if len(hits) >= limit:
+                    return
+            return
+        if not isinstance(node, str):
+            return
+        text = str(node or "")
+        for pattern in PUBLIC_REBUILD_PATTERNS:
+            if re.search(pattern, text, flags=re.I):
+                hits.append(
+                    {
+                        "path": node_path,
+                        "pattern": pattern,
+                        "snippet": _compact(text, 180),
+                    }
+                )
+                return
+
+    walk(value, path)
+    return hits
+
+
+def needs_public_rebuild(
+    *,
+    argument_units: Optional[Sequence[Dict[str, Any]]] = None,
+    chapter_packages: Optional[Sequence[Dict[str, Any]]] = None,
+    structured_analysis: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    hits: List[Dict[str, Any]] = []
+    hits.extend(_scan_public_rebuild_hits(argument_units or [], path="argument_units", limit=16))
+    hits.extend(_scan_public_rebuild_hits(chapter_packages or [], path="chapter_packages", limit=16))
+    hits.extend(_scan_public_rebuild_hits(_as_dict(structured_analysis), path="structured_analysis", limit=8))
+    return {
+        "required": bool(hits),
+        "hit_count": len(hits),
+        "hits": hits[:24],
+        "argument_unit_count_before": len([item for item in list(argument_units or []) if isinstance(item, dict)]),
+        "chapter_package_count_before": len([item for item in list(chapter_packages or []) if isinstance(item, dict)]),
+    }
+
+
+def rebuild_public_argument_pipeline(
+    *,
+    chapter_evidence_packages: Sequence[Dict[str, Any]],
+    micro_layouts: Sequence[Dict[str, Any]],
+    structured_analysis: Dict[str, Any],
+    report_blueprint: Dict[str, Any],
+    table_packages: Sequence[Dict[str, Any]],
+    llm_client: Any = None,
+) -> Dict[str, Any]:
+    rebuilt_units = run_claim_builder_agent(
+        chapter_evidence_packages=chapter_evidence_packages,
+        micro_layouts=micro_layouts,
+        structured_analysis=structured_analysis,
+        llm_client=llm_client,
+    )
+    rebuilt_chapters = run_chapter_argument_agent(
+        report_blueprint=report_blueprint,
+        micro_layouts=micro_layouts,
+        argument_units=rebuilt_units,
+        table_packages=table_packages,
+        chapter_evidence_packages=chapter_evidence_packages,
+        llm_client=llm_client,
+    )
+    return {
+        "argument_units": _as_list(rebuilt_units),
+        "chapter_packages": _as_list(rebuilt_chapters),
+        "argument_unit_count_after": len([item for item in _as_list(rebuilt_units) if isinstance(item, dict)]),
+        "chapter_package_count_after": len([item for item in _as_list(rebuilt_chapters) if isinstance(item, dict)]),
+    }
+
+
+def _fill_section_from_unit(section: Dict[str, Any], unit: Dict[str, Any], fallback_refs: Sequence[str]) -> Dict[str, Any]:
+    result = dict(section)
+    if not str(result.get("section_title") or "").strip():
+        result["section_title"] = unit.get("section_title") or unit.get("question") or "证据边界"
+    if not str(result.get("claim") or "").strip():
+        result["claim"] = unit.get("claim") or unit.get("section_title") or result.get("section_title")
+    if not str(result.get("reasoning") or "").strip() and unit.get("reasoning"):
+        result["reasoning"] = unit.get("reasoning")
+    if not str(result.get("counter_evidence") or "").strip():
+        result["counter_evidence"] = unit.get("counter_evidence") or "仍需跟踪反证信号和口径变化。"
+    if not str(result.get("actionable") or "").strip():
+        result["actionable"] = unit.get("actionable") or unit.get("decision_implication") or "优先补充可核验来源并持续跟踪。"
+    if not _as_list(result.get("evidence_refs")):
+        refs = _pick_refs(unit, limit=8) or list(fallback_refs or [])
+        if refs:
+            result["evidence_refs"] = refs
+    return result
+
+
+def _sanitize_public_table_cell(value: Any, *, max_chars: int = 180) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        return ""
+    text = re.sub(r"第\s*\d+\s*轮\s*[｜|:：]\s*", "", text)
+    text = re.sub(r"^[^：:]{0,120}(?:报告|研究|query|查询|检索)[^：:]{0,120}[：:]\s*", "", text, flags=re.I)
+    text = re.sub(r"(?:竞争对比|政策监管|技术产业链|市场规模|成本|金额)\s*=\s*(?=；|;|$)", "", text)
+    text = re.sub(r"(?:；\s*){2,}", "；", text).strip(" ；;，,")
+    if any(re.search(pattern, text, flags=re.I) for pattern in TABLE_INTERNAL_TRACE_PATTERNS):
+        return ""
+    if len(text) > max_chars:
+        text = text[: max(0, max_chars - 1)].rstrip() + "..."
+    return text
+
+
+def _sanitize_table_for_public(table: Dict[str, Any], diagnostics: Dict[str, Any]) -> Dict[str, Any]:
+    result = dict(table)
+    rows = []
+    dropped_rows = 0
+    for row in _as_list(result.get("rows")):
+        row_dict = dict(row) if isinstance(row, dict) else {"cells": _as_list(row)}
+        cells = [_sanitize_public_table_cell(cell, max_chars=160) for cell in _as_list(row_dict.get("cells"))]
+        if not cells or any(not str(cell or "").strip() for cell in cells[:1]):
+            dropped_rows += 1
+            continue
+        if not any(str(cell or "").strip() for cell in cells):
+            dropped_rows += 1
+            continue
+        row_dict["cells"] = cells
+        row_claim = _sanitize_public_table_cell(row_dict.get("row_claim"), max_chars=240)
+        if row_claim:
+            row_dict["row_claim"] = row_claim
+        rows.append(row_dict)
+    if dropped_rows:
+        diagnostics["sanitized_table_row_count"] = int(diagnostics.get("sanitized_table_row_count") or 0) + dropped_rows
+        result.setdefault("reject_reasons", [])
+        if isinstance(result["reject_reasons"], list):
+            result["reject_reasons"].append("internal_or_empty_table_rows_removed")
+    result["rows"] = rows
+    if not rows:
+        result["should_render"] = False
+        result.setdefault("reject_reasons", [])
+        if isinstance(result["reject_reasons"], list):
+            result["reject_reasons"].append("no_public_table_rows_after_sanitization")
+    return result
+
+
+def _demote_invalid_table(table: Dict[str, Any], diagnostics: Dict[str, Any], *, nested: bool = False) -> Dict[str, Any]:
+    result = _sanitize_table_for_public(dict(table), diagnostics)
+    if not result.get("should_render") or result.get("appendix_only"):
+        return result
+    validation = validate_table_package(result)
+    if validation.get("passed"):
+        return result
+    result["should_render"] = False
+    result["demoted_from_clean_report"] = True
+    result["table_validation_for_clean"] = validation
+    reasons = result.setdefault("reject_reasons", [])
+    if isinstance(reasons, list):
+        reasons.append("contract_normalizer_table_validation_failed")
+    diagnostics["demoted_table_count"] = int(diagnostics.get("demoted_table_count") or 0) + 1
+    if len(diagnostics.setdefault("demoted_tables", [])) < 8:
+        diagnostics["demoted_tables"].append(
+            {
+                "table_id": result.get("table_id"),
+                "chapter_id": result.get("chapter_id"),
+                "nested": nested,
+                "error_types": [str(_as_dict(item).get("type") or item) for item in _as_list(validation.get("errors"))][:6],
+            }
+        )
+    return result
+
+
+def _normalize_public_packages_for_contract(
+    *,
+    chapter_evidence_packages: Sequence[Dict[str, Any]],
+    micro_layouts: Sequence[Dict[str, Any]],
+    table_packages: Sequence[Dict[str, Any]],
+    argument_units: Sequence[Dict[str, Any]],
+    chapter_packages: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    diagnostics: Dict[str, Any] = {
+        "demoted_table_count": 0,
+        "omitted_section_count": 0,
+        "omitted_chapter_count": 0,
+        "filled_section_count": 0,
+        "demoted_tables": [],
+        "omitted_sections": [],
+    }
+    evidence_by_chapter = {
+        str(package.get("chapter_id") or "").strip(): package
+        for package in list(chapter_evidence_packages or [])
+        if isinstance(package, dict) and str(package.get("chapter_id") or "").strip()
+    }
+    units = [dict(unit) for unit in list(argument_units or []) if isinstance(unit, dict)]
+    for unit in units:
+        if unit.get("omit_from_report") or unit.get("public_render") is False:
+            continue
+        chapter_id = str(unit.get("chapter_id") or "").strip()
+        fallback_refs = _refs_from_evidence_package(_as_dict(evidence_by_chapter.get(chapter_id)))
+        claim = _compact(unit.get("claim") or unit.get("section_title") or unit.get("question"), 220)
+        if claim and not str(unit.get("reasoning") or "").strip():
+            unit["reasoning"] = f"{claim} 这一判断需要结合已绑定证据、时间口径和反向样本持续验证。"
+        if not str(unit.get("counter_evidence") or "").strip():
+            unit["counter_evidence"] = "反向边界在于后续官方披露、订单或经营指标不能延续当前信号。"
+        if not str(unit.get("actionable") or unit.get("decision_implication") or "").strip():
+            unit["actionable"] = "优先验证关键来源、指标口径和反向样本，再决定是否提高判断权重。"
+        if not _as_list(unit.get("evidence_refs")) and fallback_refs:
+            unit["evidence_refs"] = list(fallback_refs)
+    first_unit = _first_public_unit_by_chapter(units)
+    unit_lookup = _unit_lookup(units)
+
+    normalized_tables = [
+        _demote_invalid_table(dict(table), diagnostics)
+        for table in list(table_packages or [])
+        if isinstance(table, dict)
+    ]
+
+    normalized_layouts: List[Dict[str, Any]] = []
+    for layout in list(micro_layouts or []):
+        if not isinstance(layout, dict):
+            continue
+        copied = copy.deepcopy(layout)
+        chapter_id = str(copied.get("chapter_id") or "").strip()
+        fallback_refs = _refs_from_evidence_package(_as_dict(evidence_by_chapter.get(chapter_id)))
+        followups = _as_list(copied.get("follow_up_queries"))
+        normalized_sections: List[Dict[str, Any]] = []
+        for section in _as_list(copied.get("sections")):
+            if not isinstance(section, dict):
+                continue
+            section_id = str(section.get("section_id") or "").strip()
+            section_title = str(section.get("section_title") or "").strip()
+            unit = unit_lookup.get(section_id) or unit_lookup.get(section_title) or first_unit.get(chapter_id) or {}
+            next_section = dict(section)
+            if unit:
+                next_section = _fill_section_from_unit(next_section, unit, fallback_refs)
+            elif fallback_refs and not _as_list(next_section.get("required_evidence_refs")):
+                next_section["required_evidence_refs"] = list(fallback_refs)
+            if not str(next_section.get("section_title") or "").strip():
+                next_section["section_title"] = "证据边界"
+            if not _as_list(next_section.get("required_evidence_refs")) and not followups:
+                diagnostics["omitted_section_count"] += 1
+                if len(diagnostics["omitted_sections"]) < 12:
+                    diagnostics["omitted_sections"].append({"chapter_id": chapter_id, "section_id": section_id, "source": "micro_layout"})
+                continue
+            normalized_sections.append(next_section)
+        copied["sections"] = normalized_sections
+        normalized_layouts.append(copied)
+
+    normalized_chapters: List[Dict[str, Any]] = []
+    for chapter in list(chapter_packages or []):
+        if not isinstance(chapter, dict):
+            continue
+        copied = copy.deepcopy(chapter)
+        chapter_id = str(copied.get("chapter_id") or "").strip()
+        fallback_refs = _refs_from_evidence_package(_as_dict(evidence_by_chapter.get(chapter_id)))
+        fallback_unit = first_unit.get(chapter_id) or {}
+        if not str(copied.get("lead") or "").strip() and fallback_unit:
+            copied["lead"] = _compact(fallback_unit.get("claim") or fallback_unit.get("reasoning"), 260)
+        copied["table_packages"] = [
+            _demote_invalid_table(dict(table), diagnostics, nested=True)
+            for table in _as_list(copied.get("table_packages"))
+            if isinstance(table, dict)
+        ]
+        normalized_sections = []
+        for section in _as_list(copied.get("sections")):
+            if not isinstance(section, dict):
+                continue
+            section_id = str(section.get("section_id") or "").strip()
+            section_title = str(section.get("section_title") or "").strip()
+            unit = unit_lookup.get(section_id) or unit_lookup.get(section_title) or fallback_unit
+            next_section = _fill_section_from_unit(dict(section), unit, fallback_refs) if unit else dict(section)
+            if not _as_list(next_section.get("evidence_refs")) and fallback_refs:
+                next_section["evidence_refs"] = list(fallback_refs)
+            if (
+                not str(next_section.get("claim") or "").strip()
+                or not _as_list(next_section.get("evidence_refs"))
+            ):
+                diagnostics["omitted_section_count"] += 1
+                if len(diagnostics["omitted_sections"]) < 12:
+                    diagnostics["omitted_sections"].append({"chapter_id": chapter_id, "section_id": section_id, "source": "chapter_package"})
+                continue
+            if next_section != section:
+                diagnostics["filled_section_count"] += 1
+            normalized_sections.append(next_section)
+        public_tables = [
+            table for table in _as_list(copied.get("table_packages")) if isinstance(table, dict) and table.get("should_render")
+        ]
+        if not normalized_sections and not public_tables:
+            if fallback_refs and str(copied.get("lead") or "").strip():
+                normalized_sections.append(
+                    {
+                        "section_id": f"{chapter_id or 'chapter'}_evidence_boundary",
+                        "section_title": "证据边界",
+                        "claim": _compact(copied.get("lead"), 220),
+                        "reasoning": _compact(copied.get("lead"), 260),
+                        "counter_evidence": "仍需跟踪反证信号和口径变化。",
+                        "actionable": "优先补充可核验来源并持续跟踪。",
+                        "evidence_refs": fallback_refs,
+                    }
+                )
+                diagnostics["filled_section_count"] += 1
+            else:
+                copied["omit_from_report"] = True
+                copied["omit_from_clean_report"] = True
+                copied["omit_reason"] = "contract_normalizer_no_supported_sections"
+                diagnostics["omitted_chapter_count"] += 1
+        copied["sections"] = normalized_sections
+        normalized_chapters.append(copied)
+
+    return {
+        "micro_layouts": normalized_layouts,
+        "table_packages": normalized_tables,
+        "argument_units": units,
+        "chapter_packages": normalized_chapters,
+        "summary": diagnostics,
+    }
 
 
 def _env_float(name: str, default: float, *, min_value: float = 0.0, max_value: float = 10.0) -> float:
@@ -193,6 +691,8 @@ def _safe_len(value: Any) -> int:
 
 
 def _pick_refs(item: Dict[str, Any], *, limit: int = 6) -> List[str]:
+    if _contract_pick_refs is not None:
+        return _contract_pick_refs(item, limit=limit)
     refs: List[Any] = []
     for key in ("source_refs", "evidence_refs", "supporting_evidence", "refs"):
         refs.extend(_as_list(item.get(key)))
@@ -442,6 +942,7 @@ def _pipeline_artifact_summary(
     package_quality_report: Dict[str, Any],
 ) -> Dict[str, Any]:
     rendered_tables = [table for table in table_packages if isinstance(table, dict) and table.get("should_render") and not table.get("appendix_only")]
+    rendered_high_value_tables = [table for table in rendered_tables if str(table.get("table_value_tier") or "") == "high"]
     public_units = [unit for unit in argument_units if isinstance(unit, dict) and unit.get("public_render") and not unit.get("omit_from_report")]
     public_chapters = [chapter for chapter in chapter_packages if isinstance(chapter, dict) and not chapter.get("omit_from_report")]
     return {
@@ -451,6 +952,7 @@ def _pipeline_artifact_summary(
         "micro_layout_count": len([item for item in micro_layouts if isinstance(item, dict)]),
         "table_package_count": len([item for item in table_packages if isinstance(item, dict)]),
         "rendered_table_count": len(rendered_tables),
+        "rendered_high_value_table_count": len(rendered_high_value_tables),
         "argument_unit_count": len([item for item in argument_units if isinstance(item, dict)]),
         "public_argument_unit_count": len(public_units),
         "source_count": len([item for item in source_registry if isinstance(item, dict)]),
@@ -461,6 +963,248 @@ def _pipeline_artifact_summary(
         "package_passed": bool(package_quality_report.get("passed")),
         "package_warning_count": len(_as_list(package_quality_report.get("warnings"))),
     }
+
+
+def _table_planning_summary(micro_layouts: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    chapters_with_table: List[Dict[str, Any]] = []
+    chapters_without_table: List[Dict[str, Any]] = []
+    request_count = 0
+    why_no_table_samples: List[Dict[str, Any]] = []
+    for layout in micro_layouts:
+        if not isinstance(layout, dict):
+            continue
+        chapter_id = str(layout.get("chapter_id") or "").strip()
+        plan = _as_dict(layout.get("table_planning"))
+        requests = [request for request in _as_list(layout.get("table_requests")) if isinstance(request, dict) and request.get("need_table") is not False]
+        request_count += len(requests)
+        if requests or plan.get("need_table"):
+            chapters_with_table.append(
+                {
+                    "chapter_id": chapter_id,
+                    "table_type": plan.get("table_type") or (requests[0].get("table_type") if requests else ""),
+                    "placement_slot": plan.get("placement_slot") or (requests[0].get("placement_slot") if requests else ""),
+                    "reason": plan.get("why_table_needed") or (requests[0].get("why_table_needed") if requests else ""),
+                }
+            )
+        else:
+            reason = plan.get("why_no_table") or "No table request was planned for this chapter."
+            chapters_without_table.append({"chapter_id": chapter_id, "reason": reason})
+            if len(why_no_table_samples) < 6:
+                why_no_table_samples.append({"chapter_id": chapter_id, "reason": reason})
+    return {
+        "chapter_count": len([layout for layout in micro_layouts if isinstance(layout, dict)]),
+        "chapters_with_table": chapters_with_table,
+        "chapters_without_table": chapters_without_table,
+        "llm_table_request_count": request_count,
+        "why_no_table_samples": why_no_table_samples,
+    }
+
+
+def _table_quality_summary(table_packages: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    candidate_count = 0
+    validated_count = 0
+    rendered_count = 0
+    repaired_count = 0
+    demoted_count = 0
+    calculation_error_count = 0
+    missing_claim_binding_count = 0
+    type_distribution: Dict[str, int] = {}
+    demoted_samples: List[Dict[str, Any]] = []
+    for table in table_packages:
+        if not isinstance(table, dict):
+            continue
+        candidate_count += 1
+        table_type = str(table.get("table_type") or "unknown")
+        type_distribution[table_type] = type_distribution.get(table_type, 0) + 1
+        validation = _as_dict(table.get("validation") or table.get("table_validation_for_clean"))
+        errors = _as_list(validation.get("errors")) + _as_list(table.get("validation_errors"))
+        warnings = _as_list(validation.get("warnings"))
+        if validation:
+            validated_count += 1
+        if table.get("should_render") and not table.get("appendix_only"):
+            rendered_count += 1
+        else:
+            demoted_count += 1
+            if len(demoted_samples) < 8:
+                demoted_samples.append(
+                    {
+                        "table_id": table.get("table_id"),
+                        "chapter_id": table.get("chapter_id"),
+                        "table_type": table_type,
+                        "reject_reasons": _as_list(table.get("reject_reasons")),
+                    }
+                )
+        if table.get("repaired") or table.get("repair_applied"):
+            repaired_count += 1
+        if any(str(_as_dict(error).get("type") or "").startswith("metric_") for error in errors):
+            calculation_error_count += 1
+        if any(_as_dict(item).get("type") == "missing_table_anchor" for item in [*errors, *warnings]):
+            missing_claim_binding_count += 1
+    return {
+        "candidate_count": candidate_count,
+        "validated_count": validated_count,
+        "rendered_count": rendered_count,
+        "repaired_count": repaired_count,
+        "demoted_count": demoted_count,
+        "calculation_error_count": calculation_error_count,
+        "missing_claim_binding_count": missing_claim_binding_count,
+        "table_type_distribution": type_distribution,
+        "demoted_samples": demoted_samples,
+    }
+
+
+def _table_placement_summary(table_packages: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    placement_by_slot: Dict[str, int] = {}
+    low_confidence: List[Dict[str, Any]] = []
+    placed = 0
+    rendered = 0
+    fallback_count = 0
+    for table in table_packages:
+        if not isinstance(table, dict) or not table.get("should_render") or table.get("appendix_only"):
+            continue
+        rendered += 1
+        slot = str(table.get("placement_slot") or "chapter_end")
+        placement_by_slot[slot] = placement_by_slot.get(slot, 0) + 1
+        if slot == "chapter_end":
+            fallback_count += 1
+        if table.get("anchor_section_id") or table.get("anchor_block_type"):
+            placed += 1
+        elif len(low_confidence) < 8:
+            low_confidence.append(
+                {
+                    "table_id": table.get("table_id"),
+                    "chapter_id": table.get("chapter_id"),
+                    "placement_slot": slot,
+                    "reason": "missing_anchor_section_or_block",
+                }
+            )
+    return {
+        "placed_table_count": placed,
+        "unplaced_table_count": max(0, rendered - placed),
+        "chapter_end_fallback_count": fallback_count,
+        "placement_by_slot": placement_by_slot,
+        "low_confidence_placements": low_confidence,
+    }
+
+
+def _table_gap_summary(table_packages: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    requirement_count = 0
+    follow_up_count = 0
+    missing_fields: Dict[str, int] = {}
+    samples: List[Dict[str, Any]] = []
+    rendered_high_value_table_count = 0
+    for table in table_packages:
+        if not isinstance(table, dict):
+            continue
+        if table.get("should_render") and not table.get("appendix_only") and str(table.get("table_value_tier") or "") == "high":
+            rendered_high_value_table_count += 1
+        requirements = [_as_dict(item) for item in _as_list(table.get("table_evidence_requirements")) if isinstance(item, dict)]
+        followups = [_as_dict(item) for item in _as_list(table.get("table_follow_up_queries")) if isinstance(item, dict)]
+        requirement_count += len(requirements)
+        follow_up_count += len(followups)
+        for requirement in requirements:
+            for field in _as_list(requirement.get("missing_fields")):
+                key = str(field or "").strip()
+                if key:
+                    missing_fields[key] = missing_fields.get(key, 0) + 1
+            if len(samples) < 8:
+                samples.append(
+                    {
+                        "table_id": requirement.get("table_id") or table.get("table_id"),
+                        "chapter_id": requirement.get("chapter_id") or table.get("chapter_id"),
+                        "table_type": requirement.get("table_type") or table.get("table_type"),
+                        "missing_fields": _as_list(requirement.get("missing_fields")),
+                        "query": requirement.get("query"),
+                    }
+                )
+    return {
+        "table_evidence_requirement_count": requirement_count,
+        "table_follow_up_count": follow_up_count,
+        "rendered_high_value_table_count": rendered_high_value_table_count,
+        "missing_field_distribution": missing_fields,
+        "samples": samples,
+    }
+
+
+def _table_follow_up_queries(table_packages: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    followups: List[Dict[str, Any]] = []
+    seen = set()
+    for table in table_packages:
+        if not isinstance(table, dict):
+            continue
+        for item in _as_list(table.get("table_follow_up_queries")):
+            if not isinstance(item, dict):
+                continue
+            query = _compact(item.get("query"), 240)
+            key = (query, str(item.get("table_id") or ""), str(item.get("chapter_id") or ""))
+            if not query or key in seen:
+                continue
+            seen.add(key)
+            followups.append({**item, "query": query})
+    return followups
+
+
+def _normalize_followup_query_item(item: Any) -> Dict[str, Any]:
+    if isinstance(item, dict):
+        query = _compact(item.get("query") or item.get("suggested_query"), 240)
+        return {**item, "query": query} if query else dict(item)
+    query = _compact(item, 240)
+    return {"query": query} if query else {}
+
+
+def _merge_table_followups_into_refinement_plan(plan: Dict[str, Any], table_followups: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    merged = copy.deepcopy(_as_dict(plan))
+    existing = [
+        normalized
+        for item in _as_list(merged.get("follow_up_queries"))
+        for normalized in [_normalize_followup_query_item(item)]
+        if normalized
+    ]
+    seen = {
+        (
+            _compact(item.get("query"), 240),
+            str(item.get("table_id") or ""),
+            str(item.get("chapter_id") or ""),
+        )
+        for item in existing
+    }
+    for item in table_followups:
+        if not isinstance(item, dict):
+            continue
+        query = _compact(item.get("query"), 240)
+        key = (query, str(item.get("table_id") or ""), str(item.get("chapter_id") or ""))
+        if not query or key in seen:
+            continue
+        seen.add(key)
+        existing.append(dict(item))
+    merged["follow_up_queries"] = existing
+    merged["table_follow_up_count"] = len(table_followups)
+    return merged
+
+
+def _table_appendix_rows(table_packages: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    appendix_tables: List[Dict[str, Any]] = []
+    for table in table_packages:
+        if not isinstance(table, dict):
+            continue
+        rows = [
+            _as_list(_as_dict(row).get("cells"))
+            for row in _as_list(table.get("appendix_rows"))
+            if isinstance(row, dict)
+        ]
+        if not rows:
+            continue
+        appendix_tables.append(
+            {
+                "table_id": table.get("table_id"),
+                "chapter_id": table.get("chapter_id"),
+                "title": table.get("title"),
+                "headers": _as_list(table.get("headers")),
+                "rows": rows,
+                "evidence_refs": _as_list(table.get("evidence_refs")),
+            }
+        )
+    return appendix_tables
 
 
 def _compact_graph(graph: Dict[str, Any]) -> Dict[str, Any]:
@@ -586,6 +1330,15 @@ HARD_DELIVERY_FORBIDDEN_PATTERNS = [
     r"Retrieval\.",
     r"TestUserQueryExceeded",
     r"query\s+exceed(?:ed)?\s+the\s+limit",
+    r"(?<![A-Za-z0-9_])EV-\d+(?:-[A-Za-z0-9]+)?",
+    r"\bevidence_cards?\b",
+    r"(?<![A-Za-z0-9_])ch_\d{1,3}(?![A-Za-z0-9_])",
+    r"当前卡片",
+    r"本章应写成",
+    r"本章可以作为",
+    r"本章可作为",
+    r"建议写成",
+    r"适合写成",
     r"暂无可核验数据",
     r"本维度暂无可核验数据",
     r"建议后续补充调研",
@@ -601,6 +1354,64 @@ SOFT_DELIVERY_GAP_PATTERNS = {
     r"\bcase_evidence_missing\b",
     r"\bcounter_evidence_missing\b",
 }
+
+GENERIC_REPORT_FAMILIES = {
+    "dynamic_research",
+    "dynamic_research_report",
+    "topic_report",
+    "general_report",
+    "research_report",
+}
+
+
+def _deep_report_family(value: Any) -> bool:
+    family = str(value or "").strip().lower()
+    return family == "industry_deep_report" or "deep" in family
+
+
+def _report_family_from(payload: Dict[str, Any]) -> str:
+    payload = _as_dict(payload)
+    return str(payload.get("report_family") or payload.get("report_type") or payload.get("type") or "").strip()
+
+
+def _report_family_delivery_blockers(
+    *,
+    research_plan: Dict[str, Any],
+    report_blueprint: Dict[str, Any],
+    report_plan: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    values = {
+        "research_plan": _report_family_from(research_plan),
+        "report_blueprint": _report_family_from(report_blueprint),
+        "report_plan": _report_family_from(report_plan),
+    }
+    normalized = {
+        key: value.strip().lower()
+        for key, value in values.items()
+        if value and value.strip().lower() not in GENERIC_REPORT_FAMILIES
+    }
+    distinct = sorted(set(normalized.values()))
+    if len(distinct) <= 1:
+        return []
+    return [{"type": "report_family_mismatch", "families": values}]
+
+
+def _layout_delivery_blockers(report_blueprint: Dict[str, Any]) -> List[Dict[str, Any]]:
+    layout_validation = _as_dict(_as_dict(report_blueprint).get("layout_validation"))
+    try:
+        blocking_count = int(float(layout_validation.get("blocking_count") or 0))
+    except (TypeError, ValueError):
+        blocking_count = 0
+    blocking_issues = _as_list(layout_validation.get("blocking_issues")) or _as_list(layout_validation.get("errors"))
+    if blocking_count <= 0 and not blocking_issues:
+        return []
+    return [
+        {
+            "type": "layout_validation_failed",
+            "blocking_count": blocking_count or len(blocking_issues),
+            "issues": blocking_issues[:8],
+        }
+    ]
 
 GAP_LABELS = {
     "insufficient_ab_sources": "高等级来源数量未达标",
@@ -649,7 +1460,7 @@ def _coverage_has_usable_signal(coverage_rows: Sequence[Dict[str, Any]]) -> bool
             continue
         if bool(item.get("decision_ready")):
             return True
-        if str(item.get("claim_status") or "").strip().lower() == "directional":
+        if str(item.get("claim_status") or "").strip().lower() in {"directional", "directional_ready"}:
             return True
         if int(item.get("actual_ab_sources") or 0) > 0:
             return True
@@ -838,10 +1649,20 @@ def _hard_delivery_blockers(
     qa_result: Dict[str, Any],
     package_quality_report: Dict[str, Any],
     coverage_matrix: Sequence[Dict[str, Any]],
+    delivery_gate: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     blockers: List[Dict[str, Any]] = []
     text = str(markdown or "")
     strict_gate = _strict_delivery_gate()
+    gate = _as_dict(delivery_gate)
+    if gate.get("diagnostic_only") or str(gate.get("tier") or "").strip() == "diagnostic_only":
+        blockers.append(
+            {
+                "type": "diagnostic_only",
+                "detail": gate,
+                "count": len(_as_list(gate.get("blocking_reasons"))),
+            }
+        )
     for pattern in HARD_DELIVERY_FORBIDDEN_PATTERNS:
         if re.search(pattern, text, flags=re.I):
             if not strict_gate and pattern in SOFT_DELIVERY_GAP_PATTERNS:
@@ -849,8 +1670,10 @@ def _hard_delivery_blockers(
             blockers.append({"type": "forbidden_public_text", "pattern": pattern})
 
     deep_eval = _as_dict(qa_result.get("deep_evaluation"))
+    deep_report = _deep_report_family(qa_result.get("report_family"))
     block_deep_gaps = (
         strict_gate
+        or deep_report
         or _env_flag("REPORT_BLOCK_ON_DEEP_GAPS", False)
     )
     if block_deep_gaps:
@@ -867,7 +1690,7 @@ def _hard_delivery_blockers(
         elif not _coverage_has_usable_signal(coverage_rows):
             blockers.append({"type": "no_publishable_evidence", "count": len(coverage_rows)})
     if _env_flag("REPORT_BLOCK_ON_PROOF_GAPS", strict_gate):
-        hard_gap_types = {"insufficient_ab_sources", "metric_evidence_missing", "case_evidence_missing", "counter_evidence_missing"}
+        hard_gap_types = {"insufficient_ab_sources", "metric_evidence_missing", "case_evidence_missing"}
         hard_gap_rows = [
             item
             for item in gap_rows
@@ -894,7 +1717,7 @@ def _hard_delivery_blockers(
     qa_errors = [_as_dict(item) for item in _as_list(qa_result.get("errors"))]
     if any(str(item.get("type") or "") in {"chapter_packages_missing", "report_markdown_empty"} for item in qa_errors):
         blockers.append({"type": "pipeline_empty_package", "count": len(qa_errors), "examples": qa_errors[:5]})
-    if not bool(qa_result.get("passed")) and _env_flag("REPORT_BLOCK_ON_QA_FAILURE", strict_gate):
+    if not bool(qa_result.get("passed")) and (deep_report or _env_flag("REPORT_BLOCK_ON_QA_FAILURE", strict_gate)):
         blockers.append({"type": "qa_not_passed", "quality_score": qa_result.get("quality_score")})
 
     deduped: List[Dict[str, Any]] = []
@@ -910,6 +1733,403 @@ def _hard_delivery_blockers(
         seen.add(key)
         deduped.append(item)
     return deduped
+
+
+def _delivery_gate_from_evidence_package(evidence_package: Dict[str, Any]) -> Dict[str, Any]:
+    def as_int(value: Any) -> int:
+        try:
+            return int(float(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    summary = _as_dict(_as_dict(evidence_package).get("summary"))
+    health = _evidence_health_summary_from_package(evidence_package)
+    summary_readpage_coverage = _as_dict(summary.get("readpage_coverage"))
+    summary_has_readpage = "succeeded" in summary_readpage_coverage
+    health_has_readpage = "readpage_succeeded" in health
+    summary_readpage_succeeded = as_int(summary_readpage_coverage.get("succeeded"))
+    health_readpage_succeeded = as_int(health.get("readpage_succeeded"))
+    derived_inconsistencies = list(_as_list(health.get("inconsistencies")))
+    if summary_has_readpage and health_has_readpage and summary_readpage_succeeded != health_readpage_succeeded:
+        derived_inconsistencies.append(
+            {
+                "type": "readpage_succeeded_mismatch",
+                "summary_readpage_succeeded": summary_readpage_succeeded,
+                "health_readpage_succeeded": health_readpage_succeeded,
+            }
+        )
+    health_inconsistent = bool(health.get("inconsistent")) or bool(derived_inconsistencies)
+    if health_inconsistent:
+        return {
+            "tier": "diagnostic_only",
+            "publishable": False,
+            "draft_allowed": False,
+            "diagnostic_only": True,
+            "blocking_reasons": [
+                {
+                    "type": "evidence_health_summary_inconsistent",
+                    "details": derived_inconsistencies,
+                }
+            ],
+            "evidence_health_summary": {**health, "inconsistencies": derived_inconsistencies},
+        }
+    gate = _as_dict(summary.get("delivery_gate"))
+    if gate:
+        gate = dict(gate)
+        preflight = (
+            _as_dict(_as_dict(evidence_package).get("evidence_preflight_summary"))
+            or _as_dict(summary.get("evidence_preflight_summary"))
+            or _as_dict(_as_dict(_as_dict(evidence_package).get("metadata")).get("evidence_preflight_summary"))
+        )
+        if preflight:
+            gate["evidence_preflight_summary"] = preflight
+            if not bool(preflight.get("ready_for_clean_writer")):
+                gate["publishable"] = False
+                gate["tier"] = "diagnostic_only" if bool(preflight.get("diagnostic_only")) else "limited_review_draft"
+                gate["draft_allowed"] = bool(preflight.get("review_draft_allowed")) and gate["tier"] != "diagnostic_only"
+                gate["diagnostic_only"] = gate["tier"] == "diagnostic_only"
+                reason_key = "blocking_reasons" if gate["diagnostic_only"] else "review_reasons"
+                reasons = _as_list(gate.get(reason_key))
+                reasons.append({"type": "evidence_preflight_not_ready", "evidence_preflight_summary": preflight})
+                gate[reason_key] = reasons
+        evidence_signal = _as_dict(gate.get("evidence_signal"))
+        if health_has_readpage:
+            evidence_signal["readpage_succeeded"] = max(as_int(evidence_signal.get("readpage_succeeded")), health_readpage_succeeded)
+        if evidence_signal:
+            gate["evidence_signal"] = evidence_signal
+        if _count_value(health.get("analysis_ready_ab_count")) > 0 and _count_value(health.get("traceable_ab_source_count")) <= 0:
+            gate["tier"] = "limited_review_draft" if _count_value(health.get("analysis_ready_count")) > 0 else "diagnostic_only"
+            gate["publishable"] = False
+            gate["draft_allowed"] = gate["tier"] != "diagnostic_only"
+            gate["diagnostic_only"] = gate["tier"] == "diagnostic_only"
+            reasons = _as_list(gate.get("review_reasons" if gate["tier"] != "diagnostic_only" else "blocking_reasons"))
+            reasons.append({"type": "traceable_ab_sources_missing", "evidence_health_summary": health})
+            if gate["tier"] == "diagnostic_only":
+                gate["blocking_reasons"] = reasons
+            else:
+                gate["review_reasons"] = reasons
+            gate["evidence_health_summary"] = health
+        return gate
+    publishable_gate = _as_dict(summary.get("publishable_evidence_gate"))
+    if bool(publishable_gate.get("passed")):
+        return {"tier": "publishable_clean", "publishable": True, "draft_allowed": True, "diagnostic_only": False}
+    analysis_ready = as_int(summary.get("analysis_ready_count"))
+    source_dist = _as_dict(summary.get("source_level_distribution"))
+    ab_count = as_int(source_dist.get("A")) + as_int(source_dist.get("B"))
+    readpage = max(summary_readpage_succeeded, health_readpage_succeeded)
+    diagnostic = analysis_ready <= 0 and ab_count <= 0 and readpage <= 0
+    return {
+        "tier": "diagnostic_only" if diagnostic else "limited_review_draft",
+        "publishable": False,
+        "draft_allowed": not diagnostic,
+        "diagnostic_only": diagnostic,
+        "review_reasons": _as_list(publishable_gate.get("blocking_reasons")),
+        "blocking_reasons": [{"type": "no_usable_evidence_signal"}] if diagnostic else [],
+    }
+
+
+def _evidence_limitations_from_delivery_gate(delivery_gate: Dict[str, Any], qa_result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    limitations: List[Dict[str, Any]] = []
+    for reason in _as_list(_as_dict(delivery_gate).get("review_reasons")) + _as_list(_as_dict(delivery_gate).get("blocking_reasons")):
+        payload = _as_dict(reason)
+        if payload:
+            limitations.append(payload)
+    for followup in _as_list(_as_dict(qa_result).get("blocking_evidence_repair_followups")) + _as_list(_as_dict(qa_result).get("evidence_repair_followups")):
+        payload = _as_dict(followup)
+        if payload:
+            limitations.append({"type": payload.get("type") or "evidence_repair_followup", "detail": payload})
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for item in limitations:
+        key = (str(item.get("type") or ""), str(item.get("chapter_id") or ""), str(item.get("hypothesis_id") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped[:20]
+
+
+FATAL_DELIVERY_BLOCKER_TYPES = {
+    "pipeline_empty_package",
+}
+
+
+def _fatal_delivery_blockers(blockers: Sequence[Dict[str, Any]], *, markdown: str) -> List[Dict[str, Any]]:
+    fatal = [
+        _as_dict(item)
+        for item in list(blockers or [])
+        if str(_as_dict(item).get("type") or "").strip() in FATAL_DELIVERY_BLOCKER_TYPES
+    ]
+    if not str(markdown or "").strip():
+        fatal.append({"type": "report_markdown_empty"})
+    return fatal
+
+
+def _quality_findings_from_review(
+    *,
+    delivery_blockers: Sequence[Dict[str, Any]],
+    qa_result: Dict[str, Any],
+    package_quality_report: Dict[str, Any],
+    delivery_gate: Dict[str, Any],
+    table_gap_summary: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    findings: List[Dict[str, Any]] = []
+    for item in list(delivery_blockers or []):
+        payload = _as_dict(item)
+        if payload:
+            findings.append({"source": "delivery_gate", **payload})
+    for item in _as_list(_as_dict(qa_result).get("errors")):
+        payload = _as_dict(item)
+        findings.append({"source": "qa", **(payload or {"type": str(item)})})
+    for item in _as_list(_as_dict(qa_result).get("warnings")):
+        payload = _as_dict(item)
+        findings.append({"source": "qa_warning", **(payload or {"type": str(item)})})
+    for item in _as_list(_as_dict(package_quality_report).get("blocking_errors")) + _as_list(_as_dict(package_quality_report).get("errors")):
+        payload = _as_dict(item)
+        findings.append({"source": "package_quality", **(payload or {"type": str(item)})})
+    for item in _as_list(_as_dict(delivery_gate).get("review_reasons")) + _as_list(_as_dict(delivery_gate).get("blocking_reasons")):
+        payload = _as_dict(item)
+        if payload:
+            findings.append({"source": "evidence_gate", **payload})
+    if _count_value(_as_dict(table_gap_summary).get("table_follow_up_count")) > 0:
+        findings.append({"source": "table_quality", "type": "table_followups_pending", "detail": table_gap_summary})
+
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for item in findings:
+        item_type = str(item.get("type") or item.get("issue_type") or item.get("source") or "quality_finding")
+        key = (
+            item_type,
+            str(item.get("chapter_id") or item.get("hypothesis_id") or item.get("path") or ""),
+            str(item.get("pattern") or item.get("package") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        item["type"] = item_type
+        deduped.append(item)
+    return deduped[:80]
+
+
+def _quality_score_from_findings(
+    *,
+    qa_result: Dict[str, Any],
+    quality_findings: Sequence[Dict[str, Any]],
+    evidence_health_summary: Dict[str, Any],
+    delivery_gate: Dict[str, Any],
+) -> int:
+    raw_qa = _as_dict(qa_result).get("quality_score")
+    try:
+        score = int(float(raw_qa))
+    except (TypeError, ValueError):
+        score = 72
+    if bool(_as_dict(qa_result).get("passed")):
+        score = max(score, 78)
+    if _as_dict(delivery_gate).get("publishable"):
+        score = max(score, 90)
+
+    finding_count = len(list(quality_findings or []))
+    score -= min(25, finding_count * 2)
+    if _count_value(_as_dict(evidence_health_summary).get("traceable_ab_source_count")) <= 0:
+        score -= 12
+    if _count_value(_as_dict(evidence_health_summary).get("readpage_succeeded")) <= 0:
+        score -= 8
+    if bool(_as_dict(evidence_health_summary).get("inconsistent")):
+        score -= 20
+    return max(0, min(100, score))
+
+
+def _quality_grade(score: int) -> str:
+    if score >= 90:
+        return "可发布级"
+    if score >= 75:
+        return "高质量但需人工复核"
+    if score >= 60:
+        return "证据有限但可参考"
+    return "强风险报告，仅供内部研判"
+
+
+def _claim_strength_from_gate(delivery_gate: Dict[str, Any], evidence_health_summary: Dict[str, Any]) -> str:
+    if bool(_as_dict(delivery_gate).get("publishable")):
+        return "strong"
+    traceable_ab = _count_value(_as_dict(evidence_health_summary).get("traceable_ab_source_count"))
+    analysis_ab = _count_value(_as_dict(evidence_health_summary).get("analysis_ready_ab_count"))
+    analysis_ready = _count_value(_as_dict(evidence_health_summary).get("analysis_ready_count"))
+    if traceable_ab >= 2:
+        return "moderate"
+    if analysis_ab > 0 or analysis_ready > 0:
+        return "directional"
+    return "weak"
+
+
+def _public_claim_strength_label(claim_strength: str) -> str:
+    return {
+        "strong": "强支撑判断",
+        "moderate": "中等支撑判断",
+        "directional": "方向性判断",
+        "weak": "弱支撑判断",
+    }.get(str(claim_strength or "").strip().lower(), "方向性判断")
+
+
+def _downgrade_overconfident_language(markdown: str, *, claim_strength: str) -> str:
+    if claim_strength in {"strong", "moderate"}:
+        return markdown
+    replacements = [
+        ("可以确定", "现有证据初步显示"),
+        ("已经证明", "现有证据显示"),
+        ("确定趋势", "方向性信号"),
+        ("必然", "可能"),
+        ("一定会", "可能会"),
+        ("判断为", "初步判断为"),
+        ("核心结论是", "待验证判断是"),
+    ]
+    text = str(markdown or "")
+    for old, new in replacements:
+        text = text.replace(old, new)
+    return text
+
+
+PUBLIC_QUALITY_FINDING_LABELS = {
+    "chapter_core_ab_below_minimum": "部分核心章节的高质量来源不足",
+    "report_counter_sources_below_minimum": "报告级反向样本不足",
+    "blocking_evidence_gaps": "部分论证链仍有缺口",
+    "readpage_evidence_missing": "部分来源未完成正文级核验",
+    "missing_sources_appendix": "来源附录不完整",
+    "table_validation_error": "表格数据口径需要复核",
+    "public_chapter_without_ab_sources": "部分章节缺少高质量来源支撑",
+    "report_body_below_target_chars": "正文篇幅低于深度报告目标",
+    "search_tasks_dropped": "部分检索任务未完成",
+    "iqs_lane_no_success": "部分主检索通道没有有效结果",
+    "iqs_lane_timeout_without_signal": "部分主检索通道超时",
+    "page_results_zero": "部分检索通道未得到可用页面",
+    "qa_not_passed": "自动质量审查未通过",
+    "deep_report_blocking_gap": "深度审查发现关键缺陷",
+    "package_contract": "报告结构合同存在问题",
+    "table_quality": "表格质量需要复核",
+    "internal_gap_language_leaked": "正文存在需清理的内部痕迹",
+    "publishable_evidence_gate_failed": "可发布证据门槛未通过",
+    "traceable_ab_sources_missing": "可追溯高质量来源不足",
+    "evidence_health_summary_inconsistent": "证据健康摘要存在不一致",
+    "forbidden_public_text": "正文存在需要清理的内部痕迹",
+    "low_ab_core_coverage": "核心章节高质量来源覆盖不足",
+    "core_proof_gaps": "核心证明材料仍不完整",
+    "layout_validation_failed": "版式结构仍需复核",
+    "missing_proof_standards": "部分证明标准未达成",
+}
+
+
+def _public_quality_label(value: Any) -> str:
+    raw = str(value or "quality_finding").strip()
+    if not raw:
+        return "质量问题"
+    return PUBLIC_QUALITY_FINDING_LABELS.get(raw, "质量审查发现")
+
+
+def _format_quality_finding(item: Dict[str, Any]) -> str:
+    payload = _as_dict(item)
+    label = _public_quality_label(payload.get("type") or payload.get("issue_type") or payload.get("source"))
+    parts: List[str] = []
+    chapter = payload.get("chapter_title") or payload.get("chapter_id")
+    if chapter:
+        parts.append(f"章节：{_compact(chapter, 60)}")
+    if payload.get("actual") is not None and payload.get("required") is not None:
+        parts.append(f"当前 {payload.get('actual')} / 要求 {payload.get('required')}")
+    chapters = _as_list(payload.get("chapters"))
+    if chapters:
+        parts.append(f"涉及 {len(chapters)} 个章节")
+    count = payload.get("count")
+    if count is not None:
+        parts.append(f"数量 {count}")
+    if not parts and payload.get("quality_score") is not None:
+        parts.append(f"质量分 {payload.get('quality_score')}")
+    suffix = "；".join(str(part) for part in parts if str(part).strip())
+    return f"{label}" + (f"（{suffix}）" if suffix else "")
+
+
+def _render_quality_scorecard(
+    *,
+    query: str,
+    quality_score: int,
+    clean_report_eligible: bool,
+    claim_strength: str,
+    evidence_health_summary: Dict[str, Any],
+    quality_findings: Sequence[Dict[str, Any]],
+    delivery_gate: Dict[str, Any],
+    evidence_package: Dict[str, Any],
+) -> str:
+    if clean_report_eligible:
+        clean_text = "是"
+    else:
+        clean_text = "否，本报告按证据强度降级生成"
+    health = _as_dict(evidence_health_summary)
+    source_dist = _as_dict(health.get("source_level_distribution"))
+    openai_summary = (
+        _as_dict(_as_dict(evidence_package).get("metadata")).get("openai_web_search_summary")
+        or _as_dict(_as_dict(evidence_package).get("summary")).get("openai_web_search_summary")
+    )
+    review_reasons = _as_list(_as_dict(delivery_gate).get("review_reasons")) + _as_list(_as_dict(delivery_gate).get("blocking_reasons"))
+    lines = [
+        "## 报告质量评分与证据限制",
+        "",
+        f"- 质量总分：{quality_score}/100（{_quality_grade(quality_score)}）",
+        f"- Clean 资格：{clean_text}",
+        f"- 结论强度：{_public_claim_strength_label(claim_strength)}",
+        (
+            "- 证据体量："
+            f"可进入分析材料 {_count_value(health.get('analysis_ready_count'))} 条，"
+            f"清洗后事实 {_count_value(health.get('clean_fact_count'))} 条，"
+            f"可追溯 A/B 来源 {_count_value(health.get('traceable_ab_source_count'))} 个，"
+            f"正文级核验成功 {_count_value(health.get('readpage_succeeded'))} 次"
+        ),
+        (
+            "- 来源等级："
+            f"A={_count_value(source_dist.get('A'))}，"
+            f"B={_count_value(source_dist.get('B'))}，"
+            f"C={_count_value(source_dist.get('C'))}，"
+            f"D={_count_value(source_dist.get('D'))}"
+        ),
+    ]
+    if openai_summary:
+        openai_status = str(openai_summary.get("openai_web_status") or "").strip()
+        if not openai_status:
+            openai_status = "quota_blocked" if openai_summary.get("quota_blocked") else (
+                "available" if _count_value(openai_summary.get("success_count")) > 0 else "no_valid_evidence"
+            )
+        lines.append(
+            "- 辅助联网检索："
+            f"计划 {_count_value(openai_summary.get('planned_count') or openai_summary.get('gap_repair_task_count'))} 项，"
+            f"有效 {_count_value(openai_summary.get('success_count'))} 项，"
+            f"失败 {_count_value(openai_summary.get('failed_count'))} 项，"
+            f"状态 {openai_status}"
+        )
+    if review_reasons or quality_findings:
+        lines.extend(["", "### 主要未达标项"])
+        for item in list(review_reasons)[:6]:
+            payload = _as_dict(item)
+            if payload:
+                lines.append(f"- {_format_quality_finding(payload)}")
+        for item in list(quality_findings)[:8]:
+            payload = _as_dict(item)
+            lines.append(f"- {_format_quality_finding(payload)}")
+    lines.extend(
+        [
+            "",
+            "### 使用说明",
+            "本报告已经按现有可用证据生成正式分析；未达到 Clean 标准的部分已在上方列出，并在正文中按证据强度降低结论语气。B/C 级来源只用于趋势、背景和案例线索，不等同于强审计证据。",
+            "",
+        ]
+    )
+    return "\n".join(lines).strip()
+
+
+def _prepend_quality_scorecard(markdown: str, scorecard: str) -> str:
+    text = str(markdown or "").strip()
+    if not text or "## 报告质量评分与证据限制" in text:
+        return text
+    lines = text.splitlines()
+    if lines and lines[0].startswith("# "):
+        return "\n".join([lines[0], "", scorecard, "", *lines[1:]]).strip()
+    return f"{scorecard}\n\n{text}".strip()
 
 
 def _render_not_ready_report(
@@ -1087,6 +2307,10 @@ def _infer_dimensions_from_inputs(evidence_package: Dict[str, Any], structured_a
 
 def prepare_dimension_materials(items: Sequence[Dict[str, Any]], *, dimension: str = "") -> List[Dict[str, Any]]:
     prepared: List[Dict[str, Any]] = []
+    mode = str(os.getenv("REPORT_QUALITY_MODE") or os.getenv("QUALITY_MODE") or "balanced").strip().lower()
+    strict_quality = mode in {"strict", "deep_strict", "due_diligence", "investment_due_diligence"} or str(
+        os.getenv("STRICT_EVIDENCE_MODE") or ""
+    ).strip().lower() in {"1", "true", "yes", "on", "strict"}
     for item in list(items or []):
         if not isinstance(item, dict):
             continue
@@ -1099,6 +2323,19 @@ def prepare_dimension_materials(items: Sequence[Dict[str, Any]], *, dimension: s
             continue
         copied = dict(item)
         copied.setdefault("dimension", dimension)
+        if apply_evidence_quality_contract is not None:
+            copied = apply_evidence_quality_contract(
+                copied,
+                strict_quality=strict_quality,
+                directional_c_min_confidence=_env_float(
+                    "REPORT_DIRECTIONAL_C_MIN_CONFIDENCE",
+                    0.55,
+                    min_value=0.0,
+                    max_value=1.0,
+                ),
+            )
+            prepared.append(copied)
+            continue
         try:
             confidence = float(copied.get("confidence") or 0.0)
         except (TypeError, ValueError):
@@ -1459,6 +2696,20 @@ def build_writer_report(
         report_plan=report_plan,
         llm_client=llm_client,
     )
+    config_warnings: List[Dict[str, Any]] = []
+    configured_proof_mode = str(os.getenv("REPORT_PROOF_MODE") or "").strip().lower()
+    if (
+        configured_proof_mode == "quick_market_scan"
+        and _deep_report_family(report_blueprint.get("report_family") or research_plan.get("report_family"))
+        and not _env_flag("REPORT_ALLOW_QUICK_PROOF_FOR_DEEP", False)
+    ):
+        config_warnings.append(
+            {
+                "type": "quick_proof_upgraded_for_deep_report",
+                "configured_mode": configured_proof_mode,
+                "effective_mode": "deep_industry_report",
+            }
+        )
 
     if chapter_evidence_packages is None or source_registry is None:
         binder = run_evidence_binder(
@@ -1532,20 +2783,48 @@ def build_writer_report(
             continue
         rendered_tables += 1
         rendered_tables_by_chapter[chapter_id] = rendered_tables_by_chapter.get(chapter_id, 0) + 1
-    argument_units = list(argument_units or run_claim_builder_agent(
-        chapter_evidence_packages=chapter_evidence_packages,
-        micro_layouts=micro_layouts,
-        structured_analysis=structured_analysis,
-        llm_client=llm_client,
-    ))
-    chapter_packages = list(chapter_packages or run_chapter_argument_agent(
-        report_blueprint=report_blueprint,
-        micro_layouts=micro_layouts,
+    public_rebuild_summary = needs_public_rebuild(
         argument_units=argument_units,
-        table_packages=table_packages,
+        chapter_packages=chapter_packages,
+        structured_analysis=structured_analysis,
+    )
+    if public_rebuild_summary.get("required") or not argument_units or not chapter_packages:
+        rebuild_result = rebuild_public_argument_pipeline(
+            chapter_evidence_packages=chapter_evidence_packages,
+            micro_layouts=micro_layouts,
+            structured_analysis=structured_analysis,
+            report_blueprint=report_blueprint,
+            table_packages=table_packages,
+            llm_client=llm_client,
+        )
+        argument_units = _as_list(rebuild_result.get("argument_units"))
+        chapter_packages = _as_list(rebuild_result.get("chapter_packages"))
+        public_rebuild_summary = {
+            **public_rebuild_summary,
+            "triggered": bool(public_rebuild_summary.get("required")),
+            "generated_missing_inputs": bool(not public_rebuild_summary.get("argument_unit_count_before") or not public_rebuild_summary.get("chapter_package_count_before")),
+            "argument_unit_count_after": rebuild_result.get("argument_unit_count_after"),
+            "chapter_package_count_after": rebuild_result.get("chapter_package_count_after"),
+        }
+    else:
+        argument_units = list(argument_units or [])
+        chapter_packages = list(chapter_packages or [])
+        public_rebuild_summary = {**public_rebuild_summary, "triggered": False}
+    package_normalization = _normalize_public_packages_for_contract(
         chapter_evidence_packages=chapter_evidence_packages,
-        llm_client=llm_client,
-    ))
+        micro_layouts=micro_layouts,
+        table_packages=table_packages,
+        argument_units=argument_units,
+        chapter_packages=chapter_packages,
+    )
+    micro_layouts = _as_list(package_normalization.get("micro_layouts"))
+    table_packages = _as_list(package_normalization.get("table_packages"))
+    argument_units = _as_list(package_normalization.get("argument_units"))
+    chapter_packages = _as_list(package_normalization.get("chapter_packages"))
+    package_normalization_summary = _as_dict(package_normalization.get("summary"))
+    package_normalization_summary["public_rebuild"] = public_rebuild_summary
+    table_followups = _table_follow_up_queries(table_packages)
+    evidence_refinement_plan = _merge_table_followups_into_refinement_plan(evidence_refinement_plan, table_followups)
     public_chapter_packages = [
         chapter
         for chapter in chapter_packages
@@ -1599,6 +2878,7 @@ def build_writer_report(
         "coverage_matrix": coverage_matrix,
         "missing_proof_standards": missing_proof_standards,
         "analytics_outputs": analytics_outputs,
+        "table_appendix_rows": _table_appendix_rows(table_packages),
     }
 
     writer_output = run_final_writer_agent(
@@ -1632,6 +2912,11 @@ def build_writer_report(
         re.split(r"\n##\s*(?:\u9644\u5f55|附錄|研究口径|研究口徑)", str(writer_output.get("report_markdown") or ""), maxsplit=1)[0]
     )
     writer_output["target_body_chars"] = target_body_chars
+    retrieval_strategy_summary = (
+        _as_dict(_as_dict(evidence_package.get("metadata")).get("retrieval_strategy_summary"))
+        or _as_dict(_as_dict(evidence_package.get("summary")).get("retrieval_strategy_summary"))
+    )
+    evidence_health_summary = _evidence_health_summary_from_package(evidence_package)
     qa_result = run_qa_agent(
         report_markdown=str(writer_output.get("report_markdown") or ""),
         report_blueprint=report_blueprint,
@@ -1642,10 +2927,12 @@ def build_writer_report(
         package_quality_report=package_quality_report,
         search_task_schedule=search_task_schedule,
         lane_coverage=lane_coverage,
+        retrieval_strategy_summary=retrieval_strategy_summary,
         metric_normalization_table=metric_normalization_table,
         coverage_matrix=coverage_matrix,
         missing_proof_standards=missing_proof_standards,
         analytics_outputs=analytics_outputs,
+        evidence_health_summary=evidence_health_summary,
     )
     if qa_result.get("rewrite_required"):
         rewrite_instructions = [
@@ -1681,10 +2968,12 @@ def build_writer_report(
                 package_quality_report=package_quality_report,
                 search_task_schedule=search_task_schedule,
                 lane_coverage=lane_coverage,
+                retrieval_strategy_summary=retrieval_strategy_summary,
                 metric_normalization_table=metric_normalization_table,
                 coverage_matrix=coverage_matrix,
                 missing_proof_standards=missing_proof_standards,
                 analytics_outputs=analytics_outputs,
+                evidence_health_summary=evidence_health_summary,
             )
             current_error_count = len(_as_list(qa_result.get("errors")))
             candidate_error_count = len(_as_list(candidate_qa.get("errors")))
@@ -1715,22 +3004,52 @@ def build_writer_report(
     layout = _as_dict(layout_plan) or _layout_plan_from_packages(report_blueprint, micro_layouts, chapter_evidence_packages)
     package_passed = bool(package_quality_report.get("passed"))
     public_markdown = str(writer_output.get("report_markdown") or "")
+    delivery_gate = _delivery_gate_from_evidence_package(evidence_package)
+    delivery_tier = str(delivery_gate.get("tier") or "limited_review_draft").strip() or "limited_review_draft"
     package_warning_types = _package_warning_types(package_quality_report)
     package_warning_blocked = (
         _env_flag("QA_BLOCK_LOW_AB_CORE_COVERAGE", False)
         and "low_ab_core_coverage" in package_warning_types
     )
+    table_gap_summary = _table_gap_summary(table_packages)
     delivery_blockers = _hard_delivery_blockers(
         markdown=public_markdown,
         qa_result=qa_result,
         package_quality_report=package_quality_report,
         coverage_matrix=coverage_matrix,
+        delivery_gate=delivery_gate,
     )
-    if delivery_blockers:
+    delivery_blockers.extend(_layout_delivery_blockers(report_blueprint))
+    delivery_blockers.extend(
+        _report_family_delivery_blockers(
+            research_plan=research_plan,
+            report_blueprint=report_blueprint,
+            report_plan=report_plan,
+        )
+    )
+    qa_pending_repair_reasons = _qa_pending_repair_reasons(qa_result)
+    qa_pending_repair = bool(qa_pending_repair_reasons)
+    quality_findings = _quality_findings_from_review(
+        delivery_blockers=delivery_blockers,
+        qa_result=qa_result,
+        package_quality_report=package_quality_report,
+        delivery_gate=delivery_gate,
+        table_gap_summary=table_gap_summary,
+    )
+    fatal_delivery_blockers = _fatal_delivery_blockers(delivery_blockers, markdown=public_markdown)
+    clean_report_eligible = False
+    claim_strength = _claim_strength_from_gate(delivery_gate, evidence_health_summary)
+    quality_score = _quality_score_from_findings(
+        qa_result=qa_result,
+        quality_findings=quality_findings,
+        evidence_health_summary=evidence_health_summary,
+        delivery_gate=delivery_gate,
+    )
+    if fatal_delivery_blockers:
         blocked_markdown = _render_not_ready_report(
             query=query,
             report_blueprint=report_blueprint,
-            blockers=delivery_blockers,
+            blockers=fatal_delivery_blockers,
             qa_result=qa_result,
             coverage_matrix=coverage_matrix,
             missing_proof_standards=missing_proof_standards,
@@ -1740,17 +3059,50 @@ def build_writer_report(
         writer_output = {
             **writer_output,
             "report_markdown": "",
+            "diagnostic_markdown": blocked_markdown,
             "blocked_report_markdown": blocked_markdown,
             "estimated_chars": 0,
             "estimated_body_chars": 0,
             "blocked_draft_chars": len(public_markdown),
         }
         public_markdown = ""
-        report_status = "not_ready"
+        report_status = "diagnostic_only"
+        delivery_tier = "diagnostic_only"
         message = "公开资料条件不足，正式报告未生成。"
     else:
-        report_status = "final" if qa_result.get("passed") and package_passed and not package_warning_blocked and not has_internal_gap_language(public_markdown) else "review_required"
-        message = "" if report_status == "final" else "正式报告仍需人工复核后发布。"
+        report_ready = _writer_ready_for_final(
+            markdown=public_markdown,
+            qa_result=qa_result,
+            package_passed=package_passed,
+            package_warning_blocked=package_warning_blocked,
+        ) and delivery_tier == "publishable_clean"
+        clean_report_eligible = bool(report_ready and not delivery_blockers)
+        report_status = "final_clean" if clean_report_eligible else "formal_scored"
+        if report_status == "final_clean":
+            message = ""
+        elif qa_pending_repair:
+            message = "报告已按证据强度降级生成；QA 建议继续补证/重写后再发布 Clean 版本。"
+        else:
+            message = "报告已按证据强度降级生成，建议结合评分和缺陷清单人工复核。"
+        if report_status == "formal_scored":
+            delivery_tier = "scored_formal_report"
+            public_markdown = _downgrade_overconfident_language(public_markdown, claim_strength=claim_strength)
+        scorecard = _render_quality_scorecard(
+            query=query,
+            quality_score=quality_score,
+            clean_report_eligible=clean_report_eligible,
+            claim_strength=claim_strength,
+            evidence_health_summary=evidence_health_summary,
+            quality_findings=quality_findings,
+            delivery_gate=delivery_gate,
+            evidence_package=evidence_package,
+        )
+        public_markdown = _prepend_quality_scorecard(public_markdown, scorecard)
+        writer_output["report_markdown"] = public_markdown
+        writer_output["estimated_chars"] = len(public_markdown)
+        writer_output["estimated_body_chars"] = len(
+            re.split(r"\n##\s*(?:\u9644\u5f55|附录|附錄|研究口径|研究口徑)", public_markdown, maxsplit=1)[0]
+        )
     debug_snapshot = build_pipeline_debug_snapshot(
         evidence_package=evidence_package,
         research_plan=research_plan,
@@ -1769,6 +3121,9 @@ def build_writer_report(
         package_quality_report=package_quality_report,
         qa_result=qa_result,
     )
+    debug_snapshot["table_gap_summary"] = table_gap_summary
+    debug_snapshot["table_follow_up_count"] = table_gap_summary.get("table_follow_up_count", 0)
+    debug_snapshot["rendered_high_value_table_count"] = table_gap_summary.get("rendered_high_value_table_count", 0)
     artifact_payload = _pipeline_artifacts_payload(
         chapter_evidence_packages=[item for item in list(chapter_evidence_packages or []) if isinstance(item, dict)],
         source_quality_map=source_quality_map,
@@ -1788,15 +3143,43 @@ def build_writer_report(
         qa_result=_as_dict(qa_result),
         package_quality_report=_as_dict(package_quality_report),
     )
+    table_planning_summary = _table_planning_summary(micro_layouts)
+    table_quality_summary = _table_quality_summary(table_packages)
+    table_placement_summary = _table_placement_summary(table_packages)
+    evidence_analysis_summary = _as_dict(evidence_package.get("evidence_analysis_summary"))
+    evidence_gap_ledger = _as_list(evidence_package.get("evidence_gap_ledger"))
+    evidence_analysis_by_chapter = _as_dict(evidence_package.get("evidence_analysis_by_chapter"))
+    chapter_evidence_diagnostics = (
+        _as_dict(evidence_package.get("chapter_evidence_diagnostics"))
+        or _as_dict(structured_analysis.get("chapter_evidence_diagnostics"))
+        or evidence_analysis_by_chapter
+    )
+    analysis_depth_quality = _as_dict(structured_analysis.get("analysis_depth_quality"))
+    analysis_stage_diagnostics = _as_dict(structured_analysis.get("analysis_stage_diagnostics"))
+    llm_analysis_synthesis = _as_dict(structured_analysis.get("llm_analysis_synthesis"))
+    claim_binding_feedback_summary = _as_dict(structured_analysis.get("claim_binding_feedback_summary"))
     return {
         **writer_output,
         "report_type": report_blueprint.get("report_family") or select_report_layout(report_plan).report_type,
         "report_status": report_status,
+        "delivery_tier": delivery_tier,
+        "delivery_gate": delivery_gate,
+        "draft_mode": "scored_formal" if report_status == "formal_scored" else ("diagnostic_only" if report_status == "diagnostic_only" else ""),
+        "evidence_limitations": _evidence_limitations_from_delivery_gate(delivery_gate, qa_result),
         "message": message,
+        "config_warnings": config_warnings,
         "delivery_blockers": delivery_blockers,
+        "fatal_delivery_blockers": fatal_delivery_blockers,
+        "quality_findings": quality_findings,
+        "quality_score": quality_score,
+        "quality_grade": _quality_grade(quality_score),
+        "clean_report_eligible": clean_report_eligible,
+        "claim_strength": claim_strength,
         "delivery_gate_mode": _delivery_gate_mode(),
-        "skip_reformatter": report_status == "not_ready",
+        "skip_reformatter": report_status == "diagnostic_only",
         "package_warning_blocked": package_warning_blocked,
+        "qa_pending_repair": qa_pending_repair,
+        "qa_pending_repair_reasons": qa_pending_repair_reasons,
         "report_blueprint": report_blueprint,
         "search_tasks": _as_list(research_plan.get("search_tasks")),
         "search_task_schedule": search_task_schedule,
@@ -1806,16 +3189,32 @@ def build_writer_report(
         "evidence_refinement_plan": evidence_refinement_plan,
         "research_proof_profile": research_proof_profile,
         "mandatory_proof_checks": mandatory_proof_checks,
+        "table_planning_summary": table_planning_summary,
+        "table_quality_summary": table_quality_summary,
+        "table_placement_summary": table_placement_summary,
+        "table_gap_summary": table_gap_summary,
+        "evidence_health_summary": evidence_health_summary,
+        "evidence_analysis_summary": evidence_analysis_summary,
+        "evidence_gap_ledger": evidence_gap_ledger,
+        "evidence_analysis_by_chapter": evidence_analysis_by_chapter,
+        "chapter_evidence_diagnostics": chapter_evidence_diagnostics,
+        "analysis_depth_quality": analysis_depth_quality,
+        "analysis_stage_diagnostics": analysis_stage_diagnostics,
+        "llm_analysis_synthesis": llm_analysis_synthesis,
+        "claim_binding_feedback_summary": claim_binding_feedback_summary,
         **artifact_payload,
         "source_registry": list(rendered_source_registry or []),
         "footnotes": rendered_footnotes,
         "validation": {
             **qa_result,
-            "ok": bool(writer_output.get("report_markdown")) and report_status != "not_ready",
+            "ok": bool(writer_output.get("report_markdown")) and report_status != "diagnostic_only",
         },
         "qa_result": qa_result,
-        "required_followups": _as_list(_as_dict(qa_result.get("deep_evaluation")).get("required_followups")),
+        "required_followups": _as_list(qa_result.get("repair_followups"))
+        or _as_list(_as_dict(qa_result.get("deep_evaluation")).get("required_followups"))
+        or list(table_followups),
         "package_quality_report": package_quality_report,
+        "package_normalization_summary": package_normalization_summary,
         "debug_snapshot": debug_snapshot,
         "metadata": {
             "writer": AGENT_NAME,
@@ -1826,6 +3225,20 @@ def build_writer_report(
             "search_task_schedule": search_task_schedule,
             "lane_coverage": lane_coverage,
             "analytics_output_count": len(analytics_outputs),
+            "table_planning_summary": table_planning_summary,
+            "table_quality_summary": table_quality_summary,
+            "table_placement_summary": table_placement_summary,
+            "table_gap_summary": table_gap_summary,
+            "public_rebuild_triggered": bool(public_rebuild_summary.get("triggered")),
+            "public_rebuild_summary": public_rebuild_summary,
+            "table_follow_up_count": table_gap_summary.get("table_follow_up_count", 0),
+            "rendered_high_value_table_count": table_gap_summary.get("rendered_high_value_table_count", 0),
+            "evidence_analysis_summary": evidence_analysis_summary,
+            "evidence_gap_count": len(evidence_gap_ledger),
+            "chapter_evidence_diagnostics_count": len(chapter_evidence_diagnostics),
+            "analysis_depth_quality": analysis_depth_quality,
+            "analysis_stage_diagnostics": analysis_stage_diagnostics,
+            "claim_binding_feedback_summary": claim_binding_feedback_summary,
         },
     }
 

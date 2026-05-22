@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import os
 import re
+from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional, Sequence
+
+from rag_pipeline.contracts.source_registry import renumber_sources_by_first_citation as _contract_renumber_sources_by_first_citation
 
 from .markdown_renderer import (
     collect_format_warnings,
@@ -36,6 +39,7 @@ PUBLIC_SECTION_KEYS = {
     "render_blocks",
     "public_render",
 }
+CITATION_RE = re.compile(r"\[\d{1,5}\]")
 
 SUMMARY_BLOCKS = {
     "executive_summary",
@@ -103,8 +107,13 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
-def _source_appendix_enabled() -> bool:
-    return _env_flag("REPORT_FINAL_WRITER_SOURCE_APPENDIX", False)
+def _is_deep_report_family(report_blueprint: Optional[Dict[str, Any]]) -> bool:
+    family = str(_as_dict(report_blueprint).get("report_family") or _as_dict(report_blueprint).get("report_type") or "").strip().lower()
+    return family == "industry_deep_report" or "deep" in family
+
+
+def _source_appendix_enabled(report_blueprint: Optional[Dict[str, Any]] = None) -> bool:
+    return _env_flag("REPORT_FINAL_WRITER_SOURCE_APPENDIX", _is_deep_report_family(report_blueprint))
 
 
 def _as_dict(value: Any) -> Dict[str, Any]:
@@ -118,6 +127,52 @@ def _as_list(value: Any) -> List[Any]:
 def _public_text(value: Any) -> str:
     text = rewrite_internal_gap_language(str(value or "").strip())
     return "" if has_internal_gap_language(text) else text
+
+
+def _source_host(source: Dict[str, Any]) -> str:
+    url = str(source.get("url") or source.get("source_url") or "").strip()
+    if not url:
+        return ""
+    parsed = urlparse(url if re.match(r"^[a-z][a-z0-9+.-]*://", url, flags=re.I) else f"https://{url}")
+    return str(parsed.netloc or parsed.path.split("/")[0] or "").strip().lower()
+
+
+def _stable_local_source(source: Dict[str, Any]) -> bool:
+    doc_id = str(source.get("document_id") or source.get("doc_id") or source.get("page_ref") or "").strip()
+    title = str(source.get("title") or source.get("source_title") or "").strip()
+    publisher = str(source.get("publisher") or source.get("source") or "").strip()
+    date = str(source.get("date") or source.get("published_at") or "").strip()
+    return bool(doc_id and sum(bool(item) for item in (title, publisher, date)) >= 2)
+
+
+def _source_is_traceable(source: Dict[str, Any]) -> bool:
+    return bool(str(source.get("url") or source.get("source_url") or "").strip() or _stable_local_source(source))
+
+
+def _repair_generic_source(source: Dict[str, Any]) -> Dict[str, Any]:
+    copied = dict(source)
+    host = _source_host(copied)
+    title = str(copied.get("title") or copied.get("source_title") or "").strip()
+    if title.lower() == "official" and host:
+        copied.setdefault("publisher", host)
+        copied.setdefault("source", host)
+        copied["generic_title_needs_repair"] = True
+        copied["title"] = f"{host} official disclosure"
+    return copied
+
+
+def _traceable_source_registry(source_registry: Sequence[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    kept: List[Dict[str, Any]] = []
+    excluded: List[Dict[str, Any]] = []
+    for source in list(source_registry or []):
+        if not isinstance(source, dict):
+            continue
+        repaired = _repair_generic_source(source)
+        if _source_is_traceable(repaired):
+            kept.append(repaired)
+        else:
+            excluded.append(repaired)
+    return kept, excluded
 
 
 def _public_section(section: Dict[str, Any]) -> Dict[str, Any]:
@@ -173,34 +228,7 @@ def _renumber_sources_by_first_citation(
     markdown: str,
     source_registry: Sequence[Dict[str, Any]],
 ) -> tuple[str, List[Dict[str, Any]]]:
-    sources = [dict(item) for item in list(source_registry or []) if isinstance(item, dict)]
-    if not markdown or not sources:
-        return markdown, sources
-    by_ref = {str(source.get("ref") or "").strip(): source for source in sources if str(source.get("ref") or "").strip()}
-    if not by_ref:
-        return markdown, sources
-    seen_refs: List[str] = []
-    for match in re.finditer(r"\[(\d{1,3})\]", markdown):
-        ref = f"[{match.group(1)}]"
-        if ref in by_ref and ref not in seen_refs:
-            seen_refs.append(ref)
-    ordered_refs = seen_refs + [str(source.get("ref") or "").strip() for source in sources if str(source.get("ref") or "").strip() not in seen_refs]
-    mapping = {old_ref: f"[{index}]" for index, old_ref in enumerate(ordered_refs, start=1)}
-
-    def replace_ref(match: re.Match[str]) -> str:
-        ref = f"[{match.group(1)}]"
-        return mapping.get(ref, "")
-
-    rewritten_markdown = re.sub(r"\[(\d{1,3})\]", replace_ref, markdown)
-    ordered_sources: List[Dict[str, Any]] = []
-    for index, old_ref in enumerate(ordered_refs, start=1):
-        source = dict(by_ref.get(old_ref) or {})
-        if not source:
-            continue
-        source["ref"] = f"[{index}]"
-        source["source_id"] = f"SRC-{index:03d}"
-        ordered_sources.append(source)
-    return rewritten_markdown, ordered_sources
+    return _contract_renumber_sources_by_first_citation(markdown, source_registry)
 
 
 def should_render_chapter(chapter: Dict[str, Any]) -> bool:
@@ -342,11 +370,29 @@ def _render_global_block(
     if key == "appendix":
         if not _source_appendix_enabled():
             return ""
-        if "appendix" in rendered_groups:
-            return ""
-        rendered_groups.add("appendix")
-        return _rename_first_h2(render_appendix(source_registry, appendix_package), title)
+        return _render_appendix_block(
+            title=title,
+            appendix_package=appendix_package,
+            source_registry=source_registry,
+            rendered_groups=rendered_groups,
+        )
     return ""
+
+
+def _render_appendix_block(
+    *,
+    title: str,
+    appendix_package: Dict[str, Any],
+    source_registry: Sequence[Dict[str, Any]],
+    rendered_groups: set[str],
+) -> str:
+    if "appendix" in rendered_groups:
+        return ""
+    rendered = render_appendix(source_registry, appendix_package)
+    if not str(rendered or "").strip():
+        return ""
+    rendered_groups.add("appendix")
+    return _rename_first_h2(rendered, title)
 
 
 def run_final_writer_agent(
@@ -384,7 +430,7 @@ def run_final_writer_agent(
     }
     risk_package = _as_dict(risk_package)
     appendix_package = _as_dict(appendix_package)
-    source_registry = [item for item in list(source_registry or []) if isinstance(item, dict)]
+    source_registry, excluded_sources = _traceable_source_registry([item for item in list(source_registry or []) if isinstance(item, dict)])
 
     shell = _as_dict(report_blueprint.get("report_shell"))
     front_blocks = _as_block_list(shell.get("front_blocks"), ["executive_summary", "key_data"])
@@ -395,6 +441,7 @@ def run_final_writer_agent(
     )
     parts = [render_cover(query, report_blueprint)]
     rendered_groups: set[str] = set()
+    source_appendix_enabled = _source_appendix_enabled(report_blueprint)
     front_section_titles: List[str] = []
     back_section_titles: List[str] = []
     for block_key in front_blocks:
@@ -423,7 +470,7 @@ def run_final_writer_agent(
     appendix_requested = False
     for block_key in back_blocks:
         if str(block_key or "").strip() == "appendix":
-            appendix_requested = _source_appendix_enabled()
+            appendix_requested = True
             continue
         rendered = _render_global_block(
             block_key,
@@ -441,15 +488,12 @@ def run_final_writer_agent(
     body_markdown = "\n\n".join(part for part in parts if str(part or "").strip())
     body_markdown, source_registry = _renumber_sources_by_first_citation(body_markdown, source_registry)
     parts = [body_markdown]
-    if appendix_requested and _source_appendix_enabled():
-        rendered = _render_global_block(
-            "appendix",
-            title_override="",
-            decision_package=decision_package,
-            risk_package=risk_package,
+    citation_appendix_required = bool(CITATION_RE.search(body_markdown))
+    if (appendix_requested and source_appendix_enabled) or citation_appendix_required:
+        rendered = _render_appendix_block(
+            title=GLOBAL_BLOCK_TITLES.get("appendix", "appendix"),
             appendix_package=appendix_package,
             source_registry=source_registry,
-            table_packages=table_packages,
             rendered_groups=rendered_groups,
         )
         if rendered:
@@ -472,6 +516,15 @@ def run_final_writer_agent(
         ],
         "source_count": len(source_registry),
         "source_registry": list(source_registry),
+        "excluded_untraceable_source_count": len(excluded_sources),
+        "excluded_untraceable_sources": [
+            {
+                "ref": source.get("ref"),
+                "title": source.get("title") or source.get("source_title"),
+                "reason": "title_only_or_untraceable",
+            }
+            for source in excluded_sources[:20]
+        ],
         "estimated_chars": len(markdown),
         "format_warnings": warnings,
     }

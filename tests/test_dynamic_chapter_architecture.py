@@ -95,7 +95,7 @@ def test_search_tasks_are_expanded_from_chapters():
     for task in plan["search_tasks"]:
         assert task["chapter_id"] in chapter_ids
         assert task["evidence_goal"]
-        assert task["proof_role"] in {"metric", "support", "counter", "case", "source_check"}
+        assert task["proof_role"] in {"metric", "support", "counter", "case", "source_check", "technology_product"}
         assert task["lane_targets"]
 
 

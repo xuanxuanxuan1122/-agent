@@ -4,8 +4,6 @@ import asyncio
 import json
 import os
 import re
-import urllib.error
-import urllib.request
 from typing import Any, Dict, List, Optional, Set
 
 from .evidence_extractor import CONTAMINATION_PATTERNS, REPORT_DIMENSIONS, clean_evidence_text
@@ -16,25 +14,11 @@ except ModuleNotFoundError:  # pragma: no cover - direct script mode fallback.
     from ...agents.public_report_sanitizer import find_publication_blockers, sanitize_public_markdown
 
 try:
-    from rag_pipeline.config.search_config import (
-        DEFAULT_LLM_SYNTHESIS_API_KEY,
-        DEFAULT_LLM_SYNTHESIS_DISABLE_THINKING,
-        DEFAULT_LLM_SYNTHESIS_MODEL,
-        DEFAULT_LLM_SYNTHESIS_PROVIDER,
-        DEFAULT_LLM_SYNTHESIS_TIMEOUT,
-        DEFAULT_LLM_SYNTHESIS_URL,
-    )
-    from rag_pipeline.search.memory import llm_config_is_ready, normalize_llm_config, normalize_openai_compatible_chat_url
+    from rag_pipeline.config.search_config import build_llm_config_for_task
+    from rag_pipeline.search.memory import call_openai_compatible_text, llm_config_is_ready
 except ModuleNotFoundError:  # pragma: no cover - only for unusual direct execution.
-    from ...config.search_config import (
-        DEFAULT_LLM_SYNTHESIS_API_KEY,
-        DEFAULT_LLM_SYNTHESIS_DISABLE_THINKING,
-        DEFAULT_LLM_SYNTHESIS_MODEL,
-        DEFAULT_LLM_SYNTHESIS_PROVIDER,
-        DEFAULT_LLM_SYNTHESIS_TIMEOUT,
-        DEFAULT_LLM_SYNTHESIS_URL,
-    )
-    from ...search.memory import llm_config_is_ready, normalize_llm_config, normalize_openai_compatible_chat_url
+    from ...config.search_config import build_llm_config_for_task
+    from ...search.memory import call_openai_compatible_text, llm_config_is_ready
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -53,14 +37,14 @@ def _env_int(name: str, default: int, *, min_value: int = 0, max_value: int = 1_
 
 
 def _source_appendix_mode() -> str:
-    mode = os.environ.get("REPORT_REFORMATTER_SOURCE_APPENDIX", "none").strip().lower()
+    mode = os.environ.get("REPORT_REFORMATTER_SOURCE_APPENDIX", "cited").strip().lower()
     if mode in {"all", "cited"}:
         return mode
     return "none"
 
 
 def _source_appendix_required() -> bool:
-    return _env_flag("REPORT_REFORMATTER_REQUIRE_SOURCE_APPENDIX", False)
+    return _env_flag("REPORT_REFORMATTER_REQUIRE_SOURCE_APPENDIX", True)
 
 
 REFORMATTER_SYSTEM_PROMPT = """
@@ -302,14 +286,7 @@ def _select_dimension_facts(facts: List[Dict[str, Any]], max_items: int) -> List
 
 
 def build_llm_config() -> Dict[str, Any]:
-    return {
-        "provider": DEFAULT_LLM_SYNTHESIS_PROVIDER,
-        "url": DEFAULT_LLM_SYNTHESIS_URL,
-        "api_key": DEFAULT_LLM_SYNTHESIS_API_KEY,
-        "model": DEFAULT_LLM_SYNTHESIS_MODEL,
-        "timeout": DEFAULT_LLM_SYNTHESIS_TIMEOUT,
-        "disable_thinking": DEFAULT_LLM_SYNTHESIS_DISABLE_THINKING,
-    }
+    return dict(build_llm_config_for_task("reformatter"))
 
 
 def _source_line(source: Dict[str, Any], *, include_date: bool = True) -> str:
@@ -417,56 +394,16 @@ def _chat_text_with_openai_compatible(
     temperature: float,
     max_tokens: int,
 ) -> str:
-    normalized = normalize_llm_config(config)
-    if normalized["provider"] != "openai_compatible":
-        raise RuntimeError(f"Unsupported LLM provider: {normalized['provider']}")
-    if not llm_config_is_ready(normalized):
+    if not llm_config_is_ready(config):
         raise RuntimeError("ReformatterAgent 的大模型配置不完整。")
-
-    payload: Dict[str, Any] = {
-        "model": normalized["model"],
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content},
-        ],
-    }
-    if normalized.get("disable_thinking"):
-        payload["enable_thinking"] = False
-
-    request = urllib.request.Request(
-        normalize_openai_compatible_chat_url(normalized["url"]),
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {normalized['api_key']}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
+    response = call_openai_compatible_text(
+        config=config,
+        system_prompt=system_prompt,
+        user_content=user_content,
+        temperature=temperature,
+        max_tokens=max_tokens,
     )
-    opener = (
-        urllib.request.build_opener()
-        if normalized.get("trust_env")
-        else urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    )
-    try:
-        with opener.open(request, timeout=normalized["timeout"]) as response:
-            raw = response.read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"ReformatterAgent LLM request failed with HTTP {exc.code}: {detail}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"ReformatterAgent LLM request failed: {exc}") from exc
-
-    data = json.loads(raw)
-    choices = data.get("choices") or []
-    if not choices:
-        raise RuntimeError("ReformatterAgent LLM response did not include choices.")
-    message = choices[0].get("message") or {}
-    content = message.get("content", "")
-    if isinstance(content, list):
-        content = "\n".join(str(item.get("text", item)) if isinstance(item, dict) else str(item) for item in content)
-    text = str(content or "").strip()
+    text = str(response.get("text") or "").strip()
     if not text:
         raise RuntimeError("ReformatterAgent LLM response content is empty.")
     return text

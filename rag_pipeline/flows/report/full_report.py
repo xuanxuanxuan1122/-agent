@@ -166,9 +166,152 @@ def write_json(path: Path, payload: Any) -> None:
     )
 
 
+def attach_token_usage_snapshot(payload: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        from rag_pipeline.telemetry.token_usage import token_usage_payload
+
+        usage_payload = token_usage_payload()
+    except Exception as exc:  # pragma: no cover - telemetry must never block report delivery.
+        payload["token_usage_error"] = str(exc)
+        return payload
+    summary = as_dict(usage_payload.get("token_usage_summary"))
+    if summary.get("enabled") or int(summary.get("call_count") or 0) > 0:
+        payload.update(usage_payload)
+    return payload
+
+
 def write_markdown(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(finalize_public_report(str(text or "")).strip() + "\n", encoding="utf-8")
+
+
+def finalize_formal_report(markdown: str) -> str:
+    text = str(markdown or "")
+    try:
+        return finalize_public_report(text)
+    except ValueError:
+        cleaned = sanitize_public_markdown(text)
+        for _ in range(8):
+            blockers = find_publication_blockers(cleaned)
+            if not blockers:
+                break
+            blocked_lines = {int(item.get("line") or 0) for item in blockers}
+            cleaned = "\n".join(
+                line
+                for line_no, line in enumerate(cleaned.splitlines(), start=1)
+                if line_no not in blocked_lines
+            )
+            cleaned = sanitize_public_markdown(cleaned)
+        return cleaned.strip()
+
+
+def write_formal_markdown(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(finalize_formal_report(str(text or "")).strip() + "\n", encoding="utf-8")
+
+
+FINAL_AUDIT_PUBLIC_LABELS = {
+    "unsupported_claim": "部分判断支撑不足",
+    "evidence_gap": "部分证据链仍有缺口",
+    "citation_issue": "引用或来源附录需要复核",
+    "data_conflict": "数据口径存在冲突",
+    "logic_jump": "存在推理跨度偏大的判断",
+    "risk_understated": "风险提示不够充分",
+    "scope_issue": "适用范围需要收窄",
+    "missing_sources_appendix": "来源附录不完整",
+    "title_only_source": "部分来源缺少可独立访问链接",
+    "fake_or_placeholder_source": "来源登记中存在占位来源",
+    "fake_or_placeholder_evidence": "正文存在占位证据痕迹",
+    "internal_evidence_id": "正文存在内部证据编号",
+    "internal_chapter_id": "正文存在内部章节编号",
+    "empty_markdown_table": "存在空表或坏表",
+}
+
+
+def _public_audit_label(value: Any) -> str:
+    text = str(value or "audit_finding").strip()
+    return FINAL_AUDIT_PUBLIC_LABELS.get(text, text.replace("_", " "))
+
+
+def final_audit_public_note(final_audit_result: Dict[str, Any]) -> str:
+    result = as_dict(final_audit_result)
+    if not result or not result.get("enabled"):
+        return ""
+    audit = as_dict(result.get("audit"))
+    deterministic = as_dict(result.get("deterministic_audit"))
+    findings = []
+    seen_findings = set()
+    for item in [*as_list(deterministic.get("findings")), *as_list(audit.get("critical_findings"))]:
+        payload = as_dict(item)
+        key = (
+            str(payload.get("type") or ""),
+            str(payload.get("severity") or ""),
+            str(payload.get("message") or payload.get("suggested_fix") or "")[:180],
+        )
+        if key in seen_findings:
+            continue
+        seen_findings.add(key)
+        findings.append(payload)
+    status = str(result.get("status") or audit.get("status") or "").strip() or "unknown"
+    blocked = bool(result.get("blocked"))
+    lines = [
+        "## 最终审查补充",
+        "",
+        f"- 最终审查状态：{status}",
+        f"- 洁净版资格：{'暂不建议自动交付' if blocked else '未发现阻断洁净版的问题'}",
+    ]
+    summary = str(audit.get("summary") or deterministic.get("summary") or "").strip()
+    if summary:
+        lines.append(f"- 审查摘要：{summary[:220]}")
+    if findings:
+        lines.extend(["", "### 审查发现"])
+        for item in findings[:8]:
+            payload = as_dict(item)
+            label = _public_audit_label(payload.get("type"))
+            message = str(payload.get("message") or payload.get("suggested_fix") or "").strip()
+            severity = str(payload.get("severity") or "").strip()
+            detail = "；".join(part for part in [severity, message[:180]] if part)
+            lines.append(f"- {label}" + (f"：{detail}" if detail else ""))
+    return "\n".join(lines).strip()
+
+
+def append_final_audit_note(markdown: str, final_audit_result: Dict[str, Any]) -> str:
+    note = final_audit_public_note(final_audit_result)
+    text = str(markdown or "").strip()
+    if not note or not text or "## 最终审查补充" in text:
+        return text
+    return f"{text}\n\n{note}".strip()
+
+
+def review_draft_markdown(report_markdown: str, writer_report: Dict[str, Any]) -> str:
+    reasons: List[str] = []
+    for item in [
+        writer_report.get("message"),
+        *as_list(writer_report.get("evidence_limitations")),
+        *as_list(writer_report.get("qa_pending_repair_reasons")),
+        *as_list(writer_report.get("delivery_blockers")),
+    ]:
+        if isinstance(item, dict):
+            text = str(item.get("message") or item.get("type") or item.get("reason") or "").strip()
+        else:
+            text = str(item or "").strip()
+        if text and text not in reasons:
+            reasons.append(text)
+        if len(reasons) >= 8:
+            break
+    lines = [
+        "# 复核草稿说明",
+        "",
+        "本文件是复核草稿，不是正式交付版本。系统已保留正文供人工判断，但未满足正式报告的全部证据和质量门槛。",
+        "",
+        "## 未达正式交付的主要原因",
+    ]
+    if reasons:
+        lines.extend(f"- {reason}" for reason in reasons)
+    else:
+        lines.append("- 证据、质量或版式门禁尚未全部通过。")
+    lines.extend(["", "## 草稿正文", "", str(report_markdown or "").strip()])
+    return "\n".join(lines).strip()
 
 
 def finalize_public_report(markdown: str) -> str:
@@ -583,6 +726,13 @@ def full_report_iqs_options() -> Dict[str, Any]:
     return options
 
 
+def default_full_report_route() -> str:
+    route = str(os.getenv("FULL_REPORT_DEFAULT_ROUTE") or os.getenv("BRAIN_AGENT_ROUTE") or "web").strip().lower()
+    if route in {"all", "both", "auto", "web", "local"}:
+        return route
+    return "web"
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -592,7 +742,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("query", nargs="*", help="报告问题/主题，例如：智能机器人行业投资机会")
     parser.add_argument("--query", dest="query_option", default="", help="报告问题/主题。")
-    parser.add_argument("--route", choices=["all", "both", "auto", "web", "local"], default="all", help="默认 all，确保 RAG 与 6 路 IQS 都参与。")
+    parser.add_argument("--route", choices=["all", "both", "auto", "web", "local"], default=default_full_report_route(), help="默认 web，只调度 IQS/联网证据；如需本地 RAG 可显式设置 local/both/all 并启用 BRAIN_ENABLE_LOCAL_RAG。")
     parser.add_argument("--llm-profile", default="", help="选择本次报告执行大模型 profile，例如 qwen、deepseek-v4-pro。")
     parser.add_argument("--select-llm", action="store_true", help="运行前在终端列出 RAG_LLM_PROFILES 并交互选择执行大模型。")
     parser.add_argument("--output-dir", default=str(PIPELINE_ROOT / "output" / "full_reports"), help="状态和调试文件输出目录。")
@@ -605,7 +755,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-interactive-input", action="store_true", help="没有传 query 时直接失败，不进入终端输入等待。")
     parser.add_argument("--print-report", action="store_true", help="兼容旧参数；报告正文现在默认输出到 stdout，不再生成 md 文件。")
     parser.add_argument("--skip-review", action="store_true", help="跳过 ReviewAgent 终审；默认启用规则审查。")
-    parser.add_argument("--enable-llm-review", action="store_true", help="启用 ReviewAgent 的 LLM 精修层；默认只跑规则层。")
+    parser.add_argument(
+        "--enable-llm-review",
+        dest="enable_llm_review",
+        action="store_true",
+        default=env_flag("REPORT_ENABLE_LLM_REVIEW", True),
+        help="启用 ReviewAgent 的 LLM 精修层；默认启用。",
+    )
+    parser.add_argument("--disable-llm-review", dest="enable_llm_review", action="store_false", help="关闭 ReviewAgent 的 LLM 精修层。")
     parser.add_argument("--skip-reformatter", action="store_true", help="跳过 ReformatterAgent，回退到旧 WriterAgent/ReviewAgent 输出路径。")
     parser.add_argument("--reformatter-output", default="", help="可选：指定 ReformatterAgent 洁净报告输出路径。")
     parser.add_argument("--no-progress-bar", action="store_true", help="关闭整体进度条，恢复普通阶段日志。")
@@ -628,10 +785,10 @@ def main() -> int:
     progress_enabled = (not args.no_progress_bar) and env_flag("REPORT_PROGRESS_BAR", True)
     global QUIET_STAGE_LOGS
     QUIET_STAGE_LOGS = bool(progress_enabled and not args.verbose_progress)
-    if progress_enabled and not args.verbose_progress:
-        os.environ["PIPELINE_PROGRESS"] = "0"
+    if args.verbose_progress:
+        os.environ["PIPELINE_PROGRESS"] = "1"
     else:
-        os.environ.setdefault("PIPELINE_PROGRESS", "1")
+        os.environ["PIPELINE_PROGRESS"] = "0"
     progress = OverallProgress(enabled=progress_enabled)
     progress.update(1, "准备参数")
     if selected_llm_profile:
@@ -656,7 +813,10 @@ def main() -> int:
     pipeline_started = time.perf_counter()
     progress.update(5, "问题分析与任务规划")
     log("[1/6] 问题分析与拆解启动")
-    log("[2/6] 调度 RAG 与 6 路 IQS Agent")
+    if args.route in {"local", "both", "all"} and env_flag("BRAIN_ENABLE_LOCAL_RAG", False):
+        log("[2/6] 调度本地 RAG 与 IQS Agent")
+    else:
+        log("[2/6] 调度 IQS 联网证据 Agent（本地 RAG 默认关闭）")
     log("[3/6] Evidence Merger / Analysis Agent / Writer Agent 将在 merge 阶段串行执行")
 
     progress.pulse_to(72, "检索 / 证据 / 正文生成")
@@ -684,8 +844,10 @@ def main() -> int:
     writer_report = as_dict(state_dict.get("writer_report")) or as_dict(raw_output.get("writer_report"))
     report_markdown = str(writer_report.get("report_markdown") or state_dict.get("answer_text") or "").strip()
     writer_status = str(writer_report.get("report_status") or "").strip().lower()
-    writer_not_ready = writer_status == "not_ready" or bool(writer_report.get("skip_reformatter"))
-    writer_publishable = bool(report_markdown) and writer_status == "final" and not writer_not_ready
+    delivery_tier = str(writer_report.get("delivery_tier") or as_dict(as_dict(state_dict.get("evidence_package")).get("summary")).get("delivery_tier") or "").strip()
+    writer_not_ready = writer_status in {"not_ready", "diagnostic_only"} and not report_markdown
+    writer_publishable = bool(report_markdown) and writer_status in {"final", "final_clean"} and not writer_not_ready
+    formal_report_available = bool(report_markdown) and not writer_not_ready
     if not report_markdown:
         reformatter_skip_reason = "no_report_markdown"
     elif writer_not_ready:
@@ -698,8 +860,9 @@ def main() -> int:
         reformatter_skip_reason = ""
     review_result: Dict[str, Any] = {}
     reformatter_result: Dict[str, Any] = {}
+    last_clean_evidence: Dict[str, Any] = {}
 
-    if report_markdown and args.skip_reformatter and not args.skip_review and not writer_not_ready:
+    if report_markdown and writer_publishable and args.skip_reformatter and not args.skip_review and not writer_not_ready:
         from .review_pipeline import run_review_pipeline_sync
 
         progress.pulse_to(82, "ReviewAgent 审查")
@@ -735,15 +898,26 @@ def main() -> int:
     state_path = output_dir / f"{base_name}.state.json"
     package_path = output_dir / f"{base_name}.writer_package.json"
     writer_md_path = output_dir / f"{base_name}.writer.md"
+    formal_report_md_path = output_dir / f"{base_name}_report.md"
+    review_draft_md_path = output_dir / f"{base_name}_review_draft.md"
+    diagnostic_md_path = output_dir / f"{base_name}.diagnostic.md"
 
     state_dict["writer_package_path"] = str(package_path)
-    if report_markdown and not writer_not_ready:
+    if formal_report_available:
         report_markdown = finalize_public_report(report_markdown)
         writer_report["report_markdown"] = report_markdown
         state_dict["answer_text"] = report_markdown
-        write_markdown(writer_md_path, report_markdown)
-        writer_report["writer_markdown_path"] = str(writer_md_path)
-        state_dict["writer_markdown_path"] = str(writer_md_path)
+        write_formal_markdown(formal_report_md_path, report_markdown)
+        writer_report["formal_report_path"] = str(formal_report_md_path)
+        writer_report["writer_markdown_path"] = str(formal_report_md_path)
+        state_dict["formal_report_path"] = str(formal_report_md_path)
+        state_dict["writer_markdown_path"] = str(formal_report_md_path)
+        state_dict["writer_report"] = writer_report
+    diagnostic_markdown = str(writer_report.get("diagnostic_markdown") or writer_report.get("blocked_report_markdown") or "").strip()
+    if writer_not_ready and diagnostic_markdown:
+        write_markdown(diagnostic_md_path, finalize_public_report(diagnostic_markdown))
+        writer_report["diagnostic_markdown_path"] = str(diagnostic_md_path)
+        state_dict["diagnostic_markdown_path"] = str(diagnostic_md_path)
         state_dict["writer_report"] = writer_report
     write_state_json(state_path, state_dict)
     llm_status = llm_runtime_status()
@@ -753,11 +927,24 @@ def main() -> int:
         "skipped_reason": reformatter_skip_reason,
         "llm_runtime": llm_status,
     }
+    evidence_package_payload = as_dict(state_dict.get("evidence_package")) or as_dict(raw_output.get("evidence_package"))
+    evidence_health_summary = (
+        as_dict(evidence_package_payload.get("evidence_health_summary"))
+        or as_dict(as_dict(evidence_package_payload.get("summary")).get("evidence_health_summary"))
+        or as_dict(as_dict(evidence_package_payload.get("metadata")).get("evidence_health_summary"))
+    )
+    source_registry_payload = (
+        as_list(as_dict(state_dict.get("writer_report")).get("source_registry"))
+        or as_list(evidence_package_payload.get("source_registry"))
+        or as_list(evidence_package_payload.get("sources"))
+    )
     writer_package_payload = {
         "query": query,
         "stage_status": stage_status(state_dict),
         "llm_runtime": llm_status,
-        "evidence_package": as_dict(state_dict.get("evidence_package")) or as_dict(raw_output.get("evidence_package")),
+        "evidence_package": evidence_package_payload,
+        "evidence_health_summary": evidence_health_summary,
+        "source_registry": source_registry_payload,
         "structured_analysis": as_dict(state_dict.get("structured_analysis")) or as_dict(raw_output.get("structured_analysis")),
         "report_blueprint": as_dict(state_dict.get("report_blueprint")) or as_dict(raw_output.get("report_blueprint")),
         "chapter_evidence_packages": as_list(state_dict.get("chapter_evidence_packages")) or as_list(raw_output.get("chapter_evidence_packages")),
@@ -769,7 +956,56 @@ def main() -> int:
         "review_result": review_result,
         "reformatter_result": reformatter_result,
     }
-    write_json(package_path, writer_package_payload)
+
+    def refresh_llm_call_trace() -> None:
+        calls: List[Dict[str, Any]] = []
+
+        def add_call(stage: str, payload: Any) -> None:
+            call = as_dict(payload)
+            if not call:
+                return
+            normalized = {"stage": stage, **call}
+            key = (
+                str(normalized.get("stage") or ""),
+                str(normalized.get("task") or ""),
+                str(normalized.get("profile") or ""),
+                str(normalized.get("model") or ""),
+                str(normalized.get("api") or ""),
+                str(normalized.get("status") or ""),
+                str(normalized.get("error") or ""),
+            )
+            existing = {
+                (
+                    str(item.get("stage") or ""),
+                    str(item.get("task") or ""),
+                    str(item.get("profile") or ""),
+                    str(item.get("model") or ""),
+                    str(item.get("api") or ""),
+                    str(item.get("status") or ""),
+                    str(item.get("error") or ""),
+                )
+                for item in calls
+            }
+            if key not in existing:
+                calls.append(normalized)
+
+        research_plan = as_dict(state_dict.get("research_plan")) or as_dict(as_dict(state_dict.get("query_analysis")).get("research_plan"))
+        add_call("planning", research_plan.get("planner_llm_call"))
+        coverage_payload = as_dict(state_dict.get("coverage_evaluation")) or as_dict(raw_output.get("coverage_evaluation"))
+        add_call("coverage_eval", coverage_payload.get("llm_call"))
+        for trace_item in as_list(state_dict.get("loop_trace")) + as_list(raw_output.get("loop_trace")):
+            add_call("coverage_eval", as_dict(trace_item).get("llm_call"))
+        add_call("review_stage2", as_dict(as_dict(writer_package_payload.get("review_result")).get("structured_review")).get("llm_call"))
+        add_call("qa", as_dict(writer_report.get("qa_result")).get("llm_call"))
+        add_call("final_audit", as_dict(writer_package_payload.get("final_audit_result")).get("llm_call"))
+        writer_package_payload["llm_call_trace"] = calls
+
+    def write_writer_package() -> None:
+        refresh_llm_call_trace()
+        attach_token_usage_snapshot(writer_package_payload)
+        write_json(package_path, writer_package_payload)
+
+    write_writer_package()
 
     status = stage_status(state_dict)
     missing = missing_required_stages(status)
@@ -789,10 +1025,13 @@ def main() -> int:
             "skipped_reason": reformatter_skip_reason,
         }
         writer_package_payload["reformatter_result"] = reformatter_result
-        write_json(package_path, writer_package_payload)
+        write_writer_package()
         if writer_not_ready:
             log("[5/6] 证据门槛未达成，跳过 ReformatterAgent，只输出补证清单")
             progress.update(96, "已阻断正式报告")
+        elif formal_report_available:
+            log(f"[5/6] WriterAgent 状态为 {writer_status or 'unknown'}，跳过 ReformatterAgent，已保留评分正式报告")
+            progress.update(96, "已生成评分正式报告")
         else:
             log(f"[5/6] WriterAgent 状态为 {writer_status or 'unknown'}，跳过 ReformatterAgent，保留 review draft")
             progress.update(96, "保留待复核草稿")
@@ -800,11 +1039,13 @@ def main() -> int:
         progress.pulse_to(96, "ReformatterAgent 清洗报告")
         log("[5/6] ReformatterAgent 从 writer_package 重写洁净报告")
         clean_output_path = Path(args.reformatter_output).resolve() if args.reformatter_output else package_path.with_name(package_path.name.replace(".writer_package.json", "_clean.md"))
+        fallback_output_path = package_path.with_name(package_path.name.replace(".writer_package.json", "_fallback_writer.md"))
         try:
             from .evidence_extractor import extract_clean_evidence
             from .reformatter_agent import build_reformatter_repair_plan, run_reformatter, validate_reformatted_report
 
             writer_v3_markdown = str(writer_report.get("report_markdown") or report_markdown or "").strip()
+            fallback_output_path = package_path.with_name(package_path.name.replace(".writer_package.json", "_fallback_writer.md"))
             reformatter_result = {
                 **reformatter_result,
                 "enabled": True,
@@ -813,8 +1054,9 @@ def main() -> int:
                 "output_path": str(clean_output_path),
             }
             writer_package_payload["reformatter_result"] = reformatter_result
-            write_json(package_path, writer_package_payload)
+            write_writer_package()
             clean_evidence = extract_clean_evidence(str(package_path))
+            last_clean_evidence = clean_evidence
             clean_report = asyncio.run(run_reformatter(clean_evidence, llm_client=None))
             fallback_reason = ""
             if has_legacy_decision_sections(clean_report) and writer_v3_markdown and not has_legacy_decision_sections(writer_v3_markdown):
@@ -845,10 +1087,10 @@ def main() -> int:
                     fallback_report = finalize_public_report(writer_v3_markdown)
                     fallback_validation = validate_reformatted_report(fallback_report, as_list(clean_evidence.get("sources")), clean_evidence)
                     fallback_repair_plan = build_reformatter_repair_plan(fallback_validation, clean_evidence, topic=query)
-                    clean_output_path.parent.mkdir(parents=True, exist_ok=True)
-                    write_markdown(clean_output_path, fallback_report)
+                    fallback_output_path.parent.mkdir(parents=True, exist_ok=True)
+                    write_markdown(fallback_output_path, fallback_report)
                     report_markdown = fallback_report.strip()
-                    writer_report["reformatter_output_path"] = str(clean_output_path)
+                    writer_report["fallback_output_path"] = str(fallback_output_path)
                     writer_report["reformatter_failed_validation"] = validation
                     writer_report["reformatter_validation"] = fallback_validation
                     writer_report["report_markdown"] = report_markdown
@@ -857,10 +1099,14 @@ def main() -> int:
                     fallback_output_written = True
                 reformatter_result = {
                     "enabled": True,
-                    "success": fallback_output_written,
+                    "success": False,
                     "status": "fallback_writer" if fallback_output_written else ("repair_required" if repair_required else "validation_failed"),
                     "output_path": str(clean_output_path),
-                    "output_written": fallback_output_written,
+                    "output_written": False,
+                    "fallback_output_path": str(fallback_output_path) if fallback_output_written else "",
+                    "fallback_output_written": fallback_output_written,
+                    "fallback_draft_path": str(fallback_output_path) if fallback_output_written else "",
+                    "fallback_draft_written": fallback_output_written,
                     "validation": fallback_validation if fallback_output_written else validation,
                     "reformatter_validation": validation,
                     "fallback_validation": fallback_validation,
@@ -871,7 +1117,7 @@ def main() -> int:
                     "clean_body_chars_without_sources": int((fallback_validation if fallback_output_written else validation).get("body_chars_without_sources") or 0),
                     "clean_body_citation_count": int((fallback_validation if fallback_output_written else validation).get("citation_count") or 0),
                     "clean_body_unique_source_count": int((fallback_validation if fallback_output_written else validation).get("unique_cited_source_count") or 0),
-                    "fallback_to_writer": bool(fallback_reason),
+                    "fallback_to_writer": fallback_output_written,
                     "fallback_reason": fallback_reason or ("reformatter_repair_required" if repair_required else "reformatter_validation_failed"),
                 }
                 writer_report.setdefault("reformatter_validation", validation)
@@ -879,13 +1125,49 @@ def main() -> int:
                 writer_package_payload["writer_report"] = writer_report
                 writer_package_payload["reformatter_result"] = reformatter_result
                 write_state_json(state_path, state_dict)
-                write_json(package_path, writer_package_payload)
+                write_writer_package()
                 if fallback_output_written:
-                    log(f"  [WARN] ReformatterAgent 未达到 clean 标准，已写出 Writer 回退报告: {clean_output_path}")
+                    log(f"  [WARN] ReformatterAgent 未达到 clean 标准，已写出 Writer 回退报告: {fallback_output_path}")
                     progress.update(96, "ReformatterAgent 已回退")
                 else:
                     log(f"  [WARN] ReformatterAgent 未达到 clean 标准，未写出 Clean report: {validation}")
                     progress.update(96, "ReformatterAgent 需补正")
+            elif fallback_reason:
+                fallback_output_path.parent.mkdir(parents=True, exist_ok=True)
+                write_markdown(fallback_output_path, clean_report)
+
+                report_markdown = clean_report.strip()
+                writer_report["fallback_output_path"] = str(fallback_output_path)
+                writer_report["reformatter_validation"] = validation
+                writer_report["report_markdown"] = report_markdown
+                state_dict["writer_report"] = writer_report
+                state_dict["answer_text"] = report_markdown
+                reformatter_result = {
+                    "enabled": True,
+                    "success": False,
+                    "status": "fallback_writer",
+                    "output_path": str(clean_output_path),
+                    "output_written": False,
+                    "fallback_output_path": str(fallback_output_path),
+                    "fallback_output_written": True,
+                    "fallback_draft_path": str(fallback_output_path),
+                    "fallback_draft_written": True,
+                    "validation": validation,
+                    "repair_plan": repair_plan,
+                    "llm_runtime": llm_status,
+                    "clean_evidence_count": int(as_dict(clean_evidence.get("metadata")).get("evidence_count") or 0),
+                    "clean_body_chars_without_sources": int(validation.get("body_chars_without_sources") or 0),
+                    "clean_body_citation_count": int(validation.get("citation_count") or 0),
+                    "clean_body_unique_source_count": int(validation.get("unique_cited_source_count") or 0),
+                    "fallback_to_writer": True,
+                    "fallback_reason": fallback_reason,
+                }
+                writer_package_payload["writer_report"] = writer_report
+                writer_package_payload["reformatter_result"] = reformatter_result
+                write_state_json(state_path, state_dict)
+                write_writer_package()
+                log(f"  [WARN] ReformatterAgent 回退 Writer 报告，未写出 Clean report: {fallback_output_path}")
+                progress.update(96, "ReformatterAgent 已回退")
             else:
                 clean_output_path.parent.mkdir(parents=True, exist_ok=True)
                 write_markdown(clean_output_path, clean_report)
@@ -915,7 +1197,7 @@ def main() -> int:
                 writer_package_payload["writer_report"] = writer_report
                 writer_package_payload["reformatter_result"] = reformatter_result
                 write_state_json(state_path, state_dict)
-                write_json(package_path, writer_package_payload)
+                write_writer_package()
                 log(f"  - Clean report Markdown: {clean_output_path}")
                 progress.update(96, "ReformatterAgent 清洗完成")
         except Exception as exc:
@@ -929,7 +1211,7 @@ def main() -> int:
                 "error": str(exc),
             }
             writer_package_payload["reformatter_result"] = reformatter_result
-            write_json(package_path, writer_package_payload)
+            write_writer_package()
             log(f"  [WARN] ReformatterAgent 失败，保留 WriterAgent 输出: {exc}")
             if report_markdown and not args.skip_review:
                 from .review_pipeline import run_review_pipeline_sync
@@ -953,87 +1235,213 @@ def main() -> int:
                 writer_package_payload["writer_report"] = writer_report
                 writer_package_payload["review_result"] = review_result
                 write_state_json(state_path, state_dict)
-                write_json(package_path, writer_package_payload)
+                write_writer_package()
             if report_markdown:
                 report_markdown = finalize_public_report(report_markdown)
                 fallback_output_written = False
                 fallback_write_error = ""
+                fallback_output_path = package_path.with_name(package_path.name.replace(".writer_package.json", "_fallback_writer.md"))
                 try:
-                    clean_output_path.parent.mkdir(parents=True, exist_ok=True)
-                    write_markdown(clean_output_path, report_markdown)
+                    fallback_output_path.parent.mkdir(parents=True, exist_ok=True)
+                    write_markdown(fallback_output_path, report_markdown)
                     fallback_output_written = True
                 except Exception as fallback_exc:  # pragma: no cover - filesystem edge case.
                     fallback_write_error = str(fallback_exc)
                 writer_report["report_markdown"] = report_markdown
                 if fallback_output_written:
-                    writer_report["reformatter_output_path"] = str(clean_output_path)
+                    writer_report["fallback_output_path"] = str(fallback_output_path)
                 state_dict["writer_report"] = writer_report
                 state_dict["answer_text"] = report_markdown
                 writer_package_payload["writer_report"] = writer_report
-                writer_package_payload["reformatter_result"] = {
+                reformatter_result = {
                     **reformatter_result,
                     "fallback_to_writer": True,
-                    "fallback_output_path": str(clean_output_path) if fallback_output_written else "",
-                    "output_written": fallback_output_written,
+                    "fallback_output_path": str(fallback_output_path) if fallback_output_written else "",
+                    "output_written": False,
+                    "fallback_output_written": fallback_output_written,
+                    "fallback_draft_path": str(fallback_output_path) if fallback_output_written else "",
+                    "fallback_draft_written": fallback_output_written,
                     "fallback_write_error": fallback_write_error,
                 }
+                writer_package_payload["reformatter_result"] = reformatter_result
                 write_state_json(state_path, state_dict)
-                write_json(package_path, writer_package_payload)
+                write_writer_package()
                 if fallback_output_written:
-                    log(f"  [WARN] ReformatterAgent 失败，已写出 Writer 回退报告: {clean_output_path}")
+                    log(f"  [WARN] ReformatterAgent 失败，已写出 Writer 回退报告: {fallback_output_path}")
                 else:
                     log("  [WARN] ReformatterAgent 失败，已保留 Writer 草稿但不写出 Clean report")
             progress.update(96, "ReformatterAgent 已降级")
 
     reformatter_required = bool(writer_publishable and not args.skip_reformatter)
     reformatter_output_written = bool(as_dict(reformatter_result).get("output_written"))
-    reformatter_blocked_clean = bool(reformatter_required and not reformatter_output_written)
+    clean_report_written = bool(
+        reformatter_output_written
+        and as_dict(reformatter_result).get("status") == "completed"
+        and not as_dict(reformatter_result).get("fallback_to_writer")
+        and as_dict(reformatter_result).get("success")
+    )
+    fallback_report_written = bool(as_dict(reformatter_result).get("fallback_output_written"))
+    reformatter_blocked_clean = bool(reformatter_required and not clean_report_written)
+    final_audit_result: Dict[str, Any] = as_dict(writer_package_payload.get("final_audit_result"))
+    final_audit_blocked = False
+
+    final_audit_candidate = bool(report_markdown and not writer_not_ready)
+    if final_audit_candidate:
+        try:
+            from .final_audit_agent import run_final_audit
+
+            audit_target = "Clean report" if clean_report_written else ("Writer fallback report" if fallback_report_written else "Scored formal report")
+            log(f"[5.5/6] FinalAuditAgent 审查 {audit_target}")
+            final_audit_result = run_final_audit(
+                report_markdown=report_markdown,
+                validation=as_dict(reformatter_result.get("validation")) or as_dict(writer_report.get("reformatter_validation")),
+                clean_evidence=last_clean_evidence,
+                writer_package_payload=writer_package_payload,
+                query=query,
+            )
+        except Exception as audit_exc:  # pragma: no cover - defensive guard.
+            final_audit_result = {
+                "enabled": True,
+                "success": False,
+                "status": "failed",
+                "blocked": True,
+                "error": str(audit_exc),
+                "llm_call": as_dict(getattr(audit_exc, "diagnostic", {})),
+            }
+        final_audit_blocked = bool(final_audit_result.get("blocked"))
+        writer_report["final_audit_result"] = final_audit_result
+        writer_package_payload["writer_report"] = writer_report
+        writer_package_payload["final_audit_result"] = final_audit_result
+        state_dict["writer_report"] = writer_report
+        state_dict["final_audit_result"] = final_audit_result
+        reformatter_result = {
+            **reformatter_result,
+            "final_audit_status": str(final_audit_result.get("status") or ""),
+            "final_audit_blocked": final_audit_blocked,
+        }
+        writer_package_payload["reformatter_result"] = reformatter_result
+        if final_audit_blocked:
+            writer_report["clean_report_blocked_reason"] = "final_audit_fatal"
+            writer_package_payload["clean_report_blocked_reason"] = "final_audit_fatal"
+            log("  [BLOCKED] FinalAuditAgent 返回 fatal，Clean report 需要人工复核后再交付")
+        elif final_audit_result.get("enabled") and final_audit_result.get("status") not in {"skipped", "failed"}:
+            log(f"  - Final audit status: {final_audit_result.get('status')}")
+        formal_path = str(writer_report.get("formal_report_path") or writer_report.get("writer_markdown_path") or "")
+        if formal_path and report_markdown:
+            report_markdown = append_final_audit_note(report_markdown, final_audit_result)
+            writer_report["report_markdown"] = report_markdown
+            state_dict["answer_text"] = report_markdown
+            state_dict["writer_report"] = writer_report
+            write_formal_markdown(Path(formal_path), report_markdown)
+        write_state_json(state_path, state_dict)
+        write_writer_package()
+
+    formal_report_path = str(writer_report.get("formal_report_path") or writer_report.get("writer_markdown_path") or "")
+    formal_report_written = bool(formal_report_path and report_markdown and not writer_not_ready)
+    clean_report_eligible = bool(writer_report.get("clean_report_eligible") or clean_report_written)
+    quality_findings_count = len(as_list(writer_report.get("quality_findings")))
+    quality_score_value = writer_report.get("quality_score")
+    quality_grade_value = writer_report.get("quality_grade")
+    if quality_score_value is None and report_markdown:
+        score_match = re.search(r"质量总分[:：]\s*(\d{1,3})\s*/\s*100", report_markdown)
+        if score_match:
+            quality_score_value = int(score_match.group(1))
+    writer_package_payload["report_delivery_status"] = {
+        "delivery_tier": delivery_tier or str(writer_report.get("delivery_tier") or ""),
+        "formal_report_written": formal_report_written,
+        "formal_report_path": formal_report_path if formal_report_written else "",
+        "quality_score": quality_score_value,
+        "quality_grade": quality_grade_value,
+        "clean_report_eligible": clean_report_eligible,
+        "quality_findings_count": quality_findings_count,
+        "clean_report_written": clean_report_written,
+        "clean_report_path": str(writer_report.get("reformatter_output_path") or "") if clean_report_written else "",
+        "fallback_report_written": fallback_report_written,
+        "fallback_report_path": str(writer_report.get("fallback_output_path") or as_dict(reformatter_result).get("fallback_output_path") or "") if fallback_report_written else "",
+        "review_draft_written": bool(writer_report.get("review_draft_markdown_path")),
+        "review_draft_path": str(writer_report.get("review_draft_markdown_path") or ""),
+        "diagnostic_markdown_path": str(writer_report.get("diagnostic_markdown_path") or "") if writer_not_ready else "",
+        "review_required": bool((not clean_report_eligible) or reformatter_blocked_clean or final_audit_blocked),
+        "blocked_reason": "final_audit_fatal" if final_audit_blocked else ("reformatter_clean_missing" if reformatter_blocked_clean else ""),
+        "final_audit_status": str(final_audit_result.get("status") or ""),
+        "final_audit_blocked": final_audit_blocked,
+    }
+    write_writer_package()
 
     if writer_not_ready:
         log("[6/6] 正式报告已阻断，输出研究未完成与补证清单")
-    elif not writer_publishable:
-        log("[6/6] WriterAgent 输出为待复核草稿，已跳过 Clean report 写出")
+    elif formal_report_written and not writer_publishable:
+        log("[6/6] 已产出带评分的正式报告；Clean report 未达标，质量问题已写入报告首页与 writer_package")
     elif reformatter_blocked_clean:
         log("[6/6] ReformatterAgent 未产出 Clean report，已保留 Writer 草稿和失败状态")
+    elif final_audit_blocked:
+        log("[6/6] FinalAuditAgent 已阻断 Clean report 自动交付")
     elif args.skip_reformatter:
         log("[5/6] 状态文件已生成，报告正文直接输出" if args.skip_review else "[5/6] ReviewAgent 与状态文件已完成，报告正文直接输出")
     else:
         log("[6/6] ReformatterAgent 与状态文件已完成，洁净报告正文直接输出")
     progress.update(98, "准备输出结果")
     final_incomplete = bool(missing and not args.allow_missing_stage)
-    progress.finish("研究未完成" if writer_not_ready else ("Clean report 未生成" if reformatter_blocked_clean else ("流程不完整" if final_incomplete else "全流程完成")))
+    if writer_not_ready:
+        finish_label = "研究未完成"
+    elif formal_report_written and not writer_publishable:
+        finish_label = "已生成评分正式报告"
+    elif final_audit_blocked:
+        finish_label = "Clean report 待复核"
+    elif reformatter_blocked_clean:
+        finish_label = "Clean report 未生成"
+    elif formal_report_written:
+        finish_label = "全流程完成"
+    elif final_incomplete:
+        finish_label = "流程不完整"
+    else:
+        finish_label = "全流程完成"
+    progress.finish(finish_label)
     log(f"  - Full state JSON: {state_path}", force=True)
     log(f"  - Writer package JSON: {package_path}", force=True)
-    if report_markdown and not writer_not_ready:
-        log(f"  - Writer Markdown: {writer_md_path}", force=True)
+    if formal_report_written:
+        log(f"  - Formal Report Markdown: {formal_report_path}", force=True)
     clean_path = str(writer_report.get("reformatter_output_path") or "")
-    if clean_path:
+    if clean_path and clean_report_written:
         log(f"  - Clean Markdown: {clean_path}", force=True)
+    fallback_path = str(writer_report.get("fallback_output_path") or as_dict(reformatter_result).get("fallback_output_path") or "")
+    if fallback_path and fallback_report_written:
+        log(f"  - Fallback Writer Markdown: {fallback_path}", force=True)
+    review_draft_path = str(writer_report.get("review_draft_markdown_path") or "")
+    if review_draft_path:
+        log(f"  - Review Draft Markdown: {review_draft_path}", force=True)
+    diagnostic_path = str(writer_report.get("diagnostic_markdown_path") or "")
+    if diagnostic_path:
+        log(f"  - Diagnostic Markdown: {diagnostic_path}", force=True)
 
     if errors:
         log("[WARN] 运行中存在非致命错误/降级：", force=True)
         for item in errors:
             log(f"  - {item}", force=True)
 
-    final_stdout_allowed = bool(report_markdown and writer_publishable and not writer_not_ready and not reformatter_blocked_clean)
+    final_stdout_allowed = bool(report_markdown and writer_publishable and not writer_not_ready and not reformatter_blocked_clean and not final_audit_blocked)
     if final_stdout_allowed:
         print(report_markdown)
 
-    if final_incomplete:
+    if final_incomplete and not formal_report_written:
         log("[6/6] 全流程执行不完整，以上阶段缺失。", force=True)
         return 2
 
     if writer_not_ready:
         log("[6/6] 检索或证据门槛未通过，正式报告未生成。", force=True)
-        return 3 if env_flag("REPORT_NOT_READY_EXIT_NONZERO", True) else 0
+        return 3 if env_flag("REPORT_NOT_READY_EXIT_NONZERO", False) else 0
 
     if not writer_publishable:
-        log("[6/6] 流程完成但报告仍为待复核草稿，未发布 Clean report。", force=True)
-        return 4 if env_flag("REPORT_REVIEW_REQUIRED_EXIT_NONZERO", False) else 0
+        log("[6/6] 流程完成，已产出带评分的正式报告；未发布 Clean report。", force=True)
+        return 0 if formal_report_written else (4 if env_flag("REPORT_REVIEW_REQUIRED_EXIT_NONZERO", False) else 0)
 
     if reformatter_blocked_clean:
         log("[6/6] 流程完成但 Reformatter 未生成 Clean report；请查看 writer_package.reformatter_result。", force=True)
         return 5 if env_flag("REPORT_REFORMATTER_FAILURE_EXIT_NONZERO", False) else 0
+
+    if final_audit_blocked:
+        log("[6/6] 流程完成但 FinalAuditAgent 阻断自动交付；请查看 writer_package.final_audit_result。", force=True)
+        return 6 if env_flag("REPORT_FINAL_AUDIT_EXIT_NONZERO", False) else 0
 
     log("[6/6] 全流程执行完成。", force=True)
     return 0

@@ -6,12 +6,7 @@ import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from ..config.search_config import (
-    DEFAULT_LLM_SYNTHESIS_API_KEY,
-    DEFAULT_LLM_SYNTHESIS_DISABLE_THINKING,
-    DEFAULT_LLM_SYNTHESIS_MODEL,
-    DEFAULT_LLM_SYNTHESIS_PROVIDER,
-    DEFAULT_LLM_SYNTHESIS_TIMEOUT,
-    DEFAULT_LLM_SYNTHESIS_URL,
+    build_llm_config_for_task,
 )
 from ..search.memory import call_openai_compatible_json, llm_config_is_ready
 from .qa_agent import INTERNAL_LABELS
@@ -41,14 +36,7 @@ def _env_flag(name: str, default: bool) -> bool:
 def _llm_config(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if config:
         return _as_dict(config)
-    return {
-        "provider": DEFAULT_LLM_SYNTHESIS_PROVIDER,
-        "url": DEFAULT_LLM_SYNTHESIS_URL,
-        "api_key": DEFAULT_LLM_SYNTHESIS_API_KEY,
-        "model": DEFAULT_LLM_SYNTHESIS_MODEL,
-        "timeout": DEFAULT_LLM_SYNTHESIS_TIMEOUT,
-        "disable_thinking": DEFAULT_LLM_SYNTHESIS_DISABLE_THINKING,
-    }
+    return dict(build_llm_config_for_task("qa"))
 
 
 def _qa_instructions(qa_result: Optional[Dict[str, Any]], rewrite_instructions: Optional[Sequence[Any]]) -> List[str]:

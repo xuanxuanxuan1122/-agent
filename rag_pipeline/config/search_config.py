@@ -32,13 +32,19 @@ def llm_profile_env_name(profile: str, field: str) -> str:
     return f"RAG_LLM_PROFILE_{profile_key}_{field_key}" if profile_key and field_key else ""
 
 
+def llm_task_profile_env_name(task_name: str) -> str:
+    task_key = normalize_llm_profile(task_name)
+    return f"RAG_MODEL_{task_key}_PROFILE" if task_key else ""
+
+
 def env_profile_value(profile: str, field: str, *fallback_names: str, default: str = "") -> str:
     profile_key = normalize_llm_profile(profile)
     if profile_key:
         raw = os.getenv(llm_profile_env_name(profile_key, field))
-        if raw is not None:
+        if raw is not None and str(raw).strip():
             return str(raw).strip()
-        return ""
+        if not fallback_names and not default:
+            return ""
     return env_first_nonempty(*fallback_names, default=default)
 
 
@@ -59,6 +65,104 @@ def env_profile_flag(profile: str, field: str, default: bool) -> bool:
     if raw is None:
         return default
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return float(str(raw).strip())
+    except ValueError:
+        return default
+
+
+def _env_int_optional(name: str) -> int | None:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        return max(1, int(str(raw).strip()))
+    except ValueError:
+        return None
+
+
+def _config_is_ready(config: dict[str, object]) -> bool:
+    return bool(
+        str(config.get("url") or "").strip()
+        and str(config.get("api_key") or "").strip()
+        and str(config.get("model") or "").strip()
+    )
+
+
+GPT55_QUALITY_TASKS = {
+    "planning",
+    "coverage_eval",
+    "qa",
+    "review_stage2",
+    "reflection",
+    "reformatter",
+    "final_audit",
+}
+GPT55_QUALITY_PROFILE = "gpt-5.5"
+GPT55_FALLBACK_PROFILE = os.getenv("RAG_LLM_GPT55_FALLBACK_PROFILE", "deepseek-v4-pro").strip()
+
+
+def build_llm_config_from_profile(profile: str, *, default_timeout: float = 180.0) -> dict[str, object]:
+    """Build an OpenAI-compatible LLM config from a named RAG_LLM_PROFILE_* block."""
+
+    profile = str(profile or "").strip()
+    provider = env_profile_value(profile, "PROVIDER", default="openai_compatible") or "openai_compatible"
+    timeout_env = llm_profile_env_name(profile, "TIMEOUT")
+    reasoning_effort = env_profile_value(profile, "REASONING_EFFORT").lower()
+    max_output_tokens = _env_int_optional(llm_profile_env_name(profile, "MAX_OUTPUT_TOKENS"))
+    config: dict[str, object] = {
+        "provider": provider.strip().lower(),
+        "url": env_profile_value(profile, "URL"),
+        "api_key": env_profile_value(profile, "API_KEY"),
+        "model": env_profile_value(profile, "MODEL"),
+        "timeout": _env_float(timeout_env, default_timeout) if timeout_env else default_timeout,
+        "profile": profile,
+        "disable_thinking": env_profile_flag(
+            profile,
+            "DISABLE_THINKING",
+            env_flag("RAG_LLM_DISABLE_THINKING", True),
+        ),
+    }
+    if reasoning_effort:
+        config["reasoning_effort"] = reasoning_effort
+    if max_output_tokens:
+        config["max_output_tokens"] = max_output_tokens
+    return config
+
+
+def _config_uses_gpt55(config: dict[str, object]) -> bool:
+    model = str(config.get("model") or "").strip().lower()
+    profile = str(config.get("profile") or "").strip().lower()
+    return model.startswith("gpt-5.5") or profile == GPT55_QUALITY_PROFILE
+
+
+def _attach_gpt55_fallback(config: dict[str, object], *, task_name: str = "") -> dict[str, object]:
+    """Attach a DeepSeek fallback to GPT-5.5 configs without changing callers."""
+
+    config = dict(config or {})
+    if not _config_uses_gpt55(config):
+        return config
+    fallback_profile = os.getenv("RAG_LLM_GPT55_FALLBACK_PROFILE", GPT55_FALLBACK_PROFILE).strip()
+    if not fallback_profile or fallback_profile.lower() == str(config.get("profile") or "").strip().lower():
+        return config
+    fallback_config = build_llm_config_from_profile(
+        fallback_profile,
+        default_timeout=float(config.get("timeout") or DEFAULT_LLM_SYNTHESIS_TIMEOUT),
+    )
+    if not _config_is_ready(fallback_config):
+        return config
+    fallback_config["task_name"] = task_name or str(config.get("task_name") or "")
+    fallback_config["fallback_for_profile"] = str(config.get("profile") or "")
+    fallback_config.pop("forced_quality_profile", None)
+    config["fallback_profile"] = fallback_profile
+    config["fallback_config"] = fallback_config
+    return config
 
 
 PIPELINE_ROOT = Path(__file__).resolve().parents[2]
@@ -283,6 +387,58 @@ DEFAULT_LLM_REFLECTION_TIMEOUT = env_profile_timeout(
     "RAG_LLM_REFLECTION_TIMEOUT",
     DEFAULT_LLM_SYNTHESIS_TIMEOUT,
 )
+
+
+def build_legacy_synthesis_llm_config() -> dict[str, object]:
+    """Return the historical synthesis config used before functional model routing."""
+
+    config: dict[str, object] = {
+        "provider": DEFAULT_LLM_SYNTHESIS_PROVIDER,
+        "url": DEFAULT_LLM_SYNTHESIS_URL,
+        "api_key": DEFAULT_LLM_SYNTHESIS_API_KEY,
+        "model": DEFAULT_LLM_SYNTHESIS_MODEL,
+        "timeout": DEFAULT_LLM_SYNTHESIS_TIMEOUT,
+        "profile": DEFAULT_LLM_EXECUTION_PROFILE or DEFAULT_LLM_ACTIVE_PROFILE or "legacy_synthesis",
+        "disable_thinking": DEFAULT_LLM_SYNTHESIS_DISABLE_THINKING,
+    }
+    reasoning_effort = env_first_nonempty("RAG_LLM_SYNTHESIS_REASONING_EFFORT").lower()
+    max_output_tokens = _env_int_optional("RAG_LLM_SYNTHESIS_MAX_OUTPUT_TOKENS")
+    if reasoning_effort:
+        config["reasoning_effort"] = reasoning_effort
+    if max_output_tokens:
+        config["max_output_tokens"] = max_output_tokens
+    return config
+
+
+def build_llm_config_for_task(task_name: str) -> dict[str, object]:
+    """Resolve an LLM config for a functional task.
+
+    The resolver reads RAG_MODEL_{TASK}_PROFILE first. If the selected profile
+    is absent or missing URL/API key/model, it falls back to the existing
+    synthesis config so older deployments keep working.
+    """
+
+    task = str(task_name or "").strip()
+    if env_flag("RAG_FORCE_GPT55_QUALITY_TASKS", True) and normalize_llm_profile(task).lower() in {
+        normalize_llm_profile(item).lower() for item in GPT55_QUALITY_TASKS
+    }:
+        config = build_llm_config_from_profile(GPT55_QUALITY_PROFILE, default_timeout=DEFAULT_LLM_SYNTHESIS_TIMEOUT)
+        if _config_is_ready(config):
+            config["task_name"] = task
+            config["forced_quality_profile"] = True
+            return _attach_gpt55_fallback(config, task_name=task)
+
+    task_env_name = llm_task_profile_env_name(task)
+    profile = os.getenv(task_env_name, "").strip() if task_env_name else ""
+    if profile:
+        config = build_llm_config_from_profile(profile, default_timeout=DEFAULT_LLM_SYNTHESIS_TIMEOUT)
+        if _config_is_ready(config):
+            config["task_name"] = task
+            return _attach_gpt55_fallback(config, task_name=task)
+    config = build_legacy_synthesis_llm_config()
+    config["task_name"] = task
+    return _attach_gpt55_fallback(config, task_name=task)
+
 
 DEFAULT_ENABLE_MEMORY = env_flag("RAG_ENABLE_MEMORY", True)
 DEFAULT_ENABLE_CONTEXTUALIZER = env_flag(

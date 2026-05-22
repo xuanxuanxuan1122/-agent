@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>报告生成工作台</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <main class="shell">
+    <section class="workspace">
+      <aside class="panel">
+        <div class="brand">
+          <h1>报告生成工作台</h1>
+          <span id="health" class="pill">连接中</span>
+        </div>
+
+        <form id="reportForm" class="form">
+          <label for="mainTitle">主标题</label>
+          <input id="mainTitle" name="mainTitle" type="text" placeholder="请输入报告主标题" />
+
+          <label for="researchDirection">副标题/研究方向</label>
+          <textarea id="researchDirection" name="researchDirection" rows="6" placeholder="可选：输入副标题、研究方向或重点问题"></textarea>
+
+          <div>
+            <label for="llmProfile">LLM Profile</label>
+            <input id="llmProfile" name="llmProfile" type="text" placeholder="默认" />
+          </div>
+
+          <label class="check">
+            <input id="skipReformatter" type="checkbox" />
+            <span>跳过 Reformatter</span>
+          </label>
+
+          <button id="submitButton" type="submit">生成报告</button>
+        </form>
+
+        <div class="status-block">
+          <div>
+            <span class="muted">主标题</span>
+            <strong id="jobTitle">-</strong>
+          </div>
+          <div>
+            <span class="muted">研究方向</span>
+            <strong id="jobDirection">-</strong>
+          </div>
+          <div>
+            <span class="muted">当前任务</span>
+            <strong id="jobId">-</strong>
+          </div>
+          <div>
+            <span class="muted">状态</span>
+            <strong id="jobStatus">未开始</strong>
+          </div>
+          <div>
+            <span class="muted">耗时</span>
+            <strong id="elapsed">0.0s</strong>
+          </div>
+        </div>
+      </aside>
+
+      <section class="result">
+        <div class="tabs" role="tablist">
+          <button class="tab active" data-kind="review_draft" type="button">待复核草稿</button>
+          <button class="tab" data-kind="final" type="button">最终报告</button>
+          <button class="tab" data-kind="writer" type="button">Writer</button>
+          <button class="tab" data-kind="log" type="button">日志</button>
+          <button class="tab" data-kind="files" type="button">文件</button>
+        </div>
+
+        <div id="notice" class="notice">输入主标题后开始生成。</div>
+        <div id="fileActions" class="actions"></div>
+        <pre id="preview" class="preview"></pre>
+        <div id="files" class="files hidden"></div>
+      </section>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>

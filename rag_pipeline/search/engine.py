@@ -137,9 +137,9 @@ from ..config.search_config import (
 from .memory import (
     ConversationMemory,
     build_turn_summary,
+    call_openai_compatible_json,
     contextualize_query,
     generate_turn_id,
-    normalize_openai_compatible_chat_url,
 )
 from .reflection import evidence_chunk_uids, evidence_overlap_ratio, reflect_on_evidence
 from .review import review_answer_with_fallback
@@ -3567,11 +3567,6 @@ def call_external_planner_api(
     if not api_url or not api_key or not model:
         raise RuntimeError("External planner requires URL, API key, and model.")
 
-    try:
-        import requests
-    except ImportError as exc:
-        raise RuntimeError("External planner requires the optional 'requests' package.") from exc
-
     provider = normalize_text(provider)
     if provider != "openai_compatible":
         raise RuntimeError(f"Unsupported planner provider: {provider}")
@@ -3595,41 +3590,18 @@ def call_external_planner_api(
         "rule_plan": rule_plan.to_dict(),
         "current_intent": intent,
     }
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": model,
-        "temperature": 0.1,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
-        ],
-        "response_format": {"type": "json_object"},
-    }
-    data = post_external_json(
-        api_url=normalize_openai_compatible_chat_url(api_url),
-        headers=headers,
-        payload=payload,
-        timeout=timeout,
+    response = call_openai_compatible_json(
+        config={
+            "provider": provider,
+            "url": api_url,
+            "api_key": api_key,
+            "model": model,
+            "timeout": timeout,
+        },
+        system_prompt=system_prompt,
+        user_payload=user_payload,
     )
-    choices = data.get("choices") or []
-    if not choices:
-        raise RuntimeError("Planner response did not include choices.")
-    message = choices[0].get("message") or {}
-    content = message.get("content", "")
-    if isinstance(content, list):
-        text_parts = []
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
-                text_parts.append(str(item.get("text", "")))
-            elif isinstance(item, dict) and "text" in item:
-                text_parts.append(str(item.get("text", "")))
-            else:
-                text_parts.append(str(item))
-        content = "\n".join(text_parts)
-    return extract_json_payload(content)
+    return extract_json_payload(response.get("payload"))
 
 
 def merge_filter_hints(primary: Dict[str, List[str]], secondary: Dict[str, List[str]]) -> Dict[str, List[str]]:

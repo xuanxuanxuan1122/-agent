@@ -125,7 +125,7 @@ PUBLIC_PROCESS_REWRITES = [
     (r"补证任务", "持续观察项"),
     (r"公开表达采用相应边界", "结论保留相应边界"),
     (r"关联证据[:：][^\n。]*[。]?", ""),
-    (r"\bEV-\d+\b", ""),
+    (r"(?<![A-Za-z0-9_])EV-\d+(?:-[A-Za-z0-9]+)?", ""),
 ]
 
 
@@ -306,10 +306,41 @@ def _report_title(research_object: str) -> str:
     return f"# {title}研究报告"
 
 
+def _cover_title_from_blueprint(query: str, report_blueprint: Dict[str, Any]) -> str:
+    brief = _as_dict(report_blueprint.get("article_brief"))
+    explicit = (
+        report_blueprint.get("report_title")
+        or report_blueprint.get("display_title")
+        or brief.get("display_title")
+        or brief.get("main_title")
+    )
+    title = _compact(explicit, 140).strip(" #")
+    if title:
+        return f"# {title}"
+    research_object = str(report_blueprint.get("research_object") or query or "研究对象").strip()
+    return _report_title(research_object)
+
+
+def _cover_subtitle_from_blueprint(report_blueprint: Dict[str, Any]) -> str:
+    brief = _as_dict(report_blueprint.get("article_brief"))
+    subtitle = _compact(
+        report_blueprint.get("report_subtitle")
+        or report_blueprint.get("display_subtitle")
+        or brief.get("display_subtitle")
+        or brief.get("direction"),
+        220,
+    ).strip()
+    subtitle = re.sub(r"^[—–-]{1,3}\s*", "", subtitle).strip()
+    return f"——{subtitle}" if subtitle else ""
+
+
 def render_cover(query: str, report_blueprint: Dict[str, Any]) -> str:
     research_object = str(report_blueprint.get("research_object") or query or "研究对象").strip()
     narrative = _public_text(report_blueprint.get("narrative"), 240)
-    lines = [_report_title(research_object), ""]
+    lines = [_cover_title_from_blueprint(query, report_blueprint), ""]
+    subtitle = _cover_subtitle_from_blueprint(report_blueprint)
+    if subtitle:
+        lines.extend([subtitle, ""])
     if narrative:
         lines.append(f"研究主线：{narrative}")
     return "\n".join(_dedupe_narrative_lines(lines))
@@ -361,28 +392,82 @@ def _markdown_table(headers: Sequence[Any], rows: Sequence[Sequence[Any]]) -> st
     headers = [_public_text(str(header or "").replace("|", "/").strip(), 80) for header in headers]
     if not headers or not rows:
         return ""
-    lines = ["| " + " | ".join(headers) + " |", "| " + " | ".join(["---"] * len(headers)) + " |"]
+    cleaned_rows: List[List[str]] = []
     for row in rows:
-        cells = [_public_text(str(cell or "").replace("\n", " ").replace("|", "/").strip(), 220) for cell in row]
+        cells = []
+        for cell in row:
+            text = str(cell or "").replace("\n", " ").replace("|", "/").strip()
+            text = re.sub(r"第\s*\d+\s*轮\s*[｜|:：]\s*", "", text)
+            text = re.sub(r"(?:竞争对比|政策监管|技术产业链|市场规模|成本|金额)\s*=\s*(?=；|;|$)", "", text)
+            text = re.sub(r"(?:；\s*){2,}", "；", text).strip(" ；;，,")
+            if re.search(r"(?:第\s*\d+\s*轮|openai_task_\d+)", text, flags=re.I):
+                text = ""
+            cells.append(_public_text(text, 220))
         cells = (cells + [""] * len(headers))[: len(headers)]
+        if any(cell.strip() for cell in cells):
+            cleaned_rows.append(cells)
+    if not cleaned_rows:
+        return ""
+    lines = ["| " + " | ".join(headers) + " |", "| " + " | ".join(["---"] * len(headers)) + " |"]
+    for cells in cleaned_rows:
         lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines)
+
+
+def _is_internal_table_header(header: Any) -> bool:
+    text = str(header or "").strip().lower()
+    return bool(re.search(r"(来源|引用|证据|evidence|source|ref)", text))
+
+
+def _public_table_shape(headers: Sequence[Any], rows: Sequence[Sequence[Any]]) -> tuple[List[Any], List[List[Any]]]:
+    keep_indices = [index for index, header in enumerate(headers) if not _is_internal_table_header(header)]
+    public_headers = [headers[index] for index in keep_indices]
+    public_rows = []
+    for row in rows:
+        row_values = list(row)
+        public_rows.append([row_values[index] if index < len(row_values) else "" for index in keep_indices])
+    return public_headers, public_rows
+
+
+def _line_with_citations(text: str, evidence_refs: Sequence[Any]) -> str:
+    suffix = _citation_suffix(evidence_refs)
+    if not suffix or re.search(r"\[\d{1,3}\]\s*$", text):
+        return text
+    return text.rstrip("。；;，,") + "。" + suffix
 
 
 def render_table_package(table: Dict[str, Any]) -> str:
     if not table.get("should_render") or table.get("appendix_only"):
         return ""
     headers = _as_list(table.get("headers"))
-    rows = [_as_list(_as_dict(row).get("cells")) for row in _as_list(table.get("rows")) if isinstance(row, dict)]
-    if len(rows) < 2:
+    row_objects = [_as_dict(row) for row in _as_list(table.get("rows")) if isinstance(row, dict)]
+    rows = [_as_list(row.get("cells")) for row in row_objects]
+    headers, rows = _public_table_shape(headers, rows)
+    minimum_rows = 1 if str(table.get("table_type") or "") == "cagr_calculation" else 2
+    if len(rows) < minimum_rows:
         return ""
     table_md = _markdown_table(headers, rows)
     if not table_md:
         return ""
     parts = [f"**{_compact(table.get('title'), 120)}**", "", table_md]
+    decision_implication = _public_text(table.get("decision_implication"), 260)
+    limitations = [
+        item
+        for item in (_public_text(value, 160) for value in _as_list(table.get("limitations"))[:1])
+        if item
+    ]
     takeaway = _public_text(table.get("takeaway"), 220)
+    citation_refs = _as_list(table.get("evidence_refs")) or [
+        ref
+        for row in row_objects
+        for ref in _as_list(row.get("evidence_refs"))
+    ]
     if takeaway:
-        parts.extend(["", f"这张表显示，{takeaway}"])
+        parts.extend(["", _line_with_citations(f"这张表显示，{takeaway}", citation_refs)])
+    if decision_implication and decision_implication != takeaway:
+        parts.extend(["", f"判断含义：{decision_implication}"])
+    if limitations:
+        parts.extend(["", f"使用边界：{limitations[0]}"])
     return "\n".join(parts)
 
 
@@ -666,6 +751,51 @@ def _clause(value: str) -> str:
     return str(value or "").strip(" \t\r\n，。；")
 
 
+def _table_slot(table: Dict[str, Any]) -> str:
+    slot = str(table.get("placement_slot") or "").strip()
+    return slot or "chapter_end"
+
+
+def _table_render_priority(table: Dict[str, Any]) -> int:
+    try:
+        return int(table.get("render_priority") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _section_matches_table(section: Dict[str, Any], table: Dict[str, Any]) -> bool:
+    section_id = str(section.get("section_id") or "").strip()
+    block_type = str(section.get("block_type") or section.get("output_type") or "").strip()
+    anchor_section_id = str(table.get("anchor_section_id") or "").strip()
+    anchor_block_type = str(table.get("anchor_block_type") or "").strip()
+    if anchor_section_id and section_id == anchor_section_id:
+        return True
+    if anchor_block_type and block_type == anchor_block_type:
+        return True
+    section_refs = {
+        str(ref or "").strip()
+        for ref in _as_list(section.get("evidence_refs")) + _as_list(section.get("required_evidence_refs"))
+        if str(ref or "").strip()
+    }
+    table_refs = {str(ref or "").strip() for ref in _as_list(table.get("evidence_refs")) if str(ref or "").strip()}
+    return bool(section_refs and table_refs and section_refs.intersection(table_refs))
+
+
+def _slot_matches_section(slot: str, section: Dict[str, Any]) -> bool:
+    block_type = str(section.get("block_type") or section.get("output_type") or "").strip()
+    if slot == "after_thesis":
+        return block_type == "thesis"
+    if slot == "after_evidence_matrix":
+        return block_type in {"evidence_matrix", "metric_reconciliation", "competitive_positioning", "case_comparison"}
+    if slot == "after_mechanism":
+        return block_type in {"mechanism_chain", "technology_maturity", "value_chain_map", "policy_timeline", "stakeholder_map"}
+    if slot == "before_risk":
+        return block_type == "risk_trigger"
+    if slot == "before_decision":
+        return block_type in {"verification_checklist", "scenario_analysis"}
+    return False
+
+
 def render_chapter_package(
     chapter: Dict[str, Any],
     index: int,
@@ -682,32 +812,51 @@ def render_chapter_package(
     if lead and lead != flow_intro:
         lines.append(lead)
     chapter_tables = [
-        rendered
+        {"table": table, "rendered": rendered}
         for table in _as_list(chapter.get("table_packages"))
         if isinstance(table, dict)
         for rendered in [render_table_package(table)]
         if rendered
     ]
-    table_cursor = 0
+    chapter_tables.sort(key=lambda item: (-_table_render_priority(_as_dict(item.get("table"))), str(_as_dict(item.get("table")).get("table_id") or "")))
+    placed_tables: set[str] = set()
 
-    def append_next_table() -> None:
-        nonlocal table_cursor
-        if table_cursor >= len(chapter_tables):
-            return
-        lines.extend(["", chapter_tables[table_cursor]])
-        table_cursor += 1
+    def append_tables(slot: str, *, section: Dict[str, Any] | None = None, limit: int = 1) -> None:
+        appended = 0
+        for item in chapter_tables:
+            table = _as_dict(item.get("table"))
+            table_id = str(table.get("table_id") or id(table))
+            if table_id in placed_tables:
+                continue
+            table_slot = _table_slot(table)
+            if table_slot != slot and not (section and _section_matches_table(section, table) and _slot_matches_section(slot, section)):
+                continue
+            if section and not (_section_matches_table(section, table) or _slot_matches_section(table_slot, section)):
+                continue
+            lines.extend(["", str(item.get("rendered") or "")])
+            placed_tables.add(table_id)
+            appended += 1
+            if appended >= limit:
+                return
 
     for section_index, section in enumerate(_as_list(chapter.get("sections")), start=1):
         section = _as_dict(section)
         if section.get("omit_from_report"):
             continue
+        if _slot_matches_section("before_risk", section):
+            append_tables("before_risk", section=section, limit=1)
+        if _slot_matches_section("before_decision", section):
+            append_tables("before_decision", section=section, limit=1)
         if _as_list(section.get("render_blocks")):
             rendered_section = render_section(section)
             if rendered_section:
                 _append_citation_to_last_paragraph(rendered_section, _as_list(section.get("evidence_refs")))
                 lines.append("")
                 lines.extend(rendered_section)
-                append_next_table()
+                for slot in ("after_thesis", "after_evidence_matrix", "after_mechanism"):
+                    if _slot_matches_section(slot, section):
+                        append_tables(slot, section=section, limit=1)
+                        break
             continue
         section_title = _compact(section.get("section_title"), 120)
         if section_title and not _is_internal_section_title(section_title):
@@ -733,7 +882,10 @@ def render_chapter_package(
             lines.extend(_paragraph_chunks(_natural_transition("落到行业含义上，", decision_implication), max_chars=680, max_chunks=2))
         if len(lines) > before_section_len:
             _append_citation_to_last_paragraph(lines, _as_list(section.get("evidence_refs")))
-            append_next_table()
+            for slot in ("after_thesis", "after_evidence_matrix", "after_mechanism"):
+                if _slot_matches_section(slot, section):
+                    append_tables(slot, section=section, limit=1)
+                    break
     fact_digest = render_chapter_fact_digest(chapter)
     if fact_digest:
         lines.append("")
@@ -741,8 +893,13 @@ def render_chapter_package(
     deep_synthesis = render_chapter_deep_synthesis(chapter)
     if deep_synthesis:
         lines.extend(deep_synthesis)
-    while table_cursor < len(chapter_tables):
-        append_next_table()
+    append_tables("chapter_end", limit=2)
+    for item in chapter_tables:
+        table = _as_dict(item.get("table"))
+        table_id = str(table.get("table_id") or id(table))
+        if table_id not in placed_tables:
+            lines.extend(["", str(item.get("rendered") or "")])
+            placed_tables.add(table_id)
     transition = _chapter_transition(chapter, next_chapter)
     if transition:
         lines.extend(["", transition])
@@ -941,6 +1098,21 @@ def render_appendix(source_registry: Sequence[Dict[str, Any]], appendix_package:
         table_md = _markdown_table(["指标", "主体", "范围", "期间", "单位", "值", "来源等级"], rows)
         if table_md:
             lines.extend(["", "### 指标口径表", table_md])
+    appendix_tables = [
+        _as_dict(item)
+        for item in _as_list(_as_dict(appendix_package).get("table_appendix_rows"))
+        if isinstance(item, dict)
+    ]
+    if appendix_tables:
+        for table in appendix_tables[:6]:
+            headers = _as_list(table.get("headers"))
+            rows = [_as_list(row) for row in _as_list(table.get("rows"))[:12]]
+            headers, rows = _public_table_shape(headers, rows)
+            table_md = _markdown_table(headers, rows)
+            if not table_md:
+                continue
+            title = _compact(table.get("title") or "表格附录明细", 90)
+            lines.extend(["", f"### {title}（附录明细）", table_md])
     if not source_registry:
         return "\n".join(lines) if len(lines) > 1 else ""
     for source in list(source_registry)[:50]:

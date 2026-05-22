@@ -31,16 +31,16 @@ def test_quality_gate_blocks_final_status():
     assert any(item["type"] == "internal_label_or_template_phrase" for item in validation["errors"])
 
 
-def test_failed_gate_returns_review_required():
+def test_empty_material_returns_diagnostic_only():
     result = build_writer_report(
         query="智能农业机器人",
         evidence_package={"analysis_ready_evidence": []},
         structured_analysis={"evidence_analyses": []},
     )
 
-    assert result["report_status"] == "review_required"
+    assert result["report_status"] == "diagnostic_only"
     assert result["validation"]["passed"] is False
-    assert "质量门禁未通过" in result["message"]
+    assert result["report_markdown"] == ""
 
 
 def test_narrative_gate_blocks_evidence_listing_style():

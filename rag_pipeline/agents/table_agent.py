@@ -20,6 +20,65 @@ POLLUTED_ENTITY_CELL_RE = re.compile(
     r"^\d{4}年.{0,50}(?:报告|分析|研判|前瞻|展望|白皮书|研究)|"
     r"(?:报告|分析|研判|前瞻|展望|白皮书|研究报告)$)"
 )
+INTERNAL_TABLE_TRACE_RE = re.compile(
+    r"(?:第\s*\d+\s*轮\s*[｜|:：]|openai_task_\d+|(?:竞争对比|政策监管|技术产业链|市场规模|成本|金额)\s*=\s*(?:[；;]|$))",
+    re.I,
+)
+
+
+HIGH_VALUE_TABLE_TYPES = {
+    "market_metric_table",
+    "cagr_calculation",
+    "regional_share_table",
+    "competitor_matrix",
+    "industry_chain_profit_pool",
+    "policy_impact_table",
+    "risk_register",
+    "investment_priority_table",
+    "strategic_options_matrix",
+}
+LOW_VALUE_TABLE_TYPES = {
+    "source_list",
+    "evidence_list",
+    "raw_detail_table",
+    "raw_facts_table",
+    "appendix_source_table",
+}
+TABLE_REQUIRED_FIELDS: Dict[str, List[str]] = {
+    "market_metric_table": ["metric", "value", "unit", "period", "source"],
+    "cagr_calculation": ["metric", "value", "unit", "period", "source"],
+    "regional_share_table": ["metric", "value", "unit", "period", "source"],
+    "metric_reconciliation": ["metric", "value", "unit", "period", "source"],
+}
+TABLE_MINIMUM_ROWS: Dict[str, int] = {
+    "market_metric_table": 2,
+    "cagr_calculation": 1,
+    "regional_share_table": 2,
+    "competitor_matrix": 2,
+    "industry_chain_profit_pool": 2,
+    "policy_impact_table": 2,
+    "risk_register": 2,
+    "investment_priority_table": 2,
+}
+TABLE_SOURCE_LEVEL: Dict[str, str] = {
+    "market_metric_table": "B",
+    "cagr_calculation": "B",
+    "regional_share_table": "B",
+    "competitor_matrix": "B",
+    "industry_chain_profit_pool": "B",
+    "policy_impact_table": "B",
+    "risk_register": "C",
+    "investment_priority_table": "B",
+}
+TABLE_FOLLOW_UP_FIELD_HINTS: Dict[str, str] = {
+    "metric": "指标名称",
+    "value": "数值",
+    "unit": "单位",
+    "period": "期间",
+    "source": "可追溯来源",
+    "minimum_rows": "至少两个可比对象或时间点",
+    "evidence_refs": "引用编号",
+}
 
 
 def _as_dict(value: Any) -> Dict[str, Any]:
@@ -35,6 +94,49 @@ def _compact(value: Any, max_chars: int = 160) -> str:
     if len(text) <= max_chars:
         return text
     return text[: max(0, max_chars - 1)].rstrip() + "..."
+
+
+def sanitize_table_cell(value: Any, *, max_chars: int = 160) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        return ""
+    text = re.sub(r"第\s*\d+\s*轮\s*[｜|:：]\s*", "", text)
+    text = re.sub(r"^[^：:]{0,120}(?:报告|研究|query|查询|检索)[^：:]{0,120}[：:]\s*", "", text, flags=re.I)
+    text = re.sub(r"(?:竞争对比|政策监管|技术产业链|市场规模|成本|金额)\s*=\s*(?=；|;|$)", "", text)
+    text = re.sub(r"(?:；\s*){2,}", "；", text).strip(" ；;，,")
+    if INTERNAL_TABLE_TRACE_RE.search(text):
+        return ""
+    return _compact(text, max_chars)
+
+
+def _infer_unit_from_value(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    unit_patterns = [
+        r"亿元",
+        r"亿美元",
+        r"万元",
+        r"美元",
+        r"人民币",
+        r"元",
+        r"亿",
+        r"万",
+        r"%",
+        r"百分点",
+        r"台",
+        r"套",
+        r"吨",
+        r"GWh",
+        r"MWh",
+        r"GW",
+        r"MW",
+    ]
+    for pattern in unit_patterns:
+        match = re.search(pattern, text, flags=re.I)
+        if match:
+            return match.group(0)
+    return ""
 
 
 def _is_polluted_entity_cell(value: Any) -> bool:
@@ -73,15 +175,15 @@ def _env_int(name: str, default: int, *, min_value: int = 0, max_value: int = 10
 
 def _body_table_budget(*, chapter_count: int = 0, candidate_count: int = 0) -> int:
     if os.getenv("REPORT_MAX_BODY_TABLES") is not None:
-        requested = _env_int("REPORT_MAX_BODY_TABLES", 6, min_value=0, max_value=50)
+        requested = _env_int("REPORT_MAX_BODY_TABLES", 6, min_value=0, max_value=20)
     else:
-        requested = min(8, max(4, chapter_count + 2, min(candidate_count, 6)))
+        requested = min(6, max(3, chapter_count + 1, min(candidate_count, 5)))
     hard_limit = _env_int("REPORT_HARD_MAX_BODY_TABLES", 12, min_value=0, max_value=50)
     return max(0, min(requested, hard_limit))
 
 
 def _per_chapter_table_budget() -> int:
-    return _env_int("REPORT_MAX_BODY_TABLES_PER_CHAPTER", 3, min_value=0, max_value=20)
+    return _env_int("REPORT_MAX_BODY_TABLES_PER_CHAPTER", 1, min_value=0, max_value=6)
 
 
 TOPIC_CHAPTER_KEYWORDS = [
@@ -111,7 +213,7 @@ TOPIC_CHAPTER_KEYWORDS = [
 LOCALIZED_ANALYTICS_TABLE_COPY = {
     "market_metric_table": {
         "title": "市场指标与口径表",
-        "headers": ["指标", "范围", "期间", "数值", "单位", "来源等级"],
+        "headers": ["指标", "范围", "期间", "数值", "单位", "判断含义"],
         "takeaway": "市场数据在进入正文前已拆分为指标、范围、期间、单位和来源等级，避免把不同口径的数据直接混用。",
         "decision_implication": "优先使用口径完整且来源等级较高的指标作为量化主线，缺口数据只作为边界或后续验证项。",
     },
@@ -123,13 +225,13 @@ LOCALIZED_ANALYTICS_TABLE_COPY = {
     },
     "regional_share_table": {
         "title": "市场份额与区域/主体拆分表",
-        "headers": ["指标", "区域/主体", "期间", "份额/数值", "来源等级"],
+        "headers": ["指标", "区域/主体", "期间", "份额/数值", "判断含义"],
         "takeaway": "份额类指标已与规模类指标分开呈现，避免把比例和金额放在同一口径下比较。",
         "decision_implication": "份额数据只有在分母清楚时，才适合作为区域或竞争结论的依据。",
     },
     "competitor_matrix": {
         "title": "竞争格局对照表",
-        "headers": ["企业/来源", "维度", "期间", "信号", "来源等级"],
+        "headers": ["企业/对象", "维度", "期间", "信号", "判断含义"],
         "takeaway": "竞争信息按维度拆开呈现，避免把份额、技术、客户和出口暴露混成一个笼统分数。",
         "decision_implication": "用该表识别领先环节、风险暴露和仍需补证的竞争维度。",
     },
@@ -141,13 +243,13 @@ LOCALIZED_ANALYTICS_TABLE_COPY = {
     },
     "investment_priority_table": {
         "title": "投资优先级矩阵",
-        "headers": ["企业/来源", "信号", "期间", "数值", "评分", "分层"],
+        "headers": ["企业/对象", "信号", "期间", "数值", "评分", "分层"],
         "takeaway": "投资排序与正文判断分离，并保留到财务、融资或市场信号的引用链路。",
         "decision_implication": "优先级可用于初筛；观察和风险复核项需要结合边界条件再下结论。",
     },
     "technology_roadmap": {
         "title": "技术路线成熟度矩阵",
-        "headers": ["技术/来源", "类别", "成熟度", "期间", "影响"],
+        "headers": ["技术/环节", "类别", "成熟度", "期间", "影响"],
         "takeaway": "技术证据先按类别和成熟度映射，再用于支撑突破、替代或落地节奏判断。",
         "decision_implication": "成熟度较高的技术可支持近期采用，成熟度较低的技术应作为期权或监测项。",
     },
@@ -167,13 +269,48 @@ CELL_VALUE_TRANSLATIONS = {
 }
 
 
+def _table_value_tier(table_type: Any) -> str:
+    normalized = str(table_type or "").strip().lower()
+    if normalized in HIGH_VALUE_TABLE_TYPES:
+        return "high"
+    if normalized in LOW_VALUE_TABLE_TYPES:
+        return "low"
+    return "medium"
+
+
+def _table_value_score(table_type: Any) -> int:
+    normalized = str(table_type or "").strip().lower()
+    if normalized == "market_metric_table":
+        return 96
+    if normalized == "competitor_matrix":
+        return 94
+    if normalized in {"industry_chain_profit_pool", "policy_impact_table", "risk_register", "investment_priority_table"}:
+        return 92
+    if normalized == "cagr_calculation":
+        return 88
+    if normalized == "regional_share_table":
+        return 84
+    tier = _table_value_tier(table_type)
+    if tier == "high":
+        return 90
+    if tier == "low":
+        return 20
+    return 55
+
+
 def _table_priority(package: Dict[str, Any]) -> int:
+    try:
+        explicit_priority = int(package.get("render_priority"))
+    except (TypeError, ValueError):
+        explicit_priority = 0
+    if explicit_priority:
+        return max(0, 100 - explicit_priority)
     table_type = str(package.get("table_type") or "").strip().lower()
     analytics_type = str(package.get("analytics_type") or "").strip().lower()
-    if table_type == "cagr_calculation":
-        return 10
     if table_type == "market_metric_table":
-        return 20
+        return 4
+    if table_type == "cagr_calculation":
+        return 12
     if table_type == "competitor_matrix":
         return 30
     if analytics_type == "regulatory_impact" or table_type == "risk_register":
@@ -184,11 +321,26 @@ def _table_priority(package: Dict[str, Any]) -> int:
         return 60
     if table_type == "regional_share_table":
         return 70
+    score = _table_value_score(table_type or analytics_type)
+    if score >= 90:
+        return 80
+    if score <= 20:
+        return 140
     return 100
 
 
 def _headers_for_request(request: Dict[str, Any], chapter_question: str) -> List[str]:
     table_type = str(request.get("table_type") or "").strip()
+    if table_type == "market_metric_table":
+        return ["指标", "范围", "期间", "数值", "单位", "判断含义"]
+    if table_type == "cagr_calculation":
+        return ["指标", "范围", "期间", "CAGR", "基期到末期"]
+    if table_type == "competitor_matrix":
+        return ["企业/对象", "竞争信号", "期间", "判断含义", "使用边界"]
+    if table_type == "technology_roadmap":
+        return ["技术/环节", "成熟度信号", "期间", "判断含义", "使用边界"]
+    if table_type == "investment_priority_table":
+        return ["方向/对象", "支撑信号", "期间", "优先级", "风险边界"]
     if table_type == "customer_painpoint_matrix":
         return ["场景", "需求痛点", "付费主体", "影响方向"]
     if table_type == "segment_matrix":
@@ -229,16 +381,50 @@ def _subject(item: Dict[str, Any]) -> str:
 
 
 def _row_for_item(item: Dict[str, Any], headers: Sequence[str]) -> Dict[str, Any]:
-    fact = _compact(item.get("fact"), 180)
-    metric = _compact(item.get("metric"), 80)
-    value = _compact(item.get("value"), 80)
-    period = _compact(item.get("period"), 60)
+    fact = sanitize_table_cell(item.get("clean_fact") or item.get("analysis_input") or item.get("fact"), max_chars=180)
+    metric = sanitize_table_cell(item.get("metric"), max_chars=80)
+    value = sanitize_table_cell(item.get("value"), max_chars=80)
+    period = sanitize_table_cell(item.get("period"), max_chars=60)
+    unit = sanitize_table_cell(item.get("unit") or _infer_unit_from_value(value), max_chars=40)
     subject = _subject(item)
-    signal = " / ".join(part for part in [metric, value] if part) or fact
-    boundary = " / ".join(part for part in [period, _compact(item.get("source_level"), 20)] if part) or "需用高等级来源复核"
+    signal = sanitize_table_cell(" / ".join(part for part in [metric, value] if part) or fact, max_chars=120)
+    boundary = sanitize_table_cell(" / ".join(part for part in [period, _compact(item.get("source_level"), 20)] if part) or "需用高等级来源复核", max_chars=120)
     implication = "该信号只有与反例和高等级来源同向时，影响才会扩大" if not item.get("appendix_only") else "仅适合作为附录线索"
     row_claim = _row_claim(item, subject=subject, signal=signal, boundary=boundary, implication=implication)
     cells_by_header = {
+        "Metric": metric or subject,
+        "Scope": subject,
+        "Period": period,
+        "Value": value or signal,
+        "Unit": unit,
+        "Implication": implication,
+        "Base to end": signal,
+        "Player/source": subject,
+        "Competitive signal": fact or signal,
+        "Technology/source": subject,
+        "Maturity signal": fact or signal,
+        "Direction/entity": subject,
+        "Supporting signal": signal,
+        "Priority": implication,
+        "Risk boundary": boundary,
+        "Boundary": boundary,
+        "指标": metric or subject,
+        "范围": subject,
+        "期间": period,
+        "数值": value or signal,
+        "单位": unit,
+        "CAGR": value or signal,
+        "基期到末期": signal,
+        "企业/对象": subject,
+        "竞争信号": fact or signal,
+        "技术/环节": subject,
+        "成熟度信号": fact or signal,
+        "方向/对象": subject,
+        "支撑信号": signal,
+        "优先级": implication,
+        "风险边界": boundary,
+        "判断含义": implication,
+        "使用边界": boundary,
         "场景": subject,
         "细分场景": subject,
         "对象/场景": subject,
@@ -291,7 +477,7 @@ def _row_for_item(item: Dict[str, Any], headers: Sequence[str]) -> Dict[str, Any
         "有效信号": signal,
         "可复制边界": boundary,
     }
-    cells = [_compact(cells_by_header.get(str(header), fact), 160) for header in headers]
+    cells = [sanitize_table_cell(cells_by_header.get(str(header), fact), max_chars=160) for header in headers]
     return {
         "cells": cells,
         "row_claim": row_claim,
@@ -305,12 +491,22 @@ def _row_for_item(item: Dict[str, Any], headers: Sequence[str]) -> Dict[str, Any
             ],
             limit=3,
         ),
+        "metric": metric,
+        "value": value,
+        "unit": unit,
+        "period": period,
+        "source": _compact(item.get("source_ref") or item.get("ref") or item.get("evidence_id") or _as_dict(item.get("source")).get("title"), 120),
+        "source_ref": _compact(item.get("source_ref") or item.get("ref") or item.get("evidence_id"), 120),
     }
 
 
 def _row_has_valid_leading_cell(headers: Sequence[str], row: Dict[str, Any]) -> bool:
     cells = _as_list(row.get("cells"))
     if not cells:
+        return False
+    if any(INTERNAL_TABLE_TRACE_RE.search(str(cell or "")) for cell in cells):
+        return False
+    if not any(str(cell or "").strip() for cell in cells):
         return False
     first_cell = str(cells[0] or "").strip()
     if _is_polluted_entity_cell(first_cell):
@@ -407,6 +603,128 @@ def _table_reject_reasons(rows: Sequence[Dict[str, Any]], selected: Sequence[Dic
     if rows and weak_refs / max(len(rows), 1) > 0.5:
         reasons.append("majority_rows_missing_evidence_refs")
     return reasons
+
+
+def _required_fields_for_table(table_type: Any) -> List[str]:
+    return list(TABLE_REQUIRED_FIELDS.get(str(table_type or "").strip().lower()) or [])
+
+
+def _minimum_rows_for_table(table_type: Any) -> int:
+    return int(TABLE_MINIMUM_ROWS.get(str(table_type or "").strip().lower()) or 2)
+
+
+def _row_contract_value(row: Dict[str, Any], field: str) -> str:
+    cells = _as_list(row.get("cells"))
+    if field == "metric":
+        return _compact(row.get("metric") or row.get("metric_name") or (cells[0] if cells else ""), 120)
+    if field == "value":
+        return _compact(row.get("value") or row.get("value_display") or row.get("share") or (cells[3] if len(cells) > 3 else ""), 120)
+    if field == "unit":
+        return _compact(row.get("unit") or (cells[4] if len(cells) > 4 else ""), 60)
+    if field == "period":
+        return _compact(row.get("period") or row.get("date") or (cells[2] if len(cells) > 2 else ""), 80)
+    if field == "source":
+        refs = _as_list(row.get("evidence_refs"))
+        return _compact(row.get("source") or row.get("source_ref") or row.get("ref") or (refs[0] if refs else ""), 120)
+    return _compact(row.get(field), 120)
+
+
+def _row_missing_contract_fields(row: Dict[str, Any], required_fields: Sequence[str]) -> List[str]:
+    missing = []
+    for field in required_fields:
+        if not _row_contract_value(row, field):
+            missing.append(field)
+    return missing
+
+
+def _requirement_query(
+    *,
+    request: Dict[str, Any],
+    chapter_question: str,
+    table_type: str,
+    missing_fields: Sequence[str],
+) -> str:
+    query = _compact(request.get("query") or request.get("question") or "", 180)
+    if query:
+        return query
+    field_hint = "、".join(TABLE_FOLLOW_UP_FIELD_HINTS.get(field, field) for field in missing_fields[:5])
+    table_hint = {
+        "market_metric_table": "市场规模、增速、渗透率、价格等关键指标",
+        "cagr_calculation": "可计算 CAGR 的基期、末期、期间和单位",
+        "regional_share_table": "区域、主体或细分市场份额",
+        "competitor_matrix": "主要竞争者、份额、产能、客户或技术信号",
+        "policy_impact_table": "政策条款、影响环节、时间窗口和约束",
+        "risk_register": "风险触发条件、影响范围和缓释信号",
+        "investment_priority_table": "进入或投资优先级的量化支撑",
+    }.get(table_type, "表格所需关键事实")
+    topic = chapter_question or str(request.get("table_title") or request.get("title") or table_type)
+    return _compact(f"{topic} {table_hint} {field_hint}", 220)
+
+
+def _table_evidence_requirement(
+    *,
+    table_id: str,
+    chapter_id: str,
+    table_type: str,
+    request: Optional[Dict[str, Any]] = None,
+    chapter_question: str = "",
+    rows: Optional[Sequence[Dict[str, Any]]] = None,
+    selected: Optional[Sequence[Dict[str, Any]]] = None,
+) -> Optional[Dict[str, Any]]:
+    request = request or {}
+    rows = list(rows or [])
+    required_fields = _required_fields_for_table(table_type)
+    minimum_rows = _minimum_rows_for_table(table_type)
+    missing_fields: List[str] = []
+    if len(rows) < minimum_rows or len(list(selected or [])) < minimum_rows:
+        missing_fields.append("minimum_rows")
+    for row in rows:
+        missing_fields.extend(_row_missing_contract_fields(_as_dict(row), required_fields))
+    if required_fields and not rows:
+        missing_fields.extend(required_fields)
+    missing_fields = _dedupe(missing_fields, limit=12)
+    if not missing_fields:
+        return None
+    priority = "high" if _table_value_tier(table_type) == "high" else "medium"
+    return {
+        "table_id": table_id,
+        "chapter_id": chapter_id,
+        "table_type": table_type,
+        "required_fields": required_fields,
+        "missing_fields": missing_fields,
+        "minimum_rows": minimum_rows,
+        "minimum_source_level": TABLE_SOURCE_LEVEL.get(str(table_type or "").strip().lower(), "B"),
+        "query": _requirement_query(
+            request=request,
+            chapter_question=chapter_question,
+            table_type=table_type,
+            missing_fields=missing_fields,
+        ),
+        "priority": priority,
+    }
+
+
+def _follow_up_queries_for_requirement(requirement: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not requirement:
+        return []
+    query = _compact(requirement.get("query"), 240)
+    if not query:
+        return []
+    return [
+        {
+            "query": query,
+            "reason": "table_evidence_gap",
+            "priority": requirement.get("priority") or "medium",
+            "table_id": requirement.get("table_id"),
+            "chapter_id": requirement.get("chapter_id"),
+            "table_type": requirement.get("table_type"),
+            "required_fields": _as_list(requirement.get("required_fields")),
+            "missing_fields": _as_list(requirement.get("missing_fields")),
+            "minimum_rows": requirement.get("minimum_rows"),
+            "minimum_source_level": requirement.get("minimum_source_level"),
+            "target": "table_evidence_requirements",
+        }
+    ]
 
 
 def _chapter_records(
@@ -591,7 +909,7 @@ def _localized_analytics_copy(table_type: str) -> Dict[str, Any]:
     return _as_dict(LOCALIZED_ANALYTICS_TABLE_COPY.get(str(table_type or "").strip()))
 
 
-def _localize_analytics_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _localize_analytics_row(row: Dict[str, Any], *, table_type: str, headers: Sequence[str]) -> Optional[Dict[str, Any]]:
     copied = dict(row)
     cells = [
         CELL_VALUE_TRANSLATIONS.get(str(cell or "").strip(), cell)
@@ -599,7 +917,53 @@ def _localize_analytics_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     ]
     if cells and _is_polluted_entity_cell(cells[0]):
         return None
-    copied["cells"] = cells
+    cells = [_compact(cell, 160) for cell in cells]
+    if str(table_type or "").strip() in {"market_metric_table", "regional_share_table", "competitor_matrix"}:
+        if headers and str(headers[-1]) == "判断含义":
+            while len(cells) < len(headers):
+                cells.append("")
+            cells[len(headers) - 1] = _compact(
+                row.get("decision_implication")
+                or row.get("row_claim")
+                or row.get("takeaway")
+                or "该项用于支撑本章判断，仍需结合来源等级和反向证据校准。",
+                160,
+            )
+    copied["cells"] = (cells + [""] * len(headers))[: len(headers)]
+    copied = _normalize_row_contract(copied, table_type=table_type)
+    return copied
+
+
+def _normalize_row_contract(row: Dict[str, Any], *, table_type: str = "") -> Dict[str, Any]:
+    copied = dict(row)
+    cells = _as_list(copied.get("cells"))
+    metric = _compact(copied.get("metric") or copied.get("metric_name") or (cells[0] if cells else ""), 120)
+    value_index = 3 if len(cells) > 3 else max(0, len(cells) - 1)
+    value = _compact(copied.get("value") or copied.get("value_display") or (cells[value_index] if cells else ""), 120)
+    period = _compact(copied.get("period") or copied.get("date") or (cells[2] if len(cells) > 2 else ""), 80)
+    unit = _compact(
+        copied.get("unit")
+        or (cells[4] if len(cells) > 4 and table_type != "cagr_calculation" else "")
+        or _infer_unit_from_value(value),
+        60,
+    )
+    refs = _dedupe(_as_list(copied.get("evidence_refs")) + [copied.get("source_ref"), copied.get("ref")], limit=8)
+    source = _compact(copied.get("source") or copied.get("source_ref") or copied.get("source_ref_id") or (refs[0] if refs else ""), 120)
+    if metric:
+        copied["metric"] = metric
+        copied.setdefault("metric_name", metric)
+    if value:
+        copied["value"] = value
+        copied.setdefault("value_display", value)
+    if unit:
+        copied["unit"] = unit
+    if period:
+        copied["period"] = period
+    if source:
+        copied["source"] = source
+        copied.setdefault("source_ref", source)
+    if refs:
+        copied["evidence_refs"] = refs
     return copied
 
 
@@ -615,18 +979,20 @@ def _analytics_table_packages(
         rows = [row for row in _as_list(table.get("rows")) if isinstance(row, dict)]
         if not rows:
             continue
-        localized = _localized_analytics_copy(str(table.get("table_type") or "analytics_table"))
+        table_type = str(table.get("table_type") or "analytics_table")
+        localized = _localized_analytics_copy(table_type)
+        headers = _as_list(localized.get("headers")) or _as_list(table.get("headers"))
         body_rows = [
             localized_row
             for row in rows[:body_row_limit]
-            for localized_row in [_localize_analytics_row(row)]
+            for localized_row in [_localize_analytics_row(row, table_type=table_type, headers=headers)]
             if localized_row is not None
         ]
         appendix_rows = [
             localized_row
             for row in (_as_list(table.get("appendix_rows")) or rows[body_row_limit : body_row_limit + appendix_row_limit])
             if isinstance(row, dict)
-            for localized_row in [_localize_analytics_row(row)]
+            for localized_row in [_localize_analytics_row(row, table_type=table_type, headers=headers)]
             if localized_row is not None
         ]
         if not body_rows and not appendix_rows:
@@ -643,10 +1009,15 @@ def _analytics_table_packages(
             "agent": AGENT_NAME,
             "table_id": str(table.get("table_id") or f"analytics_t{index}"),
             "chapter_id": str(table.get("chapter_id") or "analytics"),
-            "table_type": str(table.get("table_type") or "analytics_table"),
+            "table_type": table_type,
+            "table_role": str(table.get("table_role") or "analytics_support_table"),
+            "placement_slot": str(table.get("placement_slot") or "after_evidence_matrix"),
+            "anchor_section_id": str(table.get("anchor_section_id") or ""),
+            "anchor_block_type": str(table.get("anchor_block_type") or "evidence_matrix"),
+            "render_priority": table.get("render_priority") or _table_value_score(table_type),
             "title": str(localized.get("title") or table.get("title") or "Analytics table"),
             "purpose": str(table.get("purpose") or localized.get("takeaway") or ""),
-            "headers": _as_list(localized.get("headers")) or _as_list(table.get("headers")),
+            "headers": headers,
             "rows": body_rows,
             "appendix_rows": appendix_rows,
             "takeaway": str(localized.get("takeaway") or table.get("takeaway") or ""),
@@ -658,6 +1029,8 @@ def _analytics_table_packages(
             "evidence_refs": evidence_refs,
             "analytics_type": table.get("analytics_type"),
             "analytics_agent": table.get("analytics_agent") or table.get("analytics_source"),
+            "table_value_tier": _table_value_tier(table_type),
+            "table_value_score": _table_value_score(table_type),
             "reject_reasons": [],
             "validation_errors": [],
         }
@@ -665,6 +1038,16 @@ def _analytics_table_packages(
         package["validation"] = validation
         package["validation_errors"] = validation.get("errors", [])
         package["should_render"] = bool(validation.get("passed"))
+        requirement = _table_evidence_requirement(
+            table_id=str(package.get("table_id") or ""),
+            chapter_id=str(package.get("chapter_id") or ""),
+            table_type=table_type,
+            rows=body_rows,
+            selected=rows,
+        )
+        if requirement:
+            package["table_evidence_requirements"] = [requirement]
+            package["table_follow_up_queries"] = _follow_up_queries_for_requirement(requirement)
         packages.append(package)
     packages.sort(key=_table_priority)
     return packages
@@ -687,8 +1070,8 @@ def run_table_agent(
         if isinstance(package, dict)
     }
     table_packages: List[Dict[str, Any]] = []
-    body_row_limit = int(os.getenv("REPORT_MAX_BODY_TABLE_ROWS", "8"))
-    appendix_row_limit = int(os.getenv("REPORT_MAX_APPENDIX_TABLE_ROWS", "30"))
+    body_row_limit = _env_int("REPORT_MAX_BODY_TABLE_ROWS", 6, min_value=1, max_value=50)
+    appendix_row_limit = _env_int("REPORT_MAX_APPENDIX_TABLE_ROWS", 30, min_value=0, max_value=200)
     analytics_packages = _analytics_table_packages(
         analytics_outputs,
         body_row_limit=body_row_limit,
@@ -720,6 +1103,9 @@ def run_table_agent(
         for request_index, request in enumerate(_as_list(layout.get("table_requests")), start=1):
             if not isinstance(request, dict):
                 continue
+            if request.get("need_table") is False:
+                continue
+            table_type = str(request.get("table_type") or "evidence_matrix")
             headers = _headers_for_request(request, chapter_question)
             selected = _select_table_evidence(evidence_items, limit=10)
             rows = []
@@ -743,7 +1129,15 @@ def run_table_agent(
                 "agent": AGENT_NAME,
                 "table_id": str(request.get("table_id") or f"{chapter_id}_t{request_index}"),
                 "chapter_id": chapter_id,
-                "table_type": str(request.get("table_type") or "evidence_matrix"),
+                "table_type": table_type,
+                "table_role": str(request.get("table_role") or "supporting_table"),
+                "placement_slot": str(request.get("placement_slot") or "chapter_end"),
+                "anchor_section_id": str(request.get("anchor_section_id") or ""),
+                "anchor_block_type": str(request.get("anchor_block_type") or ""),
+                "render_priority": request.get("render_priority") or _table_value_score(table_type),
+                "why_table_needed": request.get("why_table_needed"),
+                "why_no_table": request.get("why_no_table"),
+                "fallback_if_invalid": request.get("fallback_if_invalid") or "demote_to_narrative",
                 "title": str(request.get("title") or f"{evidence_package.get('chapter_title') or '本章'}核心变量对照"),
                 "purpose": str(request.get("purpose") or ""),
                 "headers": headers,
@@ -759,6 +1153,8 @@ def run_table_agent(
                 "appendix_only": False,
                 "high_quality_evidence_count": len(retained_refs),
                 "evidence_refs": retained_refs,
+                "table_value_tier": _table_value_tier(table_type),
+                "table_value_score": _table_value_score(table_type),
                 "reject_reasons": reject_reasons,
                 "validation_errors": [],
             }
@@ -766,6 +1162,18 @@ def run_table_agent(
             package["validation"] = validation
             package["validation_errors"] = validation.get("errors", [])
             package["should_render"] = bool(validation.get("passed")) and not reject_reasons
+            requirement = _table_evidence_requirement(
+                table_id=str(package.get("table_id") or ""),
+                chapter_id=chapter_id,
+                table_type=table_type,
+                request=request,
+                chapter_question=chapter_question,
+                rows=body_rows,
+                selected=selected,
+            )
+            if requirement:
+                package["table_evidence_requirements"] = [requirement]
+                package["table_follow_up_queries"] = _follow_up_queries_for_requirement(requirement)
             table_packages.append(package)
     chapter_order = [chapter.get("chapter_id", "") for chapter in chapters]
     _apply_render_budget(

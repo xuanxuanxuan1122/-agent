@@ -399,7 +399,22 @@ def _metric_table_rows(metrics: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]
             item.get("source_level"),
         ]
         row_claim = "该指标须同时披露范围、期间、单位与来源等级,才进入正文判断。"
-        rows.append({"cells": [compact(cell, 120) for cell in cells], "row_claim": row_claim, "evidence_refs": as_list(item.get("evidence_refs"))})
+        source_ref = _source_ref(item)
+        rows.append(
+            {
+                "cells": [compact(cell, 120) for cell in cells],
+                "row_claim": row_claim,
+                "evidence_refs": as_list(item.get("evidence_refs")),
+                "metric": compact(item.get("metric_name"), 100),
+                "metric_name": compact(item.get("metric_name"), 100),
+                "value": compact(item.get("value_display"), 120),
+                "value_display": compact(item.get("value_display"), 120),
+                "unit": compact(item.get("unit"), 40),
+                "period": compact(item.get("period"), 80),
+                "source": source_ref,
+                "source_ref": source_ref,
+            }
+        )
     return rows
 
 
@@ -425,7 +440,23 @@ def _cagr_table_rows(calculations: Sequence[Dict[str, Any]]) -> List[Dict[str, A
             base_to_latest,
         ]
         row_claim = "CAGR 来自基期与末期同口径数值的实际推算,不直接复用未经校验的增速表述。"
-        rows.append({"cells": [compact(cell, 120) for cell in cells], "row_claim": row_claim, "evidence_refs": as_list(item.get("evidence_refs"))})
+        refs = as_list(item.get("evidence_refs"))
+        source_ref = str(refs[0] or "").strip() if refs else ""
+        rows.append(
+            {
+                "cells": [compact(cell, 120) for cell in cells],
+                "row_claim": row_claim,
+                "evidence_refs": refs,
+                "metric": compact(item.get("metric_name"), 100),
+                "metric_name": compact(item.get("metric_name"), 100),
+                "value": compact(item.get("result_display"), 80),
+                "value_display": compact(item.get("result_display"), 80),
+                "unit": "%",
+                "period": f"{item.get('start_year')}-{item.get('end_year')}",
+                "source": source_ref,
+                "source_ref": source_ref,
+            }
+        )
     return rows
 
 
@@ -443,7 +474,22 @@ def _share_table_rows(metrics: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]
             item.get("source_level"),
         ]
         row_claim = "份额类指标只在同范围、同时间窗口内可比,跨范围比较需说明边界。"
-        rows.append({"cells": [compact(cell, 120) for cell in cells], "row_claim": row_claim, "evidence_refs": as_list(item.get("evidence_refs"))})
+        source_ref = _source_ref(item)
+        rows.append(
+            {
+                "cells": [compact(cell, 120) for cell in cells],
+                "row_claim": row_claim,
+                "evidence_refs": as_list(item.get("evidence_refs")),
+                "metric": compact(item.get("metric_name"), 100),
+                "metric_name": compact(item.get("metric_name"), 100),
+                "value": compact(item.get("value_display"), 120),
+                "value_display": compact(item.get("value_display"), 120),
+                "unit": compact(item.get("unit") or "%", 40),
+                "period": compact(item.get("period"), 80),
+                "source": source_ref,
+                "source_ref": source_ref,
+            }
+        )
     return rows
 
 
@@ -470,7 +516,7 @@ def _build_tables(metrics: Sequence[Dict[str, Any]], calculations: Sequence[Dict
                 chapter_id=chapter_id,
                 table_type="market_metric_table",
                 title="市场指标与口径表",
-                headers=["指标", "范围", "期间", "数值", "单位", "来源等级"],
+                headers=["指标", "范围", "期间", "数值", "单位", "判断含义"],
                 rows=metric_rows,
                 takeaway="市场数据已按指标、范围、期间、单位与来源等级拆开,避免直接合并不同口径。",
                 purpose="在表格与正文渲染前对市场指标做口径归一。",
@@ -504,7 +550,7 @@ def _build_tables(metrics: Sequence[Dict[str, Any]], calculations: Sequence[Dict
                 chapter_id=chapter_id,
                 table_type="regional_share_table",
                 title="市场份额与区域/主体拆分表",
-                headers=["指标", "区域/主体", "期间", "份额/数值", "来源等级"],
+                headers=["指标", "区域/主体", "期间", "份额/数值", "判断含义"],
                 rows=share_rows,
                 takeaway="份额类指标与规模类指标分开呈现,避免比例与金额混在同一口径下比较。",
                 purpose="支持区域或主体的份额比较。",

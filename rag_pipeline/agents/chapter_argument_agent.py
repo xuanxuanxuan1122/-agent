@@ -152,10 +152,16 @@ def _public_section_title(unit: Dict[str, Any], chapter: Dict[str, Any], *, inde
 
 def _section_from_unit(unit: Dict[str, Any], chapter: Dict[str, Any], *, index: int) -> Dict[str, Any]:
     evidence_refs = _as_list(unit.get("evidence_refs"))
+    supporting_facts = [
+        _compact(item, 260)
+        for item in _as_list(unit.get("supporting_facts"))
+        if str(item or "").strip()
+    ][:3]
     render_blocks = _as_list(unit.get("render_blocks"))
     if not render_blocks:
         render_blocks = [
             {"type": "paragraph", "label": "关键判断", "text": unit.get("claim") or ""},
+            {"type": "paragraph", "label": "事实锚点", "text": "；".join(supporting_facts)},
             {"type": "paragraph", "label": "证据依据", "text": unit.get("reasoning") or ""},
             {"type": "paragraph", "label": "边界", "text": unit.get("counter_evidence") or ""},
             {"type": "paragraph", "label": "含义", "text": unit.get("decision_implication") or unit.get("actionable") or ""},
@@ -164,6 +170,7 @@ def _section_from_unit(unit: Dict[str, Any], chapter: Dict[str, Any], *, index: 
     return {
         "section_id": unit.get("section_id"),
         "section_title": _public_section_title(unit, chapter, index=index),
+        "block_type": unit.get("block_type") or unit.get("layout_section_role") or "",
         "claim": unit.get("claim") or "",
         "reasoning": unit.get("reasoning") or "",
         "mechanism": unit.get("mechanism") or unit.get("reasoning") or "",
@@ -171,7 +178,7 @@ def _section_from_unit(unit: Dict[str, Any], chapter: Dict[str, Any], *, index: 
         "actionable": unit.get("actionable") or "",
         "decision_implication": unit.get("decision_implication") or unit.get("actionable") or "",
         "what_to_verify_next": _as_list(unit.get("what_to_verify_next")),
-        "supporting_facts": _as_list(unit.get("supporting_facts")),
+        "supporting_facts": supporting_facts,
         "confidence": unit.get("confidence") or "medium",
         "evidence_refs": evidence_refs,
         "render_blocks": render_blocks,

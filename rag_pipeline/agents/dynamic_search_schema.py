@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List
@@ -15,6 +16,34 @@ HIGH_STAKES_RE = re.compile(
 def _requires_strong_proof(*values: Any) -> bool:
     text = " ".join(str(value or "") for value in values)
     return bool(HIGH_STAKES_RE.search(text))
+
+
+def _env_int(name: str, default: int, *, min_value: int = 0, max_value: int = 10_000) -> int:
+    try:
+        value = int(os.getenv(name, str(default)) or default)
+    except (TypeError, ValueError):
+        value = default
+    return max(min_value, min(max_value, value))
+
+
+def _industry_report_family(value: Any) -> bool:
+    family = str(value or "").strip().lower()
+    return family in {"industry_deep_report", "deep_industry_report", "industry_report", "industry_scan_report"}
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", "none", "null", ""}:
+        return False
+    return default
 
 
 @dataclass
@@ -46,7 +75,7 @@ class Chapter:
     source_template_keys: List[str] = field(default_factory=list)
     required_evidence_mix: List[str] = field(default_factory=list)
     min_total_sources: int = 12
-    min_ab_sources: int = 4
+    min_ab_sources: int = 2
     min_counter_sources: int = 1
     evidence_goals: List[Dict[str, Any]] = field(default_factory=list)
     search_tasks: List[Dict[str, Any]] = field(default_factory=list)
@@ -127,6 +156,11 @@ class ResearchPlan:
     evidence_goals: List[EvidenceGoal]
     search_tasks: List[SearchTask]
     core_question: str = ""
+    planning_query: str = ""
+    article_direction: str = ""
+    report_title: str = ""
+    report_subtitle: str = ""
+    article_brief: Dict[str, Any] = field(default_factory=dict)
     proof_standards: Dict[str, Any] = field(default_factory=dict)
     source_requirements: Dict[str, Any] = field(default_factory=dict)
     report_depth_target: str = "standard"
@@ -234,8 +268,10 @@ def normalize_chapter(raw: Dict[str, Any], *, fallback_index: int = 1, query: st
         "source_template_keys": _string_list(chapter.get("source_template_keys") or chapter.get("template_keys")),
         "required_evidence_mix": required_mix,
         "min_total_sources": int(chapter.get("min_total_sources") or 12),
-        "min_ab_sources": int(chapter.get("min_ab_sources") or 4),
+        "min_ab_sources": int(chapter.get("min_ab_sources") or 2),
         "min_counter_sources": int(chapter.get("min_counter_sources") or 1),
+        "key_chapter": _as_bool(chapter.get("key_chapter"), fallback_index <= 2),
+        "chapter_evidence_contract": _as_dict(chapter.get("chapter_evidence_contract")),
         "evidence_goals": _dict_list(chapter.get("evidence_goals")),
         "search_tasks": _dict_list(chapter.get("search_tasks")),
     }
@@ -350,8 +386,11 @@ def normalize_search_task(raw: Dict[str, Any], *, fallback_index: int = 1) -> Di
     evidence_goal = str(task.get("evidence_goal") or task.get("goal") or task.get("targets_gap") or "").strip()
     intent = str(task.get("intent") or "analysis").strip().lower()
     agent = str(task.get("agent") or "iqs").strip().lower()
-    if agent not in {"iqs", "rag", "both", "all"} and not agent.startswith("iqs_"):
+    if agent not in {"iqs", "rag", "both", "all", "openai_web"} and not agent.startswith("iqs_"):
         agent = "iqs"
+    retrieval_mode = str(task.get("retrieval_mode") or "").strip().lower()
+    if retrieval_mode not in {"deep", "normal", "hybrid", "openai_repair"}:
+        retrieval_mode = ""
     return {
         "task_id": task_id,
         "agent": agent,
@@ -362,7 +401,16 @@ def normalize_search_task(raw: Dict[str, Any], *, fallback_index: int = 1) -> Di
         "chapter_question": chapter_question,
         "query": query,
         "evidence_goal": evidence_goal,
+        "targets_gap": str(task.get("targets_gap") or evidence_goal).strip(),
         "evidence_goal_id": str(task.get("evidence_goal_id") or task.get("goal_id") or "").strip(),
+        "gap_id": str(task.get("gap_id") or task.get("mandatory_proof_id") or task.get("proof_id") or task.get("targets_gap") or "").strip(),
+        "gap_type": str(task.get("gap_type") or task.get("type") or "").strip(),
+        "type": str(task.get("type") or "").strip(),
+        "reason": str(task.get("reason") or "").strip(),
+        "blocking_gaps": _string_list(task.get("blocking_gaps") or task.get("missing")),
+        "required_fields": _string_list(task.get("required_fields")),
+        "origin_node": str(task.get("origin_node") or "").strip(),
+        "loop_name": str(task.get("loop_name") or "").strip(),
         "intent": intent,
         "search_options": _as_dict(task.get("search_options")),
         "must_have_terms": _compact_search_terms(task.get("must_have_terms"), limit=5),
@@ -381,6 +429,22 @@ def normalize_search_task(raw: Dict[str, Any], *, fallback_index: int = 1) -> Di
         "required_evidence_mix": _string_list(task.get("required_evidence_mix")),
         "min_source_level": _string_list(task.get("min_source_level") or task.get("required_source_levels")) or ["A", "B"],
         "deep_search_variant": bool(task.get("deep_search_variant")),
+        "prefer_deep": bool(task.get("prefer_deep")),
+        "deep_reason": str(task.get("deep_reason") or "").strip(),
+        "deep_status": str(task.get("deep_status") or "").strip(),
+        "deep_skip_reason": str(task.get("deep_skip_reason") or "").strip(),
+        "engineTypes": _string_list(task.get("engineTypes")),
+        "retrieval_mode": retrieval_mode,
+        "retrieval_reason": str(task.get("retrieval_reason") or "").strip(),
+        "primary_provider": str(task.get("primary_provider") or "").strip(),
+        "fallback_providers": _string_list(task.get("fallback_providers")),
+        "provider": str(task.get("provider") or "").strip(),
+        "repair_source": str(task.get("repair_source") or "").strip(),
+        "gap_repair_round": task.get("gap_repair_round"),
+        "scheduled_lane": str(task.get("scheduled_lane") or "").strip(),
+        "scheduled_lane_type": str(task.get("scheduled_lane_type") or "").strip(),
+        "lane_focus": str(task.get("lane_focus") or "").strip(),
+        "allowed_domains": _string_list(task.get("allowed_domains")),
         "research_object": str(task.get("research_object") or "").strip(),
         "global_required_terms": _compact_search_terms(task.get("global_required_terms"), limit=6),
     }
@@ -540,6 +604,12 @@ _BUNDLE_ROLE_CONFIG = {
         "lane_targets": ["customer_case", "filing_company", "technology_product"],
         "source_priority": ["company", "filing", "customer", "procurement", "case"],
     },
+    "technology_product": {
+        "intent": "technology",
+        "evidence_type": "technology_product",
+        "lane_targets": ["technology_product", "official_data", "market_research"],
+        "source_priority": ["product_doc", "technical_standard", "patent", "company_official", "whitepaper"],
+    },
     "expert": {
         "intent": "research",
         "evidence_type": "expert",
@@ -556,7 +626,7 @@ def _bundle_terms(hypothesis: Dict[str, Any], role: str) -> List[str]:
         return terms[:8]
     if role == "counter":
         return _string_list(hypothesis.get("must_disprove"))[:8]
-    if role in {"metric", "source_check", "case", "expert"}:
+    if role in {"metric", "source_check", "case", "technology_product", "expert"}:
         return (_string_list(hypothesis.get("must_prove")) + _string_list(hypothesis.get("required_evidence_types")))[:8]
     return _string_list(hypothesis.get("must_prove"))[:8]
 
@@ -571,6 +641,7 @@ def _bundle_task_for_hypothesis(hypothesis: Dict[str, Any], role: str, *, fallba
         "metric": "market size price capacity margin shipment penetration utilization",
         "source_check": "official filing annual report association brokerage verification",
         "case": "customer certification order mass production supply contract case",
+        "technology_product": "product docs technology standard patent architecture benchmark",
         "expert": "brokerage association industry research expert view",
     }.get(role, role)
     return normalize_search_task(
@@ -628,7 +699,7 @@ def _ensure_hypothesis_task_contract(tasks: List[Dict[str, Any]], hypotheses: Li
             completed.append(counter)
             bucket.append(counter)
         roles_present = {str(task.get("proof_role") or "").strip().lower() for task in bucket if str(task.get("proof_role") or "").strip()}
-        for required_role in ["metric", "source_check", "case", "expert"]:
+        for required_role in ["metric", "source_check", "case", "technology_product", "expert"]:
             if required_role in roles_present:
                 continue
             task = _bundle_task_for_hypothesis(hypothesis, required_role, fallback_index=next_index)
@@ -662,9 +733,130 @@ def _dedupe_plan_items(items: List[Any], *, id_key: str, fallback_keys: List[str
     return deduped
 
 
+def _chapter_trim_score(chapter: Dict[str, Any], query: str, index: int) -> tuple:
+    text = " ".join(
+        str(chapter.get(key) or "")
+        for key in ("chapter_title", "core_question", "chapter_question", "reason_to_include")
+    ).lower()
+    query_terms = [part for part in re.split(r"\W+", str(query or "").lower()) if len(part) >= 3]
+    query_overlap = sum(1 for term in query_terms[:12] if term and term in text)
+    mix = {str(item or "").strip().lower() for item in _string_list(chapter.get("required_evidence_mix"))}
+    proof_score = sum(
+        1
+        for wanted in ("official_data", "market_research", "company_filing", "case", "customer_case", "metric")
+        if wanted in mix
+    )
+    nested_count = len(_as_list(chapter.get("evidence_goals"))) + len(_as_list(chapter.get("search_tasks")))
+    return (
+        1 if _as_bool(chapter.get("key_chapter")) else 0,
+        min(query_overlap, 5),
+        min(proof_score, 5),
+        min(nested_count, 8),
+        -index,
+    )
+
+
+def enforce_research_plan_chapter_limits(plan: Dict[str, Any], *, query: str = "") -> Dict[str, Any]:
+    payload = dict(plan or {})
+    if not _industry_report_family(payload.get("report_family")):
+        return payload
+    target_count = _env_int("REPORT_TARGET_CORE_CHAPTER_COUNT", 5, min_value=4, max_value=8)
+    max_count = _env_int("REPORT_MAX_CORE_CHAPTER_COUNT", 6, min_value=4, max_value=10)
+    chapters = [dict(item) for item in _as_list(payload.get("chapters")) if isinstance(item, dict)]
+    original_chapter_ids = {
+        str(item.get("chapter_id") or item.get("id") or "").strip()
+        for item in chapters
+        if str(item.get("chapter_id") or item.get("id") or "").strip()
+    }
+    diagnostics = dict(_as_dict(payload.get("planning_diagnostics")))
+    diagnostics.setdefault("target_core_chapter_count", target_count)
+    diagnostics.setdefault("max_core_chapter_count", max_count)
+    diagnostics["original_chapter_count"] = len(chapters)
+    if chapters:
+        for index, chapter in enumerate(chapters, start=1):
+            chapter["key_chapter"] = _as_bool(chapter.get("key_chapter"), index <= 2)
+            contract = dict(_as_dict(chapter.get("chapter_evidence_contract")))
+            contract.setdefault(
+                "required_traceable_ab",
+                _env_int("REPORT_KEY_CHAPTER_MIN_TRACEABLE_AB", 3, min_value=1, max_value=10)
+                if _as_bool(chapter.get("key_chapter"))
+                else _env_int("REPORT_MIN_CORE_AB_SOURCES_PER_CHAPTER", 2, min_value=1, max_value=10),
+            )
+            contract.setdefault("required_proof_roles", ["metric", "source_check", "case"] if _as_bool(chapter.get("key_chapter")) else ["source_check", "case"])
+            chapter["chapter_evidence_contract"] = contract
+        if len(chapters) > max_count:
+            ranked = sorted(
+                enumerate(chapters, start=1),
+                key=lambda item: _chapter_trim_score(item[1], query or payload.get("query"), item[0]),
+                reverse=True,
+            )
+            keep_ids = {
+                str(chapter.get("chapter_id") or chapter.get("id") or index)
+                for index, chapter in ranked[:max_count]
+            }
+            trimmed = [chapter for _, chapter in ranked[max_count:]]
+            chapters = [
+                chapter
+                for chapter in chapters
+                if str(chapter.get("chapter_id") or chapter.get("id") or "") in keep_ids
+            ]
+            diagnostics["trimmed_chapters"] = [
+                {
+                    "chapter_id": chapter.get("chapter_id") or chapter.get("id"),
+                    "chapter_title": chapter.get("chapter_title") or chapter.get("title"),
+                    "reason": "over_max_core_chapter_count",
+                }
+                for chapter in trimmed
+            ]
+    allowed_chapter_ids = {str(item.get("chapter_id") or item.get("id") or "").strip() for item in chapters if str(item.get("chapter_id") or item.get("id") or "").strip()}
+    if allowed_chapter_ids:
+        def keep_by_chapter(item: Dict[str, Any]) -> bool:
+            chapter_id = str(item.get("chapter_id") or "").strip()
+            if chapter_id:
+                if chapter_id in original_chapter_ids:
+                    return chapter_id in allowed_chapter_ids
+                if chapter_id in allowed_chapter_ids:
+                    return True
+                dimension_id = str(item.get("dimension_id") or "").strip()
+                if dimension_id and dimension_id == chapter_id and dimension_id not in original_chapter_ids:
+                    return True
+                return True
+            dimension_id = str(item.get("dimension_id") or "").strip()
+            if dimension_id and dimension_id in original_chapter_ids:
+                return dimension_id in allowed_chapter_ids
+            return True
+
+        def mark_global_task(item: Any) -> Any:
+            if not isinstance(item, dict):
+                return item
+            payload_item = dict(item)
+            chapter_id = str(payload_item.get("chapter_id") or "").strip()
+            dimension_id = str(payload_item.get("dimension_id") or "").strip()
+            if chapter_id and chapter_id not in allowed_chapter_ids and chapter_id not in original_chapter_ids:
+                payload_item.setdefault("scope", "global_evidence_task")
+                payload_item.setdefault("report_level", True)
+            elif not chapter_id and dimension_id and dimension_id not in original_chapter_ids:
+                payload_item.setdefault("scope", "global_evidence_task")
+                payload_item.setdefault("report_level", True)
+            return payload_item
+
+        payload["dimensions"] = [item for item in _as_list(payload.get("dimensions")) if not isinstance(item, dict) or keep_by_chapter(item)]
+        payload["evidence_goals"] = [mark_global_task(item) for item in _as_list(payload.get("evidence_goals")) if not isinstance(item, dict) or keep_by_chapter(item)]
+        payload["search_tasks"] = [mark_global_task(item) for item in _as_list(payload.get("search_tasks")) if not isinstance(item, dict) or keep_by_chapter(item)]
+    payload["chapters"] = chapters
+    payload["target_core_chapter_count"] = target_count
+    payload["max_core_chapter_count"] = max_count
+    payload["planning_diagnostics"] = diagnostics
+    return payload
+
+
 def normalize_research_plan(raw: Dict[str, Any], *, query: str = "") -> Dict[str, Any]:
     payload = _as_dict(raw)
-    plan_query = str(payload.get("query") or query or "").strip()
+    article_brief = _as_dict(payload.get("article_brief"))
+    plan_query = str(payload.get("planning_query") or article_brief.get("planning_query") or payload.get("query") or query or "").strip()
+    article_direction = str(payload.get("article_direction") or article_brief.get("direction") or article_brief.get("display_subtitle") or "").strip()
+    report_title = str(payload.get("report_title") or article_brief.get("display_title") or article_brief.get("main_title") or "").strip()
+    report_subtitle = str(payload.get("report_subtitle") or article_brief.get("display_subtitle") or "").strip()
     plan_research_object = str(payload.get("research_object") or query or "").strip()
     plan_global_required_terms = _string_list(payload.get("global_required_terms")) or _derive_global_required_terms(
         plan_query,
@@ -860,8 +1052,18 @@ def normalize_research_plan(raw: Dict[str, Any], *, query: str = "") -> Dict[str
         item = dict(payload_item)
         if plan_research_object and not item.get("research_object"):
             item["research_object"] = plan_research_object
+        if plan_research_object and item.get("query") and plan_research_object not in str(item.get("query") or ""):
+            item["query"] = f"{plan_research_object} {str(item.get('query') or '').strip()}".strip()
         if plan_global_required_terms and not item.get("global_required_terms"):
             item["global_required_terms"] = plan_global_required_terms
+        if plan_global_required_terms:
+            existing_terms = _string_list(item.get("must_have_terms"))
+            merged_terms: List[str] = []
+            for term in [*plan_global_required_terms, *existing_terms]:
+                if term and term not in merged_terms:
+                    merged_terms.append(term)
+            if merged_terms:
+                item["must_have_terms"] = merged_terms[:8]
         return item
 
     tasks = [_attach_plan_topic(_inherit_hypothesis(_inherit_chapter(task))) for task in tasks]
@@ -902,8 +1104,14 @@ def normalize_research_plan(raw: Dict[str, Any], *, query: str = "") -> Dict[str
         )
         existing_goal_keys.add(key)
     normalized_goals = [_inherit_hypothesis(_inherit_chapter(goal)) for goal in normalized_goals]
-    return {
+    normalized_plan = {
         "query": plan_query,
+        "planning_query": plan_query,
+        "raw_query": str(payload.get("raw_query") or article_brief.get("raw_query") or "").strip(),
+        "article_brief": article_brief,
+        "article_direction": article_direction,
+        "report_title": report_title,
+        "report_subtitle": report_subtitle,
         "research_type": str(payload.get("research_type") or "generic_topic").strip(),
         "decision_context": str(payload.get("decision_context") or "").strip(),
         "report_family": str(payload.get("report_family") or "briefing_note").strip(),
@@ -930,3 +1138,4 @@ def normalize_research_plan(raw: Dict[str, Any], *, query: str = "") -> Dict[str
         "legacy_planner_search_tasks": [dict(item) for item in _as_list(payload.get("legacy_planner_search_tasks")) if isinstance(item, dict)],
         "dropped_template_sections": [dict(item) for item in _as_list(payload.get("dropped_template_sections")) if isinstance(item, dict)],
     }
+    return enforce_research_plan_chapter_limits(normalized_plan, query=plan_query)

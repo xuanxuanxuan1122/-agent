@@ -53,6 +53,22 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _quality_mode() -> str:
+    return str(os.getenv("REPORT_QUALITY_MODE") or os.getenv("QUALITY_MODE") or "balanced").strip().lower()
+
+
+def _strict_quality_mode() -> bool:
+    mode = _quality_mode()
+    if mode in {"strict", "hard", "deep_strict", "due_diligence", "investment_due_diligence"}:
+        return True
+    raw = os.getenv("STRICT_EVIDENCE_MODE")
+    return str(raw or "").strip().lower() in {"1", "true", "yes", "on", "strict"}
+
+
+def _default_min_ab_sources() -> int:
+    return 4 if _strict_quality_mode() else 2
+
+
 def _dedupe(values: Iterable[Any], *, limit: int = 20) -> List[str]:
     result: List[str] = []
     seen = set()
@@ -279,7 +295,8 @@ def normalize_chapter(raw: Dict[str, Any], *, index: int, research_plan: Dict[st
     template_keys = _source_template_keys(raw, research_plan)
     evidence_mix = _required_evidence_mix(raw, template_keys)
     min_total = int(raw.get("min_total_sources") or _env_int("REPORT_MIN_TOTAL_SOURCES_PER_CHAPTER", 12))
-    min_ab = int(raw.get("min_ab_sources") or _env_int("REPORT_MIN_AB_SOURCES_PER_CHAPTER", 4))
+    min_ab_floor = 4 if _strict_quality_mode() else 1
+    min_ab = int(raw.get("min_ab_sources") or _env_int("REPORT_MIN_AB_SOURCES_PER_CHAPTER", _default_min_ab_sources()))
     min_counter_default = 1 if any(item in evidence_mix for item in ["counter", "counter_evidence", "risk"]) else 0
     min_counter = int(raw.get("min_counter_sources") or _env_int("REPORT_MIN_COUNTER_SOURCES_PER_DECISION_CHAPTER", max(1, min_counter_default)))
     goals = _goals_for_chapter(research_plan, raw, chapter_id, title)
@@ -294,7 +311,7 @@ def normalize_chapter(raw: Dict[str, Any], *, index: int, research_plan: Dict[st
         "source_template_keys": template_keys,
         "required_evidence_mix": evidence_mix,
         "min_total_sources": max(12, min_total),
-        "min_ab_sources": max(4, min_ab),
+        "min_ab_sources": max(min_ab_floor, min_ab),
         "min_counter_sources": max(0, min_counter),
         "evidence_goals": goals,
         "search_task_hints": _search_hints_for_chapter(research_plan, chapter_id, title),
@@ -398,6 +415,30 @@ def _validate_blueprint(chapters: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {"passed": not issues, "issues": issues}
 
 
+def _attach_article_brief_fields(
+    blueprint: Dict[str, Any],
+    research_plan: Dict[str, Any],
+    report_plan: Dict[str, Any],
+) -> Dict[str, Any]:
+    brief = _as_dict(research_plan.get("article_brief")) or _as_dict(report_plan.get("article_brief"))
+    report_title = str(research_plan.get("report_title") or report_plan.get("report_title") or brief.get("display_title") or "").strip()
+    report_subtitle = str(
+        research_plan.get("report_subtitle") or report_plan.get("report_subtitle") or brief.get("display_subtitle") or ""
+    ).strip()
+    article_direction = str(
+        research_plan.get("article_direction") or report_plan.get("article_direction") or brief.get("direction") or ""
+    ).strip()
+    planning_query = str(research_plan.get("planning_query") or report_plan.get("planning_query") or brief.get("planning_query") or "").strip()
+    return {
+        **blueprint,
+        "article_brief": brief,
+        "article_direction": article_direction,
+        "planning_query": planning_query,
+        "report_title": report_title,
+        "report_subtitle": report_subtitle,
+    }
+
+
 def run_pre_layout_agent(
     *,
     query: str = "",
@@ -418,7 +459,7 @@ def run_pre_layout_agent(
                     **_as_dict(compiled.get("layout_validation")),
                     "legacy_normalizer_validation": _validate_blueprint(_as_list(compiled.get("chapters"))),
                 }
-                return compiled
+                return _attach_article_brief_fields(compiled, plan, report_plan)
         except Exception as exc:
             logger.exception("Layout compiler failed", extra={"query": query})
             plan = {
@@ -477,8 +518,9 @@ def run_pre_layout_agent(
             "chapters_come_from_hypotheses": bool(quality_rules.get("chapters_come_from_hypotheses")),
             "layout_stage": "pre_search_dynamic_blueprint",
             "min_sources_per_chapter": _env_int("REPORT_MIN_TOTAL_SOURCES_PER_CHAPTER", 12),
-            "min_ab_sources_per_chapter": _env_int("REPORT_MIN_AB_SOURCES_PER_CHAPTER", 4),
+            "min_ab_sources_per_chapter": _env_int("REPORT_MIN_AB_SOURCES_PER_CHAPTER", _default_min_ab_sources()),
         },
     }
+    blueprint = _attach_article_brief_fields(blueprint, plan, report_plan)
     blueprint["layout_validation"] = _validate_blueprint(chapters)
     return blueprint

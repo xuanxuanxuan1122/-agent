@@ -457,6 +457,17 @@ def compile_report_layout(
         for index, raw in enumerate(selected, start=1)
     ]
     research_object = _compact(research_plan.get("research_object") or report_plan.get("research_object") or query or "研究对象", 160)
+    article_brief = _as_dict(research_plan.get("article_brief")) or _as_dict(report_plan.get("article_brief"))
+    report_title = _compact(research_plan.get("report_title") or report_plan.get("report_title") or article_brief.get("display_title"), 160)
+    report_subtitle = _compact(
+        research_plan.get("report_subtitle") or report_plan.get("report_subtitle") or article_brief.get("display_subtitle"),
+        220,
+    )
+    article_direction = _compact(
+        research_plan.get("article_direction") or report_plan.get("article_direction") or article_brief.get("direction"),
+        220,
+    )
+    planning_query = _compact(research_plan.get("planning_query") or report_plan.get("planning_query") or article_brief.get("planning_query"), 220)
     quality_rules = {
         **_as_dict(research_plan.get("quality_rules")),
         "forbid_legacy_five_dimensions": True,
@@ -470,6 +481,11 @@ def compile_report_layout(
         "report_family": profile.get("name"),
         "research_type": research_plan.get("research_type") or profile.get("name"),
         "research_object": research_object,
+        "article_brief": article_brief,
+        "article_direction": article_direction,
+        "planning_query": planning_query,
+        "report_title": report_title,
+        "report_subtitle": report_subtitle,
         "layout_strategy": {
             "profile": profile.get("name"),
             "narrative_spine": _as_list(profile.get("narrative_spines"))[0] if _as_list(profile.get("narrative_spines")) else "evidence_to_judgment",

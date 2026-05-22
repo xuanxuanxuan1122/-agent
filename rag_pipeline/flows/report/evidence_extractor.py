@@ -6,6 +6,13 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Set, Tuple
 from urllib.parse import urlparse
 
+from rag_pipeline.contracts.evidence_ledger import attach_evidence_ledger
+
+try:
+    from rag_pipeline.agents.article_brief import extract_research_subject
+except ModuleNotFoundError:  # pragma: no cover - direct script mode fallback.
+    from ...agents.article_brief import extract_research_subject
+
 
 CONTAMINATION_PATTERNS = [
     r"因此可用于支撑：[^。\n]{0,140}的阶段判断、机会排序或风险提示，但必须保留口径边界",
@@ -185,6 +192,24 @@ def _as_list(value: Any) -> List[Any]:
     return list(value) if isinstance(value, list) else []
 
 
+def _empty_clean_evidence(topic: str = "", *, error: str = "") -> Dict[str, Any]:
+    metadata: Dict[str, Any] = {
+        "extractor": "writer_package_clean_evidence_extractor",
+        "source": "empty_or_failed_input",
+        "evidence_count": 0,
+    }
+    if error:
+        metadata["errors"] = [error]
+    return attach_evidence_ledger(
+        {
+            "topic": str(topic or "").strip(),
+            "sources": [],
+            "dimensions": {dimension: [] for dimension in REPORT_DIMENSIONS},
+            "metadata": metadata,
+        }
+    )
+
+
 def _compact_text(value: Any, *, max_chars: int = 900) -> str:
     text = re.sub(r"\s+", " ", str(value or "").strip())
     if len(text) <= max_chars:
@@ -232,16 +257,16 @@ CREDIBILITY_DOMAIN_MAP = {
     "askci.com": "B",
     "chyxx.com": "B",
     "chinabgao.com": "B",
-    "caixin.com": "B",
-    "yicai.com": "B",
-    "21jingji.com": "B",
-    "cls.cn": "B",
-    "stcn.com": "B",
-    "xinhuanet.com": "B",
-    "people.com.cn": "B",
-    "cctv.com": "B",
-    "chinanews.com": "B",
-    "chinadaily.com.cn": "B",
+    "caixin.com": "C",
+    "yicai.com": "C",
+    "21jingji.com": "C",
+    "cls.cn": "C",
+    "stcn.com": "C",
+    "xinhuanet.com": "C",
+    "people.com.cn": "C",
+    "cctv.com": "C",
+    "chinanews.com": "C",
+    "chinadaily.com.cn": "C",
     "36kr.com": "C",
     "thepaper.cn": "C",
     "sina.com.cn": "C",
@@ -269,11 +294,41 @@ TITLE_CREDIBILITY_PATTERNS = [
     (re.compile(r"(?:自媒体|公众号|百家号|头条号|股吧|文库)"), "D"),
 ]
 
+LOW_CREDIBILITY_URL_FRAGMENTS = (
+    "caifuhao.eastmoney",
+    "guba.eastmoney",
+    "mguba.eastmoney",
+    "baijiahao",
+    "toutiao",
+    "zhihu.com",
+    "xueqiu.com",
+    "weibo.com",
+    "sohu.com",
+    "book118.com",
+    "renrendoc.com",
+    "docin.com",
+    "doc88.com",
+    "wenku.baidu.com",
+    "wk.baidu.com",
+)
+
+AGGREGATOR_URL_FRAGMENTS = (
+    "view.inews.qq.com",
+    "kuaixun",
+    "finance.sina.com.cn",
+    "news.10jqka.com.cn",
+    "eastmoney.com/a/",
+)
+
 
 def _infer_credibility(url: str, title: str, source_type: str = "") -> str:
     url_lower = str(url or "").lower()
     title_text = str(title or "")
     source_type_lower = str(source_type or "").lower()
+    if source_type_lower in {"self_media", "ugc", "low"} or any(fragment in url_lower for fragment in LOW_CREDIBILITY_URL_FRAGMENTS):
+        return "D"
+    if any(fragment in url_lower for fragment in AGGREGATOR_URL_FRAGMENTS):
+        return "C"
     domain_level = ""
     for domain, level in CREDIBILITY_DOMAIN_MAP.items():
         if domain in url_lower or domain in title_text.lower():
@@ -282,6 +337,8 @@ def _infer_credibility(url: str, title: str, source_type: str = "") -> str:
     if domain_level == "A":
         return domain_level
     if domain_level == "D":
+        return domain_level
+    if domain_level in {"B", "C"}:
         return domain_level
     for pattern, level in TITLE_CREDIBILITY_PATTERNS:
         if pattern.search(title_text):
@@ -446,10 +503,20 @@ class SourceRegistry:
 
 def _seed_sources(pkg: Dict[str, Any], registry: SourceRegistry) -> None:
     writer_report = _as_dict(pkg.get("writer_report"))
+    for container_key in ("reformatter_evidence_package", "evidence_package"):
+        container = _as_dict(pkg.get(container_key))
+        for key in ("sources", "source_registry"):
+            for source in _as_list(container.get(key)):
+                if isinstance(source, dict):
+                    registry.add(source)
     for key in ("sources", "source_registry"):
         for source in _as_list(writer_report.get(key)):
             if isinstance(source, dict):
                 registry.add(source)
+
+
+def _primary_evidence_package(pkg: Dict[str, Any]) -> Dict[str, Any]:
+    return _as_dict(pkg.get("reformatter_evidence_package")) or _as_dict(pkg.get("evidence_package"))
 
 
 def _strip_report_appendix(markdown: str) -> str:
@@ -535,9 +602,12 @@ def _iter_report_cited_facts(pkg: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
         yield from _iter_segment_citation_facts(text, dimension=current_dimension, seen=seen)
     chunks = re.split(r"\n{2,}", markdown)
     for chunk in chunks:
-        heading_matches = list(re.finditer(r"(?m)^#{2,6}\s+(.+?)\s*$", str(chunk or "")))
+        raw_chunk = str(chunk or "")
+        if re.search(r"(?m)^\s*\|.*\|\s*$", raw_chunk):
+            continue
+        heading_matches = list(re.finditer(r"(?m)^#{2,6}\s+(.+?)\s*$", raw_chunk))
         chunk_dimension = heading_matches[-1].group(1).strip() if heading_matches else current_dimension
-        text = re.sub(r"(?m)^#{1,6}\s*.*$", "", str(chunk or "")).strip()
+        text = re.sub(r"(?m)^#{1,6}\s*.*$", "", raw_chunk).strip()
         text = re.sub(r"(?m)^\s*\|?\s*:?-{3,}.*$", " ", text)
         text = _clean_report_fact_line(text)
         if not text or not re.search(r"\[\d{1,3}\]", text):
@@ -546,7 +616,7 @@ def _iter_report_cited_facts(pkg: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
 
 
 def _iter_raw_evidence(pkg: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
-    evidence_package = _as_dict(pkg.get("evidence_package"))
+    evidence_package = _primary_evidence_package(pkg)
     for key in ["clean_evidence_list", "analysis_ready_evidence"]:
         for item in _as_list(evidence_package.get(key)):
             if isinstance(item, dict):
@@ -641,11 +711,34 @@ def _evidence_source_id(item: Dict[str, Any], registry: SourceRegistry) -> str:
 
 
 def extract_clean_evidence_from_package(pkg: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(pkg, dict):
+        return _empty_clean_evidence(error="writer_package_not_object")
     registry = SourceRegistry()
     _seed_sources(pkg, registry)
-    topic = str(pkg.get("topic") or pkg.get("query") or _as_dict(pkg.get("evidence_package")).get("query") or "").strip()
+    evidence_package = _primary_evidence_package(pkg)
+    blueprint = _as_dict(pkg.get("report_blueprint"))
+    article_brief = _as_dict(pkg.get("article_brief")) or _as_dict(blueprint.get("article_brief"))
+    report_title = str(pkg.get("report_title") or blueprint.get("report_title") or article_brief.get("display_title") or "").strip()
+    report_subtitle = str(pkg.get("report_subtitle") or blueprint.get("report_subtitle") or article_brief.get("display_subtitle") or "").strip()
+    planning_query = str(
+        pkg.get("planning_query")
+        or blueprint.get("planning_query")
+        or article_brief.get("planning_query")
+        or pkg.get("query")
+        or evidence_package.get("query")
+        or ""
+    ).strip()
+    research_object = str(pkg.get("research_object") or blueprint.get("research_object") or "").strip()
+    if not research_object:
+        research_object = extract_research_subject(report_subtitle or planning_query)
+    topic = str(pkg.get("topic") or report_subtitle or planning_query or "").strip()
     clean_pkg: Dict[str, Any] = {
         "topic": topic,
+        "planning_query": planning_query,
+        "article_brief": article_brief,
+        "report_title": report_title,
+        "report_subtitle": report_subtitle,
+        "research_object": research_object,
         "sources": registry.sources,
         "dimensions": {dimension: [] for dimension in REPORT_DIMENSIONS},
         "metadata": {
@@ -665,9 +758,10 @@ def extract_clean_evidence_from_package(pkg: Dict[str, Any]) -> Dict[str, Any]:
             continue
         source_id = _evidence_source_id(item, registry)
         metric, value = _clean_metric_value(item, text)
-        if not value and not re.search(r"\d", text) and len(text) < 40:
-            continue
         source_type = _source_type_from_item(item)
+        if not value and not re.search(r"\d", text) and len(text) < 40:
+            if source_type != "report_citation" or len(text) < 18:
+                continue
         period = _evidence_period(item)
         unit = _evidence_unit(item)
         scope = _evidence_scope(item)
@@ -678,8 +772,10 @@ def extract_clean_evidence_from_package(pkg: Dict[str, Any]) -> Dict[str, Any]:
         seen.add(key)
         clean_pkg["dimensions"].setdefault(dimension, []).append(
             {
+                "evidence_id": item.get("evidence_id") or item.get("id") or item.get("ref_id"),
                 "text": text,
                 "source": source_id,
+                "source_id": source_id,
                 "time": _evidence_time(item),
                 "period": period,
                 "scope": scope,
@@ -689,16 +785,26 @@ def extract_clean_evidence_from_package(pkg: Dict[str, Any]) -> Dict[str, Any]:
                 "credibility_level": credibility_level,
                 "source_type": source_type,
                 "source_quality": _source_quality(source_type),
+                "search_task_id": item.get("search_task_id") or item.get("task_id"),
+                "chapter_id": item.get("chapter_id"),
+                "claim_id": item.get("claim_id"),
+                "hypothesis_id": item.get("hypothesis_id"),
+                "proof_role": item.get("proof_role"),
+                "evidence_type": item.get("evidence_type"),
+                "source_stage": item.get("source_stage") or item.get("origin_query_source"),
             }
         )
 
     clean_pkg["sources"] = sorted(registry.sources, key=lambda item: int(item.get("id") or 0))
     clean_pkg["metadata"]["evidence_count"] = sum(len(items) for items in clean_pkg["dimensions"].values())
-    return clean_pkg
+    return attach_evidence_ledger(clean_pkg)
 
 
 def extract_clean_evidence(writer_package_path: str) -> Dict[str, Any]:
     path = Path(writer_package_path)
-    with path.open("r", encoding="utf-8") as file:
-        pkg = json.load(file)
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            pkg = json.load(file)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return _empty_clean_evidence(error=f"{type(exc).__name__}: {exc}")
     return extract_clean_evidence_from_package(pkg)

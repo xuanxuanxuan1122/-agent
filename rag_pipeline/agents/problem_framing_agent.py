@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional
 
+from .article_brief import extract_research_subject, is_broad_ai_subject, normalize_article_brief
+
 
 AGENT_NAME = "problem_framing_agent"
 AGENT_DESCRIPTION = "Problem Framing Agent. Converts a user question into testable hypotheses before search."
@@ -10,6 +12,10 @@ AGENT_DESCRIPTION = "Problem Framing Agent. Converts a user question into testab
 
 def _as_dict(value: Any) -> Dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
+
+
+def _as_list(value: Any) -> List[Any]:
+    return list(value) if isinstance(value, list) else []
 
 
 def _compact(value: Any, max_chars: int = 260) -> str:
@@ -118,6 +124,9 @@ def _research_subject(query: str) -> str:
     text = re.sub(r"(企业行研|行业研究|行研|深度研究|研究)?(报告|文档)$", "", text).strip()
     text = re.sub(r"(怎么样|如何|有哪些|怎么看)[？?]?$", "", text).strip()
     text = re.sub(r"(焦虑与机遇|机遇与挑战)$", "", text).strip()
+    specific = extract_research_subject(text)
+    if specific and not is_broad_ai_subject(specific):
+        return specific
     if re.search(r"(中国|国内).*(AI|人工智能)|(?:AI|人工智能).*(中国|国内)", text, re.I):
         return "中国人工智能行业"
     if re.search(r"\bAI\b|人工智能|大模型|生成式", text, re.I) and re.search(r"行业|产业|市场|赛道", text):
@@ -126,6 +135,9 @@ def _research_subject(query: str) -> str:
 
 
 def _looks_like_ai_industry(query: str) -> bool:
+    subject = _research_subject(query)
+    if subject and not is_broad_ai_subject(subject):
+        return False
     return bool(
         re.search(r"AI|人工智能|大模型|生成式AI|AIGC", query, re.I)
         and re.search(r"中国|国内|行业|产业|市场|焦虑|机遇|发展|竞争|应用", query)
@@ -489,49 +501,49 @@ def _generic_hypotheses(query: str, decision_use: str) -> List[Dict[str, Any]]:
     return [
         _hypothesis(
             1,
-            claim=f"{subject}是否存在真实需求，而不是概念热度",
-            must_prove=["需求增速", "付费/采购主体", "订单或使用案例", "可比指标"],
+            claim=f"{subject}是否存在真实需求和可验证市场空间，而不是概念热度",
+            must_prove=["市场规模", "需求增速", "付费/采购主体", "使用或订单案例"],
             must_disprove=["需求不可持续", "只停留在试点", "缺少客户预算"],
             bundle=_bundle(
-                metric_terms=["市场规模", "增速", "价格", "渗透率", "销量"],
-                case_terms=["客户", "订单", "采购", "量产", "落地案例"],
+                metric_terms=["市场规模", "增速", "渗透率", "活跃用户/客户", "订单"],
+                case_terms=["客户", "订单", "采购", "使用案例", "落地案例"],
                 counter_terms=["失败案例", "需求放缓", "预算收缩", "订单取消"],
             ),
             decision_use=decision_use,
         ),
         _hypothesis(
             2,
-            claim=f"{subject}的行情是否得到价格、产能、订单和盈利质量支撑",
-            must_prove=["价格", "产能", "订单", "毛利/利润", "产能利用率"],
-            must_disprove=["价格下行", "产能过剩", "毛利下滑", "库存上升"],
+            claim=f"{subject}的竞争格局由哪些玩家、能力、成本和渠道变量决定",
+            must_prove=["主要玩家", "产品/服务差异", "价格或成本", "客户获取", "生态合作"],
+            must_disprove=["同质化竞争", "价格战", "替代方案", "客户迁移"],
             bundle=_bundle(
-                metric_terms=["价格", "产能", "订单", "毛利率", "库存", "开工率"],
-                case_terms=["公告", "合同", "客户认证", "批量交付"],
-                counter_terms=["产能过剩", "价格战", "毛利下滑", "库存增加"],
+                metric_terms=["市场份额", "价格", "成本", "用户/客户规模", "调用量/出货量"],
+                case_terms=["产品发布", "客户案例", "生态合作", "渠道合作"],
+                counter_terms=["同质化", "价格战", "替代路线", "客户流失"],
             ),
             decision_use=decision_use,
         ),
         _hypothesis(
             3,
-            claim=f"{subject}中哪些环节已有商业化证据，哪些仍处于概念或试点",
-            must_prove=["商业化收入", "客户认证", "量产/交付", "复购或长协"],
+            claim=f"{subject}哪些环节已有商业化证据，哪些仍处于概念或试点",
+            must_prove=["商业化收入", "客户验证", "可复制交付", "复购/留存"],
             must_disprove=["仅概念宣传", "试点未扩张", "收入未披露"],
             bundle=_bundle(
-                metric_terms=["收入", "订单", "客户数量", "交付量"],
-                case_terms=["客户案例", "量产", "供货", "复购", "长协"],
+                metric_terms=["收入", "订单", "客户数量", "留存/复购", "交付成本"],
+                case_terms=["客户案例", "付费案例", "规模化交付", "复购", "合同"],
                 counter_terms=["试点停滞", "客户未采购", "商业化收入不足"],
             ),
             decision_use=decision_use,
         ),
         _hypothesis(
             4,
-            claim=f"{subject}的进入/投资/产品布局优先级必须被反证和高等级来源共同校准",
-            must_prove=["A/B来源交叉验证", "反证检查", "指标口径一致", "客户行为验证"],
-            must_disprove=["仅C/D来源支撑", "缺少反证", "指标口径不可比"],
+            claim=f"{subject}的技术、供应、监管或替代约束会如何改变机会排序",
+            must_prove=["关键瓶颈", "供应/基础设施约束", "监管/合规", "替代路线"],
+            must_disprove=["瓶颈缓解", "监管放松", "替代方案成熟", "成本快速下降"],
             bundle=_bundle(
-                metric_terms=["规模", "增速", "价格", "利润", "产能"],
-                case_terms=["客户", "订单", "公告", "认证"],
-                counter_terms=["替代技术", "产能过剩", "监管风险", "需求不及预期"],
+                metric_terms=["成本", "供给", "效率", "合规成本", "研发投入"],
+                case_terms=["技术路线", "基础设施", "监管案例", "替代方案"],
+                counter_terms=["替代技术", "供给过剩", "监管风险", "需求不及预期"],
             ),
             decision_use=decision_use,
         ),
@@ -542,10 +554,13 @@ def run_problem_framing_agent(
     *,
     query: str,
     llm_config: Optional[Dict[str, Any]] = None,
+    article_brief: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     del llm_config
-    query = str(query or "").strip()
+    brief = normalize_article_brief(article_brief, fallback_query=query) if article_brief else {}
+    query = str(brief.get("planning_query") or query or "").strip()
     decision_context = _decision_context(query)
+    research_object = _research_subject(query)
     if _looks_like_us_china_policy_multisector(query):
         core_question = "中美关税、出口管制与市场准入新格局下，半导体、新能源、消费品与互联网分别承受什么压力，哪些环节可能反而受益？"
         hypotheses = _us_china_policy_multisector_hypotheses(query, decision_context)
@@ -556,16 +571,20 @@ def run_problem_framing_agent(
         core_question = "新能源汽车新材料当前市场行情是否向好，哪些环节最确定，哪些仍只是线索？"
         hypotheses = _ev_material_hypotheses(query, decision_context)
     elif _looks_like_ai_industry(query):
-        subject = _research_subject(query)
-        core_question = f"{subject}的机会、焦虑来源和可兑现路径分别是什么，哪些判断能被公开证据支撑？"
+        core_question = f"{research_object}的机会、焦虑来源和可兑现路径分别是什么，哪些判断能被公开证据支撑？"
         hypotheses = _ai_industry_hypotheses(query, decision_context)
     else:
-        core_question = f"{_research_subject(query)}当前是否具备可验证的市场机会，哪些判断能被证据证明？"
+        core_question = f"{research_object}当前是否具备可验证的市场机会，哪些判断能被证据证明？"
         hypotheses = _generic_hypotheses(query, decision_context)
     return {
         "agent": AGENT_NAME,
         "core_question": core_question,
+        "research_object": research_object,
         "decision_context": decision_context,
+        "article_brief": brief,
+        "planning_query": query,
+        "article_direction": str(brief.get("direction") or ""),
+        "topic_anchor_terms": _topic_anchor_terms(query),
         "hypotheses": hypotheses,
         "coverage_requirements": {
             "per_hypothesis": _coverage_requirements(decision_context)
@@ -575,6 +594,7 @@ def run_problem_framing_agent(
             "core_claim_requires_A_or_B": True,
             "c_level_is_directional_signal": True,
             "single_evidence_cannot_be_claim": True,
+            "reject_generic_industry_fallback": True,
         },
     }
 
@@ -596,6 +616,27 @@ SOURCE_PRIORITY_BY_ROLE = {
     "filing": ["年报", "公告", "招股书", "投资者关系", "财报"],
     "source_check": ["官方", "原文", "政策文件", "协会", "白皮书"],
 }
+
+
+def _dedupe_terms(items: List[str], *, limit: int = 8) -> List[str]:
+    result: List[str] = []
+    for item in items:
+        text = str(item or "").strip()
+        if text and text not in result:
+            result.append(text)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _topic_anchor_terms(query: str) -> List[str]:
+    subject = _research_subject(query)
+    if not subject:
+        return []
+    terms = [subject]
+    if re.search(r"中国|国内|国产", query) and not re.search(r"中国|国内|国产", subject):
+        terms.append("中国")
+    return _dedupe_terms(terms, limit=3)
 
 
 def _terms_for_role(hypothesis: Dict[str, Any], role: str) -> List[str]:
@@ -621,6 +662,7 @@ def _build_chapter_goal_task_packages(
     chapters: List[Dict[str, Any]] = []
     goals: List[Dict[str, Any]] = []
     tasks: List[Dict[str, Any]] = []
+    topic_terms = _topic_anchor_terms(query)
     for index, hypothesis in enumerate(hypotheses[:8], start=1):
         hypothesis_id = str(hypothesis.get("hypothesis_id") or f"H{index}").strip()
         statement = _compact(hypothesis.get("statement") or hypothesis.get("claim_to_test") or query, 120)
@@ -633,6 +675,7 @@ def _build_chapter_goal_task_packages(
             if role == "counter" and not (counter_required or hypothesis.get("must_disprove")):
                 continue
             terms = _terms_for_role(hypothesis, role)
+            must_have_terms = _dedupe_terms([*topic_terms, *terms], limit=8)
             goal_id = f"{hypothesis_id}_{role}"
             question = f"{statement}：补齐{label}，并保留来源、时间、范围和口径。"
             goal = {
@@ -643,7 +686,7 @@ def _build_chapter_goal_task_packages(
                 "chapter_title": statement,
                 "question": question,
                 "expected_metrics": terms,
-                "must_have_terms": terms[:3],
+                "must_have_terms": must_have_terms[:5],
                 "forbidden_terms": [],
                 "source_priority": SOURCE_PRIORITY_BY_ROLE.get(role, lane_targets),
                 "freshness": "recent",
@@ -671,7 +714,7 @@ def _build_chapter_goal_task_packages(
                 "proof_role": role,
                 "lane_targets": lane_targets,
                 "min_source_level": "A" if proof_standard == "strong" else "B",
-                "must_have_terms": terms[:4],
+                "must_have_terms": must_have_terms,
                 "forbidden_terms": [],
                 "source_priority": SOURCE_PRIORITY_BY_ROLE.get(role, lane_targets),
                 "hypothesis_id": hypothesis_id,
@@ -759,10 +802,13 @@ def apply_problem_framing(plan: Dict[str, Any], framing: Dict[str, Any]) -> Dict
         "core_claim_requires_A_or_B": True,
         "c_level_is_directional_signal": True,
         "single_evidence_cannot_be_claim": True,
+        "reject_generic_industry_fallback": True,
+        "topic_anchor_terms": _as_list(framing.get("topic_anchor_terms")) or _topic_anchor_terms(str(plan.get("query") or "")),
     }
     return {
         **plan,
         "core_question": framing.get("core_question") or plan.get("core_question") or plan.get("query"),
+        "research_object": framing.get("research_object") or plan.get("research_object"),
         "decision_context": framing.get("decision_context") or plan.get("decision_context"),
         "problem_framing": framing,
         "legacy_planner_chapters": legacy_chapters,

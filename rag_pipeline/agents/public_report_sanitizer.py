@@ -4,6 +4,9 @@ import re
 from typing import List
 
 
+PUBLIC_EV_ID_PATTERN = r"(?<![A-Za-z0-9_])EV-\d+(?:-[A-Za-z0-9]+)?"
+
+
 INTERNAL_GAP_PATTERNS = [
     r"证据不足",
     r"暂无可核验数据",
@@ -45,6 +48,20 @@ INTERNAL_GAP_PATTERNS = [
     r"counter_evidence_missing",
     r"metric_scope_period_unit_incomplete",
     r"evidence_refs",
+    r"\bevidence_cards?\b",
+    r"当前卡片",
+    r"本章应写成",
+    r"本章可以作为",
+    r"本章可作为",
+    r"正文\s*只能\s*写成",
+    r"本章\s*只能\s*写成",
+    r"本章\s*可\s*写成",
+    r"本章\s*应\s*写成",
+    r"本章\s*仍需\s*连续观察",
+    r"建议避免",
+    r"建议在后续版本中补充",
+    r"建议写成",
+    r"适合写成",
     r"claim_status",
     r"render_blocks",
     r"technology_maturity_to_adoption",
@@ -125,7 +142,7 @@ STRICT_PUBLICATION_BLOCKERS = [
     r"\brender_blocks\b",
     r"\bnot_ready\b",
     r"no publishable",
-    r"\bEV-\d+\b",
+    PUBLIC_EV_ID_PATTERN,
     r"当前材料",
     r"当前证据",
     r"当前可用事实",
@@ -219,6 +236,12 @@ INTERNAL_GAP_REWRITES = [
     (r"低置信方向判断", "方向性判断"),
     (r"低置信", "方向性"),
     (r"证据不足", "现有公开信息只能支持边界化观察"),
+    (r"正文\s*只能\s*写成", "当前更适合表述为"),
+    (r"本章\s*只能\s*写成", "当前更适合表述为"),
+    (r"本章\s*可\s*写成", "本章判断为"),
+    (r"本章\s*应\s*写成", "本章判断为"),
+    (r"建议避免", "需要避免"),
+    (r"建议在后续版本中补充", "后续重点补充"),
     (r"暂无可核验数据", "尚未看到连续公开数据"),
     (r"暂无足够证据", "尚未看到连续公开数据"),
     (r"不能作为确定性结论", "更适合作为观察项"),
@@ -347,14 +370,45 @@ def remove_empty_headings(markdown: str) -> str:
     return "\n".join(result)
 
 
+def remove_empty_markdown_tables(markdown: str) -> str:
+    lines = str(markdown or "").splitlines()
+    result: List[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        next_line = lines[i + 1] if i + 1 < len(lines) else ""
+        if (
+            line.strip().startswith("|")
+            and line.strip().endswith("|")
+            and re.match(r"^\|\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|\s*$", next_line.strip())
+        ):
+            j = i + 2
+            row_count = 0
+            while j < len(lines) and lines[j].strip().startswith("|") and lines[j].strip().endswith("|"):
+                row_count += 1
+                j += 1
+            if row_count == 0:
+                while result and not result[-1].strip():
+                    result.pop()
+                if result and re.match(r"^\*\*[^*\n]+\*\*\s*$", result[-1].strip()):
+                    result.pop()
+                i = j
+                continue
+        result.append(line)
+        i += 1
+    return "\n".join(result)
+
+
 def sanitize_public_markdown(markdown: str) -> str:
     body, appendix = _split_source_appendix(str(markdown or ""))
     text = body
+    schema_like_bullet_re = re.compile(r"(?m)^\s*[-*]\s*[^。；;\n]{1,16}[；;][^。；;\n]{0,16}[；;][^。；;\n]{0,50}\s*$")
     blocks = re.split(r"\n(?=#{1,4}\s+)", text)
     kept: List[str] = []
 
     for block in blocks:
         safe_block = _drop_publication_blocker_lines(block)
+        safe_block = schema_like_bullet_re.sub("", safe_block)
         rewritten = rewrite_internal_gap_language(safe_block)
         if rewritten.strip():
             kept.append(rewritten)
@@ -363,13 +417,16 @@ def sanitize_public_markdown(markdown: str) -> str:
     for _ in range(3):
         before = cleaned
         cleaned = _drop_publication_blocker_lines(cleaned)
+        cleaned = schema_like_bullet_re.sub("", cleaned)
         cleaned = rewrite_internal_gap_language(cleaned)
+        cleaned = remove_empty_markdown_tables(cleaned)
         cleaned = remove_empty_headings(cleaned)
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
         if not find_publication_blockers(cleaned) or cleaned == before:
             break
     if find_publication_blockers(cleaned):
         cleaned = _drop_publication_blocker_lines(cleaned)
+        cleaned = remove_empty_markdown_tables(cleaned)
         cleaned = remove_empty_headings(cleaned)
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
     appendix = remove_empty_headings(_drop_publication_blocker_lines(appendix, strict_only=True)).strip()

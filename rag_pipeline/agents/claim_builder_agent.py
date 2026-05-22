@@ -4,6 +4,11 @@ import os
 import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+try:
+    from rag_pipeline.contracts.evidence_quality import infer_claim_type
+except Exception:  # pragma: no cover - direct script mode fallback
+    infer_claim_type = None  # type: ignore
+
 
 AGENT_NAME = "claim_builder_agent"
 AGENT_DESCRIPTION = "Claim Builder Agent. Converts chapter evidence into claim/argument units."
@@ -14,6 +19,12 @@ BAD_CLAIM_PATTERNS = [
     r"已有可核验证据",
     r"已有可验证证据",
     r"证据不足",
+    r"正文\s*只能\s*写成",
+    r"本章\s*只能\s*写成",
+    r"本章\s*可\s*写成",
+    r"本章\s*仍需\s*连续观察",
+    r"建议避免",
+    r"建议在后续版本中补充",
     r"可作为判断输入",
     r"需结合来源等级",
     r"需结合.*时间范围",
@@ -26,6 +37,12 @@ PUBLIC_BLOCKING_PATTERNS = [
     r"低置信",
     r"不能作为确定性结论",
     r"证据不足",
+    r"正文\s*只能\s*写成",
+    r"本章\s*只能\s*写成",
+    r"本章\s*可\s*写成",
+    r"本章\s*仍需\s*连续观察",
+    r"建议避免",
+    r"建议在后续版本中补充",
     r"暂无可核验",
     r"建议补充",
     r"A/B\s*级来源不足",
@@ -70,6 +87,22 @@ def _as_dict(value: Any) -> Dict[str, Any]:
 
 def _as_list(value: Any) -> List[Any]:
     return list(value) if isinstance(value, list) else []
+
+
+def _strict_quality_mode() -> bool:
+    mode = str(os.getenv("REPORT_QUALITY_MODE") or os.getenv("QUALITY_MODE") or "balanced").strip().lower()
+    if mode in {"strict", "hard", "deep_strict", "due_diligence", "investment_due_diligence"}:
+        return True
+    return str(os.getenv("STRICT_EVIDENCE_MODE") or "").strip().lower() in {"1", "true", "yes", "on", "strict"}
+
+
+def _claim_type_for_unit(unit: Dict[str, Any]) -> str:
+    explicit = str(unit.get("claim_type") or unit.get("conclusion_type") or "").strip().lower()
+    if explicit:
+        return explicit
+    if infer_claim_type is not None:
+        return str(infer_claim_type(unit) or "industry_analysis")
+    return "industry_analysis"
 
 
 def _compact(value: Any, max_chars: int = 260) -> str:
@@ -178,6 +211,7 @@ def _support_profile(package: Dict[str, Any], refs: Sequence[str]) -> Dict[str, 
     allowed_uses: Dict[str, int] = {}
     contextual_ab_count = 0
     claim_ab_count = 0
+    directional_c_source_keys = set()
     for item in matched:
         level = str(item.get("source_level") or _as_dict(item.get("source")).get("credibility") or "").strip().upper() or "UNKNOWN"
         levels[level] = levels.get(level, 0) + 1
@@ -190,17 +224,43 @@ def _support_profile(package: Dict[str, Any], refs: Sequence[str]) -> Dict[str, 
             contextual_ab_count += 1
         elif level in {"A", "B"}:
             claim_ab_count += 1
+        elif level == "C" and allowed_use == "directional_signal":
+            source = _as_dict(item.get("source"))
+            key = re.sub(
+                r"\s+",
+                "",
+                str(
+                    item.get("source_id")
+                    or item.get("source_ref")
+                    or item.get("ref")
+                    or source.get("url")
+                    or source.get("title")
+                    or item.get("source_title")
+                    or ""
+                ).strip().lower(),
+            )
+            if key:
+                directional_c_source_keys.add(key)
     ab_count = levels.get("A", 0) + levels.get("B", 0)
     cd_count = levels.get("C", 0) + levels.get("D", 0)
     core = roles.get("core", 0)
+    core_ab = len(
+        [
+            item
+            for item in matched
+            if str(item.get("source_level") or _as_dict(item.get("source")).get("credibility") or "").strip().upper() in {"A", "B"}
+            and str(item.get("evidence_role") or item.get("role") or "").strip().lower() in {"core", "core_claim"}
+        ]
+    )
     supporting = roles.get("supporting", 0)
     clue = roles.get("clue", 0)
     directional = allowed_uses.get("directional_signal", 0)
-    if core >= 1 or claim_ab_count >= 2:
+    directional_c_distinct = len(directional_c_source_keys)
+    if core_ab >= 1 or claim_ab_count >= 2:
         strength = "strong"
-    elif claim_ab_count >= 1 or (supporting >= 1 and contextual_ab_count == 0):
+    elif claim_ab_count >= 1:
         strength = "medium"
-    elif contextual_ab_count >= 1 or directional >= 1:
+    elif contextual_ab_count >= 1 or directional >= 1 or supporting >= 1:
         strength = "directional"
     elif clue >= 1:
         strength = "weak"
@@ -218,9 +278,11 @@ def _support_profile(package: Dict[str, Any], refs: Sequence[str]) -> Dict[str, 
         "grade": grade,
         "source_level_distribution": levels,
         "ab_count": ab_count,
+        "core_ab_count": core_ab,
         "claim_ab_count": claim_ab_count,
         "contextual_ab_count": contextual_ab_count,
         "cd_count": cd_count,
+        "directional_c_distinct_sources": directional_c_distinct,
         "matched_count": len(matched),
         "role_distribution": roles,
         "allowed_use_distribution": allowed_uses,
@@ -236,12 +298,12 @@ def is_public_claim(unit: Dict[str, Any]) -> bool:
     status = str(unit.get("quality_status") or "").lower()
     if status in {"unsupported", "invalid", "weak"}:
         return False
-    if status == "insufficient" and claim_status not in {"directional", "context_only"}:
+    if status == "insufficient" and claim_status not in {"directional", "directional_ready", "context_only"}:
         return False
 
     source_quality = _as_dict(unit.get("source_quality"))
     strength = str(source_quality.get("claim_strength") or "").lower()
-    if strength in {"weak", "unsupported"} and claim_status not in {"directional", "context_only"}:
+    if strength in {"weak", "unsupported"} and claim_status not in {"directional", "directional_ready", "context_only"}:
         return False
 
     text = " ".join(
@@ -255,6 +317,54 @@ def is_public_claim(unit: Dict[str, Any]) -> bool:
         return False
 
     return True
+
+
+def _unit_has_decision_support(unit: Dict[str, Any]) -> bool:
+    source_quality = _as_dict(unit.get("source_quality"))
+    allowed_uses = _as_dict(source_quality.get("allowed_use_distribution"))
+    claim_type = str(unit.get("claim_type") or source_quality.get("claim_type") or _claim_type_for_unit(unit)).strip().lower()
+    try:
+        claim_ab_count = int(source_quality.get("claim_ab_count") or source_quality.get("ab_count") or 0)
+    except (TypeError, ValueError):
+        claim_ab_count = 0
+    try:
+        core_or_support = int(allowed_uses.get("core_claim") or 0) + int(allowed_uses.get("supporting") or 0)
+    except (TypeError, ValueError):
+        core_or_support = 0
+    try:
+        directional_c_count = int(source_quality.get("directional_c_distinct_sources") or allowed_uses.get("directional_signal") or 0)
+    except (TypeError, ValueError):
+        directional_c_count = 0
+    if claim_ab_count > 0 or core_or_support > 0:
+        return True
+    return bool(not _strict_quality_mode() and claim_type != "hard_metric" and directional_c_count >= 2)
+
+
+def _normalize_claim_binding_status(unit: Dict[str, Any], package: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(unit)
+    refs = _as_list(normalized.get("evidence_refs"))
+    if package and refs:
+        normalized["source_quality"] = _support_profile(package, refs)
+    claim_status = str(normalized.get("claim_status") or "").strip().lower()
+    if claim_status in {"decision_ready", "core_claim"} and not _unit_has_decision_support(normalized):
+        normalized["claim_status"] = "directional"
+        normalized["quality_status"] = "directional_with_boundary"
+        normalized["confidence"] = "low" if str(normalized.get("confidence") or "").strip().lower() in {"", "high"} else normalized.get("confidence")
+        normalized["claim_downgraded_reason"] = "decision_ready_without_ab_source"
+        normalized["rewrite_required"] = True
+    elif claim_status in {"decision_ready", "core_claim"}:
+        source_quality = _as_dict(normalized.get("source_quality"))
+        try:
+            ab_count = int(source_quality.get("claim_ab_count") or source_quality.get("ab_count") or 0)
+            directional_c_count = int(source_quality.get("directional_c_distinct_sources") or 0)
+        except (TypeError, ValueError):
+            ab_count = 0
+            directional_c_count = 0
+        if ab_count <= 0 and directional_c_count >= 2 and _claim_type_for_unit(normalized) != "hard_metric":
+            normalized["claim_status"] = "directional_ready"
+            normalized["quality_status"] = normalized.get("quality_status") or "directional_with_boundary"
+            normalized["claim_downgraded_reason"] = "directional_corroborated_without_ab_source"
+    return normalized
 
 
 def _matches(unit: Dict[str, Any], package: Dict[str, Any]) -> bool:
@@ -324,13 +434,16 @@ def _structured_units(structured_analysis: Dict[str, Any]) -> List[Dict[str, Any
                     "claim": claim,
                     "reasoning": claim_item.get("mechanism") or claim_item.get("reasoning") or "",
                     "mechanism": claim_item.get("mechanism") or "",
-                    "counter_evidence": claim_item.get("counter_evidence") or "",
-                    "decision_implication": claim_item.get("decision_implication") or "",
-                    "actionable": claim_item.get("decision_implication") or "",
+                    "counter_evidence": claim_item.get("counter_evidence") or "；".join(str(item) for item in _as_list(chapter.get("counter_evidence_boundary"))[:3]),
+                    "decision_implication": claim_item.get("decision_implication") or chapter.get("decision_implication") or "",
+                    "actionable": claim_item.get("decision_implication") or chapter.get("decision_implication") or "",
                     "confidence": claim_item.get("confidence"),
                     "supporting_evidence": _as_list(claim_item.get("supporting_evidence")) or _as_list(claim_item.get("evidence_refs")),
                     "evidence_refs": _as_list(claim_item.get("supporting_evidence")) or _as_list(claim_item.get("evidence_refs")),
                     "what_to_verify_next": _as_list(claim_item.get("what_to_verify_next")),
+                    "supporting_facts": _as_list(chapter.get("fact_chain")),
+                    "mechanism_chain": _as_list(chapter.get("mechanism_chain")),
+                    "counter_evidence_boundary": _as_list(chapter.get("counter_evidence_boundary")),
                 }
             )
     for key in ("claim_units", "analysis_units"):
@@ -586,6 +699,13 @@ def _claim_status_from_support(support: Dict[str, Any], proof_gaps: Sequence[Any
     strength = str(support.get("claim_strength") or "").lower()
     if not proof_gaps and strength in {"strong", "medium"}:
         return "decision_ready"
+    if (
+        not proof_gaps
+        and not _strict_quality_mode()
+        and strength == "directional"
+        and int(support.get("directional_c_distinct_sources") or 0) >= 2
+    ):
+        return "directional_ready"
     if strength in {"strong", "medium", "directional"}:
         return "directional"
     if int(support.get("matched_count") or 0) > 0:
@@ -616,7 +736,13 @@ def _public_verification_focus(package: Dict[str, Any], refs: Sequence[str]) -> 
 def _unit_from_structured(unit: Dict[str, Any], package: Dict[str, Any], section_id: str, fallback_refs: Sequence[str]) -> Dict[str, Any]:
     raw_refs = _as_list(unit.get("supporting_evidence")) or _as_list(unit.get("evidence_refs")) or fallback_refs
     refs = _source_refs_for_evidence_refs(package, raw_refs) or _dedupe(raw_refs, limit=8)
-    fallback_fact = _compact(unit.get("fact") or unit.get("supporting_fact") or "", 220)
+    supporting_facts = _as_list(unit.get("supporting_facts")) or _as_list(unit.get("fact_chain"))
+    fallback_fact = _compact(
+        unit.get("fact")
+        or unit.get("supporting_fact")
+        or (supporting_facts[0] if supporting_facts else ""),
+        220,
+    )
     question = _question_for(package, unit)
     original_claim = _compact(unit.get("claim") or unit.get("judgment") or unit.get("conclusion"), 320)
     original_text = " ".join(
@@ -646,7 +772,7 @@ def _unit_from_structured(unit: Dict[str, Any], package: Dict[str, Any], section
         "claim_status": claim_status,
         "supporting_evidence": _dedupe(refs, limit=8),
         "evidence_refs": _dedupe(refs, limit=8),
-        "supporting_facts": _evidence_facts_from_package(package, limit=8),
+        "supporting_facts": _dedupe([*supporting_facts, *_evidence_facts_from_package(package, limit=8)], limit=8),
         "verification_metrics": _public_verification_focus(package, refs),
         "source_quality": support,
         "rewrite_required": normalized_from_weak,
@@ -659,7 +785,7 @@ def _unit_from_structured(unit: Dict[str, Any], package: Dict[str, Any], section
     if support["grade"] == "low":
         payload = rewrite_weak_claim_unit(payload, package=package, reason="low_source_quality")
     if proof_gaps:
-        payload["claim_status"] = "directional" if claim_status in {"decision_ready", "directional"} else "context_only"
+        payload["claim_status"] = "directional" if claim_status in {"decision_ready", "directional", "directional_ready"} else "context_only"
         payload["omit_from_report"] = False
         payload["public_render"] = True
         payload["quality_status"] = "directional_with_boundary"
@@ -1099,11 +1225,67 @@ def _argument_unit_issues(unit: Dict[str, Any]) -> List[Dict[str, Any]]:
 def rewrite_weak_claim_unit(unit: Dict[str, Any], *, package: Optional[Dict[str, Any]] = None, reason: str = "weak_claim") -> Dict[str, Any]:
     package = _as_dict(package)
     rewritten = dict(unit)
-    fallback_fact = _compact(unit.get("fact") or unit.get("supporting_fact") or "", 180)
+    supporting_facts = [
+        _compact(item, 220)
+        for item in _as_list(unit.get("supporting_facts")) + _as_list(unit.get("fact_chain"))
+        if str(item or "").strip() and not _is_bad_public_fact(item)
+    ]
+    fallback_fact = _compact(unit.get("fact") or unit.get("supporting_fact") or (supporting_facts[0] if supporting_facts else ""), 220)
     question = _question_for(package, unit) if package else _compact(unit.get("question") or unit.get("section_title"), 180)
     title = _compact(package.get("chapter_title") if package else unit.get("section_title"), 80) or "本节"
     refs = _as_list(unit.get("evidence_refs"))
     source_quality = _as_dict(unit.get("source_quality")) or (_support_profile(package, refs) if package else {})
+    fact_phrase = fallback_fact or (supporting_facts[0] if supporting_facts else "")
+    facts_for_basis = _dedupe([fact_phrase, *supporting_facts, *_evidence_facts_from_package(package, limit=4)], limit=4)
+    basis = "；".join([item for item in facts_for_basis if item])
+    strength = str(source_quality.get("claim_strength") or "").strip().lower()
+    if basis:
+        if strength in {"strong", "medium"} and source_quality.get("grade") not in {"low", "medium_low"}:
+            claim = _claim_from_fact(package, fact_phrase) if package else f"{title}已有可用于判断的事实基础。"
+            reasoning = (
+                f"事实锚点显示：{basis}。这些信息把“{question}”从概念讨论推进到可观察变量，"
+                "但仍要结合披露主体、统计口径和时间窗口判断其能否外推到行业层面。"
+            )
+            confidence = unit.get("confidence") or "medium"
+        else:
+            claim = f"{title}已经出现方向性信号，但结论强度仍取决于后续可追溯来源和连续指标。"
+            reasoning = (
+                f"事实锚点显示：{basis}。这些信息能够说明阶段性变化或局部样本，"
+                "目前更适合支撑趋势判断和边界识别，不能直接扩展为确定性的规模、格局或商业化结论。"
+            )
+            confidence = "low"
+    else:
+        claim = f"{title}目前只能形成方向性观察，后续需要用可追溯来源校准结论强度。"
+        reasoning = "现有公开信息尚未形成足够清晰的事实链，正文应把可观察变量、证据限制和后续验证条件同时说明。"
+        confidence = "low"
+    counter = _ensure_counter(unit.get("counter_evidence")) or (
+        "如果后续同口径指标走弱、企业动作中断、客户验证不足或监管条件收紧，本节判断需要下调。"
+    )
+    actionable = _ensure_actionable(unit.get("actionable") or unit.get("decision_implication")) or (
+        "后续优先复核同口径指标、企业披露、客户案例和反向样本，再决定是否提高判断强度。"
+    )
+    rewritten.update(
+        {
+            "claim": claim,
+            "public_claim": claim,
+            "evidence_basis": basis,
+            "reasoning": reasoning,
+            "reasoning_chain": reasoning,
+            "mechanism": reasoning,
+            "counter_evidence": counter,
+            "limitation_boundary": counter,
+            "actionable": actionable,
+            "confidence": confidence,
+            "confidence_reason": rewritten.get("confidence_reason") or "已按事实锚点、变量解释、结论强度和边界条件重写。",
+            "rewrite_required": True,
+            "rewrite_reason": reason,
+            "verification_metrics": _as_list(unit.get("verification_metrics")) or (_verification_metrics(package, refs) if package else []),
+            "claim_status": "directional" if confidence == "low" else (unit.get("claim_status") or "decision_ready"),
+            "quality_status": "directional_with_boundary" if confidence == "low" else (unit.get("quality_status") or "valid"),
+            "supporting_facts": facts_for_basis,
+        }
+    )
+    return rewritten
     if reason == "low_source_quality" or source_quality.get("grade") == "low":
         claim = f"{title}需要按连续指标和反向样本拆解，避免把单点信号直接外推为行业结论。"
         fact_clause = (
@@ -1213,10 +1395,12 @@ def run_claim_builder_agent(
     cleaned: List[Dict[str, Any]] = []
     for unit in argument_units:
         package = _as_dict(package_by_id.get(str(unit.get("chapter_id") or "")))
+        unit = _normalize_claim_binding_status(unit, package)
         was_rewritten = bool(unit.get("rewrite_required"))
         original_issues = _argument_unit_issues(unit)
         if any(issue.get("severity") != "warning" for issue in original_issues):
             unit = rewrite_weak_claim_unit(unit, package=package, reason="contract_rewrite")
+            unit = _normalize_claim_binding_status(unit, package)
         final_issues = _argument_unit_issues(unit)
         blocking = [issue for issue in final_issues if issue.get("severity") != "warning"]
         unit["original_quality_issues"] = original_issues
