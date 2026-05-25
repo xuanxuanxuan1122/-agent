@@ -277,7 +277,7 @@ _LAYOUT_SECTION_LABELS = {
     "transmission_chain": "影响路径",
     "mechanism_map": "影响路径与约束",
     "signal_validation": "可验证信号",
-    "evidence_matrix": "关键事实对照",
+    "evidence_matrix": "事实依据",
 }
 
 

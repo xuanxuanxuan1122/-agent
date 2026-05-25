@@ -502,6 +502,28 @@ def normalize_openai_web_response(
         )
 
     summary = str(payload.get("summary") or payload.get("answer") or output_text or "").strip()
+    source_candidates: List[Dict[str, Any]] = []
+    if sources and not raw_points:
+        for source in sources:
+            if not str(source.get("url") or "").strip():
+                continue
+            source_type = str(source.get("source_type") or _source_type_from_source(source)).strip()
+            source_level = str(source.get("source_level") or _source_level(source_type)).strip()
+            source_candidates.append(
+                {
+                    "title": str(source.get("title") or source.get("url") or "").strip(),
+                    "url": str(source.get("url") or "").strip(),
+                    "date": str(source.get("date") or "").strip(),
+                    "source_type": source_type,
+                    "source_level": source_level,
+                    "provider": PROVIDER_NAME,
+                    "repair_source": repair_source,
+                    "retrieval_mode": retrieval_mode,
+                    "candidate_only": True,
+                    "candidate_reason": "url_citation_without_structured_evidence",
+                    "search_task": dict(search_task),
+                }
+            )
     avg_confidence = round(sum(confidence_values) / max(len(confidence_values), 1), 4) if confidence_values else 0.0
     status = "success" if sources and raw_points else "failed"
     evidence_gaps = _as_list(payload.get("evidence_gap")) or _as_list(payload.get("limitations"))
@@ -525,6 +547,7 @@ def normalize_openai_web_response(
         "confidence": avg_confidence,
         "key_sources": list(sources),
         "raw_data_points": raw_points,
+        "source_candidates": source_candidates,
         "limitations": {
             "provider": PROVIDER_NAME,
             "coverage": "OpenAI web search gap-repair evidence",
@@ -532,6 +555,7 @@ def normalize_openai_web_response(
             "evidence_gap": evidence_gaps,
             "failure_reason": failure_reason,
             "allowed_domains": allowed_domains,
+            "source_candidate_count": len(source_candidates),
         },
         "status": status,
         "search_task": dict(search_task),
@@ -543,6 +567,7 @@ def normalize_openai_web_response(
             "query": query,
             "source_count": len(sources),
             "raw_data_point_count": len(raw_points),
+            "source_candidate_count": len(source_candidates),
             "retrieval_mode": retrieval_mode,
             "repair_source": repair_source,
         },

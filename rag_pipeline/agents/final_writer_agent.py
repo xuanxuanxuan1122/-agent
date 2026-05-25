@@ -27,6 +27,10 @@ AGENT_DESCRIPTION = "Final Writer Agent. Only composes structured packages and r
 PUBLIC_SECTION_KEYS = {
     "section_id",
     "section_title",
+    "block_type",
+    "output_type",
+    "section_role",
+    "required_evidence_refs",
     "claim",
     "reasoning",
     "mechanism",
@@ -36,8 +40,15 @@ PUBLIC_SECTION_KEYS = {
     "what_to_verify_next",
     "confidence",
     "evidence_refs",
+    "supporting_facts",
     "render_blocks",
     "public_render",
+    "layout_generated",
+    "evidence_backed",
+    "observation_only",
+    "force_render_observation",
+    "layout_match_score",
+    "layout_match_reason",
 }
 CITATION_RE = re.compile(r"\[\d{1,5}\]")
 
@@ -161,14 +172,77 @@ def _repair_generic_source(source: Dict[str, Any]) -> Dict[str, Any]:
     return copied
 
 
+LOW_QUALITY_REPORT_SOURCE_DOMAINS = (
+    "twitter.com",
+    "x.com",
+    "instagram.com",
+    "facebook.com",
+    "baike.baidu.com",
+    "baijiahao.baidu.com",
+    "blog.csdn.net",
+    "cnblogs.com",
+    "juejin.cn",
+    "fxbaogao.com",
+    "sgpjbg.com",
+    "jazzyear.com",
+    "zbj.com",
+)
+
+LOW_QUALITY_REPORT_SOURCE_TITLE_PATTERNS = (
+    r"\u519c\u4e1a\u4eba\u5de5\u667a\u80fd",
+    r"\u6570\u636e\u6295\u6bd2",
+    r"\u7eba\u7ec7",
+    r"\u667a\u80fd\u624b\u673a",
+    r"\u53d1\u73b0\u62a5\u544a",
+    r"Scribd",
+    r"SEO",
+)
+
+
+def _source_allowed_for_report(source: Dict[str, Any]) -> bool:
+    host = _source_host(source).lower()
+    title = str(source.get("title") or source.get("source_title") or "").strip()
+    identity = " ".join(
+        str(source.get(key) or "")
+        for key in ("ref", "url", "source_url", "title", "source_title", "publisher", "source")
+    )
+    source_type = str(source.get("source_type") or source.get("type") or "").strip().lower()
+    source_level = str(source.get("source_level") or source.get("credibility") or "").strip().upper()
+    if source_level == "D":
+        return False
+    if source.get("source_title_url_mismatch_suspected"):
+        return False
+    if re.search(r"\bIQS\s*来源\b|^IQS来源$|example\.(?:com|gov|org)", identity, flags=re.I):
+        return False
+    if source_type in {"self_media", "social", "forum", "wiki", "seo", "search_page", "aggregator"}:
+        return False
+    if any(re.search(pattern, title, flags=re.I) for pattern in LOW_QUALITY_REPORT_SOURCE_TITLE_PATTERNS):
+        return False
+    return not any(host == domain or host.endswith("." + domain) for domain in LOW_QUALITY_REPORT_SOURCE_DOMAINS)
+
+
 def _traceable_source_registry(source_registry: Sequence[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     kept: List[Dict[str, Any]] = []
     excluded: List[Dict[str, Any]] = []
+    title_hosts: Dict[str, set[str]] = {}
+    for source in list(source_registry or []):
+        if not isinstance(source, dict):
+            continue
+        title = re.sub(r"\s+", " ", str(source.get("title") or source.get("source_title") or "").strip()).lower()
+        host = _source_host(source)
+        if title and host:
+            title_hosts.setdefault(title, set()).add(host)
     for source in list(source_registry or []):
         if not isinstance(source, dict):
             continue
         repaired = _repair_generic_source(source)
-        if _source_is_traceable(repaired):
+        title_key = re.sub(r"\s+", " ", str(repaired.get("title") or repaired.get("source_title") or "").strip()).lower()
+        host = _source_host(repaired)
+        if title_key and host and len(title_hosts.get(title_key, set())) > 1:
+            repaired["source_title_url_mismatch_suspected"] = True
+            repaired["original_title"] = repaired.get("title") or repaired.get("source_title")
+            repaired["title"] = f"{host} source"
+        if _source_is_traceable(repaired) and _source_allowed_for_report(repaired):
             kept.append(repaired)
         else:
             excluded.append(repaired)

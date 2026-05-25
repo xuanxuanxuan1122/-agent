@@ -6,7 +6,7 @@ from typing import Any, Dict, Iterable, List, Sequence
 
 BLOCK_REGISTRY: Dict[str, Dict[str, Any]] = {
     "thesis": {"label": "本章结论", "renderer": "render_thesis_block", "roles": ["support", "metric"]},
-    "evidence_matrix": {"label": "关键事实对照", "renderer": "render_evidence_matrix", "roles": ["support", "metric"]},
+    "evidence_matrix": {"label": "事实依据", "renderer": "render_evidence_matrix", "roles": ["support", "metric"]},
     "metric_reconciliation": {"label": "指标口径与可比性", "renderer": "render_metric_reconciliation", "roles": ["metric"]},
     "mechanism_chain": {"label": "影响路径与约束", "renderer": "render_mechanism_chain", "roles": ["support", "policy_original"]},
     "policy_timeline": {"label": "政策节点与执行节奏", "renderer": "render_policy_timeline", "roles": ["policy_original", "official_data"]},
@@ -16,7 +16,7 @@ BLOCK_REGISTRY: Dict[str, Dict[str, Any]] = {
     "customer_painpoint_matrix": {"label": "客户场景与采购约束", "renderer": "render_customer_painpoint_matrix", "roles": ["customer_case", "case"]},
     "competitive_positioning": {"label": "竞争位置与替代压力", "renderer": "render_competitive_positioning", "roles": ["case", "metric"]},
     "technology_maturity": {"label": "技术成熟度与量产边界", "renderer": "render_technology_maturity", "roles": ["technology_product", "case"]},
-    "unit_economics": {"label": "收入、利润与现金流质量", "renderer": "render_unit_economics", "roles": ["financial_metric", "filing"]},
+    "unit_economics": {"label": "商业化证据", "renderer": "render_unit_economics", "roles": ["financial_metric", "filing"]},
     "scenario_analysis": {"label": "情景分层与结论弹性", "renderer": "render_scenario_analysis", "roles": ["metric", "counter"]},
     "risk_trigger": {"label": "反向信号与失效条件", "renderer": "render_risk_trigger", "roles": ["counter"]},
     "verification_checklist": {"label": "后续验证重点", "renderer": "render_verification_checklist", "roles": ["support", "counter"]},

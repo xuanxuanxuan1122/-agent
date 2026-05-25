@@ -11,6 +11,7 @@ try:
     from rag_pipeline.contracts.evidence_quality import apply_evidence_quality_contract
     from rag_pipeline.contracts.source_registry import pick_refs as _contract_pick_refs
     from .analytics import run_analytics_agents
+    from .chapter_evidence_builder import build_chapter_evidence_packages_from_evidence_package
     from .chapter_argument_agent import run_chapter_argument_agent
     from .claim_builder_agent import run_claim_builder_agent
     from .decision_synthesis_agent import run_decision_synthesis_agent
@@ -36,6 +37,7 @@ except Exception:  # pragma: no cover - direct script mode fallback
         apply_evidence_quality_contract = None  # type: ignore
         _contract_pick_refs = None  # type: ignore
     from analytics import run_analytics_agents  # type: ignore
+    from chapter_evidence_builder import build_chapter_evidence_packages_from_evidence_package  # type: ignore
     from chapter_argument_agent import run_chapter_argument_agent  # type: ignore
     from claim_builder_agent import run_claim_builder_agent  # type: ignore
     from decision_synthesis_agent import run_decision_synthesis_agent  # type: ignore
@@ -126,6 +128,15 @@ def _as_dict(value: Any) -> Dict[str, Any]:
 
 def _as_list(value: Any) -> List[Any]:
     return list(value) if isinstance(value, list) else []
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -379,6 +390,43 @@ def needs_public_rebuild(
     hits.extend(_scan_public_rebuild_hits(argument_units or [], path="argument_units", limit=16))
     hits.extend(_scan_public_rebuild_hits(chapter_packages or [], path="chapter_packages", limit=16))
     hits.extend(_scan_public_rebuild_hits(_as_dict(structured_analysis), path="structured_analysis", limit=8))
+    quality = _as_dict(_as_dict(structured_analysis).get("analysis_depth_quality"))
+    status = str(quality.get("status") or "").strip().lower()
+    repeated_ratio = _safe_float(quality.get("repeated_claim_ratio"), 0.0)
+    title_as_claim_count = int(_safe_float(quality.get("title_as_claim_count"), 0.0))
+    ref_mismatch_count = int(_safe_float(quality.get("evidence_ref_mismatch_count"), 0.0))
+    if status == "needs_rewrite":
+        hits.append(
+            {
+                "path": "structured_analysis.analysis_depth_quality.status",
+                "pattern": "needs_rewrite",
+                "snippet": "analysis_depth_quality requested rewrite",
+            }
+        )
+    if repeated_ratio > 0.30:
+        hits.append(
+            {
+                "path": "structured_analysis.analysis_depth_quality.repeated_claim_ratio",
+                "pattern": "repeated_claim_ratio",
+                "snippet": f"repeated_claim_ratio={repeated_ratio}",
+            }
+        )
+    if title_as_claim_count > 0:
+        hits.append(
+            {
+                "path": "structured_analysis.analysis_depth_quality.title_as_claim_count",
+                "pattern": "title_as_claim_count",
+                "snippet": f"title_as_claim_count={title_as_claim_count}",
+            }
+        )
+    if ref_mismatch_count > 0:
+        hits.append(
+            {
+                "path": "structured_analysis.analysis_depth_quality.evidence_ref_mismatch_count",
+                "pattern": "evidence_ref_mismatch_count",
+                "snippet": f"evidence_ref_mismatch_count={ref_mismatch_count}",
+            }
+        )
     return {
         "required": bool(hits),
         "hit_count": len(hits),
@@ -417,6 +465,84 @@ def rebuild_public_argument_pipeline(
         "argument_unit_count_after": len([item for item in _as_list(rebuilt_units) if isinstance(item, dict)]),
         "chapter_package_count_after": len([item for item in _as_list(rebuilt_chapters) if isinstance(item, dict)]),
     }
+
+
+def _chapter_evidence_packages_are_compacted(packages: Optional[Sequence[Dict[str, Any]]]) -> bool:
+    checked = 0
+    compacted = 0
+    for package in list(packages or []):
+        if not isinstance(package, dict):
+            continue
+        checked += 1
+        has_counts = bool(package.get("evidence_counts")) or any(
+            package.get(f"{key}_count") not in (None, "", 0)
+            for key in (
+                "core_evidence",
+                "supporting_evidence",
+                "metric_evidence",
+                "case_evidence",
+                "counter_evidence",
+                "directional_evidence",
+                "sample_evidence",
+            )
+        )
+        has_substantive_lists = any(
+            _as_list(package.get(key))
+            for key in (
+                "core_evidence",
+                "supporting_evidence",
+                "metric_evidence",
+                "case_evidence",
+                "counter_evidence",
+                "directional_evidence",
+                "table_evidence",
+                "evidence_items",
+                "analysis_ready_evidence",
+            )
+        )
+        if has_counts and not has_substantive_lists:
+            compacted += 1
+    return bool(checked and compacted >= max(1, checked // 2))
+
+
+def _chapter_evidence_hydrated_count(packages: Optional[Sequence[Dict[str, Any]]]) -> int:
+    total = 0
+    for package in list(packages or []):
+        if not isinstance(package, dict):
+            continue
+        for key in (
+            "core_evidence",
+            "supporting_evidence",
+            "metric_evidence",
+            "case_evidence",
+            "counter_evidence",
+            "directional_evidence",
+        ):
+            total += _safe_len(package.get(key))
+    return total
+
+
+def _chapter_evidence_signal_count(packages: Optional[Sequence[Dict[str, Any]]]) -> int:
+    total = 0
+    for package in list(packages or []):
+        if not isinstance(package, dict):
+            continue
+        counts = _as_dict(package.get("evidence_counts"))
+        for key in (
+            "core_evidence",
+            "supporting_evidence",
+            "metric_evidence",
+            "case_evidence",
+            "counter_evidence",
+            "directional_evidence",
+            "sample_evidence",
+        ):
+            total += _safe_len(package.get(key))
+            try:
+                total += int(float(package.get(f"{key}_count") or counts.get(key) or 0))
+            except (TypeError, ValueError):
+                pass
+    return total
 
 
 def _fill_section_from_unit(section: Dict[str, Any], unit: Dict[str, Any], fallback_refs: Sequence[str]) -> Dict[str, Any]:
@@ -770,20 +896,46 @@ def _compact_issue_list(items: Sequence[Any], *, limit: int = 4) -> List[Any]:
 
 
 def _compact_evidence_package(package: Dict[str, Any]) -> Dict[str, Any]:
+    evidence_layers = (
+        "core_evidence",
+        "supporting_evidence",
+        "metric_evidence",
+        "case_evidence",
+        "counter_evidence",
+        "directional_evidence",
+        "sample_evidence",
+        "table_evidence",
+        "clue_evidence",
+        "appendix_evidence",
+        "evidence_items",
+    )
     counts = {
         key: _safe_len(package.get(key))
-        for key in (
-            "core_evidence",
-            "supporting_evidence",
-            "table_evidence",
-            "clue_evidence",
-            "appendix_evidence",
-            "evidence_items",
-        )
+        for key in evidence_layers
         if _safe_len(package.get(key))
     }
+    compact_layers: Dict[str, List[Dict[str, Any]]] = {}
+    for collection in evidence_layers:
+        layer_items = []
+        for item in _as_list(package.get(collection)):
+            if isinstance(item, dict):
+                layer_items.append(_compact_evidence_item(item))
+            if len(layer_items) >= 3:
+                break
+        if layer_items:
+            compact_layers[collection] = layer_items
     samples: List[Dict[str, Any]] = []
-    for collection in ("core_evidence", "table_evidence", "supporting_evidence", "clue_evidence"):
+    for collection in (
+        "core_evidence",
+        "supporting_evidence",
+        "metric_evidence",
+        "case_evidence",
+        "counter_evidence",
+        "directional_evidence",
+        "sample_evidence",
+        "table_evidence",
+        "clue_evidence",
+    ):
         for item in _as_list(package.get(collection)):
             if isinstance(item, dict):
                 samples.append(_compact_evidence_item(item))
@@ -799,9 +951,19 @@ def _compact_evidence_package(package: Dict[str, Any]) -> Dict[str, Any]:
             "chapter_title": _compact(package.get("chapter_title"), 160),
             "chapter_question": _compact(package.get("chapter_question"), 180),
             "evidence_counts": counts,
+            "core_evidence_count": counts.get("core_evidence", 0),
+            "supporting_evidence_count": counts.get("supporting_evidence", 0),
+            "metric_evidence_count": counts.get("metric_evidence", 0),
+            "case_evidence_count": counts.get("case_evidence", 0),
+            "counter_evidence_count": counts.get("counter_evidence", 0),
+            "directional_evidence_count": counts.get("directional_evidence", 0),
+            **compact_layers,
             "sample_evidence": samples[:2],
             "missing_evidence": _compact_issue_list(_as_list(package.get("missing_evidence")), limit=3),
             "evidence_quality_summary": _compact_mapping(quality, list(quality.keys()), text_chars=120),
+            "metadata": _compact_mapping(_as_dict(package.get("metadata")), list(_as_dict(package.get("metadata")).keys()), text_chars=120),
+            "unresolved_evidence_refs": _as_list(package.get("unresolved_evidence_refs"))[:8],
+            "unresolved_evidence_ref_count": package.get("unresolved_evidence_ref_count"),
         }.items()
         if value not in (None, "", [], {})
     }
@@ -1669,19 +1831,6 @@ def _hard_delivery_blockers(
                 continue
             blockers.append({"type": "forbidden_public_text", "pattern": pattern})
 
-    deep_eval = _as_dict(qa_result.get("deep_evaluation"))
-    deep_report = _deep_report_family(qa_result.get("report_family"))
-    block_deep_gaps = (
-        strict_gate
-        or deep_report
-        or _env_flag("REPORT_BLOCK_ON_DEEP_GAPS", False)
-    )
-    if block_deep_gaps:
-        for gap in _as_list(deep_eval.get("blocking_gaps")):
-            gap = _as_dict(gap)
-            gap_type = str(gap.get("type") or "").strip()
-            blockers.append({"type": gap_type or "deep_report_blocking_gap", "detail": gap})
-
     coverage_rows = [item for item in list(coverage_matrix or []) if isinstance(item, dict)]
     gap_rows = _coverage_gap_rows(coverage_rows)
     if coverage_rows and not any(bool(item.get("decision_ready")) for item in coverage_rows):
@@ -1689,19 +1838,8 @@ def _hard_delivery_blockers(
             blockers.append({"type": "no_decision_ready_hypotheses", "count": len(coverage_rows)})
         elif not _coverage_has_usable_signal(coverage_rows):
             blockers.append({"type": "no_publishable_evidence", "count": len(coverage_rows)})
-    if _env_flag("REPORT_BLOCK_ON_PROOF_GAPS", strict_gate):
-        hard_gap_types = {"insufficient_ab_sources", "metric_evidence_missing", "case_evidence_missing"}
-        hard_gap_rows = [
-            item
-            for item in gap_rows
-            if hard_gap_types.intersection({str(gap or "") for gap in _as_list(item.get("blocking_gaps"))})
-        ]
-        if hard_gap_rows:
-            blockers.append({"type": "core_proof_gaps", "count": len(hard_gap_rows), "examples": hard_gap_rows[:5]})
 
     warning_types = set(_package_warning_types(package_quality_report))
-    if _env_flag("REPORT_BLOCK_LOW_AB_CORE_COVERAGE", strict_gate) and "low_ab_core_coverage" in warning_types:
-        blockers.append({"type": "low_ab_core_coverage"})
     package_errors = [
         _as_dict(item)
         for item in _as_list(package_quality_report.get("blocking_errors") or package_quality_report.get("errors"))
@@ -1717,8 +1855,10 @@ def _hard_delivery_blockers(
     qa_errors = [_as_dict(item) for item in _as_list(qa_result.get("errors"))]
     if any(str(item.get("type") or "") in {"chapter_packages_missing", "report_markdown_empty"} for item in qa_errors):
         blockers.append({"type": "pipeline_empty_package", "count": len(qa_errors), "examples": qa_errors[:5]})
-    if not bool(qa_result.get("passed")) and (deep_report or _env_flag("REPORT_BLOCK_ON_QA_FAILURE", strict_gate)):
-        blockers.append({"type": "qa_not_passed", "quality_score": qa_result.get("quality_score")})
+    for item in _as_list(_as_dict(qa_result.get("render_gate")).get("blockers")):
+        payload = _as_dict(item)
+        if payload:
+            blockers.append({"type": payload.get("type") or "render_gate_blocker", "detail": payload})
 
     deduped: List[Dict[str, Any]] = []
     seen = set()
@@ -1809,6 +1949,15 @@ def _delivery_gate_from_evidence_package(evidence_package: Dict[str, Any]) -> Di
             else:
                 gate["review_reasons"] = reasons
             gate["evidence_health_summary"] = health
+        if _count_value(health.get("analysis_ready_ab_count")) > 0 and _count_value(health.get("distinct_verified_ab_source_count")) <= 0:
+            gate["publishable"] = False
+            gate["draft_allowed"] = True
+            gate["diagnostic_only"] = False
+            gate["tier"] = "limited_review_draft"
+            reasons = _as_list(gate.get("review_reasons"))
+            reasons.append({"type": "verified_ab_sources_missing", "evidence_health_summary": health})
+            gate["review_reasons"] = reasons
+            gate["evidence_health_summary"] = health
         return gate
     publishable_gate = _as_dict(summary.get("publishable_evidence_gate"))
     if bool(publishable_gate.get("passed")):
@@ -1884,6 +2033,9 @@ def _quality_findings_from_review(
     for item in _as_list(_as_dict(qa_result).get("warnings")):
         payload = _as_dict(item)
         findings.append({"source": "qa_warning", **(payload or {"type": str(item)})})
+    for item in _as_list(_as_dict(qa_result).get("quality_findings")):
+        payload = _as_dict(item)
+        findings.append({"source": payload.get("source") or "qa_quality", **(payload or {"type": str(item)})})
     for item in _as_list(_as_dict(package_quality_report).get("blocking_errors")) + _as_list(_as_dict(package_quality_report).get("errors")):
         payload = _as_dict(item)
         findings.append({"source": "package_quality", **(payload or {"type": str(item)})})
@@ -1930,7 +2082,7 @@ def _quality_score_from_findings(
 
     finding_count = len(list(quality_findings or []))
     score -= min(25, finding_count * 2)
-    if _count_value(_as_dict(evidence_health_summary).get("traceable_ab_source_count")) <= 0:
+    if _count_value(_as_dict(evidence_health_summary).get("distinct_verified_ab_source_count")) <= 0:
         score -= 12
     if _count_value(_as_dict(evidence_health_summary).get("readpage_succeeded")) <= 0:
         score -= 8
@@ -1952,10 +2104,11 @@ def _quality_grade(score: int) -> str:
 def _claim_strength_from_gate(delivery_gate: Dict[str, Any], evidence_health_summary: Dict[str, Any]) -> str:
     if bool(_as_dict(delivery_gate).get("publishable")):
         return "strong"
+    verified_ab = _count_value(_as_dict(evidence_health_summary).get("distinct_verified_ab_source_count"))
     traceable_ab = _count_value(_as_dict(evidence_health_summary).get("traceable_ab_source_count"))
     analysis_ab = _count_value(_as_dict(evidence_health_summary).get("analysis_ready_ab_count"))
     analysis_ready = _count_value(_as_dict(evidence_health_summary).get("analysis_ready_count"))
-    if traceable_ab >= 2:
+    if verified_ab >= 2:
         return "moderate"
     if analysis_ab > 0 or analysis_ready > 0:
         return "directional"
@@ -2711,6 +2864,9 @@ def build_writer_report(
             }
         )
 
+    if _chapter_evidence_packages_are_compacted(chapter_evidence_packages):
+        chapter_evidence_packages = None
+
     if chapter_evidence_packages is None or source_registry is None:
         binder = run_evidence_binder(
             research_plan=research_plan,
@@ -2741,6 +2897,33 @@ def build_writer_report(
         evidence_refinement_plan = _as_dict(_as_dict(structured_analysis).get("evidence_refinement_plan"))
         research_proof_profile = _as_dict(_as_dict(structured_analysis).get("research_proof_profile"))
         mandatory_proof_checks = _as_list(_as_dict(structured_analysis).get("mandatory_proof_checks"))
+
+    rebuilt_chapter_evidence_packages = build_chapter_evidence_packages_from_evidence_package(
+        report_blueprint=report_blueprint,
+        evidence_package=evidence_package,
+        existing_chapter_evidence_packages=chapter_evidence_packages,
+        source_registry=source_registry,
+    )
+    rebuilt_signal_count = _chapter_evidence_signal_count(rebuilt_chapter_evidence_packages)
+    existing_signal_count = _chapter_evidence_signal_count(chapter_evidence_packages)
+    rebuilt_hydrated_count = _chapter_evidence_hydrated_count(rebuilt_chapter_evidence_packages)
+    existing_hydrated_count = _chapter_evidence_hydrated_count(chapter_evidence_packages)
+    if rebuilt_chapter_evidence_packages and (
+        rebuilt_hydrated_count > 0
+        and (rebuilt_hydrated_count >= existing_hydrated_count or existing_hydrated_count <= 0)
+    ):
+        chapter_evidence_packages = rebuilt_chapter_evidence_packages
+        evidence_package["chapter_evidence_packages"] = list(chapter_evidence_packages)
+    elif rebuilt_chapter_evidence_packages:
+        evidence_package.setdefault("chapter_evidence_rebuild_diagnostics", {})
+        evidence_package["chapter_evidence_rebuild_diagnostics"] = {
+            "status": "kept_existing_packages",
+            "reason": "rebuilt_package_had_less_hydrated_evidence",
+            "rebuilt_signal_count": rebuilt_signal_count,
+            "existing_signal_count": existing_signal_count,
+            "rebuilt_hydrated_count": rebuilt_hydrated_count,
+            "existing_hydrated_count": existing_hydrated_count,
+        }
 
     evidence_graph = run_evidence_synthesizer(
         chapter_evidence_packages=chapter_evidence_packages,
@@ -3097,7 +3280,7 @@ def build_writer_report(
             delivery_gate=delivery_gate,
             evidence_package=evidence_package,
         )
-        public_markdown = _prepend_quality_scorecard(public_markdown, scorecard)
+        writer_output["score_markdown"] = scorecard
         writer_output["report_markdown"] = public_markdown
         writer_output["estimated_chars"] = len(public_markdown)
         writer_output["estimated_body_chars"] = len(

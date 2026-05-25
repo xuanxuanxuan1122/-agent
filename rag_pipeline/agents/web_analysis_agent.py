@@ -1443,7 +1443,7 @@ def call_iqs_search_with_fallback(query_item: Dict[str, Any], base_options: Dict
             trace["deep_exhausted"] = True
         if not _should_use_fallback(results, trace, primary_options):
             return results, trace
-        trace["errors"].append("主查询结果数量不足，启用降级查询")
+        trace["errors"].append("主查询结果数量不足，启用检索策略 fallback")
     except Exception as exc:
         logger.exception("IQS primary search failed", extra={"query": text})
         results = []
@@ -2248,6 +2248,9 @@ def run_iqs_optimized_search(query: str, options: Optional[Dict[str, Any]] = Non
                 break
         if len(search_tasks) >= max_tasks:
             break
+    if any(bool(item.get("prefer_deep")) for item in search_tasks):
+        base_options["enableBatchSearch"] = False
+        base_options["enable_batch_search"] = False
     raw_results: List[Dict[str, Any]] = []
     search_trace: List[Dict[str, Any]] = []
     errors: List[str] = []

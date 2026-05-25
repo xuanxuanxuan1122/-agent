@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -74,6 +75,22 @@ def _as_dict(value: Any) -> Dict[str, Any]:
 
 def _as_list(value: Any) -> List[Any]:
     return list(value) if isinstance(value, list) else []
+
+
+def _parse_structured_string(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text or text[0] not in "[{":
+        return value
+    for parser in (json.loads, ast.literal_eval):
+        try:
+            parsed = parser(text)
+        except Exception:
+            continue
+        if isinstance(parsed, (dict, list)):
+            return parsed
+    return value
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -294,6 +311,59 @@ def _has_traceable_source(item: Dict[str, Any]) -> bool:
     return bool(url or (document_ref and metadata_count >= 2))
 
 
+VERIFIED_SOURCE_STATUSES = {"readpage_verified", "document_verified"}
+DOCUMENT_SOURCE_RE = re.compile(
+    r"(\.pdf(?:$|\?)|annual[-_ ]?report|financial[-_ ]?report|filing|prospectus|"
+    r"announcement|disclosure|standard|whitepaper|policy|regulation|official|gov\.|\.gov|exchange)",
+    re.I,
+)
+
+
+def _source_verification_status(item: Dict[str, Any]) -> str:
+    source = _source_payload(item)
+    explicit = str(
+        item.get("source_verification_status")
+        or source.get("source_verification_status")
+        or item.get("verification_status")
+        or source.get("verification_status")
+        or ""
+    ).strip().lower()
+    if explicit in {"search_result_only", "readpage_verified", "document_verified", "inaccessible"}:
+        return explicit
+    if not _has_traceable_source(item):
+        return "inaccessible"
+    url = str(source.get("url") or source.get("source_url") or item.get("source_url") or "").strip()
+    document_ref = str(
+        source.get("document_id")
+        or source.get("doc_id")
+        or source.get("page_ref")
+        or item.get("document_id")
+        or item.get("doc_id")
+        or item.get("page_ref")
+        or ""
+    ).strip()
+    source_text = " ".join(str(value or "") for value in [url, source.get("source_type"), source.get("title"), item.get("source_type"), item.get("source_family")])
+    if document_ref or DOCUMENT_SOURCE_RE.search(source_text):
+        return "document_verified"
+    if bool(
+        source.get("readpage_verified")
+        or source.get("auto_readpage")
+        or source.get("readpage_priority")
+        or item.get("readpage_verified")
+        or item.get("auto_readpage")
+        or item.get("readpage_priority")
+    ):
+        return "readpage_verified"
+    for key in ("mainText", "main_text", "markdown", "content", "text", "quote", "page_content"):
+        if str(source.get(key) or item.get(key) or "").strip():
+            return "readpage_verified"
+    return "search_result_only"
+
+
+def _has_verified_source(item: Dict[str, Any]) -> bool:
+    return _source_verification_status(item) in VERIFIED_SOURCE_STATUSES
+
+
 def _is_fake_or_placeholder_source(item: Dict[str, Any]) -> bool:
     source = _source_payload(item)
     if bool(source.get("fake_or_placeholder_source") or item.get("fake_or_placeholder_source")):
@@ -398,7 +468,7 @@ def _select_analysis_items_for_dimension(items: Sequence[Dict[str, Any]], *, max
             item
             for item in item_list
             if _analysis_source_level(item) in {"A", "B"}
-            and _has_traceable_source(item)
+            and _has_verified_source(item)
             and _analysis_allowed_use(item) in {"core_claim", "supporting", "supporting_context"}
         ],
         6,
@@ -470,6 +540,7 @@ def _claim_units_from_synthesis(dimension_synthesis: Dict[str, Dict[str, Any]]) 
                 "question": dimension,
                 "claim": synthesis.get("takeaway") or "",
                 "claim_status": "decision_ready" if _as_list(synthesis.get("evidence_ids")) else "directional",
+                "claim_strength": synthesis.get("claim_strength") or ("moderate" if _as_list(synthesis.get("evidence_ids")) else "directional"),
                 "quality_status": "valid" if _as_list(synthesis.get("evidence_ids")) else "directional_with_boundary",
                 "supporting_evidence": synthesis.get("evidence_ids") or synthesis.get("directional_evidence_ids") or [],
                 "evidence_refs": synthesis.get("evidence_ids") or synthesis.get("directional_evidence_ids") or [],
@@ -502,6 +573,7 @@ def _chapter_insights_from_synthesis(dimension_synthesis: Dict[str, Dict[str, An
                     {
                         "claim": synthesis.get("takeaway") or "",
                         "claim_status": "decision_ready" if _as_list(synthesis.get("evidence_ids")) else "directional",
+                        "claim_strength": synthesis.get("claim_strength") or ("moderate" if _as_list(synthesis.get("evidence_ids")) else "directional"),
                         "supporting_evidence": synthesis.get("evidence_ids") or synthesis.get("directional_evidence_ids") or [],
                         "evidence_refs": synthesis.get("evidence_ids") or synthesis.get("directional_evidence_ids") or [],
                         "mechanism": synthesis.get("mechanism") or "",
@@ -559,7 +631,7 @@ def _is_usable_for_claim(item: Dict[str, Any]) -> bool:
     return (
         _analysis_source_level(item) in {"A", "B"}
         and allowed_use in {"core_claim", "supporting"}
-        and _has_traceable_source(item)
+        and _has_verified_source(item)
     )
 
 
@@ -567,10 +639,13 @@ def _evidence_strength(item: Dict[str, Any]) -> str:
     level = _analysis_source_level(item)
     allowed = _analysis_allowed_use(item)
     traceable = _has_traceable_source(item)
+    verified = _has_verified_source(item)
     if allowed == "directional_signal":
         return "directional"
     if level in {"A", "B"} and allowed in {"core_claim", "supporting"} and not traceable:
         return "weak"
+    if level in {"A", "B"} and allowed in {"core_claim", "supporting"} and not verified:
+        return "moderate"
     if level in {"A", "B"} and allowed == "core_claim":
         return "strong"
     if level in {"A", "B"} and allowed == "supporting":
@@ -589,6 +664,8 @@ def _evidence_gap_tags(item: Dict[str, Any]) -> List[str]:
         gaps.append("source_trace_missing")
         if _is_title_only_source(item):
             gaps.append("title_only_source")
+    if level in {"A", "B"} and allowed in {"core_claim", "supporting"} and traceable and not _has_verified_source(item):
+        gaps.append("source_not_verified")
     if level not in {"A", "B"} and allowed != "directional_signal":
         gaps.append("needs_authoritative_source")
     if allowed in {"clue", "appendix_only"}:
@@ -682,6 +759,8 @@ def _evidence_analysis(item: Dict[str, Any], dimension: str, index: int) -> Dict
         "writer_evidence": fact,
         "source": source,
         "source_label": _source_label(item),
+        "source_verification_status": _source_verification_status(item),
+        "source_verified": _has_verified_source(item),
         "confidence": _confidence(item),
         "hypothesis_id": item.get("hypothesis_id"),
         "hypothesis_statement": item.get("hypothesis_statement"),
@@ -698,6 +777,7 @@ def _evidence_analysis(item: Dict[str, Any], dimension: str, index: int) -> Dict
         "evidence_card": card,
         "evidence_card_only": True,
         "evidence_strength": strength,
+        "claim_strength": strength,
         "evidence_gaps": gaps,
         "verification_questions": verification_questions,
         "suggested_followup_query": followup_query,
@@ -730,6 +810,20 @@ def _dimension_synthesis(dimension: str, analyses: List[Dict[str, Any]]) -> Dict
     directional_ids = [str(item.get("evidence_id")) for item in directional if item.get("evidence_id")][:12]
     usable_facts = [_compact(item.get("fact"), 120) for item in usable if str(item.get("fact") or "").strip()]
     directional_facts = [_compact(item.get("fact"), 120) for item in directional if str(item.get("fact") or "").strip()]
+    verified_source_keys = {
+        str(_source_payload(item).get("url") or _source_payload(item).get("document_id") or _source_label(item) or item.get("evidence_id") or "").strip().lower()
+        for item in usable
+        if _has_verified_source(item)
+    }
+    verified_source_keys = {key for key in verified_source_keys if key}
+    if len(verified_source_keys) >= 2:
+        claim_strength = "strong"
+    elif usable:
+        claim_strength = "moderate"
+    elif directional:
+        claim_strength = "directional"
+    else:
+        claim_strength = "weak"
     all_gaps = _dedupe(
         [
             gap
@@ -803,6 +897,8 @@ def _dimension_synthesis(dimension: str, analyses: List[Dict[str, Any]]) -> Dict
         "decision_implication": decision,
         "evidence_ids": evidence_ids,
         "directional_evidence_ids": directional_ids,
+        "claim_strength": claim_strength,
+        "distinct_verified_ab_source_count": len(verified_source_keys),
         "confidence": round(sum(float(item.get("confidence") or 0.0) for item in (usable or directional)) / max(len(usable or directional), 1), 3) if (usable or directional) else 0.0,
         "limits": "；".join(all_gaps[:5]),
         "evidence_gap_tags": all_gaps,
@@ -1446,7 +1542,10 @@ def validate_llm_analysis_output(payload: Dict[str, Any], evidence_package: Dict
             if isinstance(value, dict)
         ]
     else:
-        chapter_iterable = _as_list(raw_chapters)
+        chapter_iterable = [
+            _parse_structured_string(item)
+            for item in _as_list(raw_chapters)
+        ]
     for raw_chapter in chapter_iterable:
         if not isinstance(raw_chapter, dict):
             continue

@@ -6,7 +6,7 @@ from rag_pipeline.agents.writer_agent_clean import (
     validate_report_narrative_quality,
 )
 from rag_pipeline.agents.markdown_renderer import render_appendix, render_decision_package
-from rag_pipeline.agents.qa_agent import validate_no_internal_gap_language
+from rag_pipeline.agents.qa_agent import run_qa_agent, validate_no_internal_gap_language
 from rag_pipeline.flows.report.full_report import reformatter_structure_loss_reason
 
 
@@ -123,9 +123,44 @@ def test_strict_delivery_gate_blocks_proof_and_qa_failures(monkeypatch):
     blocker_types = {item["type"] for item in blockers}
 
     assert "forbidden_public_text" in blocker_types
-    assert "core_proof_gaps" in blocker_types
-    assert "low_ab_core_coverage" in blocker_types
-    assert "qa_not_passed" in blocker_types
+    assert "core_proof_gaps" not in blocker_types
+    assert "low_ab_core_coverage" not in blocker_types
+    assert "qa_not_passed" not in blocker_types
+
+
+def test_qa_failed_stays_clean_blocker_but_allows_formal_render(monkeypatch):
+    monkeypatch.setenv("QA_SCORING_MODE", "score")
+    monkeypatch.setenv("QA_DEEP_EVALUATOR_BLOCKING", "true")
+    report = (
+        "# AI Agent report\n\n"
+        "## Market signal\n\n"
+        "Enterprise AI Agent adoption is still uneven, but available evidence [1] supports a directional discussion."
+    )
+    qa = run_qa_agent(
+        report_markdown=report,
+        report_blueprint={"report_family": "industry_deep_report"},
+        chapter_packages=[
+            {
+                "chapter_id": "ch_01",
+                "sections": [
+                    {
+                        "section_id": "s1",
+                        "claim": "Enterprise adoption is directional rather than fully proven.",
+                        "reasoning": "The evidence is limited and should lower claim strength.",
+                        "counter_evidence": "Public verified counter samples remain insufficient.",
+                        "actionable": "Track verified deployments and renewals.",
+                        "evidence_refs": ["[1]"],
+                    }
+                ],
+            }
+        ],
+    )
+
+    assert qa["passed"] is False
+    assert qa["clean_gate"]["eligible"] is False
+    assert qa["render_gate"]["can_render_formal_report"] is True
+    assert not qa["render_blocking_followups"]
+    assert any(item.get("type") == "missing_sources_appendix" for item in qa["quality_findings"])
 
 
 def test_public_renderer_hides_internal_reference_analysis_and_coverage_matrix(monkeypatch):

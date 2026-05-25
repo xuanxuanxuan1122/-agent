@@ -206,12 +206,29 @@ def _can_use_directional_c(*, level: str, confidence: float, role: str, semantic
 def _evidence_source_key(item: Dict[str, Any]) -> str:
     source = _as_dict(item.get("source"))
     raw_url = str(source.get("url") or source.get("source_url") or item.get("source_url") or item.get("url") or "").strip()
-    domain = urlparse(raw_url).netloc.lower().removeprefix("www.")
-    if domain:
-        return f"domain:{domain}"
+    if raw_url:
+        parsed = urlparse(raw_url)
+        domain = parsed.netloc.lower().removeprefix("www.")
+        path = re.sub(r"/+$", "", parsed.path or "")
+        query = f"?{parsed.query}" if parsed.query else ""
+        if domain:
+            return f"url:{domain}{path}{query}".lower()
+    document_ref = str(
+        source.get("document_id")
+        or source.get("doc_id")
+        or source.get("page_ref")
+        or item.get("document_id")
+        or item.get("doc_id")
+        or item.get("page_ref")
+        or ""
+    ).strip().lower()
+    if document_ref:
+        return f"doc:{document_ref}"
     title = re.sub(r"\s+", "", str(source.get("title") or item.get("source_title") or "").strip().lower())
+    publisher = re.sub(r"\s+", "", str(source.get("publisher") or source.get("source") or item.get("source_text") or "").strip().lower())
+    date = re.sub(r"\s+", "", str(source.get("date") or item.get("date") or item.get("period") or "").strip().lower())
     if title:
-        return f"title:{title}"
+        return f"title:{title}|{publisher}|{date}"
     for value in [item.get("source_id"), source.get("id"), item.get("source_ref"), item.get("ref")]:
         text = re.sub(r"\s+", "", str(value or "").strip().lower())
         if text:
@@ -222,6 +239,62 @@ def _evidence_source_key(item: Dict[str, Any]) -> str:
 def _distinct_source_count(items: Sequence[Dict[str, Any]]) -> int:
     keys = {_evidence_source_key(item) for item in items if isinstance(item, dict)}
     return len({key for key in keys if key})
+
+
+VERIFIED_SOURCE_STATUSES = {"readpage_verified", "document_verified"}
+DOCUMENT_SOURCE_RE = re.compile(
+    r"(\.pdf(?:$|\?)|annual[-_ ]?report|financial[-_ ]?report|filing|prospectus|"
+    r"announcement|disclosure|standard|whitepaper|policy|regulation|official|gov\.|\.gov|exchange)",
+    re.I,
+)
+
+
+def _source_verification_status(item: Dict[str, Any]) -> str:
+    source = _as_dict(item.get("source"))
+    explicit = str(
+        item.get("source_verification_status")
+        or source.get("source_verification_status")
+        or item.get("verification_status")
+        or source.get("verification_status")
+        or ""
+    ).strip().lower()
+    if explicit in {"search_result_only", "readpage_verified", "document_verified", "inaccessible"}:
+        return explicit
+    raw_url = str(source.get("url") or source.get("source_url") or item.get("source_url") or item.get("url") or "").strip()
+    document_ref = str(
+        source.get("document_id")
+        or source.get("doc_id")
+        or source.get("page_ref")
+        or item.get("document_id")
+        or item.get("doc_id")
+        or item.get("page_ref")
+        or ""
+    ).strip()
+    if not raw_url and not document_ref:
+        return "inaccessible"
+    source_text = " ".join(
+        str(value or "")
+        for value in [raw_url, source.get("source_type"), source.get("title"), item.get("source_type"), item.get("source_family")]
+    )
+    if document_ref or DOCUMENT_SOURCE_RE.search(source_text):
+        return "document_verified"
+    if bool(
+        source.get("readpage_verified")
+        or source.get("auto_readpage")
+        or source.get("readpage_priority")
+        or item.get("readpage_verified")
+        or item.get("auto_readpage")
+        or item.get("readpage_priority")
+    ):
+        return "readpage_verified"
+    for key in ("mainText", "main_text", "markdown", "content", "text", "quote", "page_content"):
+        if str(source.get(key) or item.get(key) or "").strip():
+            return "readpage_verified"
+    return "search_result_only"
+
+
+def _has_verified_source(item: Dict[str, Any]) -> bool:
+    return _source_verification_status(item) in VERIFIED_SOURCE_STATUSES
 
 
 def _claim_type_for_hypothesis(hypothesis: Dict[str, Any], goals: Sequence[Dict[str, Any]]) -> str:
@@ -1371,15 +1444,50 @@ def build_coverage_matrix(
         usable_for_direction = usable + directional
         usable_levels = _level_distribution(usable)
         ab_count = usable_levels.get("A", 0) + usable_levels.get("B", 0)
+        ab_candidates = [
+            item
+            for item in relevant
+            if not item.get("appendix_only")
+            and str(item.get("source_level") or "").strip().upper() in {"A", "B"}
+            and str(item.get("allowed_use") or "").strip() in {"core_claim", "supporting", "supporting_context", ""}
+        ]
+        distinct_ab_source_count = _distinct_source_count(ab_candidates)
+        traceable_ab_candidates = [
+            item
+            for item in ab_candidates
+            if _evidence_source_key(item) and _source_verification_status(item) != "inaccessible"
+        ]
+        verified_ab_candidates = [item for item in traceable_ab_candidates if _has_verified_source(item)]
+        distinct_traceable_ab_source_count = _distinct_source_count(traceable_ab_candidates)
+        distinct_verified_ab_source_count = _distinct_source_count(verified_ab_candidates)
+        distinct_primary_source_count = _distinct_source_count(
+            [
+                item
+                for item in verified_ab_candidates
+                if str(item.get("source_level") or "").strip().upper() == "A"
+                or str(item.get("source_family") or "").strip().lower() in {"official/filing", "research/association"}
+            ]
+        )
         directional_count = len(directional)
         directional_distinct_count = _distinct_source_count(directional)
         claim_type = _claim_type_for_hypothesis(hypothesis, goals)
         hard_metric_claim = claim_type == "hard_metric"
         strict_mode = _strict_quality_mode()
-        counter_count = len(
+        counter_items = [
+            item
+            for item in usable_for_direction
+            if str(item.get("proof_role") or "").lower() == "counter"
+            or bool(_as_dict(item.get("raw")).get("counter_evidence"))
+        ]
+        distinct_counter_source_count = _distinct_source_count(
+            [item for item in counter_items if _evidence_source_key(item) and _source_verification_status(item) != "inaccessible"]
+        )
+        distinct_verified_counter_source_count = _distinct_source_count([item for item in counter_items if _has_verified_source(item)])
+        counter_count = distinct_verified_counter_source_count
+        counter_signal_count = len(
             [
                 item
-                for item in usable_for_direction
+                for item in counter_items
                 if str(item.get("proof_role") or "").lower() == "counter"
                 or bool(_as_dict(item.get("raw")).get("counter_evidence"))
             ]
@@ -1439,13 +1547,13 @@ def build_coverage_matrix(
                 required_sources = max(required_sources, goal_min_sources)
         missing: List[str] = []
         degradation_notes: List[str] = []
-        ab_requirement_satisfied = ab_count >= required_sources
+        ab_requirement_satisfied = distinct_verified_ab_source_count >= required_sources
         directional_ready = False
         if not ab_requirement_satisfied and not strict_mode and not hard_metric_claim:
             c_threshold = _directional_c_threshold_for_claim(claim_type)
-            if ab_count >= 1:
+            if distinct_traceable_ab_source_count >= 1:
                 ab_requirement_satisfied = True
-                degradation_notes.append("a_absent_or_ab_shortfall_b_substituted")
+                degradation_notes.append("verified_ab_shortfall_traceable_ab_substituted")
             elif directional_distinct_count >= c_threshold:
                 ab_requirement_satisfied = True
                 directional_ready = True
@@ -1454,12 +1562,12 @@ def build_coverage_matrix(
             missing.append("insufficient_ab_sources")
         counter_required = bool(hypothesis.get("counter_evidence_required", profile.get("require_counter", False)))
         if counter_required and required_counter > 0 and counter_count < required_counter:
-            if not strict_mode and not hard_metric_claim and not bool(hypothesis.get("counter_evidence_required")) and (ab_count or directional_distinct_count >= 2):
+            if not strict_mode and not hard_metric_claim and not bool(hypothesis.get("counter_evidence_required")) and (distinct_traceable_ab_source_count or directional_distinct_count >= 2):
                 degradation_notes.append("counter_evidence_missing_advisory")
             else:
                 missing.append("counter_evidence_missing")
         if required_metric > 0 and metric_source_count < required_metric:
-            if not strict_mode and not hard_metric_claim and (ab_count or directional_distinct_count >= 2):
+            if not strict_mode and not hard_metric_claim and (distinct_traceable_ab_source_count or directional_distinct_count >= 2):
                 degradation_notes.append("metric_evidence_degraded_for_non_hard_claim")
             else:
                 missing.append("metric_evidence_missing")
@@ -1485,13 +1593,13 @@ def build_coverage_matrix(
             )
         ]
         if not hypothesis_metrics and _as_list(hypothesis.get("metric_definitions")):
-            if not strict_mode and not hard_metric_claim and (ab_count or directional_distinct_count >= 2):
+            if not strict_mode and not hard_metric_claim and (distinct_traceable_ab_source_count or directional_distinct_count >= 2):
                 degradation_notes.append("metric_definition_unfilled_advisory")
             else:
                 missing.append("metric_definition_unfilled")
         incomplete_metrics = [metric for metric in hypothesis_metrics if _as_list(metric.get("missing_fields"))]
         if incomplete_metrics:
-            if not strict_mode and not hard_metric_claim and (ab_count or directional_distinct_count >= 2):
+            if not strict_mode and not hard_metric_claim and (distinct_traceable_ab_source_count or directional_distinct_count >= 2):
                 degradation_notes.append("metric_scope_period_unit_incomplete_advisory")
             else:
                 missing.append("metric_scope_period_unit_incomplete")
@@ -1503,7 +1611,7 @@ def build_coverage_matrix(
         )
         missing_proofs = missing_mandatory_proofs(proof_checks)
         if missing_proofs and "mandatory_proof_missing" not in missing:
-            if not strict_mode and not hard_metric_claim and (ab_count or directional_distinct_count >= _directional_c_threshold_for_claim(claim_type)):
+            if not strict_mode and not hard_metric_claim and (distinct_traceable_ab_source_count or directional_distinct_count >= _directional_c_threshold_for_claim(claim_type)):
                 degradation_notes.append("mandatory_proof_missing_advisory")
             else:
                 missing.append("mandatory_proof_missing")
@@ -1511,7 +1619,7 @@ def build_coverage_matrix(
             claim_status = "directional_ready"
         elif not missing:
             claim_status = "decision_ready"
-        elif ab_count or directional_count:
+        elif distinct_traceable_ab_source_count or directional_count:
             claim_status = "directional"
         else:
             claim_status = "context_only"
@@ -1519,7 +1627,7 @@ def build_coverage_matrix(
             readiness_level = "decision_ready"
         elif claim_status == "directional_ready":
             readiness_level = "directional_ready"
-        elif missing and not (ab_count or directional_count):
+        elif missing and not (distinct_traceable_ab_source_count or directional_count):
             readiness_level = "blocked"
         else:
             readiness_level = "context_only"
@@ -1533,10 +1641,17 @@ def build_coverage_matrix(
                 "claim_type": claim_type,
                 "required_ab_sources": required_sources,
                 "actual_ab_sources": ab_count,
+                "distinct_ab_source_count": distinct_ab_source_count,
+                "distinct_traceable_ab_source_count": distinct_traceable_ab_source_count,
+                "distinct_verified_ab_source_count": distinct_verified_ab_source_count,
+                "distinct_primary_source_count": distinct_primary_source_count,
                 "directional_c_sources": directional_count,
                 "directional_c_distinct_sources": directional_distinct_count,
                 "evidence_degradation_notes": degradation_notes,
                 "counter_evidence_count": counter_count,
+                "counter_signal_count": counter_signal_count,
+                "distinct_counter_source_count": distinct_counter_source_count,
+                "distinct_verified_counter_source_count": distinct_verified_counter_source_count,
                 "counter_clue_count": counter_clue_count,
                 "metric_source_count": metric_source_count,
                 "case_source_count": case_source_count,

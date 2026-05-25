@@ -755,6 +755,17 @@ HIGH_QA_ERROR_TYPES = {
     "deep_report_blocking_gap",
 }
 
+RENDER_FATAL_QA_TYPES = {
+    "report_markdown_empty",
+    "chapter_packages_missing",
+    "pipeline_empty_package",
+    "unremovable_fake_source_pollution",
+    "fake_or_placeholder_source_unremovable",
+}
+
+REPORT_BODY_SPLIT_PATTERN = r"\n##\s*(?:附录|研究口径与来源|研究口径|资料来源|数据来源|来源附录|参考来源|参考资料|来源|Appendix|Sources|References)"
+SOURCE_APPENDIX_HEADING_PATTERN = r"(?mi)^##+\s*(?:研究口径与来源|资料来源|数据来源|来源附录|参考来源|参考资料|来源|Sources|References)(?:\s|$|[：:])"
+
 
 EVIDENCE_REPAIR_FOLLOWUP_TYPES = {
     "mandatory_proof_missing",
@@ -839,8 +850,85 @@ def _qa_issue_type(issue: Dict[str, Any]) -> str:
     return str(_as_dict(issue).get("type") or "").strip()
 
 
+def _qa_finding_category(issue: Dict[str, Any]) -> str:
+    payload = _as_dict(issue)
+    explicit = str(payload.get("qa_category") or payload.get("finding_category") or "").strip()
+    if explicit:
+        return explicit
+    issue_type = _qa_issue_type(payload)
+    if issue_type in RENDER_FATAL_QA_TYPES:
+        return "render_blocker"
+    if issue_type in FATAL_QA_ERROR_TYPES or issue_type in HIGH_QA_ERROR_TYPES:
+        return "clean_blocker"
+    return "readability_finding"
+
+
+def _section_claim_strength(section: Dict[str, Any]) -> str:
+    payload = _as_dict(section)
+    source_quality = _as_dict(payload.get("source_quality"))
+    candidates = [
+        payload.get("claim_strength"),
+        payload.get("strength"),
+        payload.get("evidence_strength"),
+        source_quality.get("claim_strength"),
+        source_quality.get("grade"),
+        payload.get("claim_status"),
+        payload.get("quality_status"),
+        payload.get("confidence"),
+    ]
+    text = " ".join(str(item or "").strip().lower() for item in candidates if str(item or "").strip())
+    if payload.get("observation_only") or payload.get("layout_generated") and not payload.get("evidence_backed"):
+        return "observation"
+    if any(token in text for token in ("strong", "decision_ready", "core_claim", "high")):
+        return "strong"
+    if any(token in text for token in ("moderate", "medium", "supporting")):
+        return "moderate"
+    if any(token in text for token in ("directional", "limited", "context", "weak", "low", "observation")):
+        return "directional"
+    if not payload.get("evidence_backed"):
+        return "directional"
+    return "moderate"
+
+
+def _section_is_limited_or_observation(section: Dict[str, Any]) -> bool:
+    strength = _section_claim_strength(section)
+    if strength in {"directional", "observation", "weak", "limited"}:
+        return True
+    payload = _as_dict(section)
+    status = str(payload.get("claim_status") or payload.get("quality_status") or "").strip().lower()
+    return status in {"directional", "directional_ready", "limited_evidence", "context_only", "observation_only"}
+
+
+def _chapter_has_hydrated_signal(chapter: Dict[str, Any]) -> bool:
+    payload = _as_dict(chapter)
+    if _as_list(payload.get("chapter_fact_digest")):
+        return True
+    if _as_list(payload.get("table_packages")):
+        return True
+    quality = _as_dict(payload.get("evidence_quality_summary"))
+    for key in (
+        "core_evidence_count",
+        "supporting_evidence_count",
+        "metric_evidence_count",
+        "case_evidence_count",
+        "counter_evidence_count",
+        "directional_evidence_count",
+        "sample_evidence_count",
+        "hydrated_layer_item_count",
+    ):
+        try:
+            if int(float(payload.get(key) or quality.get(key) or 0)) > 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
 def _qa_issue_severity(issue: Dict[str, Any], *, strict_mode: bool) -> str:
     issue_type = _qa_issue_type(issue)
+    category = _qa_finding_category(issue)
+    if category == "readability_finding":
+        return "medium"
     if strict_mode and issue_type in HIGH_QA_ERROR_TYPES:
         return "fatal"
     if issue_type in FATAL_QA_ERROR_TYPES:
@@ -883,6 +971,87 @@ def _score_qa_result(
     }
 
 
+def _qa_render_gate(errors: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    blockers = [
+        _as_dict(item)
+        for item in list(errors or [])
+        if _qa_issue_type(_as_dict(item)) in RENDER_FATAL_QA_TYPES
+    ]
+    return {
+        "can_render_formal_report": not blockers,
+        "blockers": blockers,
+        "blocked": bool(blockers),
+    }
+
+
+def _qa_clean_gate(
+    *,
+    passed: bool,
+    errors: Sequence[Dict[str, Any]],
+    warnings: Sequence[Dict[str, Any]],
+    deep_evaluation: Dict[str, Any],
+    score: int,
+    min_pass_score: int,
+) -> Dict[str, Any]:
+    blockers = [_as_dict(item) for item in list(errors or []) if _as_dict(item)]
+    for gap in _as_list(_as_dict(deep_evaluation).get("blocking_gaps")):
+        payload = _as_dict(gap)
+        blockers.append({"type": payload.get("type") or "deep_report_blocking_gap", "source": "deep_evaluator", "detail": payload})
+    return {
+        "eligible": bool(passed),
+        "blockers": blockers,
+        "warnings": [_as_dict(item) for item in list(warnings or []) if _as_dict(item)],
+        "quality_score": score,
+        "minimum_pass_score": min_pass_score,
+        "publishable": bool(_as_dict(deep_evaluation).get("publishable")) and bool(passed),
+    }
+
+
+def _qa_quality_findings(
+    *,
+    errors: Sequence[Dict[str, Any]],
+    warnings: Sequence[Dict[str, Any]],
+    deep_evaluation: Dict[str, Any],
+    score_payload: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    findings: List[Dict[str, Any]] = []
+    for item in list(errors or []):
+        payload = _as_dict(item)
+        if payload:
+            findings.append({"source": "qa_error", **payload})
+    for item in list(warnings or []):
+        payload = _as_dict(item)
+        if payload:
+            findings.append({"source": "qa_warning", **payload})
+    for gap in _as_list(_as_dict(deep_evaluation).get("blocking_gaps")):
+        payload = _as_dict(gap)
+        findings.append({"source": "deep_evaluator", "type": payload.get("type") or "deep_report_blocking_gap", "detail": payload})
+    penalties = _as_dict(score_payload.get("penalties"))
+    for name, value in penalties.items():
+        try:
+            numeric = int(float(value or 0))
+        except (TypeError, ValueError):
+            numeric = 0
+        if numeric > 0:
+            findings.append({"source": "qa_score", "type": f"score_penalty_{name}", "penalty": numeric})
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for item in findings:
+        item_type = str(item.get("type") or item.get("source") or "quality_finding")
+        item["finding_category"] = _qa_finding_category(item)
+        key = (
+            item_type,
+            str(item.get("chapter_id") or item.get("section_id") or item.get("table_id") or ""),
+            str(item.get("source") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        item["type"] = item_type
+        deduped.append(item)
+    return deduped[:120]
+
+
 def run_qa_agent(
     *,
     report_markdown: str = "",
@@ -910,7 +1079,7 @@ def run_qa_agent(
     retrieval_strategy_summary = _as_dict(retrieval_strategy_summary)
     evidence_health_summary = _as_dict(evidence_health_summary)
     text = str(report_markdown or "")
-    body_text = re.split(r"\n##\s*(?:附录|研究口径|资料来源|来源|Appendix)", text, maxsplit=1, flags=re.I)[0]
+    body_text = re.split(REPORT_BODY_SPLIT_PATTERN, text, maxsplit=1, flags=re.I)[0]
     errors: List[Dict[str, Any]] = []
     warnings: List[Dict[str, Any]] = []
     analytics_quality = _analytics_quality(analytics_outputs)
@@ -930,7 +1099,7 @@ def run_qa_agent(
     if _body_table_has_source_header(body_text):
         errors.append({"type": "body_table_contains_source_header"})
     has_citations = bool(re.search(r"\[\d{1,3}\]", text))
-    has_sources_appendix = bool(re.search(r"(?mi)^##+\s*(?:资料来源|来源附录|参考资料|Sources|References)", text))
+    has_sources_appendix = bool(re.search(SOURCE_APPENDIX_HEADING_PATTERN, text))
     appendix_blocking = strict_mode or _env_flag("QA_DEEP_EVALUATOR_BLOCKING", True)
     if has_citations and not has_sources_appendix and appendix_blocking and _env_flag("QA_REQUIRE_SOURCES_APPENDIX", True):
         errors.append({"type": "missing_sources_appendix"})
@@ -953,11 +1122,21 @@ def run_qa_agent(
             if isinstance(table, dict) and table.get("should_render")
         ]
         if not sections and not public_tables:
-            errors.append({"type": "chapter_sections_missing", "chapter_id": chapter.get("chapter_id")})
+            issue = {
+                "type": "chapter_sections_missing_with_evidence" if _chapter_has_hydrated_signal(chapter) else "chapter_sections_missing_no_evidence",
+                "chapter_id": chapter.get("chapter_id"),
+                "qa_category": "readability_finding",
+            }
+            warnings.append(issue)
             continue
         for section in sections:
-            hard_fields = ("claim", "reasoning", "counter_evidence", "actionable") if strict_mode else ("claim",)
-            soft_fields = () if strict_mode else ("reasoning", "counter_evidence", "actionable")
+            limited_section = _section_is_limited_or_observation(section)
+            if limited_section:
+                hard_fields = ("claim",)
+                soft_fields = ("reasoning", "counter_evidence", "actionable")
+            else:
+                hard_fields = ("claim", "reasoning", "counter_evidence", "actionable") if strict_mode else ("claim",)
+                soft_fields = () if strict_mode else ("reasoning", "counter_evidence", "actionable")
             hard_missing = [key for key in hard_fields if not str(section.get(key) or "").strip()]
             soft_missing = [key for key in soft_fields if not str(section.get(key) or "").strip()]
             if hard_missing:
@@ -967,6 +1146,8 @@ def run_qa_agent(
                         "chapter_id": chapter.get("chapter_id"),
                         "section_id": section.get("section_id"),
                         "missing": hard_missing,
+                        "claim_strength": _section_claim_strength(section),
+                        "qa_category": "readability_finding" if limited_section else "clean_blocker",
                     }
                 )
             if soft_missing:
@@ -976,16 +1157,22 @@ def run_qa_agent(
                         "chapter_id": chapter.get("chapter_id"),
                         "section_id": section.get("section_id"),
                         "missing": soft_missing,
+                        "claim_strength": _section_claim_strength(section),
+                        "qa_category": "readability_finding",
                     }
                 )
             if not _as_list(section.get("evidence_refs")):
-                errors.append(
-                    {
-                        "type": "argument_unit_missing_evidence_refs",
-                        "chapter_id": chapter.get("chapter_id"),
-                        "section_id": section.get("section_id"),
-                    }
-                )
+                issue = {
+                    "type": "argument_unit_missing_evidence_refs",
+                    "chapter_id": chapter.get("chapter_id"),
+                    "section_id": section.get("section_id"),
+                    "claim_strength": _section_claim_strength(section),
+                    "qa_category": "readability_finding" if limited_section else "clean_blocker",
+                }
+                if limited_section:
+                    warnings.append(issue)
+                else:
+                    errors.append(issue)
 
     for table in list(table_packages or []):
         if not isinstance(table, dict):
@@ -1031,6 +1218,13 @@ def run_qa_agent(
             errors.append(
                 {
                     "type": "traceable_ab_sources_missing",
+                    "evidence_health_summary": evidence_health_summary,
+                }
+            )
+        if deep_report and _count_value(evidence_health_summary.get("analysis_ready_ab_count")) > 0 and _count_value(evidence_health_summary.get("distinct_verified_ab_source_count")) <= 0:
+            errors.append(
+                {
+                    "type": "verified_ab_sources_missing",
                     "evidence_health_summary": evidence_health_summary,
                 }
             )
@@ -1131,6 +1325,8 @@ def run_qa_agent(
         blocking_followups.append({"type": _qa_issue_type(item) or "fatal_error", "source": "fatal_error", "detail": item})
     if error_blocking:
         for item in soft_errors:
+            if _qa_finding_category(item) == "readability_finding":
+                continue
             blocking_followups.append({"type": _qa_issue_type(item) or "qa_error", "source": "qa_error", "detail": item})
     if warning_blocking:
         for item in warnings:
@@ -1147,6 +1343,25 @@ def run_qa_agent(
     rewrite_repair_required = bool(fatal_errors) or bool(blocking_content_repair_followups)
     rewrite_only_fatal = _env_flag("QA_REWRITE_ONLY_FATAL", False)
     rewrite_required = bool(fatal_errors) or (not rewrite_only_fatal and rewrite_repair_required)
+    render_gate = _qa_render_gate(errors)
+    clean_gate = _qa_clean_gate(
+        passed=passed,
+        errors=errors,
+        warnings=warnings,
+        deep_evaluation=deep_evaluation,
+        score=score,
+        min_pass_score=min_pass_score,
+    )
+    qa_quality_findings = _qa_quality_findings(
+        errors=errors,
+        warnings=warnings,
+        deep_evaluation=deep_evaluation,
+        score_payload=score_payload,
+    )
+    readability_findings = [
+        item for item in qa_quality_findings if _qa_finding_category(item) == "readability_finding"
+    ]
+    render_blocking_followups = _as_list(render_gate.get("blockers"))
     return {
         "agent": AGENT_NAME,
         "passed": passed,
@@ -1156,9 +1371,15 @@ def run_qa_agent(
         "score_breakdown": score_payload.get("penalties"),
         "fatal_errors": fatal_errors,
         "soft_errors": soft_errors,
+        "render_gate": render_gate,
+        "clean_gate": clean_gate,
+        "quality_findings": qa_quality_findings,
+        "readability_findings": readability_findings,
         "repair_required": repair_required,
+        "render_repair_required": bool(render_blocking_followups),
         "repair_followups": deep_followups,
         "blocking_followups": blocking_followups,
+        "render_blocking_followups": render_blocking_followups,
         "advisory_followups": advisory_followups,
         "evidence_repair_followups": evidence_repair_followups,
         "content_repair_followups": content_repair_followups,

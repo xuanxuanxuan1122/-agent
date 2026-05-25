@@ -306,6 +306,9 @@ def _source_payload(item: Dict[str, Any]) -> Dict[str, Any]:
         "date": str(source.get("date") or item.get("date") or item.get("period") or "").strip(),
         "source_type": str(source.get("source_type") or item.get("source_type") or item.get("source_family") or "").strip().lower(),
         "credibility": str(source.get("credibility") or source.get("source_level") or item.get("source_level") or "").strip().upper(),
+        "source_verification_status": str(source.get("source_verification_status") or item.get("source_verification_status") or "").strip().lower(),
+        "document_id": str(source.get("document_id") or source.get("doc_id") or item.get("document_id") or item.get("doc_id") or "").strip(),
+        "page_ref": str(source.get("page_ref") or item.get("page_ref") or "").strip(),
     }
 
 
@@ -328,12 +331,76 @@ def _has_traceable_source(item: Dict[str, Any]) -> bool:
     return bool(document_ref)
 
 
+VERIFIED_SOURCE_STATUSES = {"readpage_verified", "document_verified"}
+DOCUMENT_SOURCE_RE = re.compile(
+    r"(\.pdf(?:$|\?)|annual[-_ ]?report|financial[-_ ]?report|filing|prospectus|"
+    r"announcement|disclosure|standard|whitepaper|policy|regulation|official|"
+    r"gov\.|\.gov|exchange|sec\.gov|static\.sse\.com\.cn|szse\.cn)",
+    re.I,
+)
+
+
+def _source_verification_status(item: Dict[str, Any]) -> str:
+    source = _source_payload(item)
+    explicit = str(
+        source.get("source_verification_status")
+        or item.get("source_verification_status")
+        or source.get("verification_status")
+        or item.get("verification_status")
+        or ""
+    ).strip().lower()
+    if explicit in {"search_result_only", "readpage_verified", "document_verified", "inaccessible"}:
+        return explicit
+    if not _has_traceable_source(item):
+        return "inaccessible"
+    url = str(source.get("url") or item.get("url") or item.get("source_url") or "").strip()
+    document_ref = str(source.get("document_id") or source.get("page_ref") or "").strip()
+    source_text = " ".join(
+        str(value or "")
+        for value in [
+            url,
+            source.get("source_type"),
+            source.get("title"),
+            item.get("source_type"),
+            item.get("source_family"),
+        ]
+    )
+    if document_ref or DOCUMENT_SOURCE_RE.search(source_text):
+        return "document_verified"
+    if bool(
+        source.get("readpage_verified")
+        or source.get("auto_readpage")
+        or source.get("readpage_priority")
+        or item.get("readpage_verified")
+        or item.get("auto_readpage")
+        or item.get("readpage_priority")
+    ):
+        return "readpage_verified"
+    for key in ("mainText", "main_text", "markdown", "content", "text", "quote", "page_content"):
+        if str(source.get(key) or item.get(key) or "").strip():
+            return "readpage_verified"
+    return "search_result_only"
+
+
+def _has_verified_source(item: Dict[str, Any]) -> bool:
+    return _source_verification_status(item) in VERIFIED_SOURCE_STATUSES
+
+
 def _metric_unit_present(item: Dict[str, Any], fact: str) -> bool:
     if str(item.get("unit") or item.get("numeric_unit") or "").strip():
         return True
     completeness = _as_dict(item.get("metric_completeness"))
-    return bool(str(completeness.get("unit") or "").strip())
-    return bool(re.search(r"%|pct|bps|x|times|usd|rmb|yuan|dollar|billion|million|trillion|元|亿元|万元|美元|台|套|吨|gwh|mwh|kwh", text, re.I))
+    if str(completeness.get("unit") or "").strip():
+        return True
+    return bool(
+        re.search(
+            r"%|pct|bps|x|times|usd|rmb|yuan|dollar|billion|million|trillion|"
+            r"RMB|USD|CNY|EUR|JPY|亿元|万亿元|万元|美元|亿美元|人民币|元|"
+            r"台|套|吨|家|人|件|GWh|MWh|kWh",
+            str(fact or ""),
+            re.I,
+        )
+    )
 
 
 def _metric_proof_gaps(item: Dict[str, Any], claim_type: str, fact: str, period: str) -> List[str]:
@@ -364,6 +431,7 @@ def _evidence_fit_score(
     directness: str,
     metric_proof_gaps: List[str],
     traceable: bool,
+    verified: bool = False,
 ) -> float:
     score = SOURCE_LEVEL_SCORE.get(source_level, 0.46)
     if allowed_use == "core_claim":
@@ -376,7 +444,9 @@ def _evidence_fit_score(
         score += 0.06
     elif directness == "clue":
         score -= 0.10
-    if traceable:
+    if verified:
+        score += 0.08
+    elif traceable:
         score += 0.05
     else:
         score -= 0.18
@@ -392,6 +462,7 @@ def _analysis_readiness(
     metric_proof_gaps: List[str],
     semantic_status: str,
     traceable: bool,
+    verified: bool = False,
 ) -> str:
     if semantic_status in REJECTED_STATUSES or allowed_use == "rejected":
         return "blocked"
@@ -399,8 +470,10 @@ def _analysis_readiness(
         return "followup_only"
     if claim_type == "hard_metric" and metric_proof_gaps:
         return "context_only" if source_level in {"A", "B"} and traceable else "followup_only"
-    if allowed_use in {"core_claim", "supporting"} and source_level in {"A", "B"} and traceable:
+    if allowed_use in {"core_claim", "supporting"} and source_level in {"A", "B"} and verified:
         return "decision_ready"
+    if allowed_use in {"core_claim", "supporting"} and source_level in {"A", "B"} and traceable:
+        return "directional_ready"
     if allowed_use == "directional_signal":
         return "directional_ready"
     if allowed_use in {"clue", "appendix_only"}:
@@ -637,12 +710,15 @@ class EvidenceClassifier:
         period = str(copied.get("period") or _source_payload(copied).get("date") or "").strip()
         metric_proof_gaps = _metric_proof_gaps(copied, claim_type, fact, period)
         traceable = _has_traceable_source(copied)
+        source_verification_status = _source_verification_status(copied)
+        source_verified = source_verification_status in VERIFIED_SOURCE_STATUSES
         evidence_fit_score = _evidence_fit_score(
             source_level=source_level,
             allowed_use=allowed_use,
             directness=directness,
             metric_proof_gaps=metric_proof_gaps,
             traceable=traceable,
+            verified=source_verified,
         )
         analysis_readiness = _analysis_readiness(
             source_level=source_level,
@@ -651,6 +727,7 @@ class EvidenceClassifier:
             metric_proof_gaps=metric_proof_gaps,
             semantic_status=semantic_status,
             traceable=traceable,
+            verified=source_verified,
         )
         card = {
             **_as_dict(copied.get("evidence_card")),
@@ -690,6 +767,8 @@ class EvidenceClassifier:
             "evidence_fit_score": evidence_fit_score,
             "metric_proof_gaps": metric_proof_gaps,
             "analysis_readiness": analysis_readiness,
+            "source_verification_status": source_verification_status,
+            "source_verified": source_verified,
             "quality_contract_version": QUALITY_CONTRACT_VERSION,
         }
         can_support_if_corrobated = allowed_use == "directional_signal" and claim_type != "hard_metric"
@@ -714,6 +793,8 @@ class EvidenceClassifier:
             "evidence_fit_score": evidence_fit_score,
             "metric_proof_gaps": metric_proof_gaps,
             "analysis_readiness": analysis_readiness,
+            "source_verification_status": source_verification_status,
+            "source_verified": source_verified,
             "evidence_card": card,
         }
 

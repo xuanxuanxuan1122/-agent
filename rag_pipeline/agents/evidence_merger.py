@@ -996,6 +996,8 @@ def _source_from_raw_point(point: Dict[str, Any], fallback_source: Dict[str, Any
         "source": str(point.get("publisher") or point.get("source_publisher") or fallback_source.get("publisher") or fallback_source.get("source") or "").strip(),
         "document_id": str(point.get("document_id") or point.get("doc_id") or fallback_source.get("document_id") or fallback_source.get("doc_id") or "").strip(),
         "page_ref": str(point.get("page_ref") or fallback_source.get("page_ref") or "").strip(),
+        "source_verification_status": str(point.get("source_verification_status") or fallback_source.get("source_verification_status") or "").strip(),
+        "source_verified": bool(point.get("source_verified") or fallback_source.get("source_verified")),
     }
 
 
@@ -1441,6 +1443,8 @@ def _build_evidence(
         "agent": _agent_label(agent, child_agent),
         "agent_key": agent,
         "child_agent": child_agent,
+        "evidence_origin": str(item.get("evidence_origin") or item.get("origin") or agent or child_agent or "").strip(),
+        "origin": str(item.get("origin") or item.get("evidence_origin") or agent or child_agent or "").strip(),
         "round": item.get("round") or 1,
         "s_grade": s_grade,
         "conflict_flag": False,
@@ -1498,6 +1502,11 @@ def _build_evidence(
         evidence["semantic_status"] = "rejected"
     evidence["semantic_reason"] = semantic.get("reason") or ""
     evidence["source_level"] = _source_level_for_evidence(evidence)
+    verification_status = _source_verification_status_for(evidence, evidence.get("source"))
+    evidence["source_verification_status"] = verification_status
+    evidence["source_verified"] = verification_status in VERIFIED_SOURCE_STATUSES
+    evidence["source"]["source_verification_status"] = verification_status
+    evidence["source"]["source_verified"] = evidence["source_verified"]
     task_acceptance = task_acceptance_filter(evidence, task_payload)
     evidence["task_relevance_score"] = task_acceptance.get("relevance_score")
     evidence["task_accepted"] = bool(task_acceptance.get("accepted"))
@@ -1730,6 +1739,11 @@ def normalize_evidence_items(
         for item in list(evidence_pool or [])
         if isinstance(item, dict)
     )
+    source_candidate_count = sum(
+        len(_as_list(_as_dict(item).get("source_candidates")))
+        for item in list(evidence_pool or [])
+        if isinstance(item, dict)
+    )
     for pool_index, item in enumerate(evidence_pool, start=1):
         if not isinstance(item, dict) or str(item.get("status") or "") == "failed":
             continue
@@ -1824,6 +1838,7 @@ def normalize_evidence_items(
         "source_pool_rerank_input_count": source_pool_rerank_input_count,
         "source_pool_rerank_score_count": source_pool_rerank_score_count,
         "source_pool_rerank_returned_count": source_pool_rerank_returned_count,
+        "source_candidate_count": source_candidate_count,
     }
     return normalized, metadata
 
@@ -2041,6 +2056,8 @@ def _clean_chapter_fact(fact: Dict[str, Any]) -> Dict[str, Any]:
         "evidence_role": str(fact.get("evidence_role") or "").strip(),
         "semantic_status": str(fact.get("semantic_status") or "").strip(),
         "semantic_reason": str(fact.get("semantic_reason") or "").strip(),
+        "source_verification_status": str(fact.get("source_verification_status") or _as_dict(fact.get("source")).get("source_verification_status") or "").strip(),
+        "source_verified": bool(fact.get("source_verified") or _as_dict(fact.get("source")).get("source_verified")),
         "metric_kind": str(fact.get("metric_kind") or "").strip(),
         "task_id": str(fact.get("task_id") or "").strip(),
         "dimension_id": str(fact.get("dimension_id") or "").strip(),
@@ -2445,6 +2462,77 @@ def build_filter_funnel_by_chapter(
     return funnel
 
 
+VERIFIED_SOURCE_STATUSES = {"readpage_verified", "document_verified"}
+DOCUMENT_SOURCE_RE = re.compile(
+    r"(\.pdf(?:$|\?)|annual[-_ ]?report|financial[-_ ]?report|filing|prospectus|"
+    r"announcement|disclosure|standard|whitepaper|policy|regulation|official|gov\.|\.gov|exchange|sec\.gov|"
+    r"static\.sse\.com\.cn|szse\.cn)",
+    re.I,
+)
+
+
+def _source_verification_status_for(fact: Dict[str, Any], source: Optional[Dict[str, Any]] = None) -> str:
+    source = _as_dict(source if source is not None else fact.get("source"))
+    explicit = str(
+        fact.get("source_verification_status")
+        or source.get("source_verification_status")
+        or fact.get("verification_status")
+        or source.get("verification_status")
+        or ""
+    ).strip().lower()
+    if explicit in {"search_result_only", "readpage_verified", "document_verified", "inaccessible"}:
+        return explicit
+    if _is_fake_or_placeholder_source(source, fact):
+        return "inaccessible"
+    url = str(source.get("url") or source.get("source_url") or fact.get("source_url") or fact.get("url") or "").strip()
+    document_ref = str(
+        source.get("document_id")
+        or source.get("doc_id")
+        or source.get("page_ref")
+        or fact.get("document_id")
+        or fact.get("doc_id")
+        or fact.get("page_ref")
+        or ""
+    ).strip()
+    if not url and not document_ref:
+        return "inaccessible"
+    source_text = " ".join(
+        str(value or "")
+        for value in [
+            url,
+            source.get("source_type"),
+            source.get("title"),
+            fact.get("source_type"),
+            fact.get("source_family"),
+        ]
+    )
+    if document_ref or DOCUMENT_SOURCE_RE.search(source_text):
+        return "document_verified"
+    if bool(
+        source.get("readpage_verified")
+        or source.get("auto_readpage")
+        or source.get("readpage_priority")
+        or fact.get("readpage_verified")
+        or fact.get("auto_readpage")
+        or fact.get("readpage_priority")
+    ):
+        return "readpage_verified"
+    for key in ("mainText", "main_text", "markdown", "content", "text", "quote", "page_content"):
+        if str(source.get(key) or fact.get(key) or "").strip():
+            return "readpage_verified"
+    return "search_result_only"
+
+
+def _source_is_verified(fact: Dict[str, Any], traceability: Optional[Dict[str, Any]] = None) -> bool:
+    status = str(_as_dict(traceability).get("source_verification_status") or _source_verification_status_for(fact)).strip().lower()
+    return status in VERIFIED_SOURCE_STATUSES
+
+
+def _source_key_for_fact(fact: Dict[str, Any], traceability: Optional[Dict[str, Any]] = None) -> str:
+    traceability = _as_dict(traceability)
+    return _source_registry_key(_as_dict(fact.get("source")), traceability or _source_traceability_payload(fact)) or _source_identity(fact) or str(fact.get("evidence_id") or "")
+
+
 def _source_traceability_payload(fact: Dict[str, Any]) -> Dict[str, Any]:
     source = _as_dict(fact.get("source"))
     url = str(source.get("url") or source.get("source_url") or fact.get("source_url") or "").strip()
@@ -2463,6 +2551,8 @@ def _source_traceability_payload(fact: Dict[str, Any]) -> Dict[str, Any]:
     stable_local_ref = bool(document_ref and sum(bool(item) for item in [title, publisher, source_ref]) >= 2)
     fake_source = _is_fake_or_placeholder_source(source, fact)
     has_source_ref = bool((url or stable_local_ref) and not fake_source)
+    verification_status = _source_verification_status_for(fact, source)
+    source_verified = verification_status in VERIFIED_SOURCE_STATUSES
     return {
         "has_source_ref": has_source_ref,
         "has_url": bool(url and not fake_source),
@@ -2475,6 +2565,8 @@ def _source_traceability_payload(fact: Dict[str, Any]) -> Dict[str, Any]:
         "source_url": url,
         "source_title": title,
         "publisher": publisher,
+        "source_verification_status": verification_status,
+        "source_verified": source_verified,
     }
 
 
@@ -2537,6 +2629,8 @@ def _build_source_registry(clean_evidence_list: Sequence[Dict[str, Any]]) -> Lis
                 "document_id": str(source.get("document_id") or source.get("doc_id") or "").strip(),
                 "page_ref": str(source.get("page_ref") or "").strip(),
                 "traceability_status": _source_traceability_status(traceability),
+                "source_verification_status": str(traceability.get("source_verification_status") or "").strip(),
+                "source_verified": bool(traceability.get("source_verified")),
                 "has_source_ref": bool(traceability.get("has_source_ref")),
                 "fake_or_placeholder_source": fake_source,
                 "evidence_refs": [],
@@ -2552,7 +2646,11 @@ def _build_source_registry(clean_evidence_list: Sequence[Dict[str, Any]]) -> Lis
         source["ref"] = entry["ref"]
         source["id"] = entry["id"]
         source["traceability_status"] = entry["traceability_status"]
+        source["source_verification_status"] = entry.get("source_verification_status")
+        source["source_verified"] = bool(entry.get("source_verified"))
         source["fake_or_placeholder_source"] = bool(entry.get("fake_or_placeholder_source"))
+        fact["source_verification_status"] = entry.get("source_verification_status")
+        fact["source_verified"] = bool(entry.get("source_verified"))
         fact["source"] = source
     return registry
 
@@ -2584,12 +2682,59 @@ def _source_registry_summary(source_registry: Sequence[Dict[str, Any]]) -> Dict[
         for item in traceable
         if str(item.get("source_level") or "").strip().upper() in {"A", "B"}
     ]
+    verified = [
+        item
+        for item in traceable
+        if str(item.get("source_verification_status") or "").strip().lower() in VERIFIED_SOURCE_STATUSES
+        or bool(item.get("source_verified"))
+    ]
+    verified_ab = [
+        item
+        for item in verified
+        if str(item.get("source_level") or "").strip().upper() in {"A", "B"}
+    ]
+    ab_sources = [
+        item
+        for item in registry
+        if not bool(item.get("fake_or_placeholder_source"))
+        and str(item.get("source_level") or "").strip().upper() in {"A", "B"}
+    ]
+    primary_source_types = {
+        "official",
+        "government",
+        "policy",
+        "filing",
+        "financial_report",
+        "annual_report",
+        "prospectus",
+        "exchange",
+        "company_announcement",
+        "technical_standard",
+        "standard",
+        "association",
+        "whitepaper",
+        "research",
+        "industry_report",
+        "consulting",
+        "company_official",
+    }
+    primary_verified = [
+        item
+        for item in verified
+        if str(item.get("source_level") or "").strip().upper() == "A"
+        or str(item.get("source_type") or "").strip().lower() in primary_source_types
+    ]
     fake_sources = [item for item in registry if bool(item.get("fake_or_placeholder_source"))]
     return {
         "source_registry_count": len(registry),
         "traceable_source_count": len(traceable),
+        "verified_source_count": len(verified),
         "title_only_source_count": len(title_only),
         "fake_or_placeholder_source_count": len(fake_sources),
+        "distinct_ab_source_count": len(ab_sources),
+        "distinct_traceable_ab_source_count": len(traceable_ab),
+        "distinct_verified_ab_source_count": len(verified_ab),
+        "distinct_primary_source_count": len(primary_verified),
         "traceable_ab_source_count": len(traceable_ab),
         "source_registry_sample": registry[:8],
     }
@@ -2611,6 +2756,8 @@ def _raw_data_points_for_package(clean_evidence_list: Sequence[Dict[str, Any]], 
                 "source_url": _as_dict(fact.get("source")).get("url"),
                 "source_ref": fact.get("source_ref") or _as_dict(fact.get("source")).get("ref"),
                 "source_level": fact.get("source_level"),
+                "source_verification_status": fact.get("source_verification_status") or _as_dict(fact.get("source")).get("source_verification_status"),
+                "source_verified": bool(fact.get("source_verified") or _as_dict(fact.get("source")).get("source_verified")),
                 "evidence": _compact_text(fact.get("fact"), max_chars=420),
             }
         )
@@ -2628,6 +2775,8 @@ def _evidence_health_inconsistencies(health: Dict[str, Any]) -> List[Dict[str, A
         issues.append({"type": "analysis_ready_without_raw_or_normalized_evidence"})
     if int(_safe_float(payload.get("traceable_ab_source_count"), 0.0)) > int(_safe_float(payload.get("ab_source_count"), 0.0)):
         issues.append({"type": "traceable_ab_exceeds_ab_source_count"})
+    if int(_safe_float(payload.get("distinct_verified_ab_source_count"), 0.0)) > int(_safe_float(payload.get("distinct_traceable_ab_source_count"), 0.0)):
+        issues.append({"type": "verified_ab_exceeds_traceable_ab_source_count"})
     return issues
 
 
@@ -2644,9 +2793,16 @@ def _build_evidence_health_summary(
     readpage_coverage: Dict[str, Any],
     core_traceable_ab_by_chapter: Dict[str, int],
     publishable_evidence_gate: Dict[str, Any],
+    core_verified_ab_by_chapter: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Any]:
     registry_summary = _source_registry_summary(source_registry)
     ab_source_count = int(_safe_float(source_distribution.get("A"), 0.0)) + int(_safe_float(source_distribution.get("B"), 0.0))
+    origin_distribution: Dict[str, int] = {}
+    for item in list(evidence_items or []):
+        if not isinstance(item, dict):
+            continue
+        origin = str(item.get("evidence_origin") or item.get("origin") or item.get("agent_key") or item.get("agent") or "unknown").strip() or "unknown"
+        origin_distribution[origin] = int(origin_distribution.get(origin, 0)) + 1
     health = {
         "raw_data_point_count": int(_safe_float(metadata.get("raw_evidence_count"), 0.0)),
         "normalized_evidence_count": int(_safe_float(metadata.get("normalized_count"), 0.0)) or len(evidence_items or []),
@@ -2662,7 +2818,19 @@ def _build_evidence_health_summary(
         ),
         "ab_source_count": ab_source_count,
         "traceable_ab_source_count": registry_summary.get("traceable_ab_source_count", 0),
+        "distinct_ab_source_count": registry_summary.get("distinct_ab_source_count", 0),
+        "distinct_traceable_ab_source_count": registry_summary.get("distinct_traceable_ab_source_count", 0),
+        "distinct_verified_ab_source_count": registry_summary.get("distinct_verified_ab_source_count", 0),
+        "distinct_primary_source_count": registry_summary.get("distinct_primary_source_count", 0),
+        "distinct_counter_source_count": int(_safe_float(_as_dict(evidence_analysis_summary).get("total_traceable_counter_source_count"), 0.0)),
+        "distinct_verified_counter_source_count": int(_safe_float(_as_dict(evidence_analysis_summary).get("total_verified_counter_source_count"), 0.0)),
+        "verified_source_count": registry_summary.get("verified_source_count", 0),
+        "evidence_origin_distribution": origin_distribution,
+        "topic_bundle_seed_evidence_count": int(origin_distribution.get("topic_bundle_cache", 0)),
+        "live_evidence_count": max(0, len(evidence_items or []) - int(origin_distribution.get("topic_bundle_cache", 0))),
+        "source_candidate_count": int(_safe_float(metadata.get("source_candidate_count"), 0.0)),
         "core_traceable_ab_by_chapter": dict(core_traceable_ab_by_chapter or {}),
+        "core_verified_ab_by_chapter": dict(core_verified_ab_by_chapter or {}),
         "readpage_attempted": int(_safe_float(readpage_coverage.get("attempted"), 0.0)),
         "readpage_succeeded": int(_safe_float(readpage_coverage.get("succeeded"), 0.0)),
         "blocking_gap_count": len([item for item in list(evidence_gap_ledger or []) if str(_as_dict(item).get("severity") or "") == "blocking"]),
@@ -2720,6 +2888,7 @@ def _evidence_analysis_contract_for(fact: Dict[str, Any]) -> Dict[str, Any]:
     appendix_only = bool(fact.get("appendix_only")) or role in {"appendix", "clue", "rejected"}
     directness = str(card.get("directness") or fact.get("directness") or "").strip().lower()
     source_trace = _source_traceability_payload(fact)
+    source_verified = _source_is_verified(fact, source_trace)
     metric_completeness = _metric_completeness_payload(fact)
     proof_role = str(fact.get("proof_role") or card.get("proof_role") or _as_dict(fact.get("search_task")).get("proof_role") or "").strip().lower()
     claim_type = str(fact.get("claim_type") or card.get("claim_type") or "").strip().lower()
@@ -2749,11 +2918,13 @@ def _evidence_analysis_contract_for(fact: Dict[str, Any]) -> Dict[str, Any]:
     cannot_support: List[str] = []
     repair_need: List[str] = []
 
-    if source_level in {"A", "B"} and allowed_use == "core_claim" and source_trace.get("has_source_ref"):
+    if source_level in {"A", "B"} and allowed_use == "core_claim" and source_trace.get("has_source_ref") and source_verified:
         can_support.extend(["core_claim", "supporting_claim", "decision_implication"])
-    elif source_level in {"A", "B"} and allowed_use in {"supporting", "supporting_context"} and source_trace.get("has_source_ref"):
+    elif source_level in {"A", "B"} and allowed_use in {"core_claim", "supporting", "supporting_context"} and source_trace.get("has_source_ref"):
         can_support.append("supporting_claim")
         cannot_support.append("standalone_core_claim")
+        if not source_verified:
+            repair_need.append("source_not_verified")
     elif source_level == "C" and allowed_use in {"directional_signal", "clue"}:
         can_support.append("directional_claim")
         if claim_type == "hard_metric":
@@ -2764,11 +2935,14 @@ def _evidence_analysis_contract_for(fact: Dict[str, Any]) -> Dict[str, Any]:
     else:
         cannot_support.extend(["core_claim", "clean_report_claim"])
 
-    if metric_completeness.get("complete") and source_level in {"A", "B"}:
+    if metric_completeness.get("complete") and source_level in {"A", "B"} and source_verified:
         can_support.append("quantified_table")
     elif metric_completeness.get("has_metric_signal") and not metric_completeness.get("complete"):
         cannot_support.append("quantified_table")
         repair_need.append("metric_scope_period_unit_incomplete")
+    elif metric_completeness.get("complete") and source_level in {"A", "B"} and not source_verified:
+        cannot_support.append("quantified_table")
+        repair_need.append("source_not_verified")
     if claim_type == "hard_metric" and metric_proof_gaps:
         can_support = [item for item in can_support if item not in {"core_claim", "decision_implication", "quantified_table"}]
         if source_level in {"A", "B"} and source_trace.get("has_source_ref"):
@@ -2810,6 +2984,8 @@ def _evidence_analysis_contract_for(fact: Dict[str, Any]) -> Dict[str, Any]:
         "metric_completeness": metric_completeness,
         "metric_proof_gaps": sorted(set(metric_proof_gaps)),
         "source_traceability": source_trace,
+        "source_verification_status": source_trace.get("source_verification_status"),
+        "source_verified": source_verified,
         "proof_strength": proof_strength,
         "repair_need": sorted(set(repair_need)),
     }
@@ -2915,10 +3091,18 @@ def _evidence_analysis_by_chapter(clean_evidence_list: Sequence[Dict[str, Any]])
                 "core_ab_source_count": 0,
                 "core_traceable_ab_source_count": 0,
                 "core_traceable_ab_source_keys": set(),
+                "core_verified_ab_source_count": 0,
+                "core_verified_ab_source_keys": set(),
+                "distinct_ab_source_keys": set(),
+                "distinct_traceable_ab_source_keys": set(),
+                "distinct_verified_ab_source_keys": set(),
+                "distinct_primary_source_keys": set(),
                 "metric_ready_count": 0,
                 "counter_signal_count": 0,
                 "traceable_counter_source_count": 0,
                 "traceable_counter_source_keys": set(),
+                "verified_counter_source_count": 0,
+                "verified_counter_source_keys": set(),
                 "case_signal_count": 0,
                 "claim_ready_evidence_count": 0,
                 "directional_only_count": 0,
@@ -2935,13 +3119,26 @@ def _evidence_analysis_by_chapter(clean_evidence_list: Sequence[Dict[str, Any]])
         bucket["evidence_count"] += 1
         level = str(payload.get("source_level") or "").strip().upper()
         can_support = set(str(item) for item in _as_list(contract.get("can_support")))
-        has_source = bool(_as_dict(contract.get("source_traceability")).get("has_source_ref"))
+        source_traceability = _as_dict(contract.get("source_traceability"))
+        has_source = bool(source_traceability.get("has_source_ref"))
+        source_verified = bool(contract.get("source_verified")) or str(source_traceability.get("source_verification_status") or "").strip().lower() in VERIFIED_SOURCE_STATUSES
+        source_key = _source_registry_key(_as_dict(payload.get("source")), source_traceability) or _source_identity(payload) or str(payload.get("evidence_id") or "")
+        if level in {"A", "B"} and source_key:
+            bucket["distinct_ab_source_keys"].add(source_key)
+            if has_source:
+                bucket["distinct_traceable_ab_source_keys"].add(source_key)
+            if source_verified:
+                bucket["distinct_verified_ab_source_keys"].add(source_key)
+                if level == "A" or str(_as_dict(payload.get("source")).get("source_type") or "").strip().lower() in {"official", "government", "policy", "filing", "financial_report", "annual_report", "prospectus", "exchange", "company_announcement", "technical_standard", "standard", "association", "whitepaper", "research", "industry_report", "consulting", "company_official"}:
+                    bucket["distinct_primary_source_keys"].add(source_key)
         if level in {"A", "B"} and has_source and can_support.intersection({"core_claim", "supporting_claim"}):
             bucket["core_ab_source_count"] += 1
-            source_key = _source_registry_key(_as_dict(payload.get("source")), _as_dict(contract.get("source_traceability"))) or _source_identity(payload) or str(payload.get("evidence_id") or "")
             if source_key:
                 bucket["core_traceable_ab_source_keys"].add(source_key)
-        if bool(_as_dict(contract.get("metric_completeness")).get("complete")) and level in {"A", "B"}:
+                if source_verified:
+                    bucket["core_verified_ab_source_keys"].add(source_key)
+                    bucket["core_verified_ab_source_count"] += 1
+        if bool(_as_dict(contract.get("metric_completeness")).get("complete")) and level in {"A", "B"} and source_verified:
             bucket["metric_ready_count"] += 1
         role_text = " ".join(
             str(value or "").lower()
@@ -2956,9 +3153,10 @@ def _evidence_analysis_by_chapter(clean_evidence_list: Sequence[Dict[str, Any]])
         if any(token in role_text for token in ["counter", "risk", "反证", "风险"]):
             bucket["counter_signal_count"] += 1
             if has_source:
-                source_key = _source_registry_key(_as_dict(payload.get("source")), _as_dict(contract.get("source_traceability"))) or _source_identity(payload) or str(payload.get("evidence_id") or "")
                 if source_key:
                     bucket["traceable_counter_source_keys"].add(source_key)
+                    if source_verified:
+                        bucket["verified_counter_source_keys"].add(source_key)
         if any(token in role_text for token in ["case", "customer", "procurement", "order", "tender", "客户", "案例", "采购", "中标", "订单"]):
             bucket["case_signal_count"] += 1
         if can_support.intersection({"core_claim", "supporting_claim"}):
@@ -2987,25 +3185,38 @@ def _evidence_analysis_by_chapter(clean_evidence_list: Sequence[Dict[str, Any]])
         claim_ready = int(bucket.get("claim_ready_evidence_count") or 0)
         directional_only = int(bucket.get("directional_only_count") or 0)
         core_ab = int(bucket.get("core_ab_source_count") or 0)
+        core_verified_ab = len(bucket.get("core_verified_ab_source_keys") or set())
         balanced_directional_ready = bool(
             not _strict_quality_mode()
-            and core_ab <= 0
+            and core_verified_ab <= 0
             and claim_ready <= 0
             and directional_only > 0
             and directional_c_sources >= 2
         )
         bucket["directional_c_distinct_source_count"] = directional_c_sources
+        bucket["distinct_ab_source_count"] = len(bucket.get("distinct_ab_source_keys") or set())
+        bucket["distinct_traceable_ab_source_count"] = len(bucket.get("distinct_traceable_ab_source_keys") or set())
+        bucket["distinct_verified_ab_source_count"] = len(bucket.get("distinct_verified_ab_source_keys") or set())
+        bucket["distinct_primary_source_count"] = len(bucket.get("distinct_primary_source_keys") or set())
         bucket["core_traceable_ab_source_count"] = len(bucket.get("core_traceable_ab_source_keys") or set())
+        bucket["core_verified_ab_source_count"] = core_verified_ab
         bucket["traceable_counter_source_count"] = len(bucket.get("traceable_counter_source_keys") or set())
+        bucket["verified_counter_source_count"] = len(bucket.get("verified_counter_source_keys") or set())
         bucket["balanced_directional_ready"] = balanced_directional_ready
         bucket.pop("directional_c_source_keys", None)
         bucket.pop("core_traceable_ab_source_keys", None)
         bucket.pop("traceable_counter_source_keys", None)
-        if core_ab <= 0:
+        bucket.pop("core_verified_ab_source_keys", None)
+        bucket.pop("verified_counter_source_keys", None)
+        bucket.pop("distinct_ab_source_keys", None)
+        bucket.pop("distinct_traceable_ab_source_keys", None)
+        bucket.pop("distinct_verified_ab_source_keys", None)
+        bucket.pop("distinct_primary_source_keys", None)
+        if core_verified_ab <= 0:
             if balanced_directional_ready:
                 advisory.append("directional_corroborated_no_ab")
             else:
-                gaps.append("insufficient_ab_sources")
+                gaps.append("insufficient_verified_ab_sources")
         if int(bucket.get("metric_incomplete_count") or 0) > 0 and int(bucket.get("metric_ready_count") or 0) <= 0:
             if _strict_quality_mode() or int(bucket.get("hard_metric_incomplete_count") or 0) > 0:
                 gaps.append("metric_scope_period_unit_incomplete")
@@ -3070,11 +3281,11 @@ def _evidence_gap_ledger_from_analysis(chapter_analysis: Dict[str, Dict[str, Any
     for chapter in chapter_analysis.values():
         refs = _as_list(chapter.get("sample_evidence_refs"))
         gaps = set(str(item) for item in _as_list(chapter.get("evidence_gap_types")))
-        if "insufficient_ab_sources" in gaps:
+        if "insufficient_ab_sources" in gaps or "insufficient_verified_ab_sources" in gaps:
             ledger.append(
                 _gap_payload(
                     chapter=chapter,
-                    gap_type="insufficient_ab_sources",
+                    gap_type="insufficient_verified_ab_sources" if "insufficient_verified_ab_sources" in gaps else "insufficient_ab_sources",
                     severity="blocking",
                     required_proof_role="source_check",
                     required_fields=["source"],
@@ -3168,9 +3379,13 @@ def _evidence_analysis_summary(chapter_analysis: Dict[str, Dict[str, Any]], ledg
         "total_evidence_count": sum(int(_safe_float(item.get("evidence_count"), 0.0)) for item in chapter_analysis.values()),
         "total_core_ab_source_count": sum(int(_safe_float(item.get("core_ab_source_count"), 0.0)) for item in chapter_analysis.values()),
         "total_core_traceable_ab_source_count": sum(int(_safe_float(item.get("core_traceable_ab_source_count"), 0.0)) for item in chapter_analysis.values()),
+        "total_core_verified_ab_source_count": sum(int(_safe_float(item.get("core_verified_ab_source_count"), 0.0)) for item in chapter_analysis.values()),
+        "total_distinct_verified_ab_source_count": sum(int(_safe_float(item.get("distinct_verified_ab_source_count"), 0.0)) for item in chapter_analysis.values()),
+        "total_distinct_primary_source_count": sum(int(_safe_float(item.get("distinct_primary_source_count"), 0.0)) for item in chapter_analysis.values()),
         "total_metric_ready_count": sum(int(_safe_float(item.get("metric_ready_count"), 0.0)) for item in chapter_analysis.values()),
         "total_counter_signal_count": sum(int(_safe_float(item.get("counter_signal_count"), 0.0)) for item in chapter_analysis.values()),
         "total_traceable_counter_source_count": sum(int(_safe_float(item.get("traceable_counter_source_count"), 0.0)) for item in chapter_analysis.values()),
+        "total_verified_counter_source_count": sum(int(_safe_float(item.get("verified_counter_source_count"), 0.0)) for item in chapter_analysis.values()),
         "total_case_signal_count": sum(int(_safe_float(item.get("case_signal_count"), 0.0)) for item in chapter_analysis.values()),
         "total_claim_ready_evidence_count": sum(int(_safe_float(item.get("claim_ready_evidence_count"), 0.0)) for item in chapter_analysis.values()),
         "total_directional_only_count": sum(int(_safe_float(item.get("directional_only_count"), 0.0)) for item in chapter_analysis.values()),
@@ -3204,6 +3419,19 @@ def _core_traceable_ab_by_chapter(chapter_analysis: Dict[str, Dict[str, Any]]) -
         str(chapter_id): int(
             _safe_float(
                 _as_dict(payload).get("core_traceable_ab_source_count"),
+                0.0,
+            )
+        )
+        for chapter_id, payload in chapter_analysis.items()
+    }
+
+
+def _core_verified_ab_by_chapter(chapter_analysis: Dict[str, Dict[str, Any]]) -> Dict[str, int]:
+    return {
+        str(chapter_id): int(
+            _safe_float(
+                _as_dict(payload).get("core_verified_ab_source_count")
+                or _as_dict(payload).get("distinct_verified_ab_source_count"),
                 0.0,
             )
         )
@@ -3353,32 +3581,36 @@ def _publishable_evidence_gate(
     require_readpage = _report_env_flag("REPORT_REQUIRE_READPAGE_EVIDENCE", True)
     core_ab = _core_ab_by_chapter(chapter_analysis)
     traceable_core_ab = dict(core_traceable_ab_by_chapter or _core_traceable_ab_by_chapter(chapter_analysis))
+    verified_core_ab = _core_verified_ab_by_chapter(chapter_analysis)
     contracts = dict(chapter_contracts or _default_chapter_contracts(chapter_analysis))
     weak_chapters = [
         {
             "chapter_id": chapter_id,
             "chapter_title": _as_dict(contracts.get(chapter_id)).get("chapter_title") or _as_dict(chapter_analysis.get(chapter_id)).get("chapter_title"),
             "key_chapter": _as_bool(_as_dict(contracts.get(chapter_id)).get("key_chapter")),
+            "core_verified_ab_source_count": int(_safe_float(verified_core_ab.get(chapter_id), 0.0)),
             "core_traceable_ab_source_count": int(_safe_float(traceable_core_ab.get(chapter_id), 0.0)),
             "core_ab_source_count": int(_safe_float(core_ab.get(chapter_id), 0.0)),
             "required": int(_safe_float(_as_dict(contracts.get(chapter_id)).get("required_traceable_ab"), key_min_ab if _as_bool(_as_dict(contracts.get(chapter_id)).get("key_chapter")) else min_core_ab)),
         }
-        for chapter_id in sorted(set(contracts) | set(traceable_core_ab))
-        if int(_safe_float(traceable_core_ab.get(chapter_id), 0.0))
+        for chapter_id in sorted(set(contracts) | set(traceable_core_ab) | set(verified_core_ab))
+        if int(_safe_float(verified_core_ab.get(chapter_id), 0.0))
         < int(_safe_float(_as_dict(contracts.get(chapter_id)).get("required_traceable_ab"), key_min_ab if _as_bool(_as_dict(contracts.get(chapter_id)).get("key_chapter")) else min_core_ab))
     ]
     blocking_gap_count = len([item for item in evidence_gap_ledger if str(_as_dict(item).get("severity") or "") == "blocking"])
     readpage_succeeded = int(_safe_float(readpage_coverage.get("succeeded"), 0.0))
     summary = _as_dict(evidence_analysis_summary)
     traceable_counter_count = int(_safe_float(summary.get("total_traceable_counter_source_count"), 0.0))
+    verified_counter_count = int(_safe_float(summary.get("total_verified_counter_source_count"), 0.0))
     blocking_reasons: List[Dict[str, Any]] = []
     if weak_chapters:
         blocking_reasons.append({"type": "chapter_core_ab_below_minimum", "chapters": weak_chapters[:12]})
-    if min_counter_sources > 0 and traceable_counter_count < min_counter_sources:
+    if min_counter_sources > 0 and verified_counter_count < min_counter_sources:
         blocking_reasons.append(
             {
                 "type": "report_counter_sources_below_minimum",
-                "actual": traceable_counter_count,
+                "actual": verified_counter_count,
+                "actual_traceable": traceable_counter_count,
                 "required": min_counter_sources,
                 "scope": os.getenv("REPORT_COUNTER_SCOPE", "report_level") or "report_level",
             }
@@ -3395,6 +3627,7 @@ def _publishable_evidence_gate(
         "min_counter_sources_per_report": min_counter_sources,
         "require_readpage": require_readpage,
         "core_traceable_ab_by_chapter": traceable_core_ab,
+        "core_verified_ab_by_chapter": verified_core_ab,
         "chapter_contracts": contracts,
     }
 
@@ -3485,7 +3718,13 @@ def _delivery_gate(
             "analysis_ready_ab_count": analysis_ready_ab_count,
             "ab_source_count": ab_source_count,
             "traceable_ab_source_count": traceable_ab_count,
+            "distinct_traceable_ab_source_count": int(_safe_float(health.get("distinct_traceable_ab_source_count"), 0.0)),
+            "distinct_verified_ab_source_count": int(_safe_float(health.get("distinct_verified_ab_source_count"), 0.0)),
+            "distinct_primary_source_count": int(_safe_float(health.get("distinct_primary_source_count"), 0.0)),
+            "verified_source_count": int(_safe_float(health.get("verified_source_count"), 0.0)),
+            "source_candidate_count": int(_safe_float(health.get("source_candidate_count"), 0.0)),
             "core_traceable_ab_by_chapter": traceable_by_chapter,
+            "core_verified_ab_by_chapter": _as_dict(health.get("core_verified_ab_by_chapter")),
             "readpage_succeeded": readpage_succeeded,
             "evidence_health_summary_inconsistent": bool(health.get("inconsistent")),
         },
@@ -3511,7 +3750,8 @@ def _build_evidence_preflight_summary(
         contract = _as_dict(contracts.get(chapter_id))
         payload = _as_dict(chapter_analysis.get(chapter_id))
         required_ab = int(_safe_float(contract.get("required_traceable_ab"), _report_env_int("REPORT_MIN_CORE_AB_SOURCES_PER_CHAPTER", 2, min_value=1, max_value=20)))
-        actual_ab = int(_safe_float(payload.get("core_traceable_ab_source_count"), 0.0))
+        actual_ab = int(_safe_float(payload.get("core_verified_ab_source_count") or payload.get("distinct_verified_ab_source_count"), 0.0))
+        actual_traceable_ab = int(_safe_float(payload.get("core_traceable_ab_source_count"), 0.0))
         missing_roles: List[str] = []
         if actual_ab < required_ab:
             missing_roles.append("source_check")
@@ -3528,7 +3768,8 @@ def _build_evidence_preflight_summary(
                     "chapter_title": contract.get("chapter_title") or payload.get("chapter_title") or chapter_id,
                     "key_chapter": _as_bool(contract.get("key_chapter")),
                     "required_traceable_ab": required_ab,
-                    "actual_traceable_ab": actual_ab,
+                    "actual_traceable_ab": actual_traceable_ab,
+                    "actual_verified_ab": actual_ab,
                     "missing_proof_roles": sorted(set(missing_roles)),
                     "repairable_by_openai": True,
                 }
@@ -3538,14 +3779,16 @@ def _build_evidence_preflight_summary(
             "chapter_title": contract.get("chapter_title") or payload.get("chapter_title") or chapter_id,
             "key_chapter": _as_bool(contract.get("key_chapter")),
             "required_traceable_ab": required_ab,
-            "actual_traceable_ab": actual_ab,
+            "actual_traceable_ab": actual_traceable_ab,
+            "actual_verified_ab": actual_ab,
             "metric_ready_count": int(_safe_float(payload.get("metric_ready_count"), 0.0)),
             "case_signal_count": int(_safe_float(payload.get("case_signal_count"), 0.0)),
             "missing_proof_roles": sorted(set(missing_roles)),
             "repairable_by_openai": bool(missing_roles),
         }
     min_counter = _report_env_int("REPORT_MIN_COUNTER_SOURCES_PER_REPORT", 2, min_value=0, max_value=20)
-    actual_counter = int(_safe_float(analysis_summary.get("total_traceable_counter_source_count"), 0.0))
+    actual_counter = int(_safe_float(analysis_summary.get("total_verified_counter_source_count"), 0.0))
+    actual_traceable_counter = int(_safe_float(analysis_summary.get("total_traceable_counter_source_count"), 0.0))
     if min_counter > 0 and actual_counter < min_counter:
         clean_blocking_reasons.append(
             {
@@ -3554,6 +3797,7 @@ def _build_evidence_preflight_summary(
                 "proof_role": "counter",
                 "required": min_counter,
                 "actual": actual_counter,
+                "actual_traceable": actual_traceable_counter,
                 "repairable_by_openai": True,
             }
         )
@@ -3869,6 +4113,7 @@ def build_evidence_package(
     )
     core_ab_by_chapter = _core_ab_by_chapter(evidence_analysis_by_chapter)
     core_traceable_ab_by_chapter = _core_traceable_ab_by_chapter(evidence_analysis_by_chapter)
+    core_verified_ab_by_chapter = _core_verified_ab_by_chapter(evidence_analysis_by_chapter)
     chapter_contracts = _chapter_contracts_from_research_plan(_as_dict(research_plan)) or _default_chapter_contracts(evidence_analysis_by_chapter)
     publishable_evidence_gate = _publishable_evidence_gate(
         chapter_analysis=evidence_analysis_by_chapter,
@@ -3923,6 +4168,7 @@ def build_evidence_package(
         readpage_coverage=readpage_coverage,
         core_traceable_ab_by_chapter=core_traceable_ab_by_chapter,
         publishable_evidence_gate=publishable_evidence_gate,
+        core_verified_ab_by_chapter=core_verified_ab_by_chapter,
     )
     missing_traceable_ab_fields = [
         {

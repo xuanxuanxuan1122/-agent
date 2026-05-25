@@ -232,6 +232,7 @@ class BrainAgentState(TypedDict, total=False):
     layout_max_refinement_rounds: int
     output_mode: str
     parallel_raw_output: bool
+    topic_bundle_seed: Dict[str, Any]
     local_state: Dict[str, Any]
     web_state: Dict[str, Any]
     iqs_lane_1_state: Dict[str, Any]
@@ -611,7 +612,7 @@ def _role_for_lane_type_safe(lane_type: str) -> str:
 RETRIEVAL_MODES = {"deep", "normal", "hybrid", "openai_repair"}
 DEEP_DEFAULT_LANE_TYPES = {"official_data", "filing_company", "market_research", "technology_product"}
 HYBRID_DEFAULT_LANE_TYPES = {"customer_case"}
-DEEP_PROOF_ROLES = {"metric", "source_check", "filing", "official_data", "technology_product"}
+DEEP_PROOF_ROLES = {"metric", "source_check", "filing", "official_data", "technology_product", "counter"}
 AUTHORITY_DOCUMENT_RE = re.compile(
     r"(policy|regulation|regulator|official|government|gov|filing|annual report|prospectus|"
     r"announcement|disclosure|standard|statistics|whitepaper|association|"
@@ -2731,6 +2732,181 @@ def _as_list(value: Any) -> List[Any]:
     return list(value) if isinstance(value, list) else []
 
 
+def _topic_bundle_seed_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    return _as_dict(state.get("topic_bundle_seed"))
+
+
+def _evidence_identity_key(item: Dict[str, Any]) -> str:
+    payload = _as_dict(item)
+    for key in ("url", "source_url", "document_ref", "document_id", "source_ref", "evidence_id", "ref"):
+        value = str(payload.get(key) or "").strip().lower()
+        if value:
+            return f"{key}:{value}"
+    text = str(payload.get("fact") or payload.get("clean_fact") or payload.get("summary") or payload.get("title") or "").strip()
+    return f"fact:{_stable_short_hash(text, length=20)}" if text else ""
+
+
+def _topic_bundle_seed_evidence_from_state(state: Dict[str, Any]) -> List[Dict[str, Any]]:
+    seed = _topic_bundle_seed_from_state(state)
+    topic_key = str(seed.get("topic_key") or "").strip()
+    path = str(seed.get("path") or "").strip()
+    result: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in _as_list(seed.get("seed_evidence")):
+        payload = dict(_as_dict(item))
+        if not payload:
+            continue
+        fact_text = str(payload.get("evidence") or payload.get("fact") or payload.get("clean_fact") or payload.get("content") or payload.get("summary") or "").strip()
+        if fact_text:
+            payload.setdefault("evidence", fact_text)
+            payload.setdefault("fact", fact_text)
+            payload.setdefault("content", fact_text)
+        source = _as_dict(payload.get("source"))
+        if source:
+            if source.get("url") or source.get("source_url"):
+                payload.setdefault("source_url", source.get("url") or source.get("source_url"))
+            if source.get("title"):
+                payload.setdefault("source_title", source.get("title"))
+            if source.get("publisher") or source.get("source"):
+                payload.setdefault("publisher", source.get("publisher") or source.get("source"))
+        payload.setdefault("evidence_origin", "topic_bundle_cache")
+        payload.setdefault("origin", "topic_bundle_cache")
+        if topic_key:
+            payload.setdefault("topic_bundle_key", topic_key)
+        if path:
+            payload.setdefault("topic_bundle_path", path)
+        key = _evidence_identity_key(payload)
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        result.append(payload)
+    return result
+
+
+def _source_from_seed_evidence(item: Dict[str, Any]) -> Dict[str, Any]:
+    payload = _as_dict(item)
+    source = _as_dict(payload.get("source"))
+    return {
+        "title": str(source.get("title") or payload.get("source_title") or payload.get("title") or "").strip(),
+        "url": str(source.get("url") or source.get("source_url") or payload.get("source_url") or payload.get("url") or "").strip(),
+        "publisher": str(source.get("publisher") or source.get("source") or payload.get("publisher") or payload.get("source") or "").strip(),
+        "source": str(source.get("source") or source.get("publisher") or payload.get("source") or payload.get("publisher") or "").strip(),
+        "date": str(source.get("date") or payload.get("date") or payload.get("period") or "").strip(),
+        "source_level": str(payload.get("source_level") or source.get("source_level") or "").strip().upper(),
+        "source_verification_status": str(payload.get("source_verification_status") or source.get("source_verification_status") or "").strip(),
+        "source_verified": bool(payload.get("source_verified") or source.get("source_verified")),
+        "evidence_origin": "topic_bundle_cache",
+    }
+
+
+def _topic_bundle_seed_pool_item(state: Dict[str, Any]) -> Dict[str, Any]:
+    seed = _topic_bundle_seed_from_state(state)
+    seed_items = _topic_bundle_seed_evidence_from_state(state)
+    if not seed_items:
+        return {}
+    sources: List[Dict[str, Any]] = []
+    seen_sources: set[str] = set()
+    for item in seed_items:
+        source = _source_from_seed_evidence(item)
+        key = str(source.get("url") or source.get("title") or "").strip().lower()
+        if not key or key in seen_sources:
+            continue
+        seen_sources.add(key)
+        sources.append(source)
+        if len(sources) >= 40:
+            break
+    return {
+        "round": 0,
+        "agent": "topic_bundle_cache",
+        "child_agent": "topic_bundle_cache",
+        "query": str(state.get("query") or ""),
+        "targets_gap": "topic_bundle_seed",
+        "status": "success",
+        "confidence": 0.72,
+        "answer": "Topic bundle seed evidence loaded for live merge.",
+        "key_sources": sources,
+        "raw_data_points": seed_items,
+        "limitations": {"cache_seed": True, "requires_live_regrading": True},
+        "evidence_origin": "topic_bundle_cache",
+        "topic_bundle_key": seed.get("topic_key"),
+        "topic_bundle_path": seed.get("path"),
+    }
+
+
+def _merge_topic_seed_with_live_evidence(state: Dict[str, Any], evidence_pool: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seed_pool_item = _topic_bundle_seed_pool_item(state)
+    if not seed_pool_item:
+        return [dict(item) for item in list(evidence_pool or []) if isinstance(item, dict)]
+    merged: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in [seed_pool_item] + [dict(item) for item in list(evidence_pool or []) if isinstance(item, dict)]:
+        key = _evidence_identity_key(item)
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        merged.append(dict(item))
+    return merged
+
+
+def _topic_bundle_seed_summary(state: Dict[str, Any], merged_evidence_pool: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    seed = _topic_bundle_seed_from_state(state)
+    seed_count = len(_topic_bundle_seed_evidence_from_state(state))
+    if not seed and seed_count <= 0:
+        return {}
+    return {
+        "enabled": bool(seed),
+        "topic_key": seed.get("topic_key"),
+        "path": seed.get("path"),
+        "seed_evidence_count": seed_count,
+        "merged_evidence_pool_count": len(list(merged_evidence_pool or [])),
+        "preflight_status": _as_dict(seed.get("preflight")).get("status"),
+    }
+
+
+def _store_topic_bundle_from_brain(
+    *,
+    state: Dict[str, Any],
+    evidence_package: Dict[str, Any],
+    structured_analysis: Optional[Dict[str, Any]] = None,
+    writer_report: Optional[Dict[str, Any]] = None,
+    stage: str,
+) -> Dict[str, Any]:
+    try:
+        from rag_pipeline.cache.topic_bundle_cache import store_topic_bundle
+
+        report_blueprint = (
+            _as_dict(_as_dict(writer_report).get("report_blueprint"))
+            or _as_dict(state.get("report_blueprint"))
+            or _as_dict(_as_dict(state.get("query_analysis")).get("report_blueprint"))
+            or _as_dict(_as_dict(state.get("query_analysis")).get("report_plan"))
+        )
+        chapter_packages = (
+            _as_list(_as_dict(writer_report).get("chapter_evidence_packages"))
+            or _as_list(evidence_package.get("chapter_evidence_packages"))
+            or _as_list(state.get("chapter_evidence_packages"))
+        )
+        micro_layouts = _as_list(_as_dict(writer_report).get("micro_layouts")) or _as_list(state.get("micro_layouts"))
+        table_packages = _as_list(_as_dict(writer_report).get("table_packages")) or _as_list(state.get("table_packages"))
+        return store_topic_bundle(
+            query=str(state.get("query") or ""),
+            research_plan=_research_plan_from_state(state),
+            report_blueprint=report_blueprint,
+            evidence_package=evidence_package,
+            structured_analysis=_as_dict(structured_analysis),
+            source_registry=_as_list(_as_dict(writer_report).get("source_registry")) or _as_list(evidence_package.get("source_registry")) or _as_list(evidence_package.get("sources")),
+            chapter_evidence_packages=chapter_packages,
+            micro_layouts=micro_layouts,
+            table_packages=table_packages,
+            writer_report=_as_dict(writer_report),
+            stage=stage,
+            stored_from=stage,
+        )
+    except Exception as exc:  # pragma: no cover - cache must never block report runs.
+        return {"enabled": True, "stored": False, "reason": "store_failed", "error": str(exc), "stored_from": stage}
+
+
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
         return float(value)
@@ -3034,6 +3210,7 @@ def _compact_writer_report_for_state(writer_report: Dict[str, Any]) -> Dict[str,
         "qa_pending_repair_reasons",
         "reformatter_preflight",
         "post_qa_repair",
+        "topic_bundle_cache_store",
         "metadata",
     ]
     compacted = {key: writer_report.get(key) for key in keep_keys if key in writer_report}
@@ -3520,6 +3697,28 @@ def _copy_retrieval_scores(target: Dict[str, Any], source: Dict[str, Any]) -> No
 def _normalize_web_sources(raw_output: Dict[str, Any], payload: Dict[str, Any], max_items: int = 30) -> List[Dict[str, Any]]:
     payload_sources = [item for item in _as_list(payload.get("key_sources")) if isinstance(item, dict)]
     combined_results = list(raw_output.get("search_results") or []) + list(raw_output.get("page_results") or [])
+    page_verified_urls = {
+        str(item.get("url") or "").strip()
+        for item in list(raw_output.get("page_results") or [])
+        if isinstance(item, dict)
+        and str(item.get("url") or "").strip()
+        and str(item.get("mainText") or item.get("markdown") or item.get("text") or item.get("content") or item.get("summary") or "").strip()
+    }
+
+    def verification_status(source: Dict[str, Any], raw: Dict[str, Any]) -> str:
+        explicit = str(raw.get("source_verification_status") or source.get("source_verification_status") or "").strip().lower()
+        if explicit in {"search_result_only", "readpage_verified", "document_verified", "inaccessible"}:
+            return explicit
+        url = str(source.get("url") or raw.get("url") or "").strip()
+        source_text = " ".join(str(value or "") for value in [url, source.get("title"), raw.get("source_type"), raw.get("origin_intent")])
+        if re.search(r"\.pdf(?:$|\?)|annual[-_ ]?report|filing|prospectus|announcement|disclosure|standard|policy|regulation|official|gov\.|\.gov|exchange", source_text, re.I):
+            return "document_verified"
+        if url and url in page_verified_urls:
+            return "readpage_verified"
+        if str(raw.get("mainText") or raw.get("markdown") or raw.get("text") or raw.get("content") or "").strip():
+            return "readpage_verified"
+        return "search_result_only" if url else "inaccessible"
+
     score_lookup: Dict[tuple[str, str], Dict[str, Any]] = {}
     for item in combined_results:
         if not isinstance(item, dict):
@@ -3546,7 +3745,10 @@ def _normalize_web_sources(raw_output: Dict[str, Any], payload: Dict[str, Any], 
                 ),
             }
             _copy_retrieval_scores(source, item)
-            _copy_retrieval_scores(source, score_lookup.get((source["url"], source["title"]), {}) or score_lookup.get((source["url"], ""), {}))
+            matched_raw = score_lookup.get((source["url"], source["title"]), {}) or score_lookup.get((source["url"], ""), {})
+            _copy_retrieval_scores(source, matched_raw)
+            source["source_verification_status"] = verification_status(source, matched_raw or item)
+            source["source_verified"] = source["source_verification_status"] in {"readpage_verified", "document_verified"}
             key = (source["url"], source["title"])
             if key not in seen:
                 seen.add(key)
@@ -3570,6 +3772,8 @@ def _normalize_web_sources(raw_output: Dict[str, Any], payload: Dict[str, Any], 
             "snippet": _compact_text(item.get("mainText") or item.get("snippet") or item.get("summary") or item.get("content"), max_chars=900),
         }
         _copy_retrieval_scores(source, item)
+        source["source_verification_status"] = verification_status(source, item)
+        source["source_verified"] = source["source_verification_status"] in {"readpage_verified", "document_verified"}
         key = (source["url"], source["title"])
         if key in seen:
             continue
@@ -3653,10 +3857,13 @@ def _structured_evidence_to_raw_points(
     sources: Sequence[Dict[str, Any]],
     dimension: str = "",
     confidence: float = 0.0,
+    proof_role: str = "",
     max_items: int = 24,
 ) -> List[Dict[str, Any]]:
     points: List[Dict[str, Any]] = []
     seen = set()
+    role = str(proof_role or "").strip().lower()
+    qualitative_roles = {"policy", "case", "technology", "technology_product", "counter", "source_check", "filing", "official_data", "customer_case"}
     for raw_line in re.split(r"[\n\r]+", str(evidence_text or "")):
         line = re.sub(r"^\s*[-*•\d.、\)）]+\s*", "", raw_line).strip()
         if not line or line.startswith("本次使用") or line.startswith("主要来源"):
@@ -3666,7 +3873,8 @@ def _structured_evidence_to_raw_points(
         clean = re.sub(r"\s+", " ", clean)
         if len(clean) < 18:
             continue
-        if not re.search(r"\d", clean):
+        has_number = bool(re.search(r"\d", clean))
+        if not has_number and role not in qualitative_roles:
             continue
         tag_match = re.search(r"【([^】]+)】", clean)
         tag = tag_match.group(1).strip() if tag_match else ""
@@ -3681,7 +3889,7 @@ def _structured_evidence_to_raw_points(
             prefix_context = clean[max(0, value_match.start() - 16) : value_match.start()] if value_match else ""
             prefix_years = re.findall(r"20\d{2}年?", prefix_context)
             period = (prefix_years[-1] if prefix_years else "") or _extract_period(local_context) or line_period
-            metric = _infer_metric_from_context(clean, value) if value else (tag or "事实")
+            metric = _infer_metric_from_context(clean, value) if value else (tag or role or "qualitative_fact")
             key = (dimension, metric, value, clean[:100], str(source.get("url") or ""))
             if key in seen:
                 continue
@@ -3700,6 +3908,9 @@ def _structured_evidence_to_raw_points(
                     "tag": tag,
                     "confidence": confidence,
                     "citation_ids": citation_ids,
+                    "proof_role": role,
+                    "source_verification_status": str(source.get("source_verification_status") or ("readpage_verified" if source.get("readpage_verified") else "search_result_only")).strip(),
+                    "source_verified": bool(source.get("source_verified") or str(source.get("source_verification_status") or "").strip() in {"readpage_verified", "document_verified"}),
                 }
             )
             _copy_retrieval_scores(points[-1], source)
@@ -3780,6 +3991,8 @@ def normalize_web_child_output(
     if answer_payload.get("evidence_gap"):
         limitations = {**limitations, "evidence_gap": answer_payload.get("evidence_gap")}
     limitations = {**limitations, "errors": child_errors, "partial_errors": partial_errors}
+    search_options = _as_dict(raw_output.get("search_options"))
+    search_task = _as_dict(search_options.get("search_task"))
     normalized_sources = _normalize_web_sources(raw_output, payload)
     if status == "failed" or failure_answer:
         raw_data_points = []
@@ -3789,9 +4002,8 @@ def normalize_web_child_output(
             sources=normalized_sources,
             dimension=str(raw_output.get("dimension") or "").strip(),
             confidence=confidence,
+            proof_role=str(search_task.get("proof_role") or search_task.get("evidence_type") or "").strip(),
         )
-    search_options = _as_dict(raw_output.get("search_options"))
-    search_task = _as_dict(search_options.get("search_task"))
     if search_task:
         for point in raw_data_points:
             point["task_id"] = search_task.get("task_id")
@@ -4862,6 +5074,7 @@ def _child_output_to_pool_item(
         "confidence": _clip_confidence(child.get("confidence"), 0.0),
         "answer": str(child.get("answer") or "").strip(),
         "key_sources": list(child.get("key_sources") or []),
+        "source_candidates": list(child.get("source_candidates") or []),
         "limitations": _as_dict(child.get("limitations")),
         "note": str(child.get("note") or "").strip(),
         "raw_data_points": list(child.get("raw_data_points") or []),
@@ -4900,6 +5113,15 @@ def _child_output_to_pool_item(
                 source.setdefault("evidence_origin", item["evidence_origin"])
                 source.setdefault("live_verified", item["live_verified"])
                 source.setdefault("cache_seed", False)
+                source.setdefault("provider", task.get("provider") or task.get("primary_provider") or agent)
+                source.setdefault("retrieval_mode", task.get("retrieval_mode"))
+                if task.get("repair_source"):
+                    source.setdefault("repair_source", task.get("repair_source"))
+        for source in item["source_candidates"]:
+            if isinstance(source, dict):
+                source.setdefault("candidate_only", True)
+                source.setdefault("evidence_origin", item["evidence_origin"])
+                source.setdefault("live_verified", False)
                 source.setdefault("provider", task.get("provider") or task.get("primary_provider") or agent)
                 source.setdefault("retrieval_mode", task.get("retrieval_mode"))
                 if task.get("repair_source"):
@@ -5395,6 +5617,9 @@ def _record_openai_web_gap_repair_result(state: BrainAgentState, child: Dict[str
     summary = dict(metadata.get("openai_web_search_summary") or {})
     status = str(child.get("status") or "failed").strip().lower()
     has_signal = bool(_as_list(child.get("key_sources")) and _as_list(child.get("raw_data_points")))
+    source_candidates = _as_list(child.get("source_candidates"))
+    if source_candidates:
+        summary["source_candidate_count"] = int(_safe_float(summary.get("source_candidate_count"), 0.0)) + len(source_candidates)
     search_task = _as_dict(child.get("search_task"))
     chapter_key = _openai_web_candidate_chapter_key(search_task or child)
     if status in {"success", "partial"} and has_signal:
@@ -6593,7 +6818,7 @@ def _writer_quality_snapshot(writer_report: Dict[str, Any]) -> Dict[str, Any]:
     required_followups = _as_list(writer_report.get("required_followups")) or _as_list(
         _as_dict(validation.get("deep_evaluation")).get("required_followups")
     )
-    pending_repair_count = sum(
+    clean_repair_count = sum(
         [
             1 if writer_report.get("qa_pending_repair") else 0,
             1 if validation.get("repair_required") else 0,
@@ -6603,12 +6828,15 @@ def _writer_quality_snapshot(writer_report: Dict[str, Any]) -> Dict[str, Any]:
             len(required_followups),
         ]
     )
+    render_gate = _as_dict(_as_dict(writer_report.get("qa_result")).get("render_gate"))
+    render_repair_count = len(_as_list(render_gate.get("blockers")))
     return {
         "status": str(writer_report.get("report_status") or ""),
         "passed": bool(validation.get("passed")),
         "quality_score": int(_safe_float(validation.get("quality_score"), 0.0)),
         "reformatter_preflight_status": str(preflight_plan.get("status") or ""),
-        "pending_repair_count": pending_repair_count,
+        "pending_repair_count": render_repair_count,
+        "clean_repair_count": clean_repair_count,
         "error_count": len(errors),
         "warning_count": len(warnings),
         "layout_gap_count": len(gaps),
@@ -8433,19 +8661,20 @@ def _repair_task_summary(tasks: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _post_qa_repair_needed(writer_report: Dict[str, Any]) -> bool:
+    if not _env_flag("BRAIN_ENABLE_POST_QA_REPAIR", False):
+        return False
     report = _as_dict(writer_report)
     if str(report.get("report_status") or "").strip().lower() in {"final", "final_clean"}:
         return False
     qa = _as_dict(report.get("qa_result")) or _as_dict(report.get("validation"))
+    render_gate = _as_dict(qa.get("render_gate"))
+    if _as_list(render_gate.get("blockers")):
+        return True
     deep = _as_dict(qa.get("deep_evaluation"))
     return any(
         [
-            bool(report.get("qa_pending_repair")),
             bool(_as_list(report.get("required_followups"))),
-            bool(_as_list(deep.get("required_followups"))),
-            bool(_as_list(qa.get("repair_followups"))),
             bool(_as_list(qa.get("evidence_repair_followups"))),
-            bool(_as_list(qa.get("content_repair_followups"))),
             bool(_as_list(report.get("review_evidence_followups"))),
             bool(_as_list(report.get("review_logic_issues"))),
         ]
@@ -8973,10 +9202,15 @@ def _run_post_qa_repair_round(
     trace: Dict[str, Any] = {
         "round": "post_qa",
         "source": "post_qa_repair",
-        "enabled": False,
+        "enabled": _env_flag("BRAIN_ENABLE_POST_QA_REPAIR", False),
         "has_signal": None,
         "quality_before": _writer_quality_snapshot(best_report),
     }
+    if not trace["enabled"]:
+        trace["status"] = "disabled_by_default"
+        trace["stop_reason"] = "disabled_by_default"
+        best["writer_report"] = _attach_post_qa_repair(best_report, trace)
+        return {**best, "post_qa_repair_trace": [trace]}
     if not _post_qa_repair_needed(best_report):
         trace["status"] = "not_needed"
         return {**best, "post_qa_repair_trace": [trace]}
@@ -11522,13 +11756,19 @@ def merge_outputs_node(state: BrainAgentState) -> BrainAgentState:
         loop_errors = list(loop_result.get("evaluation_errors") or [])
         new_errors.extend(loop_errors)
         all_errors = errors + new_errors
-        evidence_pool = [item for item in _as_list(loop_result.get("evidence_pool")) if isinstance(item, dict)]
+        evidence_pool = _merge_topic_seed_with_live_evidence(
+            state,
+            [item for item in _as_list(loop_result.get("evidence_pool")) if isinstance(item, dict)],
+        )
         evidence_package = merge_evidence_package(
             original_query=str(state.get("query") or ""),
             evidence_pool=[item for item in list(evidence_pool or []) if isinstance(item, dict)],
             children=children,
             research_plan=research_plan,
         )
+        topic_seed_summary = _topic_bundle_seed_summary(state, evidence_pool)
+        if topic_seed_summary:
+            evidence_package.setdefault("metadata", {})["topic_bundle_seed"] = topic_seed_summary
         evidence_package = _annotate_evidence_package_runtime(evidence_package, lane_coverage=lane_coverage, state=state)
         if report_plan:
             evidence_package["report_plan"] = report_plan
@@ -11539,6 +11779,14 @@ def merge_outputs_node(state: BrainAgentState) -> BrainAgentState:
         if report_plan:
             structured_analysis["report_plan"] = report_plan
         _attach_research_plan(evidence_package, structured_analysis, research_plan)
+        topic_bundle_store = _store_topic_bundle_from_brain(
+            state=state,
+            evidence_package=evidence_package,
+            structured_analysis=structured_analysis,
+            stage="brain_full_payload",
+        )
+        if topic_bundle_store:
+            evidence_package.setdefault("metadata", {})["topic_bundle_cache_store"] = topic_bundle_store
         writer_bundle = run_writer_with_layout_refinement(
             state=state,
             children=children,
@@ -11557,6 +11805,16 @@ def merge_outputs_node(state: BrainAgentState) -> BrainAgentState:
         evidence_pool = [item for item in _as_list(writer_bundle.get("evidence_pool")) if isinstance(item, dict)]
         evidence_package = _as_dict(writer_bundle.get("evidence_package")) or evidence_package
         structured_analysis = _as_dict(writer_bundle.get("structured_analysis")) or structured_analysis
+        writer_topic_bundle_store = _store_topic_bundle_from_brain(
+            state=state,
+            evidence_package=evidence_package,
+            structured_analysis=structured_analysis,
+            writer_report=writer_report,
+            stage="writer_full_payload",
+        )
+        if writer_topic_bundle_store:
+            writer_report["topic_bundle_cache_store"] = writer_topic_bundle_store
+            evidence_package.setdefault("metadata", {})["topic_bundle_cache_store_writer"] = writer_topic_bundle_store
         analysis_state = _as_dict(writer_bundle.get("analysis_state")) or analysis_state
         layout_refinement_trace = _as_list(writer_bundle.get("layout_refinement_trace"))
         evidence_preflight_trace = _as_list(writer_bundle.get("evidence_preflight_trace"))
@@ -11693,12 +11951,19 @@ def merge_outputs_node(state: BrainAgentState) -> BrainAgentState:
     loop_errors = list(loop_result.get("evaluation_errors") or [])
     new_errors.extend(loop_errors)
     all_errors = errors + new_errors
+    loop_evidence_pool = _merge_topic_seed_with_live_evidence(
+        state,
+        [item for item in list(loop_result.get("evidence_pool") or []) if isinstance(item, dict)],
+    )
     evidence_package = merge_evidence_package(
         original_query=str(state.get("query") or ""),
-        evidence_pool=[item for item in list(loop_result.get("evidence_pool") or []) if isinstance(item, dict)],
+        evidence_pool=loop_evidence_pool,
         children=children,
         research_plan=research_plan,
     )
+    topic_seed_summary = _topic_bundle_seed_summary(state, loop_evidence_pool)
+    if topic_seed_summary:
+        evidence_package.setdefault("metadata", {})["topic_bundle_seed"] = topic_seed_summary
     evidence_package = _annotate_evidence_package_runtime(evidence_package, lane_coverage=lane_coverage, state=state)
     if report_plan:
         evidence_package["report_plan"] = report_plan
@@ -11709,6 +11974,14 @@ def merge_outputs_node(state: BrainAgentState) -> BrainAgentState:
     if report_plan:
         structured_analysis["report_plan"] = report_plan
     _attach_research_plan(evidence_package, structured_analysis, research_plan)
+    topic_bundle_store = _store_topic_bundle_from_brain(
+        state=state,
+        evidence_package=evidence_package,
+        structured_analysis=structured_analysis,
+        stage="brain_full_payload",
+    )
+    if topic_bundle_store:
+        evidence_package.setdefault("metadata", {})["topic_bundle_cache_store"] = topic_bundle_store
     analysis_errors = [str(item) for item in analysis_state.get("errors") or [] if str(item).strip()]
     if analysis_errors:
         additions = [f"Analysis Agent：{item}" for item in analysis_errors]
@@ -11749,7 +12022,7 @@ def merge_outputs_node(state: BrainAgentState) -> BrainAgentState:
             new_errors.append(error_text)
             all_errors.append(error_text)
 
-    evidence_pool = [item for item in _as_list(loop_result.get("evidence_pool")) if isinstance(item, dict)]
+    evidence_pool = loop_evidence_pool
     report_package = build_report_package(decision, evidence_pool)
     writer_bundle = run_writer_with_layout_refinement(
         state=state,
@@ -11769,6 +12042,16 @@ def merge_outputs_node(state: BrainAgentState) -> BrainAgentState:
     evidence_pool = [item for item in _as_list(writer_bundle.get("evidence_pool")) if isinstance(item, dict)]
     evidence_package = _as_dict(writer_bundle.get("evidence_package")) or evidence_package
     structured_analysis = _as_dict(writer_bundle.get("structured_analysis")) or structured_analysis
+    writer_topic_bundle_store = _store_topic_bundle_from_brain(
+        state=state,
+        evidence_package=evidence_package,
+        structured_analysis=structured_analysis,
+        writer_report=writer_report,
+        stage="writer_full_payload",
+    )
+    if writer_topic_bundle_store:
+        writer_report["topic_bundle_cache_store"] = writer_topic_bundle_store
+        evidence_package.setdefault("metadata", {})["topic_bundle_cache_store_writer"] = writer_topic_bundle_store
     analysis_state = _as_dict(writer_bundle.get("analysis_state")) or analysis_state
     layout_refinement_trace = _as_list(writer_bundle.get("layout_refinement_trace"))
     evidence_preflight_trace = _as_list(writer_bundle.get("evidence_preflight_trace"))
@@ -11982,6 +12265,7 @@ def run_brain_agent(
     layout_max_refinement_rounds: Optional[int] = None,
     output_mode: Optional[str] = None,
     parallel_raw_output: Optional[bool] = None,
+    topic_bundle_seed: Optional[Dict[str, Any]] = None,
 ) -> BrainAgentState:
     configure_pipeline_logging()
     started = time.perf_counter()
@@ -12000,6 +12284,8 @@ def run_brain_agent(
         "args_overrides": dict(args_overrides or {}),
         "web_search_options": dict(web_search_options or {}),
     }
+    if topic_bundle_seed:
+        state["topic_bundle_seed"] = dict(topic_bundle_seed)
     if enable_web_analysis is not None:
         state["enable_web_analysis"] = bool(enable_web_analysis)
     if enable_llm_merge is not None:

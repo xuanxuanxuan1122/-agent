@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import json
 import os
 import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -65,6 +67,10 @@ BAD_FACT_PATTERNS = [
 EVIDENCE_COLLECTIONS = (
     "core_evidence",
     "supporting_evidence",
+    "metric_evidence",
+    "case_evidence",
+    "counter_evidence",
+    "directional_evidence",
     "sample_evidence",
     "table_evidence",
     "clue_evidence",
@@ -75,9 +81,60 @@ EVIDENCE_COLLECTIONS = (
 PUBLIC_EVIDENCE_COLLECTIONS = (
     "core_evidence",
     "supporting_evidence",
+    "metric_evidence",
+    "case_evidence",
+    "counter_evidence",
+    "directional_evidence",
     "sample_evidence",
     "table_evidence",
     "clue_evidence",
+)
+
+# Public-output guards added as unicode escapes so this file stays robust even
+# when edited from Windows terminals with different code pages.
+_PUBLIC_TEMPLATE_PATTERNS = [
+    r"\u4e0d\u662f\u5355\u70b9\u4e8b\u5b9e\u9898",  # 不是单点事实题
+    r"\u4f9b\u7ed9\u7ea6\u675f",
+    r"\u9700\u6c42\u5151\u73b0",
+    r"\u4ef7\u683c\u5229\u6da6",
+    r"\u4ef7\u683c\u4fee\u590d",
+    r"\u5e93\u5b58\u4e0b\u964d",
+    r"\u8ba2\u5355\u786e\u8ba4",
+    r"\u540e\u7eed\u91cd\u70b9\u89c2\u5bdf\u80fd\u591f\u540c\u65f6\u89e3\u91ca",
+    r"\u6b63\u6587\s*\u53ea\u80fd\s*\u5199\u6210",
+    r"\u6b63\u6587\s*\u5e94\s*\u628a",
+    r"\u6b63\u6587\s*\u5e94\u5f53",
+    r"\u672c\u7ae0\s*\u53ea\u80fd\s*\u5199\u6210",
+    r"\u672c\u7ae0\s*\u53ef\s*\u5199\u6210",
+    r"\u5efa\u8bae\u8865\u8bc1",
+    r"\u5efa\u8bae\u907f\u514d",
+    r"\u53ef\u590d\u6838\u6765\u6e90\u8d8a\u72ec\u7acb",
+    r"\u76ee\u524d\u7ed3\u8bba\u4ecd\u53d7",
+    r"\u4f18\u5148\u590d\u6838\u53ef\u8ffd\u6eaf\u6765\u6e90",
+    r"\u672c\u7ae0\u5173\u6ce8",
+    r"\u672c\u8282\u56f4\u7ed5",
+    r"claim_status",
+    r"evidence_cards",
+]
+BAD_CLAIM_PATTERNS.extend(_PUBLIC_TEMPLATE_PATTERNS)
+PUBLIC_BLOCKING_PATTERNS.extend(_PUBLIC_TEMPLATE_PATTERNS)
+BAD_FACT_PATTERNS.extend(
+    [
+        r"\u519c\u4e1a\u4eba\u5de5\u667a\u80fd",
+        r"\u6570\u636e\u6295\u6bd2",
+        r"Scribd",
+        r"\u53d1\u73b0\u62a5\u544a",
+        r"\u7eba\u7ec7",
+        r"\u667a\u80fd\u624b\u673a",
+        r"SEO",
+        r"\u641c\u7d22\u7ed3\u679c",
+        r"Read\s*page",
+        r"\u7b2c\s*\d+\s*\u8f6e",
+        r"picture\s*\[\d+\s*x\s*\d+\]\s*intentionally\s*omitted",
+        r"\u8d2d\u7269\u8f66|\u6211\u7684\u8ba2\u5355|\u514d\u8d39\u6ce8\u518c|\u62a5\u544a\u670d\u52a1\u70ed\u7ebf",
+        r"URL[:\uff1a]",
+        r"(?:\u6210\u672c|\u5173\u952e\u4e8b\u5b9e|\u653f\u7b56\u76d1\u7ba1|\u653f\u7b56\u76ee\u6807)\s*[:\uff1a]\s*-?\d{1,3}(?:\.\d+)?%?",
+    ]
 )
 
 
@@ -87,6 +144,45 @@ def _as_dict(value: Any) -> Dict[str, Any]:
 
 def _as_list(value: Any) -> List[Any]:
     return list(value) if isinstance(value, list) else []
+
+
+def _parse_structured_string(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text or text[0] not in "[{":
+        return value
+    for parser in (json.loads, ast.literal_eval):
+        try:
+            parsed = parser(text)
+        except Exception:
+            continue
+        if isinstance(parsed, (dict, list)):
+            return parsed
+    return value
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value in (None, ""):
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _analysis_quality_requires_evidence_rebuild(structured_analysis: Dict[str, Any]) -> bool:
+    quality = _as_dict(structured_analysis.get("analysis_depth_quality"))
+    status = str(quality.get("status") or "").strip().lower()
+    repeated_ratio = _safe_float(quality.get("repeated_claim_ratio"), 0.0)
+    title_as_claim_count = int(_safe_float(quality.get("title_as_claim_count"), 0.0))
+    ref_mismatch_count = int(_safe_float(quality.get("evidence_ref_mismatch_count"), 0.0))
+    return bool(
+        status == "needs_rewrite"
+        or repeated_ratio > 0.30
+        or title_as_claim_count > 0
+        or ref_mismatch_count > 0
+    )
 
 
 def _strict_quality_mode() -> bool:
@@ -183,6 +279,110 @@ def _is_bad_public_fact(value: Any) -> bool:
     return any(re.search(pattern, text, flags=re.I) for pattern in BAD_FACT_PATTERNS)
 
 
+def _clean_public_text(value: Any, max_chars: int = 900) -> str:
+    text = _compact(value, max_chars)
+    if not text:
+        return ""
+    for pattern in _PUBLIC_TEMPLATE_PATTERNS:
+        text = re.sub(rf"[^。\n]*{pattern}[^。\n]*(?:。|$)", "", text, flags=re.I)
+    if any(re.search(pattern, text, flags=re.I) for pattern in BAD_FACT_PATTERNS):
+        return ""
+    return re.sub(r"\s{2,}", " ", text).strip()
+
+
+def _clean_argument_unit_public_fields(unit: Dict[str, Any]) -> Dict[str, Any]:
+    cleaned = dict(unit)
+    text_fields = (
+        "claim",
+        "public_claim",
+        "evidence_basis",
+        "reasoning",
+        "reasoning_chain",
+        "mechanism",
+        "counter_evidence",
+        "limitation_boundary",
+        "actionable",
+        "decision_implication",
+        "confidence_reason",
+    )
+    for key in text_fields:
+        if key in cleaned:
+            cleaned[key] = _clean_public_text(cleaned.get(key), 900)
+    facts = [
+        _clean_public_text(item, 260)
+        for item in (_as_list(cleaned.get("supporting_facts")) + _as_list(cleaned.get("fact_chain")))
+        if str(item or "").strip() and not _is_bad_public_fact(item)
+    ]
+    facts = _dedupe([item for item in facts if item], limit=8)
+    if facts:
+        cleaned["supporting_facts"] = facts
+    if not cleaned.get("claim") and facts:
+        cleaned["claim"] = facts[0]
+        cleaned["public_claim"] = facts[0]
+    render_blocks = []
+    for block in _as_list(cleaned.get("render_blocks")):
+        if not isinstance(block, dict):
+            continue
+        item = dict(block)
+        if "text" in item:
+            item["text"] = _clean_public_text(item.get("text"), 900)
+            if item.get("type") == "paragraph" and not item["text"]:
+                continue
+        render_blocks.append(item)
+    if render_blocks:
+        cleaned["render_blocks"] = render_blocks
+    return cleaned
+
+
+def _invalid_metric_item(item: Dict[str, Any]) -> bool:
+    """Reject metric-like fragments that are usually dates, URL ids, or bad parses."""
+    if not isinstance(item, dict):
+        return True
+    if str(item.get("metric_validation_status") or "").strip().lower() == "invalid":
+        return True
+    metric = str(item.get("metric") or item.get("indicator") or "").strip()
+    value = str(item.get("value") or item.get("display_value") or item.get("numeric_value") or "").strip()
+    fact = str(item.get("fact") or item.get("clean_fact") or item.get("content") or item.get("summary") or "").strip()
+    metric_lower = metric.lower()
+    if not metric and not fact:
+        return True
+    if metric_lower in {"source_check", "status", "http_status", "response_code"} and re.fullmatch(r"[1-5]\d{2}", value):
+        return True
+    if re.search(r"\bsource_check\s*[:=]\s*[1-5]\d{2}\b", fact, flags=re.I):
+        return True
+    if value:
+        if re.fullmatch(r"-?\d{1,3}(?:\.0)?", value) and re.search(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}|T\d{1,2}:\d{2}", fact):
+            return True
+        if metric in {"\u5173\u952e\u4e8b\u5b9e", "\u653f\u7b56\u76d1\u7ba1", "\u653f\u7b56\u76ee\u6807"} and re.fullmatch(r"-?\d{1,3}(?:\.0)?", value):
+            return True
+        if re.search(r"\u653f\u7b56|\u76ee\u6807|\u76d1\u7ba1", metric) and re.match(r"-\d", value):
+            return True
+        if re.search(r"\u6210\u672c", metric) and (re.search(r"\u5bb6$", value) or not fact):
+            return True
+        if re.search(r"\u5e02\u573a\u89c4\u6a21", metric) and re.search(r"%", value):
+            return True
+        if re.search(r"\u878d\u8d44", metric) and re.search(r"%", value):
+            return True
+    if re.search(r"https?://|/\d{4}/\d{1,2}/\d{1,2}/|10462|10778|10876", value):
+        return True
+    return False
+
+
+def _clean_public_fact_from_item(item: Dict[str, Any]) -> str:
+    if _invalid_metric_item(item):
+        return ""
+    fact = _compact(item.get("fact") or item.get("clean_fact") or item.get("content") or item.get("summary"), 360)
+    if _is_bad_public_fact(fact):
+        return ""
+    metric = _compact(item.get("metric") or item.get("indicator"), 80)
+    value = _compact(item.get("value") or item.get("display_value"), 80)
+    if fact:
+        return fact
+    if metric and value:
+        return f"{metric}: {value}"
+    return ""
+
+
 def _support_profile(package: Dict[str, Any], refs: Sequence[str]) -> Dict[str, Any]:
     wanted = {str(ref or "").strip() for ref in refs if str(ref or "").strip()}
     items = [
@@ -212,19 +412,27 @@ def _support_profile(package: Dict[str, Any], refs: Sequence[str]) -> Dict[str, 
     contextual_ab_count = 0
     claim_ab_count = 0
     directional_c_source_keys = set()
+    matched_collections: Dict[int, str] = {}
+    for collection in EVIDENCE_COLLECTIONS:
+        for item in _as_list(package.get(collection)):
+            if isinstance(item, dict):
+                matched_collections[id(item)] = collection
     for item in matched:
+        collection_name = matched_collections.get(id(item), "")
         level = str(item.get("source_level") or _as_dict(item.get("source")).get("credibility") or "").strip().upper() or "UNKNOWN"
         levels[level] = levels.get(level, 0) + 1
         role = str(item.get("evidence_role") or item.get("role") or "").strip().lower() or "unknown"
         roles[role] = roles.get(role, 0) + 1
         allowed_use = str(item.get("allowed_use") or _as_dict(item.get("evidence_card")).get("allowed_use") or "").strip() or "unknown"
+        if collection_name in {"directional_evidence", "case_evidence"} and allowed_use == "unknown":
+            allowed_use = "directional_signal"
         allowed_uses[allowed_use] = allowed_uses.get(allowed_use, 0) + 1
         is_contextual = allowed_use in {"supporting_context", "contextual_support"} or str(item.get("usage_tier") or "") == "corroborated_context"
         if level in {"A", "B"} and is_contextual:
             contextual_ab_count += 1
         elif level in {"A", "B"}:
             claim_ab_count += 1
-        elif level == "C" and allowed_use == "directional_signal":
+        elif level in {"B", "C"} and allowed_use == "directional_signal":
             source = _as_dict(item.get("source"))
             key = re.sub(
                 r"\s+",
@@ -260,7 +468,7 @@ def _support_profile(package: Dict[str, Any], refs: Sequence[str]) -> Dict[str, 
         strength = "strong"
     elif claim_ab_count >= 1:
         strength = "medium"
-    elif contextual_ab_count >= 1 or directional >= 1 or supporting >= 1:
+    elif contextual_ab_count >= 1 or directional >= 1 or supporting >= 1 or directional_c_distinct >= 1:
         strength = "directional"
     elif clue >= 1:
         strength = "weak"
@@ -414,7 +622,11 @@ def _matches(unit: Dict[str, Any], package: Dict[str, Any]) -> bool:
 def _structured_units(structured_analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
     units: List[Dict[str, Any]] = []
     insight_package = _as_dict(structured_analysis.get("report_insight_package"))
-    for chapter in _as_list(insight_package.get("chapters")) + _as_list(structured_analysis.get("chapter_insights")):
+    chapters = [
+        _parse_structured_string(item)
+        for item in (_as_list(insight_package.get("chapters")) + _as_list(structured_analysis.get("chapter_insights")))
+    ]
+    for chapter in chapters:
         if not isinstance(chapter, dict):
             continue
         chapter_question = chapter.get("chapter_question") or chapter.get("chapter_answer")
@@ -447,7 +659,7 @@ def _structured_units(structured_analysis: Dict[str, Any]) -> List[Dict[str, Any
                 }
             )
     for key in ("claim_units", "analysis_units"):
-        for item in _as_list(structured_analysis.get(key)):
+        for item in [_parse_structured_string(raw) for raw in _as_list(structured_analysis.get(key))]:
             if isinstance(item, dict):
                 if not str(item.get("claim") or item.get("judgment") or item.get("conclusion") or "").strip():
                     continue
@@ -532,14 +744,14 @@ def _claim_from_fact(package: Dict[str, Any], fact: str) -> str:
     title = _compact(package.get("chapter_title"), 80) or "本章"
     fact = _compact(fact, 180)
     if re.search(r"谁|付费|客户|用户|买单", question):
-        return f"{title}的核心变量在付费主体，预算明确、使用频次稳定、替代成本足够高时，需求才会从兴趣转为采购。"
+        return "需求是否成立，关键不在试用热度，而在付费主体、使用频次、替代成本和复购意愿能否连续被验证。"
     if re.search(r"政策|监管|执行|影响", question + title):
-        return f"{title}的关键不在政策表态本身，而在执行机制能否传导到预算、审批或采购动作。"
+        return "政策和监管材料只能先说明外部约束方向，真正影响行业落地的是预算、审批、采购和合规责任能否形成可执行机制。"
     if re.search(r"产品|机会|进入|切入", question + title):
-        return f"{title}更适合作为阶段性切入口，而不是直接外推为整体市场机会。"
+        return "现有材料更适合识别阶段性切入口，尚不能直接外推为整体市场机会或确定性商业化结论。"
     if fact:
-        return f"{title}当前材料能说明阶段性方向，但还不足以直接外推为整体机会；需要继续核验主体动作、指标连续性和反向样本。"
-    return f"{title}目前更适合作为背景条件，结论强度取决于后续连续指标和相反样本的变化。"
+        return "现有事实已经提供方向性观察，但结论强度仍取决于主体动作、连续指标、客户验证和反向样本能否继续相互印证。"
+    return "当前公开材料只能作为背景条件，后续需要连续指标和相反样本来校准判断强度。"
 
 
 def _directional_claim(package: Dict[str, Any], fact: str = "") -> str:
@@ -798,14 +1010,21 @@ def _unit_from_evidence(package: Dict[str, Any], section_id: str) -> Dict[str, A
     core = [item for item in _as_list(package.get("core_evidence")) if isinstance(item, dict)]
     supporting = [
         item
-        for collection in ("supporting_evidence", "sample_evidence")
+        for collection in (
+            "supporting_evidence",
+            "metric_evidence",
+            "case_evidence",
+            "counter_evidence",
+            "directional_evidence",
+            "sample_evidence",
+        )
         for item in _as_list(package.get(collection))
         if isinstance(item, dict)
     ]
     clue = [item for item in _as_list(package.get("clue_evidence")) if isinstance(item, dict)]
-    candidates = core or supporting or clue
+    candidates = [item for item in (core or supporting or clue) if _clean_public_fact_from_item(item)]
     first = candidates[0] if candidates else {}
-    fact = _compact(first.get("fact"), 260)
+    fact = _compact(_clean_public_fact_from_item(first), 260)
     supporting_facts = _evidence_facts_from_package(package, limit=8)
     refs = _dedupe([_citation_ref_from_evidence(item) for item in (core + supporting + clue)[:8]], limit=8)
     question = _question_for(package)
@@ -899,22 +1118,8 @@ def _evidence_facts_from_package(package: Dict[str, Any], *, limit: int = 5) -> 
         for item in _as_list(package.get(collection)):
             if not isinstance(item, dict):
                 continue
-            if item.get("metric_validation_status") == "invalid":
-                continue
-            fact = _compact(item.get("fact") or item.get("clean_fact") or item.get("content") or item.get("summary"), 360)
-            if _is_bad_public_fact(fact):
-                continue
-            metric = _compact(item.get("metric") or item.get("indicator"), 80)
-            value = _compact(item.get("value") or item.get("display_value"), 80)
-            # Prefer a self-contained natural-language fact; only fall back to
-            # "metric: value" when no narrative fact is available. We never
-            # concatenate metric+value+fact because the fact text usually already
-            # contains the metric and value in natural form.
-            if fact:
-                rendered = fact
-            elif metric and value:
-                rendered = f"{metric}: {value}"
-            else:
+            rendered = _clean_public_fact_from_item(item)
+            if not rendered:
                 continue
             key = _fact_key(item, rendered)
             if key in seen_keys:
@@ -981,6 +1186,28 @@ def _long_reasoning(package: Dict[str, Any], *, lens: str, facts: Sequence[str])
             f"围绕“{question}”，讨论应从供应链节点开始，再转入技术约束、政策压力、客户导入和反向情形。当前事实组合是：{fact_text}。"
             f"{profile}这些事实如果能同时覆盖政策、技术、产能、订单和反证，结论可以更强；如果只覆盖单个企业或单条新闻，结论应保留为方向性判断。"
         )
+    if not _looks_like_semiconductor_topic(package):
+        if lens == "mechanism":
+            return (
+                f"可用事实包括：{fact_text}。这些材料需要回到本题的需求来源、产品能力、客户导入和风险约束上判断。"
+                f"{profile}如果同口径事实继续同向，结论强度可以上调；如果只是不连续的局部样本，则保留为观察判断。"
+            )
+        if lens == "boundary":
+            return (
+                f"\u201c{title}\u201d\u7684\u8fb9\u754c\u6765\u81ea\u6837\u672c\u8986\u76d6\u3001\u6765\u6e90\u53ef\u6838\u9a8c\u6027\u548c\u6307\u6807\u53e3\u5f84\u3002"
+                f"\u76ee\u524d\u53ef\u653e\u5728\u6b63\u6587\u4e2d\u7684\u4e8b\u5b9e\u662f\uff1a{fact_text}\u3002"
+                "\u82e5\u540e\u7eed\u51fa\u73b0\u76f8\u53cd\u6848\u4f8b\u3001\u4ed8\u8d39\u6216\u590d\u8d2d\u4e0d\u8fbe\u9884\u671f\u3001\u6210\u672c\u4e0e\u5b89\u5168\u6cbb\u7406\u538b\u529b\u5347\u9ad8\uff0c"
+                "\u672c\u8282\u5224\u65ad\u9700\u8981\u4ece\u5f3a\u7ed3\u8bba\u964d\u7ea7\u4e3a\u6709\u9650\u8bc1\u636e\u4e0b\u7684\u8d8b\u52bf\u89c2\u5bdf\u3002"
+            )
+        if lens == "decision":
+            return (
+                f"\u201c{title}\u201d\u7684\u51b3\u7b56\u542b\u4e49\u662f\u628a\u5df2\u6709\u6750\u6599\u8f6c\u6210\u53ef\u8ffd\u8e2a\u7684\u89c2\u5bdf\u53d8\u91cf\uff1a{fact_text}\u3002"
+                "\u5f53\u8fd9\u4e9b\u53d8\u91cf\u540c\u65f6\u6307\u5411\u9700\u6c42\u771f\u5b9e\u3001\u5ba2\u6237\u5bfc\u5165\u3001\u6280\u672f\u53ef\u7528\u548c\u98ce\u9669\u53ef\u63a7\u65f6\uff0c"
+                "\u62a5\u544a\u53ef\u4ee5\u63d0\u9ad8\u7ed3\u8bba\u5f3a\u5ea6\uff1b\u53ea\u6709\u5355\u70b9\u70ed\u5ea6\u6216\u5f31\u6765\u6e90\u65f6\uff0c\u5219\u5e94\u4fdd\u6301\u8bed\u6c14\u964d\u7ea7\u3002"
+            )
+        return (
+            f"事实依据为：{fact_text}。这些事实可以支撑本节的观察判断；结论能否上升为核心判断，取决于后续是否出现同口径、可交叉验证的连续材料。"
+        )
     if lens == "mechanism":
         return (
             f"“{question}”不是单点事实题，而是变量之间能否形成同向传导的问题。上游约束决定供给弹性，中游价格和库存决定景气位置，下游订单、开工或采购行为决定需求是否真实兑现。"
@@ -1045,6 +1272,47 @@ def _deep_unit_from_package(
             "internal_reason": "missing_refs_or_fact_text",
         }
     semiconductor_topic = _looks_like_semiconductor_topic(package)
+    if not semiconductor_topic:
+        if lens == "mechanism":
+            claim = f"{chapter_title}\u5df2\u6709\u4e8b\u5b9e\u7ebf\u7d22\uff0c\u4f46\u9700\u56de\u5230\u9700\u6c42\u3001\u4ea7\u54c1\u80fd\u529b\u3001\u5ba2\u6237\u5bfc\u5165\u548c\u98ce\u9669\u7ea6\u675f\u7684\u4f20\u5bfc\u5173\u7cfb\u6765\u5224\u65ad\u3002"
+            counter = "\u82e5\u540e\u7eed\u5ba2\u6237\u4ed8\u8d39\u3001\u7eed\u7ea6\u3001ROI\u6216\u5b89\u5168\u8d23\u4efb\u8bc1\u636e\u4e0d\u8db3\uff0c\u672c\u8282\u5224\u65ad\u5e94\u4fdd\u6301\u65b9\u5411\u6027\u3002"
+            action = "\u540e\u7eed\u4f18\u5148\u8ffd\u8e2a\u5ba2\u6237\u5bfc\u5165\u3001\u590d\u8d2d\u3001\u6210\u672c\u53d8\u5316\u548c\u5b89\u5168\u6cbb\u7406\u6848\u4f8b\u3002"
+        elif lens == "boundary":
+            claim = f"{chapter_title}\u7684\u7ed3\u8bba\u8fb9\u754c\u53d6\u51b3\u4e8e\u8bc1\u636e\u662f\u5426\u72ec\u7acb\u3001\u53ef\u6838\u9a8c\uff0c\u4ee5\u53ca\u662f\u5426\u8986\u76d6\u53cd\u5411\u6837\u672c\u3002"
+            counter = "\u5982\u679c\u5f31\u6765\u6e90\u3001\u641c\u7d22\u6458\u8981\u6216\u5c40\u90e8\u6848\u4f8b\u5360\u6bd4\u8fc7\u9ad8\uff0c\u7ed3\u8bba\u4e0d\u5e94\u4e0a\u5347\u4e3a\u786e\u5b9a\u6027\u5224\u65ad\u3002"
+            action = "\u5728\u8bc4\u4f30\u7ed3\u8bba\u65f6\u540c\u6b65\u68c0\u67e5\u53ef\u8ffd\u6eaf\u6765\u6e90\u3001\u6307\u6807\u53e3\u5f84\u548c\u53cd\u8bc1\u6837\u672c\u3002"
+        elif lens == "decision":
+            claim = f"{chapter_title}\u53ef\u4f5c\u4e3a\u89c2\u5bdf\u4ea7\u4e1a\u4f18\u5148\u7ea7\u7684\u5207\u53e3\uff0c\u4f46\u5e94\u6309\u8bc1\u636e\u5f3a\u5ea6\u5206\u5c42\u8bfb\u53d6\u3002"
+            counter = "\u82e5\u4e8b\u5b9e\u4ec5\u80fd\u8bc1\u660e\u8bdd\u9898\u70ed\u5ea6\uff0c\u5374\u4e0d\u80fd\u8bc1\u660e\u4ed8\u8d39\u3001\u843d\u5730\u6216\u6280\u672f\u7a33\u5b9a\u6027\uff0c\u5219\u4e0d\u5e94\u76f4\u63a5\u63a8\u5bfc\u4e3a\u5e02\u573a\u7a7a\u95f4\u3002"
+            action = "\u628a\u5df2\u6709\u4e8b\u5b9e\u62c6\u6210\u9700\u6c42\u3001\u4f9b\u7ed9\u3001\u5546\u4e1a\u5316\u3001\u98ce\u9669\u56db\u7c7b\u53d8\u91cf\u7ee7\u7eed\u9a8c\u8bc1\u3002"
+        else:
+            claim = _claim_from_fact(package, facts[0] if facts else fact_text)
+            counter = "\u8be5\u5224\u65ad\u7684\u8fb9\u754c\u5728\u4e8e\u539f\u6587\u6838\u9a8c\u548c\u53cd\u5411\u6837\u672c\u8986\u76d6\u662f\u5426\u8db3\u591f\u3002"
+            action = "\u540e\u7eed\u89c2\u5bdf\u672c\u7ae0\u76f8\u5173\u7684\u6307\u6807\u53e3\u5f84\u3001\u4f01\u4e1a\u62ab\u9732\u548c\u5ba2\u6237\u6848\u4f8b\u3002"
+        return {
+            "agent": AGENT_NAME,
+            "chapter_id": package.get("chapter_id"),
+            "section_id": section_id,
+            "question": package.get("chapter_question") or package.get("chapter_title"),
+            "section_title": title,
+            "claim": claim,
+            "reasoning": _long_reasoning(package, lens=lens, facts=facts),
+            "mechanism": _long_reasoning(package, lens="mechanism", facts=facts[:4]),
+            "counter_evidence": counter,
+            "actionable": action,
+            "decision_implication": action,
+            "confidence": "medium" if support.get("grade") in {"high", "medium"} else "low",
+            "claim_status": "directional" if support.get("grade") in {"low", "medium_low"} else "decision_ready",
+            "supporting_evidence": refs,
+            "evidence_refs": refs,
+            "supporting_facts": list(facts),
+            "verification_metrics": _public_verification_focus(package, refs),
+            "what_to_verify_next": _public_verification_focus(package, refs),
+            "source_quality": support,
+            "quality_status": "valid",
+            "omit_from_report": False,
+            "public_render": bool(refs),
+        }
     if lens == "mechanism" and semiconductor_topic:
         claim = f"{chapter_title}应放在“管制强度、技术可得性、产能位置、客户导入”四层关系中判断，而不是按单个新闻或单个企业外推。"
         counter = "如果出口管制边际放松、关键设备验证失败、成熟制程产能利用率下行，或客户认证慢于预期，供应链重构的方向和节奏都需要重新校准。"
@@ -1102,11 +1370,23 @@ def _deep_units_from_package(package: Dict[str, Any], base_section_id: str) -> L
     boundary_title = "反证、边界与结论失效条件"
     decision_title = "产业战略含义与后续观察优先级" if semiconductor_topic else "决策含义与后续观察优先级"
     verification_title = "哪些政策和产业信号值得继续验证" if semiconductor_topic else "哪些信号值得继续验证"
-    economics_title = "受益环节、约束条件与兑现路径" if semiconductor_topic else "收益归属和商业化弹性在哪里"
+    economics_title = "受益环节、约束条件与兑现路径" if semiconductor_topic else "商业化证据"
     facts = _evidence_facts_from_package(
         package,
         limit=_env_int("REPORT_FACTS_PER_CHAPTER_ARGUMENTS", 18, min_value=6, max_value=48),
     )
+    support = _support_profile(package, _evidence_refs_from_package(package, limit=12))
+    if str(support.get("grade") or "").lower() in {"low", "medium_low"} or len(facts) < 3:
+        return [
+            _unit_from_evidence(package, base_section_id),
+            _deep_unit_from_package(
+                package,
+                section_id=f"{chapter_id}_boundary",
+                lens="boundary",
+                title=boundary_title,
+                facts=facts[:6] or facts,
+            ),
+        ]
     mechanism_facts = facts[:8] or facts
     boundary_facts = facts[4:12] or facts[:8] or facts
     decision_facts = facts[8:16] or facts[2:10] or facts
@@ -1154,6 +1434,84 @@ def _lens_for_layout_section(section: Dict[str, Any]) -> str:
     return "verification"
 
 
+def _facts_from_collections(package: Dict[str, Any], collections: Sequence[str], *, limit: int) -> List[str]:
+    facts: List[str] = []
+    seen = set()
+    for collection in collections:
+        for item in _as_list(package.get(collection)):
+            if not isinstance(item, dict):
+                continue
+            rendered = _clean_public_fact_from_item(item)
+            if not rendered:
+                continue
+            key = re.sub(r"\s+", "", rendered.lower())[:160]
+            if key in seen:
+                continue
+            seen.add(key)
+            facts.append(rendered)
+            if len(facts) >= limit:
+                return facts
+    return facts
+
+
+def _collections_for_layout_section(section: Dict[str, Any]) -> List[str]:
+    block_type = str(section.get("block_type") or section.get("output_type") or "").strip()
+    if block_type == "metric_reconciliation":
+        return ["metric_evidence", "core_evidence", "supporting_evidence"]
+    if block_type in {"competitive_positioning", "customer_painpoint_matrix", "unit_economics", "case_comparison"}:
+        return ["case_evidence", "core_evidence", "supporting_evidence", "directional_evidence"]
+    if block_type == "technology_maturity":
+        return ["metric_evidence", "core_evidence", "supporting_evidence", "directional_evidence"]
+    if block_type in {"risk_trigger", "verification_checklist", "scenario_analysis"}:
+        return ["counter_evidence", "core_evidence", "supporting_evidence", "directional_evidence"]
+    return list(PUBLIC_EVIDENCE_COLLECTIONS)
+
+
+def _refs_from_collections(package: Dict[str, Any], collections: Sequence[str], *, limit: int = 8) -> List[str]:
+    refs: List[str] = []
+    for collection in collections:
+        for item in _as_list(package.get(collection)):
+            if not isinstance(item, dict):
+                continue
+            ref = _citation_ref_from_evidence(item)
+            if ref:
+                refs.append(ref)
+            if len(refs) >= limit * 2:
+                break
+        if len(refs) >= limit * 2:
+            break
+    return _dedupe(refs, limit=limit)
+
+
+def _refs_for_layout_section(package: Dict[str, Any], section: Dict[str, Any], *, limit: int = 8) -> List[str]:
+    explicit_refs = _as_list(section.get("required_evidence_refs"))
+    if explicit_refs:
+        return _source_refs_for_evidence_refs(package, explicit_refs) or _dedupe(explicit_refs, limit=limit)
+    return _refs_from_collections(package, _collections_for_layout_section(section), limit=limit)
+
+
+def _facts_for_layout_section(package: Dict[str, Any], section: Dict[str, Any], *, index: int, fallback: Sequence[str]) -> List[str]:
+    block_type = str(section.get("block_type") or section.get("output_type") or "").strip()
+    if block_type:
+        facts = _facts_from_collections(package, _collections_for_layout_section(section), limit=8)
+    else:
+        facts = []
+    if facts:
+        return facts
+    if block_type == "metric_reconciliation":
+        facts = _facts_from_collections(package, ["metric_evidence", "core_evidence", "supporting_evidence"], limit=8)
+    elif block_type in {"competitive_positioning", "customer_painpoint_matrix", "unit_economics", "case_comparison"}:
+        facts = _facts_from_collections(package, ["case_evidence", "core_evidence", "supporting_evidence", "directional_evidence"], limit=8)
+    elif block_type == "technology_maturity":
+        facts = _facts_from_collections(package, ["core_evidence", "supporting_evidence", "directional_evidence"], limit=8)
+    elif block_type in {"risk_trigger", "verification_checklist", "scenario_analysis"}:
+        facts = _facts_from_collections(package, ["counter_evidence", "core_evidence", "supporting_evidence", "directional_evidence"], limit=8)
+    else:
+        start = max(0, (index - 1) * 4)
+        facts = list(fallback[start : start + 8] or fallback)
+    return facts
+
+
 def _units_from_layout_sections(package: Dict[str, Any], sections: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     facts = _evidence_facts_from_package(
         package,
@@ -1170,8 +1528,7 @@ def _units_from_layout_sections(package: Dict[str, Any], sections: Sequence[Dict
             unit = _unit_from_evidence(package, section_id)
             unit["section_title"] = title or unit.get("section_title")
         else:
-            start = max(0, (index - 1) * 4)
-            unit_facts = facts[start : start + 8] or facts
+            unit_facts = _facts_for_layout_section(package, section, index=index, fallback=facts)
             unit = _deep_unit_from_package(
                 package,
                 section_id=section_id,
@@ -1179,15 +1536,80 @@ def _units_from_layout_sections(package: Dict[str, Any], sections: Sequence[Dict
                 title=title or "章节论证",
                 facts=unit_facts,
             )
-        if required_refs:
-            mapped_refs = _source_refs_for_evidence_refs(package, required_refs) or _dedupe(required_refs, limit=8)
+        mapped_refs = _refs_for_layout_section(package, section, limit=8)
+        if mapped_refs:
             unit["evidence_refs"] = mapped_refs
             unit["supporting_evidence"] = mapped_refs
             unit["source_quality"] = _support_profile(package, unit["evidence_refs"])
         unit["block_type"] = section.get("block_type") or section.get("output_type")
         unit["layout_section_role"] = section.get("section_role")
+        refs = _as_list(unit.get("evidence_refs"))
+        facts_for_unit = _as_list(unit.get("supporting_facts"))
+        evidence_backed = bool(refs and facts_for_unit)
+        unit["layout_generated"] = True
+        unit["evidence_backed"] = evidence_backed
+        unit["observation_only"] = not evidence_backed
         units.append(unit)
     return units
+
+
+def _structured_unit_match_score(unit: Dict[str, Any], section: Dict[str, Any]) -> int:
+    section_id = str(section.get("section_id") or "").strip()
+    block_type = str(section.get("block_type") or section.get("output_type") or "").strip()
+    title = re.sub(r"\s+", "", str(section.get("section_title") or section.get("title") or "").strip().lower())
+    unit_section_id = str(unit.get("section_id") or "").strip()
+    unit_block = str(unit.get("block_type") or unit.get("output_type") or unit.get("layout_section_role") or "").strip()
+    unit_title = re.sub(
+        r"\s+",
+        "",
+        str(unit.get("section_title") or unit.get("question") or unit.get("dimension") or "").strip().lower(),
+    )
+    if section_id and unit_section_id == section_id:
+        return 100
+    if block_type and unit_block == block_type:
+        return 80
+    if title and unit_title and (title == unit_title or title in unit_title or unit_title in title):
+        return 50
+    required_refs = {str(ref or "").strip() for ref in _as_list(section.get("required_evidence_refs")) if str(ref or "").strip()}
+    unit_refs = {
+        str(ref or "").strip()
+        for ref in (_as_list(unit.get("supporting_evidence")) + _as_list(unit.get("evidence_refs")))
+        if str(ref or "").strip()
+    }
+    if required_refs and unit_refs and required_refs.intersection(unit_refs):
+        return 30
+    return 0
+
+
+def _pop_structured_unit_for_section(matched_units: List[Dict[str, Any]], section: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    best_index = -1
+    best_score = 0
+    for index, unit in enumerate(matched_units):
+        score = _structured_unit_match_score(unit, section)
+        if score > best_score:
+            best_score = score
+            best_index = index
+    if best_index >= 0 and best_score > 0:
+        return matched_units.pop(best_index)
+    return None
+
+
+def _layout_match_reason(score: int) -> str:
+    if score >= 100:
+        return "section_id"
+    if score >= 80:
+        return "block_type"
+    if score >= 50:
+        return "section_title"
+    if score >= 30:
+        return "evidence_ref"
+    return "layout_fallback"
+
+
+def _argument_unit_duplicate_key(unit: Dict[str, Any]) -> str:
+    refs = ",".join(sorted(str(ref or "").strip() for ref in _as_list(unit.get("evidence_refs")) if str(ref or "").strip()))
+    claim = re.sub(r"\s+", "", str(unit.get("claim") or "").strip().lower())
+    return f"{claim[:180]}|{refs}"
 
 
 def _argument_unit_issues(unit: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1203,22 +1625,26 @@ def _argument_unit_issues(unit: Dict[str, Any]) -> List[Dict[str, Any]]:
         issues.append({"type": "weak_claim"})
     if not reasoning:
         issues.append({"type": "missing_reasoning"})
-    elif _has_bad_pattern(reasoning):
+    elif _has_bad_pattern(reasoning) or _is_bad_public_fact(reasoning):
         issues.append({"type": "weak_reasoning"})
     elif not any(word in reasoning for word in CAUSE_WORDS):
         issues.append({"type": "reasoning_missing_causal_chain", "severity": "warning"})
+    strength = str(unit.get("claim_strength") or _as_dict(unit.get("source_quality")).get("claim_strength") or "").strip().lower()
+    directional_unit = strength in {"directional", "weak", "limited", "limited_evidence"} or str(unit.get("claim_status") or "").strip().lower() in {"directional", "directional_ready", "context_only"}
     if not counter:
-        issues.append({"type": "missing_counter_evidence"})
+        issues.append({"type": "missing_counter_evidence", "severity": "warning" if directional_unit else "error"})
     elif _has_bad_pattern(counter):
         issues.append({"type": "weak_counter_evidence"})
     if not actionable:
-        issues.append({"type": "missing_actionable"})
+        issues.append({"type": "missing_actionable", "severity": "warning" if directional_unit else "error"})
     elif _has_bad_pattern(actionable):
         issues.append({"type": "weak_actionable"})
     elif not any(word in actionable for word in ACTION_WORDS):
         issues.append({"type": "actionable_missing_action_word"})
     if not refs:
         issues.append({"type": "missing_evidence_refs"})
+    if any(_is_bad_public_fact(item) for item in _as_list(unit.get("supporting_facts"))):
+        issues.append({"type": "invalid_supporting_fact"})
     return issues
 
 
@@ -1231,6 +1657,8 @@ def rewrite_weak_claim_unit(unit: Dict[str, Any], *, package: Optional[Dict[str,
         if str(item or "").strip() and not _is_bad_public_fact(item)
     ]
     fallback_fact = _compact(unit.get("fact") or unit.get("supporting_fact") or (supporting_facts[0] if supporting_facts else ""), 220)
+    if _is_bad_public_fact(fallback_fact):
+        fallback_fact = ""
     question = _question_for(package, unit) if package else _compact(unit.get("question") or unit.get("section_title"), 180)
     title = _compact(package.get("chapter_title") if package else unit.get("section_title"), 80) or "本节"
     refs = _as_list(unit.get("evidence_refs"))
@@ -1243,26 +1671,26 @@ def rewrite_weak_claim_unit(unit: Dict[str, Any], *, package: Optional[Dict[str,
         if strength in {"strong", "medium"} and source_quality.get("grade") not in {"low", "medium_low"}:
             claim = _claim_from_fact(package, fact_phrase) if package else f"{title}已有可用于判断的事实基础。"
             reasoning = (
-                f"事实锚点显示：{basis}。这些信息把“{question}”从概念讨论推进到可观察变量，"
-                "但仍要结合披露主体、统计口径和时间窗口判断其能否外推到行业层面。"
+                f"可用事实包括：{basis}。这些信息需要放回研究对象的主体、口径和时间窗口中比较，"
+                "再判断它们能否外推到行业层面。"
             )
             confidence = unit.get("confidence") or "medium"
         else:
-            claim = f"{title}已经出现方向性信号，但结论强度仍取决于后续可追溯来源和连续指标。"
+            claim = _claim_from_fact(package, fact_phrase) if package else "现有事实已经提供方向性观察，但还不足以支撑强结论。"
             reasoning = (
-                f"事实锚点显示：{basis}。这些信息能够说明阶段性变化或局部样本，"
-                "目前更适合支撑趋势判断和边界识别，不能直接扩展为确定性的规模、格局或商业化结论。"
+                f"可用事实包括：{basis}。这些信息能够说明阶段性变化或局部样本，"
+                "更适合支撑趋势判断和边界识别，不能直接扩展为确定性的规模、格局或商业化结论。"
             )
             confidence = "low"
     else:
-        claim = f"{title}目前只能形成方向性观察，后续需要用可追溯来源校准结论强度。"
-        reasoning = "现有公开信息尚未形成足够清晰的事实链，正文应把可观察变量、证据限制和后续验证条件同时说明。"
+        claim = "当前缺少可复核事实链，暂不形成明确判断。"
+        reasoning = "现有公开信息尚未形成足够清晰的事实链，因此本节只记录可观察变量和边界条件。"
         confidence = "low"
     counter = _ensure_counter(unit.get("counter_evidence")) or (
         "如果后续同口径指标走弱、企业动作中断、客户验证不足或监管条件收紧，本节判断需要下调。"
     )
     actionable = _ensure_actionable(unit.get("actionable") or unit.get("decision_implication")) or (
-        "后续优先复核同口径指标、企业披露、客户案例和反向样本，再决定是否提高判断强度。"
+        "后续补充同口径指标、企业披露、客户案例和反向样本后，再更新判断强度。"
     )
     rewritten.update(
         {
@@ -1283,6 +1711,9 @@ def rewrite_weak_claim_unit(unit: Dict[str, Any], *, package: Optional[Dict[str,
             "claim_status": "directional" if confidence == "low" else (unit.get("claim_status") or "decision_ready"),
             "quality_status": "directional_with_boundary" if confidence == "low" else (unit.get("quality_status") or "valid"),
             "supporting_facts": facts_for_basis,
+            "claim_strength": strength or ("directional" if confidence == "low" else "moderate"),
+            "evidence_backed": bool(refs and facts_for_basis),
+            "observation_only": not bool(refs and facts_for_basis),
         }
     )
     return rewritten
@@ -1357,6 +1788,10 @@ def run_claim_builder_agent(
 ) -> List[Dict[str, Any]]:
     del llm_client
     structured_analysis = _as_dict(structured_analysis)
+    force_evidence_rebuild = _analysis_quality_requires_evidence_rebuild(structured_analysis)
+    # needs_rewrite means "rewrite polluted claims", not "discard the whole
+    # analysis". Keeping structured units preserves fact_chain/reasoning_chain
+    # and avoids falling back to generic chapter templates.
     structured_units = _structured_units(structured_analysis)
     layout_by_id = {
         str(layout.get("chapter_id") or ""): layout
@@ -1376,31 +1811,80 @@ def run_claim_builder_agent(
         fallback_refs = _dedupe(
             [
                 _citation_ref_from_evidence(item)
-                for collection in ("core_evidence", "supporting_evidence", "sample_evidence", "clue_evidence")
+                for collection in PUBLIC_EVIDENCE_COLLECTIONS
                 for item in _as_list(package.get(collection))
                 if isinstance(item, dict)
             ],
             limit=8,
         )
         matched = [unit for unit in structured_units if _matches(unit, package)]
-        if matched:
-            for index, unit in enumerate(matched[:4], start=1):
-                argument_units.append(_unit_from_structured(unit, package, section_id if index == 1 else f"{chapter_id}_s{index}", fallback_refs))
-            if len(matched) < 3:
-                layout_units = _units_from_layout_sections(package, sections[1:])
-                argument_units.extend(layout_units or _deep_units_from_package(package, f"{chapter_id}_deep")[1:])
+        if sections:
+            matched_pool = [dict(unit) for unit in matched]
+            generated_keys = set()
+            for index, section in enumerate(sections, start=1):
+                if str(section.get("section_role") or "").strip() == "evidence_gap" and not _as_list(section.get("required_evidence_refs")):
+                    continue
+                selected = _pop_structured_unit_for_section(matched_pool, section)
+                match_score = _structured_unit_match_score(selected, section) if selected else 0
+                if selected:
+                    built_unit = _unit_from_structured(
+                        selected,
+                        package,
+                        str(section.get("section_id") or f"{chapter_id}_s{index}"),
+                        _as_list(section.get("required_evidence_refs")) or fallback_refs,
+                    )
+                else:
+                    layout_units = _units_from_layout_sections(package, [section])
+                    if not layout_units:
+                        continue
+                    built_unit = layout_units[0]
+                built_unit["section_id"] = section.get("section_id") or built_unit.get("section_id")
+                built_unit["section_title"] = section.get("section_title") or built_unit.get("section_title")
+                built_unit["block_type"] = section.get("block_type") or section.get("output_type") or built_unit.get("block_type")
+                built_unit["output_type"] = section.get("output_type") or built_unit.get("output_type") or built_unit.get("block_type")
+                built_unit["layout_section_role"] = section.get("section_role") or built_unit.get("layout_section_role")
+                built_unit["layout_match_score"] = match_score
+                built_unit["layout_match_reason"] = _layout_match_reason(match_score)
+                if _as_list(section.get("required_evidence_refs")) and not _as_list(built_unit.get("evidence_refs")):
+                    built_unit["evidence_refs"] = _as_list(section.get("required_evidence_refs"))
+                    built_unit["supporting_evidence"] = _as_list(section.get("required_evidence_refs"))
+                if force_evidence_rebuild and _argument_unit_issues(built_unit):
+                    built_unit = rewrite_weak_claim_unit(built_unit, package=package, reason="analysis_quality_rewrite")
+                    built_unit["section_id"] = section.get("section_id") or built_unit.get("section_id")
+                    built_unit["section_title"] = section.get("section_title") or built_unit.get("section_title")
+                    built_unit["block_type"] = section.get("block_type") or section.get("output_type") or built_unit.get("block_type")
+                    built_unit["output_type"] = section.get("output_type") or built_unit.get("output_type") or built_unit.get("block_type")
+                    built_unit["layout_section_role"] = section.get("section_role") or built_unit.get("layout_section_role")
+                    built_unit["layout_match_score"] = match_score
+                    built_unit["layout_match_reason"] = _layout_match_reason(match_score)
+                duplicate_key = _argument_unit_duplicate_key(built_unit)
+                if duplicate_key and duplicate_key in generated_keys:
+                    continue
+                generated_keys.add(duplicate_key)
+                argument_units.append(built_unit)
         else:
-            layout_units = _units_from_layout_sections(package, sections)
-            argument_units.extend(layout_units or _deep_units_from_package(package, section_id))
+            if matched:
+                for index, unit in enumerate(matched[:4], start=1):
+                    built_unit = _unit_from_structured(unit, package, section_id if index == 1 else f"{chapter_id}_s{index}", fallback_refs)
+                    if force_evidence_rebuild and _argument_unit_issues(built_unit):
+                        built_unit = rewrite_weak_claim_unit(built_unit, package=package, reason="analysis_quality_rewrite")
+                    argument_units.append(built_unit)
+                if len(matched) < 3:
+                    argument_units.extend(_deep_units_from_package(package, f"{chapter_id}_deep")[1:])
+            else:
+                layout_units = _units_from_layout_sections(package, sections)
+                argument_units.extend(layout_units or _deep_units_from_package(package, section_id))
     cleaned: List[Dict[str, Any]] = []
     for unit in argument_units:
         package = _as_dict(package_by_id.get(str(unit.get("chapter_id") or "")))
         unit = _normalize_claim_binding_status(unit, package)
+        unit = _clean_argument_unit_public_fields(unit)
         was_rewritten = bool(unit.get("rewrite_required"))
         original_issues = _argument_unit_issues(unit)
         if any(issue.get("severity") != "warning" for issue in original_issues):
             unit = rewrite_weak_claim_unit(unit, package=package, reason="contract_rewrite")
             unit = _normalize_claim_binding_status(unit, package)
+            unit = _clean_argument_unit_public_fields(unit)
         final_issues = _argument_unit_issues(unit)
         blocking = [issue for issue in final_issues if issue.get("severity") != "warning"]
         unit["original_quality_issues"] = original_issues

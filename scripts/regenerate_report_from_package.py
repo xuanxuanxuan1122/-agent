@@ -11,11 +11,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from rag_pipeline.agents.analysis_agent import run_analysis_agent
+from rag_pipeline.agents.chapter_evidence_builder import build_chapter_evidence_packages_from_evidence_package
 from rag_pipeline.agents.claim_builder_agent import run_claim_builder_agent
 from rag_pipeline.agents.chapter_argument_agent import run_chapter_argument_agent
 from rag_pipeline.agents.final_writer_agent import run_final_writer_agent
 from rag_pipeline.flows.report.final_audit_agent import run_final_audit
-from rag_pipeline.flows.report.full_report import append_final_audit_note
+from rag_pipeline.flows.report.full_report import render_score_markdown, write_formal_markdown, write_score_markdown
 
 
 def _as_dict(value: Any) -> Dict[str, Any]:
@@ -24,6 +26,256 @@ def _as_dict(value: Any) -> Dict[str, Any]:
 
 def _as_list(value: Any) -> List[Any]:
     return list(value) if isinstance(value, list) else []
+
+
+def _compact_sample(value: Any) -> Any:
+    if isinstance(value, dict) and isinstance(value.get("sample"), list):
+        return list(value.get("sample") or [])
+    return value
+
+
+def _expand_compact_evidence_package(evidence_package: Dict[str, Any], *, query: str = "") -> Dict[str, Any]:
+    package = dict(evidence_package or {})
+    if query and not package.get("query"):
+        package["query"] = query
+    for key in ("raw_data_points", "normalized_evidence", "analysis_ready_evidence", "clean_evidence_list"):
+        if key in package:
+            package[key] = _compact_sample(package.get(key))
+    return package
+
+
+def _structured_analysis_has_public_material(structured_analysis: Dict[str, Any]) -> bool:
+    analysis = _as_dict(structured_analysis)
+    nested = _as_dict(analysis.get("structured_analysis"))
+    candidates = [analysis, nested]
+    for payload in candidates:
+        if _as_list(payload.get("claim_units")):
+            return True
+        if _as_list(payload.get("chapter_insights")):
+            return True
+        if _as_dict(payload.get("dimension_synthesis")):
+            return True
+        if _as_list(payload.get("evidence_analyses")):
+            return True
+    return False
+
+
+def _normalize_structured_analysis(package: Dict[str, Any]) -> Dict[str, Any]:
+    structured_analysis = _as_dict(package.get("structured_analysis"))
+    nested = _as_dict(structured_analysis.get("structured_analysis"))
+    if nested and not _structured_analysis_has_public_material(structured_analysis):
+        structured_analysis = {**structured_analysis, **nested}
+    if _structured_analysis_has_public_material(structured_analysis):
+        return structured_analysis
+    evidence_package = _expand_compact_evidence_package(
+        _as_dict(package.get("evidence_package")),
+        query=str(package.get("query") or ""),
+    )
+    analysis_state = run_analysis_agent(evidence_package, query=str(package.get("query") or ""))
+    rebuilt = _as_dict(analysis_state.get("structured_analysis"))
+    package["analysis_rebuild_diagnostics"] = {
+        "triggered": True,
+        "source": "state_or_writer_package_evidence_package",
+        "reason": "missing_structured_analysis_material",
+        "analysis_errors": _as_list(analysis_state.get("errors")),
+        "llm_analysis_status": _as_dict(analysis_state.get("metadata")).get("llm_analysis_status"),
+    }
+    return rebuilt
+
+
+def _load_rebuild_package(input_path: Path) -> Dict[str, Any]:
+    data = json.loads(input_path.read_text(encoding="utf-8"))
+    if input_path.name.endswith(".state.json"):
+        sibling_package: Dict[str, Any] = {}
+        sibling = input_path.with_name(input_path.name[: -len(".state.json")] + ".writer_package.json")
+        if sibling.exists():
+            try:
+                sibling_package = json.loads(sibling.read_text(encoding="utf-8-sig"))
+            except Exception:
+                sibling_package = {}
+        raw = _as_dict(data.get("raw_output"))
+        writer_report = _as_dict(data.get("writer_report")) or _as_dict(raw.get("writer_report"))
+        sibling_writer_report = _as_dict(sibling_package.get("writer_report"))
+        evidence_package = (
+            _as_dict(data.get("evidence_package"))
+            or _as_dict(raw.get("evidence_package"))
+            or _as_dict(_as_dict(raw.get("writer_handoff_package")).get("evidence_package"))
+            or _as_dict(sibling_package.get("evidence_package"))
+        )
+        package = {
+            "query": data.get("query") or raw.get("query") or "",
+            "stage_status": data.get("stage_status") or {},
+            "evidence_package": _expand_compact_evidence_package(evidence_package, query=str(data.get("query") or raw.get("query") or "")),
+            "evidence_health_summary": _as_dict(data.get("evidence_health_summary")) or _as_dict(evidence_package.get("evidence_health_summary")),
+            "source_registry": _as_list(data.get("source_registry")) or _as_list(writer_report.get("source_registry")) or _as_list(sibling_package.get("source_registry")) or _as_list(sibling_writer_report.get("source_registry")),
+            "structured_analysis": _as_dict(data.get("structured_analysis")) or _as_dict(raw.get("structured_analysis")) or _as_dict(sibling_package.get("structured_analysis")),
+            "report_blueprint": _as_dict(data.get("report_blueprint")) or _as_dict(raw.get("report_blueprint")) or _as_dict(writer_report.get("report_blueprint")) or _as_dict(sibling_package.get("report_blueprint")),
+            "chapter_evidence_packages": _as_list(sibling_package.get("chapter_evidence_packages")) or _as_list(data.get("chapter_evidence_packages")) or _as_list(raw.get("chapter_evidence_packages")) or _as_list(writer_report.get("chapter_evidence_packages")),
+            "micro_layouts": _as_list(data.get("micro_layouts")) or _as_list(raw.get("micro_layouts")) or _as_list(writer_report.get("micro_layouts")) or _as_list(sibling_package.get("micro_layouts")),
+            "table_packages": _as_list(data.get("table_packages")) or _as_list(raw.get("table_packages")) or _as_list(writer_report.get("table_packages")) or _as_list(sibling_package.get("table_packages")),
+            "argument_units": _as_list(data.get("argument_units")) or _as_list(raw.get("argument_units")) or _as_list(writer_report.get("argument_units")) or _as_list(sibling_package.get("argument_units")),
+            "chapter_packages": _as_list(data.get("chapter_packages")) or _as_list(raw.get("chapter_packages")) or _as_list(writer_report.get("chapter_packages")) or _as_list(sibling_package.get("chapter_packages")),
+            "writer_report": {**sibling_writer_report, **writer_report},
+            "review_result": _as_dict(data.get("review_result")),
+            "reformatter_result": _as_dict(data.get("reformatter_result")),
+            "legacy_package_incomplete": False,
+        }
+        return package
+    package = data
+    package["evidence_package"] = _expand_compact_evidence_package(_as_dict(package.get("evidence_package")), query=str(package.get("query") or ""))
+    if not _as_dict(package.get("evidence_package")):
+        package["legacy_package_incomplete"] = True
+    return package
+
+
+def _default_output_path(input_path: Path) -> Path:
+    name = input_path.name
+    for suffix in (".writer_package.json", ".state.json"):
+        if name.endswith(suffix):
+            return input_path.with_name(name[: -len(suffix)] + "_regenerated_report.md")
+    return input_path.with_name(input_path.stem + "_regenerated_report.md")
+
+
+def _fact_text(item: Dict[str, Any]) -> str:
+    return re.sub(
+        r"\s+",
+        " ",
+        str(item.get("fact") or item.get("clean_fact") or item.get("content") or item.get("evidence") or item.get("summary") or "").strip(),
+    )
+
+
+def _bad_fact_text(text: str) -> bool:
+    if not text:
+        return True
+    return any(
+        re.search(pattern, text, flags=re.I)
+        for pattern in [
+            r"\u519c\u4e1a\u4eba\u5de5\u667a\u80fd",
+            r"\u6570\u636e\u6295\u6bd2",
+            r"Scribd",
+            r"\u53d1\u73b0\u62a5\u544a",
+            r"\u7eba\u7ec7",
+            r"\u667a\u80fd\u624b\u673a",
+            r"SEO",
+            r"^URL[:\uff1a]",
+        ]
+    )
+
+
+def _invalid_metric(item: Dict[str, Any]) -> bool:
+    metric = str(item.get("metric") or item.get("indicator") or "").strip()
+    value = str(item.get("value") or item.get("display_value") or item.get("numeric_value") or "").strip()
+    fact = _fact_text(item)
+    metric_lower = metric.lower()
+    if str(item.get("metric_validation_status") or "").lower() == "invalid":
+        return True
+    if metric_lower in {"source_check", "status", "http_status", "response_code"} and re.fullmatch(r"[1-5]\d{2}", value):
+        return True
+    if re.search(r"\bsource_check\s*[:=]\s*[1-5]\d{2}\b", fact, flags=re.I):
+        return True
+    if value and re.fullmatch(r"-?\d{1,3}(?:\.0)?", value) and re.search(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}|T\d{1,2}:\d{2}", fact):
+        return True
+    if metric in {"\u5173\u952e\u4e8b\u5b9e", "\u653f\u7b56\u76d1\u7ba1", "\u653f\u7b56\u76ee\u6807"} and re.fullmatch(r"-?\d{1,3}(?:\.0)?", value):
+        return True
+    if re.search(r"\u6210\u672c", metric) and (re.search(r"\u5bb6$", value) or not fact):
+        return True
+    if re.search(r"\u5e02\u573a\u89c4\u6a21|\u878d\u8d44", metric) and re.search(r"%", value):
+        return True
+    return False
+
+
+def _chapter_match(item: Dict[str, Any], package: Dict[str, Any]) -> bool:
+    cid = str(package.get("chapter_id") or "")
+    title = str(package.get("chapter_title") or package.get("chapter_question") or "")
+    dim = str(item.get("chapter_id") or item.get("dimension") or item.get("hypothesis_id") or "")
+    if cid and dim and cid == dim:
+        return True
+    if title and dim and (dim in title or title in dim):
+        return True
+    return False
+
+
+def _evidence_ref(item: Dict[str, Any]) -> str:
+    for key in ("source_ref", "citation_ref", "ref", "evidence_id"):
+        value = str(item.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _normalize_seed_evidence(item: Dict[str, Any]) -> Dict[str, Any]:
+    copied = dict(item)
+    fact = _fact_text(copied)
+    copied["fact"] = fact
+    copied.setdefault("ref", copied.get("evidence_id") or copied.get("source_ref") or "")
+    copied.setdefault("source_ref", copied.get("citation_ref") or copied.get("source_ref") or copied.get("ref") or "")
+    copied.setdefault("source_level", copied.get("source_level") or copied.get("credibility") or "C")
+    copied.setdefault("evidence_role", copied.get("evidence_role") or copied.get("role") or "supporting")
+    copied.setdefault("allowed_use", copied.get("allowed_use") or "supporting")
+    return copied
+
+
+def _augment_chapter_evidence_packages(package: Dict[str, Any]) -> List[Dict[str, Any]]:
+    existing = _as_list(package.get("chapter_evidence_packages"))
+    rebuilt = build_chapter_evidence_packages_from_evidence_package(
+        report_blueprint=_as_dict(package.get("report_blueprint")),
+        evidence_package=_as_dict(package.get("evidence_package")),
+        existing_chapter_evidence_packages=existing,
+        source_registry=_as_list(package.get("source_registry")),
+    )
+    rebuilt_hydrated = _chapter_evidence_hydrated_count(rebuilt)
+    existing_hydrated = _chapter_evidence_hydrated_count(existing)
+    if rebuilt and rebuilt_hydrated > 0 and (rebuilt_hydrated >= existing_hydrated or existing_hydrated <= 0):
+        return rebuilt
+    package["chapter_evidence_rebuild_diagnostics"] = {
+        "status": "kept_existing_packages",
+        "reason": "rebuilt_package_had_less_hydrated_evidence",
+        "rebuilt_signal_count": _chapter_evidence_signal_count(rebuilt),
+        "existing_signal_count": _chapter_evidence_signal_count(existing),
+        "rebuilt_hydrated_count": rebuilt_hydrated,
+        "existing_hydrated_count": existing_hydrated,
+    }
+    return existing
+
+
+def _chapter_evidence_hydrated_count(packages: List[Dict[str, Any]]) -> int:
+    total = 0
+    for package in packages or []:
+        if not isinstance(package, dict):
+            continue
+        for key in (
+            "core_evidence",
+            "supporting_evidence",
+            "metric_evidence",
+            "case_evidence",
+            "counter_evidence",
+            "directional_evidence",
+        ):
+            total += len(_as_list(package.get(key)))
+    return total
+
+
+def _chapter_evidence_signal_count(packages: List[Dict[str, Any]]) -> int:
+    total = 0
+    for package in packages or []:
+        if not isinstance(package, dict):
+            continue
+        counts = _as_dict(package.get("evidence_counts"))
+        for key in (
+            "core_evidence",
+            "supporting_evidence",
+            "metric_evidence",
+            "case_evidence",
+            "counter_evidence",
+            "directional_evidence",
+            "sample_evidence",
+        ):
+            total += len(_as_list(package.get(key)))
+            try:
+                total += int(float(package.get(f"{key}_count") or counts.get(key) or 0))
+            except (TypeError, ValueError):
+                pass
+    return total
 
 
 def _quality_score(markdown: str, package: Dict[str, Any]) -> int:
@@ -61,11 +313,17 @@ def _scorecard(markdown: str, package: Dict[str, Any]) -> str:
 
 
 def regenerate(package_path: Path, output_path: Path | None = None) -> Path:
-    package = json.loads(package_path.read_text(encoding="utf-8"))
-    chapter_evidence_packages = _as_list(package.get("chapter_evidence_packages"))
+    package = _load_rebuild_package(package_path)
+    chapter_evidence_packages = _augment_chapter_evidence_packages(package)
     micro_layouts = _as_list(package.get("micro_layouts"))
-    table_packages = _as_list(package.get("table_packages"))
-    structured_analysis = _as_dict(package.get("structured_analysis"))
+    # Legacy table packages are often exactly where invalid metric parses live
+    # (dates, URL ids, "cost: 40%", etc.). Regeneration should rebuild prose
+    # first and keep table issues in the score report.
+    table_packages: List[Dict[str, Any]] = []
+    package["chapter_evidence_packages"] = chapter_evidence_packages
+    package.setdefault("evidence_package", {})["chapter_evidence_packages"] = chapter_evidence_packages
+    structured_analysis = _normalize_structured_analysis(package)
+    package["structured_analysis"] = structured_analysis
     report_blueprint = _as_dict(package.get("report_blueprint"))
     source_registry = _as_list(package.get("source_registry")) or _as_list(_as_dict(package.get("writer_report")).get("source_registry"))
 
@@ -86,8 +344,11 @@ def regenerate(package_path: Path, output_path: Path | None = None) -> Path:
         report_blueprint=report_blueprint,
         chapter_packages=chapter_packages,
         table_packages=table_packages,
-        decision_package=_as_dict(_as_dict(package.get("writer_report")).get("decision_package")),
-        risk_package=_as_dict(_as_dict(package.get("writer_report")).get("risk_package")),
+        # Do not reuse legacy decision/risk packages: those were produced by
+        # the polluted writer path and can re-inject invalid metrics such as
+        # "cost: 40%" even after claim/chapter rebuild.
+        decision_package={},
+        risk_package={},
         appendix_package={
             **_as_dict(_as_dict(package.get("writer_report")).get("appendix_package")),
             "metric_normalization_table": _as_list(_as_dict(package.get("evidence_package")).get("metric_normalization_table")),
@@ -97,9 +358,7 @@ def regenerate(package_path: Path, output_path: Path | None = None) -> Path:
     markdown = str(writer_output.get("report_markdown") or "").strip()
     if not markdown:
         raise RuntimeError("Regenerated writer output is empty.")
-    if "## 报告质量评分与证据限制" not in markdown:
-        first_line, _, rest = markdown.partition("\n")
-        markdown = f"{first_line}\n{_scorecard(markdown, package)}{rest.lstrip()}".strip()
+    markdown = re.sub(r"\n+##\s*报告质量评分与证据限制[\s\S]*?(?=\n+##\s|\Z)", "\n", markdown).strip()
 
     audit_package = {
         **package,
@@ -117,19 +376,32 @@ def regenerate(package_path: Path, output_path: Path | None = None) -> Path:
         writer_package_payload=audit_package,
         query=str(package.get("query") or ""),
     )
-    audited_markdown = append_final_audit_note(markdown, final_audit)
-    if audited_markdown == markdown and final_audit.get("enabled"):
-        audit = _as_dict(final_audit.get("audit"))
-        audited_markdown = (
-            f"{markdown}\n\n## 最终审查补充\n\n"
-            f"- 最终审查状态：{final_audit.get('status') or audit.get('status') or 'unknown'}\n"
-            f"- 洁净版资格：{'暂不建议自动交付' if final_audit.get('blocked') else '未发现阻断洁净版的问题'}\n"
-            f"- 审查摘要：{audit.get('summary') or _as_dict(final_audit.get('deterministic_audit')).get('summary') or ''}"
-        ).strip()
-    markdown = audited_markdown
-
-    output = output_path or package_path.with_name(package_path.name.replace(".writer_package.json", "_regenerated_report.md"))
-    output.write_text(markdown, encoding="utf-8")
+    output = output_path or _default_output_path(package_path)
+    writer_report = {
+        **_as_dict(package.get("writer_report")),
+        "report_markdown": markdown,
+        "report_status": _as_dict(package.get("writer_report")).get("report_status") or "formal_scored",
+        "source_registry": writer_output.get("source_registry") or [],
+    }
+    score_path = output.with_name(output.name.replace("_report.md", "_score.md")) if output.name.endswith("_report.md") else output.with_name(output.stem + "_score.md")
+    score_markdown = render_score_markdown(
+        query=str(package.get("query") or ""),
+        writer_report=writer_report,
+        writer_package={
+            **package,
+            "writer_report": writer_report,
+            "micro_layouts": micro_layouts,
+            "table_packages": table_packages,
+            "argument_units": argument_units,
+            "chapter_packages": chapter_packages,
+            "source_registry": writer_output.get("source_registry") or [],
+            "analysis_rebuild_diagnostics": _as_dict(package.get("analysis_rebuild_diagnostics")),
+        },
+        final_audit_result=final_audit,
+        reformatter_result={"enabled": False, "status": "skipped", "skipped_reason": "regenerate_report_only"},
+    )
+    write_formal_markdown(output, markdown)
+    write_score_markdown(score_path, score_markdown)
     return output
 
 

@@ -156,6 +156,35 @@ def _public_text(value: Any, max_chars: int = 500) -> str:
     return "" if has_internal_gap_language(text) else text
 
 
+PUBLIC_TEMPLATE_PHRASES = [
+    "目前只保留为观察项",
+    "目前只适合作为低强度观察项",
+    "从概念讨论推进到可观察变量",
+    "后续重点跟踪同口径指标",
+    "后续重点跟踪",
+]
+
+
+def _clean_render_text(value: Any, max_chars: int = 500) -> str:
+    text = _public_text(value, max_chars)
+    if not text:
+        return ""
+    text = text.replace("事实锚点显示：", "可用事实包括：")
+    text = text.replace("事实锚点显示", "可用事实包括")
+    text = text.replace("后续重点跟踪", "后续可观察")
+    if any(phrase in text for phrase in PUBLIC_TEMPLATE_PHRASES[:3]):
+        return ""
+    return text.strip()
+
+
+def _section_should_skip(section: Dict[str, Any]) -> bool:
+    if section.get("omit_from_report"):
+        return True
+    if section.get("observation_only") and not section.get("evidence_backed") and not section.get("force_render_observation"):
+        return True
+    return False
+
+
 def _is_internal_section_title(value: Any) -> bool:
     text = _compact(value, 160)
     return bool(text and any(re.search(pattern, text) for pattern in INTERNAL_SECTION_TITLE_PATTERNS))
@@ -353,7 +382,7 @@ def _public_tables(table_packages: Sequence[Dict[str, Any]]) -> List[Dict[str, A
         if isinstance(table, dict)
         and table.get("should_render")
         and not table.get("appendix_only")
-        and len(_as_list(table.get("rows"))) >= 2
+        and len(_as_list(table.get("rows"))) >= 3
     ]
 
 
@@ -397,16 +426,21 @@ def _markdown_table(headers: Sequence[Any], rows: Sequence[Sequence[Any]]) -> st
         cells = []
         for cell in row:
             text = str(cell or "").replace("\n", " ").replace("|", "/").strip()
+            text = re.sub(r"第\s*\d+\s*轮\s*[｜|:：-]*\s*", "", text)
+            text = re.sub(r"\b(?:query|openai_task_\d+|claim_status|evidence_cards)\b\s*[:：=]?\s*", "", text, flags=re.I)
+            text = re.sub(r"(?:竞争对比|政策监管|技术产业链|市场规模|成本|金额)\s*=\s*(?=[；;，,]|$)", "", text)
             text = re.sub(r"第\s*\d+\s*轮\s*[｜|:：]\s*", "", text)
             text = re.sub(r"(?:竞争对比|政策监管|技术产业链|市场规模|成本|金额)\s*=\s*(?=；|;|$)", "", text)
             text = re.sub(r"(?:；\s*){2,}", "；", text).strip(" ；;，,")
             if re.search(r"(?:第\s*\d+\s*轮|openai_task_\d+)", text, flags=re.I):
                 text = ""
+            if re.search(r"(?:第\s*\d+\s*轮|openai_task_\d+|claim_status|evidence_cards)", text, flags=re.I):
+                text = ""
             cells.append(_public_text(text, 220))
         cells = (cells + [""] * len(headers))[: len(headers)]
         if any(cell.strip() for cell in cells):
             cleaned_rows.append(cells)
-    if not cleaned_rows:
+    if len(cleaned_rows) < 3:
         return ""
     lines = ["| " + " | ".join(headers) + " |", "| " + " | ".join(["---"] * len(headers)) + " |"]
     for cells in cleaned_rows:
@@ -443,7 +477,9 @@ def render_table_package(table: Dict[str, Any]) -> str:
     row_objects = [_as_dict(row) for row in _as_list(table.get("rows")) if isinstance(row, dict)]
     rows = [_as_list(row.get("cells")) for row in row_objects]
     headers, rows = _public_table_shape(headers, rows)
-    minimum_rows = 1 if str(table.get("table_type") or "") == "cagr_calculation" else 2
+    if len(headers) < 2:
+        return ""
+    minimum_rows = 3
     if len(rows) < minimum_rows:
         return ""
     table_md = _markdown_table(headers, rows)
@@ -596,6 +632,17 @@ def render_chapter_deep_synthesis(chapter: Dict[str, Any]) -> List[str]:
 
 
 def render_section(section: Dict[str, Any]) -> List[str]:
+    if _section_should_skip(section):
+        return []
+    if section.get("observation_only") and section.get("force_render_observation") and not section.get("evidence_backed"):
+        title = _compact(section.get("section_title"), 120)
+        claim = _clean_render_text(section.get("claim") or section.get("reasoning"), 360)
+        lines = []
+        if title and not _is_internal_section_title(title):
+            lines.append(f"### {title}")
+        if claim:
+            lines.extend(_paragraph_chunks(claim, max_chars=360, max_chunks=1))
+        return [line for line in lines if line.strip()]
     lines: List[str] = []
     title = _compact(section.get("section_title"), 120)
     if title and not _is_internal_section_title(title):
@@ -605,7 +652,7 @@ def render_section(section: Dict[str, Any]) -> List[str]:
         block_type = str(block.get("type") or "").strip()
         raw_label = _compact(block.get("label"), 80)
         label = _public_text(block.get("label"), 80)
-        text = _public_text(block.get("text"), _env_int("REPORT_RENDER_BLOCK_MAX_CHARS", 3200, min_value=800, max_value=8000))
+        text = _clean_render_text(block.get("text"), _env_int("REPORT_RENDER_BLOCK_MAX_CHARS", 3200, min_value=800, max_value=8000))
         is_internal_label = raw_label in INTERNAL_BLOCK_LABELS or _is_internal_section_title(raw_label)
         if block_type == "paragraph":
             if not text:
@@ -707,12 +754,6 @@ def _chapter_flow_intro(
     if lead:
         # The chapter already carries its own opening narrative; do not append a template.
         return ""
-    title = _public_text(chapter.get("chapter_title"), 120)
-    previous_title = _public_text(_as_dict(previous_chapter).get("chapter_title"), 120)
-    if previous_title and title:
-        return f"承接“{previous_title}”,本章关注“{title}”。"
-    if title:
-        return f"本章关注“{title}”。"
     return ""
 
 
@@ -841,7 +882,7 @@ def render_chapter_package(
 
     for section_index, section in enumerate(_as_list(chapter.get("sections")), start=1):
         section = _as_dict(section)
-        if section.get("omit_from_report"):
+        if _section_should_skip(section):
             continue
         if _slot_matches_section("before_risk", section):
             append_tables("before_risk", section=section, limit=1)
@@ -861,13 +902,19 @@ def render_chapter_package(
         section_title = _compact(section.get("section_title"), 120)
         if section_title and not _is_internal_section_title(section_title):
             lines.extend(["", f"### {section_title}"])
-        claim = _public_text(section.get("claim"), _env_int("REPORT_SECTION_CLAIM_MAX_CHARS", 1100, min_value=300, max_value=3000))
-        reasoning = _public_text(section.get("reasoning"), _env_int("REPORT_SECTION_REASONING_MAX_CHARS", 3200, min_value=800, max_value=8000))
-        counter = _public_text(section.get("counter_evidence"), _env_int("REPORT_SECTION_COUNTER_MAX_CHARS", 1600, min_value=400, max_value=5000))
-        actionable = _public_text(section.get("actionable"), _env_int("REPORT_SECTION_ACTION_MAX_CHARS", 1600, min_value=400, max_value=5000))
-        mechanism = _public_text(section.get("mechanism") or section.get("reasoning"), _env_int("REPORT_SECTION_MECHANISM_MAX_CHARS", 2400, min_value=600, max_value=6000))
-        decision_implication = _public_text(section.get("decision_implication") or actionable, _env_int("REPORT_SECTION_ACTION_MAX_CHARS", 1600, min_value=400, max_value=5000))
+        claim = _clean_render_text(section.get("claim"), _env_int("REPORT_SECTION_CLAIM_MAX_CHARS", 1100, min_value=300, max_value=3000))
+        reasoning = _clean_render_text(section.get("reasoning"), _env_int("REPORT_SECTION_REASONING_MAX_CHARS", 3200, min_value=800, max_value=8000))
+        counter = _clean_render_text(section.get("counter_evidence"), _env_int("REPORT_SECTION_COUNTER_MAX_CHARS", 1600, min_value=400, max_value=5000))
+        actionable = _clean_render_text(section.get("actionable"), _env_int("REPORT_SECTION_ACTION_MAX_CHARS", 1600, min_value=400, max_value=5000))
+        mechanism = _clean_render_text(section.get("mechanism") or section.get("reasoning"), _env_int("REPORT_SECTION_MECHANISM_MAX_CHARS", 2400, min_value=600, max_value=6000))
+        decision_implication = _clean_render_text(section.get("decision_implication") or actionable, _env_int("REPORT_SECTION_ACTION_MAX_CHARS", 1600, min_value=400, max_value=5000))
         before_section_len = len(lines)
+        if section.get("observation_only") and section.get("force_render_observation") and not section.get("evidence_backed"):
+            if claim:
+                lines.extend(_paragraph_chunks(claim, max_chars=360, max_chunks=1))
+            if len(lines) > before_section_len:
+                _append_citation_to_last_paragraph(lines, _as_list(section.get("evidence_refs")))
+            continue
         if claim:
             lines.extend(_paragraph_chunks(claim, max_chars=700, max_chunks=2))
         if reasoning:
@@ -1102,12 +1149,16 @@ def render_appendix(source_registry: Sequence[Dict[str, Any]], appendix_package:
         _as_dict(item)
         for item in _as_list(_as_dict(appendix_package).get("table_appendix_rows"))
         if isinstance(item, dict)
+        and item.get("should_render") is True
+        and not item.get("appendix_only")
     ]
     if appendix_tables:
         for table in appendix_tables[:6]:
             headers = _as_list(table.get("headers"))
             rows = [_as_list(row) for row in _as_list(table.get("rows"))[:12]]
             headers, rows = _public_table_shape(headers, rows)
+            if len(headers) < 2 or len(rows) < 3:
+                continue
             table_md = _markdown_table(headers, rows)
             if not table_md:
                 continue
