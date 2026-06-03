@@ -1,0 +1,1288 @@
+import json
+
+import rag_pipeline.agents.analysis_agent as analysis_agent
+import rag_pipeline.agents.analysis_agent as analysis_agent
+
+from rag_pipeline.agents.analysis_agent import (
+    _chapter_evidence_diagnostics,
+    _chapter_insights_from_synthesis,
+    _evidence_analysis,
+    _evidence_cards_for_llm,
+    _build_mechanism_chain,
+    _hypothesis_insights,
+    _reasoning_from_public_facts,
+    analysis_depth_quality,
+    build_llm_analysis_input,
+    build_llm_analysis_input_v2,
+    ensure_valid_structured_analysis,
+    resolve_chapter_id,
+    run_analysis_agent,
+    validate_llm_analysis_output,
+)
+from rag_pipeline.agents.claim_builder_agent import (
+    _matches as claim_builder_matches,
+    _norm_chapter_id,
+    run_claim_builder_agent,
+)
+from rag_pipeline.agents.chapter_argument_agent import run_chapter_argument_agent
+from rag_pipeline.agents.final_writer_agent import (
+    _normalize_citation_ref,
+    _source_allowed_for_report,
+    _strip_orphan_citations,
+)
+from rag_pipeline.agents.readpage_fact_extractor_agent import _validated_card
+from rag_pipeline.agents.chapter_evidence_builder import _public_fact_quality
+from rag_pipeline.agents.markdown_renderer import render_table_package
+
+
+def _evidence(ref="EV-1", *, chapter_id="ch_01", level="B", allowed_use="core_claim", proof_role="support"):
+    return {
+        "evidence_id": ref,
+        "ref": ref,
+        "chapter_id": chapter_id,
+        "fact": "Enterprise agent deployments are moving from pilots into workflow automation.",
+        "source_level": level,
+        "allowed_use": allowed_use,
+        "proof_role": proof_role,
+        "source_verification_status": "readpage_verified",
+        "source": {
+            "title": "Verified source",
+            "url": f"https://example.org/{ref}",
+            "source_verification_status": "readpage_verified",
+        },
+    }
+
+
+def test_public_fact_card_v2_rejects_isolated_metric_and_navigation_text():
+    isolated_metric = {
+        "evidence_id": "EV-METRIC",
+        "fact": "AI Agent adoption: 50%",
+        "metric": "adoption",
+        "value": "50%",
+        "unit": "%",
+        "source_level": "B",
+        "source_url": "https://www.salesforce.com/news/agent-adoption",
+        "source_verification_status": "readpage_verified",
+    }
+    navigation_text = {
+        "evidence_id": "EV-NAV",
+        "fact": "Skip to content Product Solutions Resources Login Contact us",
+        "source_level": "B",
+        "source_url": "https://www.salesforce.com/news/navigation",
+        "source_verification_status": "readpage_verified",
+    }
+
+    assert _public_fact_quality(isolated_metric)["eligible_for_report"] is False
+    assert "no_subject_or_scope" in _public_fact_quality(isolated_metric)["rejection_reason"]
+    assert _public_fact_quality(navigation_text)["eligible_for_report"] is False
+    assert "navigation_text" in _public_fact_quality(navigation_text)["rejection_reason"]
+
+
+def test_build_fallback_analysis_does_not_select_metric_fragment_as_report_thesis(monkeypatch):
+    def fake_claim_units(_dimension_synthesis):
+        return [
+            {
+                "question": "\u6307\u6807\u7247\u6bb5",
+                "claim": "\u6e17\u900f\u7387\uff1b2023\u5e74",
+                "claim_strength": "strong",
+                "supporting_evidence": ["EV-BAD"],
+                "evidence_refs": ["EV-BAD"],
+                "confidence": 0.99,
+            },
+            {
+                "question": "\u9700\u6c42\u9a8c\u8bc1",
+                "claim": (
+                    "\u4f01\u4e1a\u7ea7 AI Agent \u7684\u9700\u6c42\u6b63\u5728\u4ece\u5de5\u5177\u8bd5\u7528"
+                    "\u8f6c\u5411\u4e1a\u52a1\u90e8\u7f72\uff0c\u4f46\u4ed8\u8d39\u6df1\u5ea6\u4ecd\u53d6\u51b3\u4e8e ROI "
+                    "\u4e0e\u6743\u9650\u6cbb\u7406\u3002"
+                ),
+                "claim_strength": "moderate",
+                "supporting_evidence": ["EV-GOOD"],
+                "evidence_refs": ["EV-GOOD"],
+                "confidence": 0.8,
+            },
+        ]
+
+    monkeypatch.setattr(analysis_agent, "_claim_units_from_synthesis", fake_claim_units)
+
+    result = analysis_agent.build_fallback_analysis(
+        {
+            "query": "AI Agent",
+            "per_dimension": {"\u7efc\u5408\u5224\u65ad": []},
+        }
+    )
+
+    insight = result["report_insight_package"]
+    assert insight["report_thesis"] != "\u6e17\u900f\u7387\uff1b2023\u5e74"
+    assert "\u4f01\u4e1a\u7ea7 AI Agent" in insight["report_thesis"]
+    assert all(
+        item.get("judgment") != "\u6e17\u900f\u7387\uff1b2023\u5e74"
+        for item in insight["executive_summary"]["top_3_judgments"]
+    )
+
+
+def test_render_table_package_filters_diagnostic_metric_table():
+    table = {
+        "title": "市场指标与口径表",
+        "should_render": True,
+        "headers": ["指标", "范围", "期间", "数值", "单位", "后续影响"],
+        "rows": [
+            {"cells": ["渗透率", "", "2023年", "达到100%", "%", "该指标须同时披露范围、期间、单位与来源等级,才进入正文判断。"]},
+            {"cells": ["份额", "", "2024年", "约1%", "%", "该指标须同时披露范围、期间、单位与来源等级,才进入正文判断。"]},
+            {"cells": ["市场份额", "", "2026年", "35.8%", "%", "该指标须同时披露范围、期间、单位与来源等级,才进入正文判断。"]},
+        ],
+        "takeaway": "表中各行来自已有证据。",
+        "limitations": ["使用边界：表中各行来自已有证据,不会凭空补齐缺失的范围、单位或期间。"],
+    }
+
+    assert render_table_package(table) == ""
+
+
+def test_chapter_argument_requires_mechanism_for_evidence_backed_section():
+    packages = run_chapter_argument_agent(
+        report_blueprint={"chapters": [{"chapter_id": "ch_01", "title": "Demand validation"}]},
+        micro_layouts=[
+            {
+                "chapter_id": "ch_01",
+                "sections": [{"section_id": "s1", "block_type": "case_comparison", "section_title": "Customer signal"}],
+            }
+        ],
+        argument_units=[
+            {
+                "chapter_id": "ch_01",
+                "section_id": "s1",
+                "block_type": "case_comparison",
+                "claim": "Customer deployments exist.",
+                "supporting_facts": ["Salesforce disclosed Agentforce usage in customer service workflows."],
+                "used_fact_refs": ["S1"],
+                "evidence_refs": ["S1"],
+                "fact_card_to_block_match": True,
+                "claim_strength": "moderate",
+            }
+        ],
+    )
+
+    assert packages[0]["sections"] == []
+    assert any(item.get("reason") in {"not_public", "layout_section_without_public_evidence"} for item in packages[0]["dropped_sections"])
+
+
+def test_structured_analysis_needs_rewrite_triggers_evidence_rebuild():
+    evidence_package = {
+        "query": "AI Agent industry report",
+        "analysis_ready_evidence": [_evidence()],
+        "chapter_evidence_packages": [
+            {
+                "chapter_id": "ch_01",
+                "chapter_title": "Demand validation",
+                "core_evidence": [_evidence()],
+            }
+        ],
+    }
+    structured = {
+        "claim_units": [{"chapter_id": "ch_01", "claim": "generic", "evidence_refs": []}],
+        "chapter_insights": [{"chapter_id": "ch_01", "chapter_question": "Demand validation"}],
+        "evidence_analyses": [{"evidence_id": "EV-1", "fact": "x"}],
+        "analysis_depth_quality": {"status": "needs_rewrite", "repeated_claim_ratio": 0.95},
+        "claim_binding_feedback_summary": {"available_ab_not_bound_count": 1},
+    }
+
+    result = ensure_valid_structured_analysis(structured, evidence_package)
+
+    assert result["analysis_rebuilt_from_evidence"] is True
+    assert "needs_rewrite_quality" in result["analysis_contract_status"]["quality_rebuild_reasons"]
+    assert result["analysis_stage_diagnostics"]["analysis_rebuilt_from_evidence"] is True
+
+
+def test_valid_llm_claims_are_not_rebuilt_due_to_legacy_binding_warnings():
+    structured = {
+        "claim_units": [
+            {
+                "chapter_id": "ch_01",
+                "claim": "AI Agent demand is moving from pilots into workflow deployment.",
+                "evidence_refs": ["EV-1"],
+                "supporting_evidence": ["EV-1"],
+                "reasoning": "Workflow deployments indicate operational adoption.",
+                "counter_evidence": "The conclusion is limited to disclosed samples.",
+            }
+        ],
+        "chapter_insights": [
+            {
+                "chapter_id": "ch_01",
+                "chapter_question": "Demand validation",
+                "key_claims": [
+                    {
+                        "claim": "AI Agent demand is moving from pilots into workflow deployment.",
+                        "evidence_refs": ["EV-1"],
+                        "supporting_evidence": ["EV-1"],
+                    }
+                ],
+            }
+        ],
+        "evidence_analyses": [{"evidence_id": "EV-1", "fact": "x"}],
+        "llm_analysis_synthesis": {
+            "validation": {
+                "status": "valid",
+                "usable_claim_count": 1,
+            }
+        },
+        "claim_binding_feedback_summary": {"available_ab_not_bound_count": 1},
+        "analysis_depth_quality": {"status": "ok", "repeated_claim_ratio": 0.0},
+    }
+
+    result = ensure_valid_structured_analysis(structured, {"analysis_ready_evidence": [_evidence("EV-1")]})
+
+    assert result.get("analysis_rebuilt_from_evidence") is not True
+    assert result["claim_units"][0]["claim"].startswith("AI Agent demand")
+    assert "chapter_binding_failed" in result["analysis_contract_status"]["quality_only_warnings"]
+    assert "unbound_ab_evidence" in result["analysis_contract_status"]["quality_only_warnings"]
+
+
+def test_llm_claim_without_refs_is_rejected_instead_of_inferred():
+    evidence_package = {"analysis_ready_evidence": [_evidence("EV-22")]}
+    payload = {
+        "chapter_synthesis": [
+            {
+                "chapter_id": "ch_01",
+                "chapter_title": "Demand validation",
+                "fact_chain": ["Enterprise workflow evidence is present (EV-22)."],
+                "evidence_refs": ["EV-22"],
+                "claim_units": [
+                    {
+                        "claim": "目前只能形成方向性观察，需要用可追溯来源和连续指标继续校准结论强度。",
+                        "claim_status": "directional",
+                        "supporting_evidence_refs": [],
+                        "reasoning": "",
+                    }
+                ],
+            }
+        ]
+    }
+
+    validation = validate_llm_analysis_output(payload, evidence_package)
+    assert validation["status"] == "invalid_output_no_usable_claims"
+    assert validation["chapter_synthesis"] == []
+    assert any(item["type"] == "llm_claim_missing_used_evidence_ids" for item in validation["issues"])
+
+
+def test_llm_claim_with_valid_used_evidence_ids_is_accepted():
+    evidence_package = {"analysis_ready_evidence": [_evidence("EV-22")]}
+    payload = {
+        "chapter_synthesis": [
+            {
+                "chapter_id": "ch_01",
+                "chapter_title": "Demand validation",
+                "claim_units": [
+                    {
+                        "claim": "Enterprise agents are moving into workflow automation.",
+                        "claim_status": "decision_ready",
+                        "claim_strength": "moderate",
+                        "used_evidence_ids": ["EV-22"],
+                        "evidence_basis": ["Enterprise workflow evidence is present."],
+                        "reasoning_chain": ["Workflow deployments indicate operational adoption."],
+                        "limitation_boundary": ["The claim still depends on comparable customer samples."],
+                    }
+                ],
+            }
+        ]
+    }
+
+    validation = validate_llm_analysis_output(payload, evidence_package)
+    unit = validation["chapter_synthesis"][0]["claim_units"][0]
+
+    assert validation["status"] == "valid"
+    assert unit["supporting_evidence_refs"] == ["EV-22"]
+    assert unit["reasoning"] == "Workflow deployments indicate operational adoption."
+
+
+def test_llm_validator_normalizes_analysis_first_claim_contract():
+    evidence_package = {"analysis_ready_evidence": [_evidence("EV-ANALYSIS")]}
+    payload = {
+        "chapter_synthesis": [
+            {
+                "chapter_id": "ch_01",
+                "chapter_title": "Demand validation",
+                "claim_units": [
+                    {
+                        "claim": "Enterprise agents are moving into workflow automation.",
+                        "claim_strength": "directional",
+                        "analysis_role": "directional",
+                        "used_evidence_ids": ["EV-ANALYSIS"],
+                        "evidence_basis": ["Enterprise workflow evidence is present."],
+                        "reasoning_chain": ["Workflow deployments indicate operational adoption."],
+                        "limitation_boundary": ["The claim is limited to disclosed customer samples."],
+                        "block_affinity": "case_comparison",
+                    }
+                ],
+            }
+        ]
+    }
+
+    validation = validate_llm_analysis_output(payload, evidence_package)
+    unit = validation["chapter_synthesis"][0]["claim_units"][0]
+
+    assert unit["claim_id"] == "ch_01_claim_1"
+    assert unit["supporting_fact_refs"] == ["EV-ANALYSIS"]
+    assert unit["source_support_map"] == {
+        "claim": ["EV-ANALYSIS"],
+        "mechanism": ["EV-ANALYSIS"],
+        "boundary": ["EV-ANALYSIS"],
+    }
+    assert unit["paragraph_seed"]
+    assert unit["analysis_role"] == "directional"
+
+
+def test_llm_input_filters_dirty_cards_and_internal_diagnostics():
+    dirty = _evidence("EV-DIRTY")
+    dirty["fact"] = "Skip to content login menu picture intentionally omitted"
+    dirty["source"] = {"title": "Official", "url": "https://example.gov/fake"}
+    clean = _evidence("EV-CLEAN")
+    evidence_package = {
+        "chapter_evidence_diagnostics": {"ch_01": {}},
+        "analysis_ready_evidence": [dirty, clean],
+    }
+    fallback = {
+        "evidence_gap_ledger": [{"type": "internal_gap"}],
+        "claim_units": [{"claim": "old fallback claim"}],
+    }
+
+    payload = build_llm_analysis_input(evidence_package, fallback)
+
+    assert "evidence_gap_ledger" not in payload
+    assert "fallback_claim_units" not in payload
+    assert "evidence_cards" not in payload
+    assert [item["evidence_id"] for item in payload["fact_cards"]] == ["EV-CLEAN"]
+
+
+def test_llm_input_uses_chapter_aliases_for_fact_cards():
+    evidence_package = {
+        "chapter_evidence_diagnostics": {
+            "ch_01": {
+                "chapter_id_aliases": ["dim-demand", "hyp-demand", "AI Agent demand validation"],
+            }
+        },
+        "analysis_ready_evidence": [
+            {
+                "evidence_id": "EV-ALIAS",
+                "dimension_id": "dim-demand",
+                "hypothesis_id": "hyp-demand",
+                "fact": "Salesforce disclosed Agentforce customer-service workflow deployments in 2025.",
+                "source_level": "B",
+                "allowed_use": "supporting",
+                "proof_role": "case",
+                "source_verification_status": "readpage_verified",
+                "source": {
+                    "title": "Salesforce Agentforce customer story",
+                    "url": "https://www.salesforce.com/news/agentforce",
+                    "source_verification_status": "readpage_verified",
+                },
+                "public_fact_card": {
+                    "subject": "Salesforce Agentforce",
+                    "distilled_fact": "Salesforce disclosed Agentforce customer-service workflow deployments in 2025.",
+                    "block_affinity": ["case_comparison"],
+                },
+            }
+        ],
+    }
+
+    cards = _evidence_cards_for_llm(evidence_package, max_chapters=1, max_per_chapter=4)
+
+    assert [card["evidence_id"] for card in cards] == ["EV-ALIAS"]
+    assert cards[0]["chapter_id"] == "ch_01"
+
+
+def test_llm_input_prefers_chapter_package_canonical_ids():
+    evidence_package = {
+        "chapter_evidence_packages": [
+            {
+                "chapter_id": "ch_01",
+                "chapter_title": "Demand validation",
+                "chapter_question": "AI Agent demand validation",
+            }
+        ],
+        "analysis_ready_evidence": [
+            {
+                "evidence_id": "EV-CANON",
+                "chapter_id": "AI Agent demand validation",
+                "fact": "Salesforce disclosed Agentforce customer-service workflow deployments in 2025.",
+                "source_level": "A",
+                "allowed_use": "core_claim",
+                "proof_role": "case",
+                "source_verification_status": "readpage_verified",
+                "source": {
+                    "title": "Salesforce Agentforce customer story",
+                    "url": "https://www.salesforce.com/news/agentforce",
+                    "source_verification_status": "readpage_verified",
+                },
+            }
+        ],
+    }
+
+    payload = build_llm_analysis_input_v2(evidence_package, {})
+
+    assert payload["chapters"][0]["chapter_id"] == "ch_01"
+    assert payload["chapters"][0]["allowed_evidence_ids"] == ["EV-CANON"]
+
+
+def test_build_llm_analysis_input_v2_is_compact_and_excludes_diagnostics(monkeypatch):
+    monkeypatch.setenv("BRAIN_LLM_ANALYSIS_MAX_FACTS_PER_CHAPTER", "1")
+    monkeypatch.setenv("BRAIN_LLM_ANALYSIS_MAX_FACT_CHARS", "42")
+    clean = _evidence("EV-CLEAN")
+    clean["fact"] = "Salesforce disclosed Agentforce deployments in customer-service workflow automation during 2025."
+    clean["public_fact_card"] = {
+        "distilled_fact": clean["fact"],
+        "fact_type": "case",
+        "block_affinity": ["case_comparison"],
+    }
+    dirty = _evidence("EV-DIRTY")
+    dirty["fact"] = "Skip to content Login Menu Products Resources"
+    evidence_package = {
+        "query": "AI Agent industry report",
+        "research_plan": {"huge": "x" * 5000},
+        "evidence_gap_ledger": [{"internal": True}],
+        "chapter_evidence_diagnostics": {
+            "ch_01": {
+                "chapter_title": "Demand validation",
+                "chapter_question": "Does AI Agent demand move into workflow deployment?",
+            }
+        },
+        "analysis_ready_evidence": [dirty, clean],
+    }
+
+    payload = build_llm_analysis_input_v2(evidence_package, {"claim_units": [{"claim": "fallback"}]})
+    payload_text = json.dumps(payload, ensure_ascii=False)
+
+    assert "research_plan" not in payload
+    assert "evidence_gap_ledger" not in payload_text
+    assert "fallback" not in payload_text
+    assert list(payload.keys()) == ["query", "chapters"]
+    chapter = payload["chapters"][0]
+    assert chapter["chapter_id"] == "ch_01"
+    assert chapter["allowed_evidence_ids"] == ["EV-CLEAN"]
+    assert len(chapter["fact_cards"]) == 1
+    card = chapter["fact_cards"][0]
+    assert set(
+        [
+            "evidence_id",
+            "distilled_fact",
+            "fact_type",
+            "source_level",
+            "source_verification_status",
+            "proof_role",
+            "block_affinity",
+            "metric",
+            "value",
+            "unit",
+            "period",
+            "source_title",
+            "source_url",
+        ]
+    ).issubset(card)
+    assert len(card["distilled_fact"]) <= 45
+
+
+def test_llm_validator_exposes_issue_counts_and_examples():
+    evidence_package = {"analysis_ready_evidence": [_evidence("EV-OK")]}
+    payload = {
+        "chapter_synthesis": [
+            {
+                "chapter_id": "ch_01",
+                "claim_units": [
+                    {
+                        "claim": "Enterprise agents are moving into workflow automation.",
+                        "used_evidence_ids": ["EV-OK"],
+                        "evidence_basis": ["The source describes workflow automation deployments."],
+                        "reasoning_chain": ["Deployments inside workflows indicate operational adoption."],
+                        "limitation_boundary": ["The conclusion is limited to the disclosed deployment samples."],
+                        "claim_strength": "moderate",
+                    },
+                    {
+                        "claim": "This claim has no refs.",
+                        "used_evidence_ids": [],
+                        "evidence_basis": ["x"],
+                        "reasoning_chain": ["y"],
+                    },
+                    {
+                        "claim": "AI Agent adoption is accelerating.",
+                        "used_evidence_ids": ["EV-MISSING"],
+                        "evidence_basis": ["x"],
+                        "reasoning_chain": ["y"],
+                    },
+                ],
+            }
+        ]
+    }
+
+    validation = validate_llm_analysis_output(payload, evidence_package)
+
+    assert validation["status"] == "valid"
+    assert validation["llm_raw_chapter_count"] == 1
+    assert validation["llm_raw_claim_count"] == 3
+    assert validation["llm_validation_issue_counts"]["llm_claim_missing_used_evidence_ids"] == 1
+    assert validation["llm_validation_issue_counts"]["invalid_llm_evidence_ref"] == 1
+    assert validation["llm_valid_claim_examples"][0]["evidence_refs"] == ["EV-OK"]
+    assert len(validation["llm_rejected_claim_examples"]) >= 2
+
+
+def test_llm_validator_accepts_string_basis_reasoning_and_boundary():
+    evidence_package = {"analysis_ready_evidence": [_evidence("EV-OK")]}
+    payload = {
+        "chapter_synthesis": [
+            {
+                "chapter_id": "ch_01",
+                "claim_units": [
+                    {
+                        "claim": "AI Agent standardization activity indicates a maturing deployment environment.",
+                        "used_evidence_ids": ["EV-OK"],
+                        "evidence_basis": "The source describes enterprise workflow automation deployments.",
+                        "reasoning_chain": "Workflow deployments indicate operational adoption rather than tool trials.",
+                        "limitation_boundary": "The claim is limited to disclosed deployment samples.",
+                        "claim_strength": "moderate",
+                    }
+                ],
+            }
+        ]
+    }
+
+    validation = validate_llm_analysis_output(payload, evidence_package)
+
+    assert validation["status"] == "valid"
+    unit = validation["chapter_synthesis"][0]["claim_units"][0]
+    assert unit["evidence_basis"] == ["The source describes enterprise workflow automation deployments."]
+    assert unit["reasoning"] == "Workflow deployments indicate operational adoption rather than tool trials."
+    assert unit["counter_boundary"] == "The claim is limited to disclosed deployment samples."
+
+
+def test_per_chapter_llm_analysis_partial_success_is_preserved(monkeypatch, tmp_path):
+    evidence_package = {
+        "query": "AI Agent industry report",
+        "chapter_evidence_diagnostics": {
+            "ch_01": {"chapter_title": "Demand validation"},
+            "ch_02": {"chapter_title": "Technology maturity"},
+        },
+        "analysis_ready_evidence": [
+            _evidence("EV-1", chapter_id="ch_01", level="A"),
+            _evidence("EV-2", chapter_id="ch_02", level="B"),
+        ],
+        "chapter_evidence_packages": [
+            {"chapter_id": "ch_01", "chapter_title": "Demand validation", "core_evidence": [_evidence("EV-1", chapter_id="ch_01", level="A")]},
+            {"chapter_id": "ch_02", "chapter_title": "Technology maturity", "core_evidence": [_evidence("EV-2", chapter_id="ch_02", level="B")]},
+        ],
+    }
+    calls = []
+
+    def fake_llm(**kwargs):
+        chapter = kwargs["user_payload"]["chapter"]
+        calls.append(chapter["chapter_id"])
+        if chapter["chapter_id"] == "ch_01":
+            return {
+                "payload": {
+                    "chapter_id": "ch_01",
+                    "claim_units": [
+                        {
+                            "claim": "AI Agent demand is moving from pilots into workflow deployment.",
+                            "used_evidence_ids": ["EV-1"],
+                            "evidence_basis": ["The verified source describes workflow automation deployments."],
+                            "reasoning_chain": ["Workflow deployment is a stronger demand signal than tool trial."],
+                            "limitation_boundary": ["The conclusion is limited to disclosed enterprise deployment samples."],
+                            "claim_strength": "moderate",
+                            "block_affinity": "case_comparison",
+                        }
+                    ],
+                    "analysis_limits": [],
+                },
+                "usage": {"input_tokens": 100, "output_tokens": 80},
+            }
+        return {
+            "payload": {
+                "chapter_id": "ch_02",
+                "claim_units": [
+                    {
+                        "claim": "证据不足，建议补证后再判断。",
+                        "used_evidence_ids": [],
+                        "evidence_basis": [],
+                        "reasoning_chain": [],
+                    }
+                ],
+            },
+            "usage": {},
+        }
+
+    monkeypatch.setattr(analysis_agent, "call_openai_compatible_json", fake_llm)
+    monkeypatch.setattr(analysis_agent, "llm_config_is_ready", lambda cfg: True)
+    monkeypatch.setattr(analysis_agent, "normalize_llm_config", lambda cfg: {"model": "fake"})
+    monkeypatch.setenv("BRAIN_ENABLE_LLM_EVIDENCE_ANALYSIS", "true")
+    monkeypatch.setenv("REPORT_QUALITY_MODE", "high")
+    monkeypatch.setenv("BRAIN_LLM_ANALYSIS_MODE", "per_chapter")
+    monkeypatch.setenv("BRAIN_LLM_ANALYSIS_INPUT_VERSION", "v2")
+    monkeypatch.setenv("BRAIN_LLM_ANALYSIS_CACHE_ENABLED", "false")
+    monkeypatch.setenv("BRAIN_LLM_ANALYSIS_CACHE_PATH", str(tmp_path))
+
+    result = run_analysis_agent(evidence_package, llm_config={"provider": "fake", "model": "fake"})
+    diagnostics = result["structured_analysis"]["analysis_stage_diagnostics"]
+
+    assert set(calls) == {"ch_01", "ch_02"}
+    assert diagnostics["llm_analysis_attempted"] is True
+    assert diagnostics["uses_llm_analysis"] is True
+    assert diagnostics["llm_analysis_status"] == "partial_success"
+    assert diagnostics["final_analysis_source"] == "llm_partial_merged"
+    assert diagnostics["llm_usable_claim_count"] >= 1
+    assert diagnostics["llm_valid_chapter_count"] == 1
+    assert diagnostics["llm_failed_chapter_count"] == 1
+
+
+def test_per_chapter_llm_analysis_uses_cache_hit(monkeypatch, tmp_path):
+    evidence_package = {
+        "query": "AI Agent industry report",
+        "chapter_evidence_diagnostics": {"ch_01": {"chapter_title": "Demand validation"}},
+        "analysis_ready_evidence": [_evidence("EV-1", chapter_id="ch_01", level="A")],
+        "chapter_evidence_packages": [
+            {"chapter_id": "ch_01", "chapter_title": "Demand validation", "core_evidence": [_evidence("EV-1", chapter_id="ch_01", level="A")]}
+        ],
+    }
+    call_count = {"count": 0}
+
+    def fake_llm(**kwargs):
+        call_count["count"] += 1
+        return {
+            "payload": {
+                "chapter_id": "ch_01",
+                "claim_units": [
+                    {
+                        "claim": "AI Agent demand is moving from pilots into workflow deployment.",
+                        "used_evidence_ids": ["EV-1"],
+                        "evidence_basis": ["The source describes workflow deployments."],
+                        "reasoning_chain": ["Workflow deployment indicates operational adoption."],
+                        "limitation_boundary": ["The conclusion is limited to disclosed deployment samples."],
+                        "claim_strength": "moderate",
+                    }
+                ],
+            },
+            "usage": {},
+        }
+
+    monkeypatch.setattr(analysis_agent, "call_openai_compatible_json", fake_llm)
+    monkeypatch.setattr(analysis_agent, "llm_config_is_ready", lambda cfg: True)
+    monkeypatch.setattr(analysis_agent, "normalize_llm_config", lambda cfg: {"model": "fake"})
+    monkeypatch.setenv("BRAIN_ENABLE_LLM_EVIDENCE_ANALYSIS", "true")
+    monkeypatch.setenv("REPORT_QUALITY_MODE", "high")
+    monkeypatch.setenv("BRAIN_LLM_ANALYSIS_MODE", "per_chapter")
+    monkeypatch.setenv("BRAIN_LLM_ANALYSIS_INPUT_VERSION", "v2")
+    monkeypatch.setenv("BRAIN_LLM_ANALYSIS_CACHE_ENABLED", "true")
+    monkeypatch.setenv("BRAIN_LLM_ANALYSIS_CACHE_PATH", str(tmp_path))
+
+    first = run_analysis_agent(evidence_package, llm_config={"provider": "fake", "model": "fake"})
+    second = run_analysis_agent(evidence_package, llm_config={"provider": "fake", "model": "fake"})
+
+    assert call_count["count"] == 1
+    assert first["structured_analysis"]["analysis_stage_diagnostics"]["llm_analysis_cache_hit_count"] == 0
+    assert second["structured_analysis"]["analysis_stage_diagnostics"]["llm_analysis_cache_hit_count"] == 1
+
+
+def test_analysis_depth_quality_deduplicates_claim_across_storage_containers():
+    claim = "企业智能体需求开始从试用转向流程部署。"
+    unit = {
+        "chapter_id": "ch_01",
+        "claim": claim,
+        "supporting_evidence": ["EV-1"],
+        "reasoning": "客户采购和部署案例同时出现。",
+        "counter_evidence": "仍需续约数据验证。",
+    }
+    structured = {
+        "report_insight_package": {
+            "chapters": [
+                {
+                    "chapter_id": "ch_01",
+                    "chapter_question": "需求验证",
+                    "key_claims": [dict(unit)],
+                }
+            ]
+        },
+        "chapter_insights": [
+            {
+                "chapter_id": "ch_01",
+                "chapter_question": "需求验证",
+                "key_claims": [dict(unit)],
+            }
+        ],
+        "claim_units": [dict(unit)],
+        "evidence_analyses": [{"evidence_id": "EV-1"}],
+    }
+
+    quality = analysis_depth_quality(structured)
+
+    assert quality["claim_count"] == 1
+    assert quality["repeated_claim_ratio"] == 0.0
+
+
+def test_fallback_reasoning_helpers_do_not_emit_public_template_labels():
+    facts = [
+        "客户案例显示智能体已进入采购流程。",
+        "企业披露开始将工具调用纳入流程自动化。",
+    ]
+    text = "\n".join(
+        [
+            _reasoning_from_public_facts(facts),
+            "\n".join(_build_mechanism_chain(facts, [], "directional", 1)),
+        ]
+    )
+
+    for phrase in ["事实链", "事实锚点", "交叉信号", "仅有 C 级", "共同构成本章判断的事实基础"]:
+        assert phrase not in text
+
+
+def test_hypothesis_insights_preserve_hypothesis_id_and_avoid_template_mechanism():
+    evidence = _evidence("EV-H1", chapter_id="ch_01", level="A", allowed_use="core_claim")
+    analysis = _evidence_analysis(evidence, "企业智能体是否进入流程部署", 1)
+    analysis["hypothesis_id"] = "H1"
+    research_plan = {
+        "hypotheses": [
+            {
+                "hypothesis_id": "H1",
+                "claim_to_test": "企业智能体是否进入流程部署",
+            }
+        ],
+        "evidence_coverage_requirements": {
+            "per_hypothesis": {"min_A_or_B_sources": 1}
+        },
+    }
+
+    insights = _hypothesis_insights(research_plan, [analysis])
+
+    assert insights[0]["chapter_id"] in {"H1", "ch_01"}
+    assert insights[0].get("chapter_id_source") in {"hypothesis_id", "evidence_chapter_id"}
+    public_text = "\n".join(str(item) for item in insights[0].get("mechanism_chain", []))
+    for phrase in ["事实锚点", "事实链", "交叉信号", "更适合留在观察层"]:
+        assert phrase not in public_text
+
+
+def test_llm_validation_rejects_refs_when_no_valid_input_cards():
+    payload = {
+        "chapter_synthesis": [
+            {
+                "chapter_id": "ch_01",
+                "claim_units": [
+                    {
+                        "claim": "AI Agent adoption is accelerating.",
+                        "used_evidence_ids": ["EV-FAKE"],
+                        "evidence_basis": ["x"],
+                        "reasoning_chain": ["y"],
+                        "limitation_boundary": ["z"],
+                    }
+                ],
+            }
+        ]
+    }
+
+    validation = validate_llm_analysis_output(payload, {})
+
+    assert validation["status"] == "invalid"
+    assert validation["reason"] == "no_valid_input_evidence_refs"
+
+
+def test_llm_success_with_quality_warning_preserves_final_source(monkeypatch):
+    evidence_package = {
+        "query": "AI Agent industry report",
+        "analysis_ready_evidence": [_evidence("EV-1")],
+        "chapter_evidence_packages": [
+            {
+                "chapter_id": "ch_01",
+                "chapter_title": "Demand validation",
+                "core_evidence": [_evidence("EV-1")],
+            }
+        ],
+    }
+
+    def fake_llm(**kwargs):
+        return {
+            "payload": {
+                "chapter_synthesis": [
+                    {
+                        "chapter_id": "ch_01",
+                        "chapter_title": "Demand validation",
+                        "claim_units": [
+                            {
+                                "claim": "Demand validation",
+                                "claim_status": "decision_ready",
+                                "claim_strength": "moderate",
+                                "used_evidence_ids": ["EV-1"],
+                                "evidence_basis": ["Enterprise workflow evidence is present."],
+                                "reasoning_chain": ["Workflow deployments indicate operational adoption."],
+                                "limitation_boundary": ["The claim depends on comparable customer samples."],
+                            }
+                        ],
+                    }
+                ]
+            },
+            "usage": {},
+        }
+
+    monkeypatch.setattr(analysis_agent, "call_openai_compatible_json", fake_llm)
+    monkeypatch.setattr(analysis_agent, "llm_config_is_ready", lambda cfg: True)
+    monkeypatch.setattr(analysis_agent, "normalize_llm_config", lambda cfg: {"model": "fake"})
+    monkeypatch.setenv("BRAIN_ENABLE_LLM_EVIDENCE_ANALYSIS", "true")
+
+    result = run_analysis_agent(evidence_package, llm_config={"provider": "fake", "model": "fake"})
+    diagnostics = result["structured_analysis"]["analysis_stage_diagnostics"]
+
+    assert diagnostics.get("analysis_rebuilt_from_evidence") is not True
+    assert diagnostics["uses_llm_analysis"] is True
+    assert diagnostics["llm_analysis_attempted"] is True
+    assert diagnostics["quality_path_degraded"] is False
+    assert diagnostics["llm_analysis_status"] == "success"
+    assert diagnostics["final_analysis_source"] == "llm_evidence_analysis"
+    assert result["structured_analysis"]["analysis_contract_status"]["quality_rebuild_reasons"]
+    assert result["structured_analysis"]["analysis_contract_status"]["structural_rebuild_reasons"] == []
+
+
+def test_quality_mode_marks_invalid_llm_analysis_as_degraded(monkeypatch):
+    evidence_package = {
+        "query": "AI Agent",
+        "analysis_ready_evidence": [_evidence("EV-1")],
+        "chapter_evidence_diagnostics": {"ch_01": {"chapter_id": "ch_01"}},
+    }
+
+    def fake_llm(**kwargs):
+        return {
+            "payload": {
+                "chapter_synthesis": [
+                    {
+                        "chapter_id": "ch_01",
+                        "claim_units": [
+                            {
+                                "claim": "证据不足，需要补证后再判断。",
+                                "used_evidence_ids": [],
+                                "evidence_basis": [],
+                                "reasoning_chain": [],
+                                "limitation_boundary": [],
+                            }
+                        ],
+                    }
+                ]
+            },
+            "usage": {},
+        }
+
+    monkeypatch.setattr(analysis_agent, "call_openai_compatible_json", fake_llm)
+    monkeypatch.setattr(analysis_agent, "llm_config_is_ready", lambda cfg: True)
+    monkeypatch.setattr(analysis_agent, "normalize_llm_config", lambda cfg: {"model": "fake"})
+    monkeypatch.setenv("BRAIN_ENABLE_LLM_EVIDENCE_ANALYSIS", "true")
+    monkeypatch.setenv("REPORT_QUALITY_MODE", "high")
+
+    result = run_analysis_agent(evidence_package, llm_config={"provider": "fake", "model": "fake"})
+    diagnostics = result["structured_analysis"]["analysis_stage_diagnostics"]
+
+    assert diagnostics["llm_analysis_attempted"] is True
+    assert diagnostics["uses_llm_analysis"] is False
+    assert diagnostics["quality_path_degraded"] is True
+    assert diagnostics["quality_path_degradation_reason"] == "invalid_output"
+
+
+def test_claim_builder_strict_layout_does_not_fill_metric_block_from_core_evidence():
+    package = {
+        "chapter_id": "ch_01",
+        "chapter_title": "Metric validation",
+        "core_evidence": [_evidence("EV-CORE")],
+    }
+    layout = {
+        "chapter_id": "ch_01",
+        "sections": [
+            {
+                "section_id": "ch_01_metric",
+                "section_title": "Metric reconciliation",
+                "block_type": "metric_reconciliation",
+            }
+        ],
+    }
+    structured = {
+        "analysis_depth_quality": {"status": "needs_rewrite", "repeated_claim_ratio": 0.9},
+        "claim_units": [],
+    }
+
+    units = run_claim_builder_agent(
+        chapter_evidence_packages=[package],
+        micro_layouts=[layout],
+        structured_analysis=structured,
+    )
+
+    assert units == []
+
+
+def test_claim_builder_strict_layout_uses_matching_metric_evidence():
+    metric = _evidence("EV-METRIC", proof_role="metric")
+    metric["metric"] = "adoption"
+    metric["value"] = "42%"
+    package = {
+        "chapter_id": "ch_01",
+        "chapter_title": "Metric validation",
+        "metric_evidence": [metric],
+    }
+    layout = {
+        "chapter_id": "ch_01",
+        "sections": [
+            {
+                "section_id": "ch_01_metric",
+                "section_title": "Metric reconciliation",
+                "block_type": "metric_reconciliation",
+            }
+        ],
+    }
+    structured = {
+        "analysis_depth_quality": {"status": "needs_rewrite", "repeated_claim_ratio": 0.9},
+        "claim_units": [],
+    }
+
+    units = run_claim_builder_agent(
+        chapter_evidence_packages=[package],
+        micro_layouts=[layout],
+        structured_analysis=structured,
+    )
+
+    assert len(units) == 1
+    assert units[0]["block_type"] == "metric_reconciliation"
+    assert units[0]["evidence_backed"] is True
+    assert units[0]["mechanism"]
+    assert units[0]["mechanism"] != metric["fact"]
+    public_text = "\n".join(
+        str(units[0].get(key) or "")
+        for key in ("claim", "reasoning", "counter_evidence", "actionable")
+    )
+    assert "这组事实更适合作为方向性判断" not in public_text
+    assert "不能直接外推" not in public_text
+    assert "事实锚点显示" not in public_text
+
+
+def test_claim_builder_fact_card_directional_section_has_no_template_tail():
+    card = {
+        "subject": "Salesforce",
+        "action": "disclosed",
+        "object": "Salesforce disclosed Agentforce as an AI Agent layer used in customer service workflows.",
+        "fact": "Salesforce disclosed Agentforce as an AI Agent layer used in customer service workflows.",
+        "source_ref": "S1",
+        "source_level": "C",
+        "fact_type": "case",
+        "analysis_variable": "客户落地与应用场景",
+        "variable": "客户落地与应用场景",
+        "block_affinity": ["customer_painpoint_matrix"],
+        "claim_strength_hint": "directional",
+        "directional_only": True,
+    }
+    evidence = {
+        "ref": "E1",
+        "source_ref": "S1",
+        "source_level": "C",
+        "allowed_use": "directional_signal",
+        "public_fact_quality": {"eligible_for_report": True, "public_fact_card": card},
+        "public_fact_card": card,
+        "fact": card["fact"],
+    }
+    package = {
+        "chapter_id": "ch_01",
+        "chapter_title": "Demand validation",
+        "directional_evidence": [evidence],
+        "chapter_analysis": {"fact_cards": [card], "claim_strength": "directional"},
+    }
+    layout = {
+        "chapter_id": "ch_01",
+        "sections": [
+            {
+                "section_id": "ch_01_case",
+                "section_title": "Customer signal",
+                "block_type": "customer_painpoint_matrix",
+            }
+        ],
+    }
+
+    units = run_claim_builder_agent(
+        chapter_evidence_packages=[package],
+        micro_layouts=[layout],
+        structured_analysis={"analysis_depth_quality": {"status": "needs_rewrite"}, "claim_units": []},
+    )
+
+    assert len(units) == 1
+    text = "\n".join(str(units[0].get(key) or "") for key in ("claim", "reasoning", "counter_evidence"))
+    assert units[0]["claim_strength"] == "directional"
+    assert units[0]["evidence_backed"] is True
+    assert "该信号可作为本章的审慎结论" not in text
+    assert "边界在于样本是否代表主流需求" not in text
+    assert "事实依据包括" not in text
+    assert "可复核事实显示" not in text
+    assert "可核验事实显示" not in text
+    assert "若相反样本或口径差异扩大" not in text
+    assert "分析重点是这些事实之间是否指向同一变量" not in text
+
+
+def test_claim_builder_technology_block_does_not_consume_metric_card():
+    card = {
+        "subject": "Market source",
+        "action": "shows",
+        "object": "AI Agent market size reached 10 billion dollars in the sample dataset.",
+        "fact": "AI Agent market size reached 10 billion dollars in the sample dataset.",
+        "source_ref": "S1",
+        "source_level": "B",
+        "fact_type": "metric",
+        "analysis_variable": "指标口径与可比性",
+        "variable": "指标口径与可比性",
+        "block_affinity": ["metric_reconciliation"],
+        "claim_strength_hint": "moderate",
+    }
+    metric = {
+        "ref": "E1",
+        "source_ref": "S1",
+        "source_level": "B",
+        "metric": "market_size",
+        "value": "10",
+        "public_fact_quality": {"eligible_for_report": True, "public_fact_card": card},
+        "public_fact_card": card,
+        "fact": card["fact"],
+    }
+    package = {
+        "chapter_id": "ch_01",
+        "chapter_title": "Technology maturity",
+        "metric_evidence": [metric],
+        "chapter_analysis": {"fact_cards": [card], "claim_strength": "moderate"},
+    }
+    layout = {
+        "chapter_id": "ch_01",
+        "sections": [
+            {
+                "section_id": "ch_01_tech",
+                "section_title": "Technology maturity",
+                "block_type": "technology_maturity",
+            }
+        ],
+    }
+
+    units = run_claim_builder_agent(
+        chapter_evidence_packages=[package],
+        micro_layouts=[layout],
+        structured_analysis={"analysis_depth_quality": {"status": "needs_rewrite"}, "claim_units": []},
+    )
+
+    assert units == []
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for the optimization pass — keep contract drift visible.
+# ---------------------------------------------------------------------------
+
+
+def test_chapter_insights_uses_evidence_chapter_id_for_english_dimensions():
+    """`_chapter_insights_from_synthesis` must not normalize away spaces.
+
+    Previously the fallback produced `"demandvalidation"` while the
+    diagnostics keyed off the raw `"demand validation"`, so
+    `claim_binding_feedback_summary` could not find the chapter. The fix
+    keeps the raw dimension string when no explicit chapter_id is known.
+    """
+
+    dimension_synthesis = {
+        "demand validation": {
+            "takeaway": "需求信号已经出现，但需要持续验证。",
+            "evidence_ids": ["EV-1"],
+            "claim_strength": "moderate",
+        }
+    }
+    insights = _chapter_insights_from_synthesis(dimension_synthesis, {})
+    assert len(insights) == 1
+    # Either the canonical chapter_id from a lookup wins, or we fall back to
+    # the raw dimension string — never a synthetic "chapter_1" or a normalized
+    # form that loses spaces.
+    assert insights[0]["chapter_id"] in {"demand validation", "ch_demand"}
+
+
+def test_chapter_insights_chapter_id_lookup_wins_over_dimension():
+    insights = _chapter_insights_from_synthesis(
+        {"demand validation": {"takeaway": "x", "evidence_ids": ["EV-1"]}},
+        {"demand validation": "ch_42"},
+    )
+    assert insights[0]["chapter_id"] == "ch_42"
+
+
+def test_norm_chapter_id_tolerates_connectors():
+    assert _norm_chapter_id("ch_01") == _norm_chapter_id("ch-01")
+    assert _norm_chapter_id("ch 01") == _norm_chapter_id("CH/01")
+    assert _norm_chapter_id("") == ""
+
+
+def test_matches_resolves_chapter_id_with_punctuation_difference():
+    """`_matches` should bind a unit whose chapter_id only differs by punctuation."""
+
+    unit = {"chapter_id": "ch-01"}
+    package = {"chapter_id": "ch_01", "chapter_title": "irrelevant"}
+    assert claim_builder_matches(unit, package) is True
+
+
+def test_resolve_chapter_id_via_aliases():
+    diagnostics = {
+        "ch_01": {
+            "chapter_id": "ch_01",
+            "chapter_title": "Demand validation",
+            "chapter_id_aliases": ["ch_01", "ch01", "Demand validation", "demandvalidation"],
+        }
+    }
+    assert resolve_chapter_id(diagnostics, "Demand validation") == "ch_01"
+    assert resolve_chapter_id(diagnostics, "ch-01") == "ch_01"
+    assert resolve_chapter_id(diagnostics, "unknown") == ""
+
+
+def test_chapter_evidence_diagnostics_emits_alias_set():
+    evidence_analyses = [
+        {
+            "evidence_id": "EV-1",
+            "chapter_id": "ch_01",
+            "dimension": "Demand validation",
+            "dimension_name": "需求验证",
+            "source_level": "B",
+            "allowed_use": "core_claim",
+            "source": {"url": "https://example.org/page", "title": "ok"},
+        }
+    ]
+    diagnostics = _chapter_evidence_diagnostics({}, evidence_analyses)
+    chapter = next(iter(diagnostics.values()))
+    aliases = chapter["chapter_id_aliases"]
+    # Raw + normalized forms for every distinct id surface.
+    assert "ch_01" in aliases
+    assert "Demand validation" in aliases
+    assert "需求验证" in aliases
+
+
+def test_should_force_strict_claim_building_field_published():
+    """When quality is poor, contract status should explicitly request strict mode."""
+
+    evidence_package = {
+        "analysis_ready_evidence": [
+            {
+                "evidence_id": "EV-1",
+                "chapter_id": "ch_01",
+                "fact": "x",
+                "source_level": "B",
+                "allowed_use": "core_claim",
+                "source": {"url": "https://example.org/EV-1", "title": "ok"},
+            }
+        ],
+    }
+    structured = {
+        "claim_units": [{"chapter_id": "ch_01", "claim": "generic", "evidence_refs": ["EV-1"]}],
+        "chapter_insights": [{"chapter_id": "ch_01", "chapter_question": "Demand"}],
+        "evidence_analyses": [{"evidence_id": "EV-1"}],
+        "analysis_depth_quality": {"status": "needs_rewrite", "repeated_claim_ratio": 0.8},
+    }
+    result = ensure_valid_structured_analysis(structured, evidence_package)
+    contract = result.get("analysis_contract_status") or {}
+    assert contract.get("should_force_strict_claim_building") is True
+
+
+def test_strip_orphan_citations_handles_bare_number_refs():
+    """Sources stored as `"42"` (no brackets) must still be recognised."""
+
+    markdown = "...[1] some text [42] more text [99]..."
+    registry = [
+        {"ref": "1", "title": "One"},
+        {"ref": "[42]", "title": "Forty-two"},
+    ]
+    output = _strip_orphan_citations(markdown, registry)
+    assert "[1]" in output
+    assert "[42]" in output
+    # `[99]` is an orphan — must be stripped.
+    assert "[99]" not in output
+
+
+def test_normalize_citation_ref_handles_large_numbers():
+    assert _normalize_citation_ref("1234") == "[1234]"
+    assert _normalize_citation_ref("[ 99 ]") == "[99]"
+    assert _normalize_citation_ref("") == ""
+
+
+def test_source_allowed_for_report_only_runs_topic_filter_when_topic_matches():
+    """Off-topic queries should not apply the AI-Agent-specific blocklist."""
+
+    petroleum_source = {
+        "url": "https://www.sinopec.com/annual-report-2025",
+        "title": "中国石油 2025 年报",
+        "source_level": "B",
+        "source_type": "official_data",
+    }
+    # A query unrelated to AI Agent → the topic filter must stay quiet.
+    assert _source_allowed_for_report(petroleum_source, query="储能行业 2026") is True
+    # A query that IS about AI Agent → the petroleum source should be excluded.
+    assert _source_allowed_for_report(petroleum_source, query="ai agent 行业研究") is False
+
+
+def test_readpage_evidence_id_includes_task_and_role_slots():
+    """The same source url + index, seen by two tasks, must produce distinct ids."""
+
+    base_card = {
+        "subject": "ACME",
+        "action_or_signal": "ships",
+        "distilled_fact": "ACME shipped 1m units in 2025.",
+        "fact_type": "metric",
+        "variable": "shipments",
+        "scope": "global",
+        "value": "1m",
+        "unit": "units",
+    }
+    card_a, _ = _validated_card(
+        dict(base_card),
+        source_url="https://reuters.com/news/12345",
+        source_ref="S-1",
+        source_level="B",
+        verification_status="readpage_verified",
+        proof_role="metric",
+        chapter_id="ch_01",
+        search_task={"task_id": "T1", "proof_role": "metric"},
+        index=0,
+    )
+    card_b, _ = _validated_card(
+        dict(base_card),
+        source_url="https://reuters.com/news/12345",
+        source_ref="S-1",
+        source_level="B",
+        verification_status="readpage_verified",
+        proof_role="case",
+        chapter_id="ch_02",
+        search_task={"task_id": "T2", "proof_role": "case"},
+        index=0,
+    )
+    assert card_a is not None and card_b is not None
+    assert card_a["evidence_id"] != card_b["evidence_id"]
+
+
+def test_validate_llm_analysis_output_early_return_carries_counter_fields():
+    """The no-valid-refs early return must still surface count fields."""
+
+    payload = {
+        "chapter_synthesis": [
+            {
+                "chapter_id": "ch_01",
+                "claim_units": [
+                    {
+                        "claim": "x",
+                        "used_evidence_ids": ["EV-FAKE"],
+                        "evidence_basis": ["a"],
+                        "reasoning_chain": ["b"],
+                        "limitation_boundary": ["c"],
+                    }
+                ],
+            }
+        ]
+    }
+    validation = validate_llm_analysis_output(payload, {})
+    # Even on the early-exit path we publish the counts so downstream
+    # diagnostics don't show `None`.
+    for key in ("usable_claim_count", "dropped_claim_count", "usable_chapter_count"):
+        assert key in validation
+        assert validation[key] == 0
+
+
+def test_load_stage_snapshot_returns_corrupt_on_bad_manifest(tmp_path, monkeypatch):
+    """A truncated manifest.json must not crash the loader."""
+
+    from rag_pipeline.cache import stage_snapshot_cache
+
+    monkeypatch.setenv("STAGE_SNAPSHOT_CACHE_PATH", str(tmp_path))
+    run_dir = tmp_path / "run-1" / "evidence_package"
+    run_dir.mkdir(parents=True)
+    (run_dir / "manifest.json").write_text("{not json", encoding="utf-8")
+    result = stage_snapshot_cache.load_stage_snapshot("run-1", "evidence_package")
+    assert result["status"] == "corrupt"
+    assert "error" in result

@@ -474,6 +474,14 @@ def compile_report_layout(
         "forbid_fixed_micro_sections": True,
         "profile_aware_contract": True,
         "chapter_must_have_question": True,
+        "chapter_source": str(
+            _as_dict(research_plan.get("quality_rules")).get("chapter_source")
+            or (
+                "problem_framing_hypotheses"
+                if _as_dict(research_plan.get("quality_rules")).get("chapters_come_from_hypotheses")
+                else "profile_module_selection"
+            )
+        ),
         "layout_stage": "compiled_dynamic_report_structure",
     }
     blueprint = {

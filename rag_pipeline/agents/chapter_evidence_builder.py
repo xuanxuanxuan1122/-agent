@@ -48,15 +48,36 @@ GENERIC_CHAPTER_TERMS = {
 
 
 BAD_FACT_PATTERNS = [
+    r"^\s*-?\d{2,6}(?:\.\d+)?\s*(?:$|[;,\.\u3002\uff1b\uff0c])",
+    r"^\s*(?:fact|key fact|metric|source_check|status|policy target|competitive comparison|cost)\s*[:\uff1a]\s*-?\d{1,6}(?:\.\d+)?\b",
+    r"^\s*(?:\u4e8b\u5b9e|\u5173\u952e\u4e8b\u5b9e|\u7ade\u4e89\u5bf9\u6bd4|\u653f\u7b56\u76ee\u6807|\u653f\u7b56\u76d1\u7ba1|\u6210\u672c)\s*[:\uff1a]\s*-?\d{1,6}(?:\.\d+)?\b",
+    r"^\s*(?:\u5185\u5bb9\u8bf4\u660e|\u65f6\u95f4)\s*[:\uff1a]",
+    r"\u4ec0\u4e48\u662f.*(?:AI\s*Agent|\u667a\u80fd\u4f53)",
+    r"\u6700\u65b0\u62a5\u9053|\u539f\u521b#|##\s*|\u80a1\u7968\s*#",
+    r"Google\s+Patents|CN\d{6,}[A-Z]?",
     r"\u519c\u4e1a\u4eba\u5de5\u667a\u80fd",
     r"\u6570\u636e\u6295\u6bd2",
     r"\u7eba\u7ec7",
     r"\u667a\u80fd\u624b\u673a",
+    r"\u6982\u5ff5\u80a1|\u6da8\u505c|\u5343\u4ebf\u4ff1\u4e50\u90e8|\u591a\u80a1\u5f3a\u52bf",
+    r"A\u80a1-\u7814\u62a5\u8be6\u60c5|\u624b\u673a\u65b0\u6d6a\u7f51|_\u624b\u673a\u65b0\u6d6a\u7f51",
+    r"\u62db\u6807\u7f16\u53f7\s*\u70b9\u51fb\u67e5\u770b|\u62db\u6807\u4f30\u4ef7\s*\u70b9\u51fb\u67e5\u770b|\u62a5\u540d\u622a\u6b62\u65f6\u95f4\s*\u70b9\u51fb\u67e5\u770b|\u6295\u6807\u622a\u6b62\u65f6\u95f4\s*\u70b9\u51fb\u67e5\u770b",
+    r"\u5b98\u65b9\u6296\u97f3\u3001\u5feb\u624b|\u4e00\u5e74\u591a\u5c11\u94b1|\u771f\u5b9e\u62a5\u4ef7|\u6743\u5a01\u6307\u5357",
+    r"\u00a9\u8457\u4f5c\u6743|\u8f6c\u8f7d\u6388\u6743|\u5c06\u8ffd\u7a76\u6cd5\u5f8b\u8d23\u4efb",
     r"Scribd",
     r"SEO",
     r"example\.(?:com|gov|org)",
     r"Official data shows AI agent adoption reached 50%",
     r"^URL[:\uff1a]",
+    r"Skip to (?:content|main content)",
+    r"picture intentionally omitted",
+    r"\*\*==>\s*picture intentionally omitted\s*<==\*\*",
+    r"登录\s+首页|上一篇|下一篇|分享到|AI帮你提炼|智能挖掘|智享会员|会员积分",
+    r"首页问\s*·\s*答|热搜公司|热搜词|登录注册",
+    r"Caret right|View all products|Product\s+Documentation",
+    r"^\s*(?:事实|竞争对比|关键事实|政策目标)\s*[:：]\s*-?\d{1,3}(?:\.\d+)?\b",
+    r"^\s*-?\d{1,3}(?:\.\d+)?\s*[;；，,]",
+    r"以下是对整篇.*(?:深度分析|框架提炼)",
 ]
 
 
@@ -87,7 +108,8 @@ def _compact(value: Any, max_chars: int = 320) -> str:
 
 def _fact_text(item: Dict[str, Any]) -> str:
     return _compact(
-        item.get("fact")
+        item.get("distilled_fact")
+        or item.get("fact")
         or item.get("clean_fact")
         or item.get("content")
         or item.get("evidence")
@@ -102,6 +124,391 @@ def _bad_fact_text(text: str) -> bool:
     if not str(text or "").strip():
         return True
     return any(re.search(pattern, text, flags=re.I) for pattern in BAD_FACT_PATTERNS)
+
+
+def _navigation_or_search_text(text: Any) -> bool:
+    value = str(text or "").strip()
+    return bool(
+        re.search(
+            r"(skip\s+to\s+(?:content|main content)|Product\s+Solutions\s+Resources|"
+            r"login\s+contact\s+us|search\s+results?|related\s+articles?|"
+            r"\u767b\u5f55|\u9996\u9875|\u5bfc\u822a|\u641c\u7d22|\u4e0b\u8f7d|\u76ee\u5f55)",
+            value,
+            flags=re.I,
+        )
+    )
+
+
+def _source_host(url: str) -> str:
+    match = re.search(r"https?://([^/]+)", str(url or "").strip().lower())
+    return match.group(1) if match else ""
+
+
+def _fact_type(item: Dict[str, Any]) -> str:
+    role_text = _role_text(item).lower()
+    if _metric_ready(item):
+        return "metric"
+    if _is_counter(item):
+        return "counter"
+    if _is_case(item):
+        return "case"
+    if re.search(r"technology|standard|patent|roadmap|maturity|技术|标准|专利|架构|路线|模型|平台|产品", role_text, flags=re.I):
+        return "technology"
+    if re.search(r"policy|regulation|official|filing|公告|监管|政策|年报|财报|披露", role_text, flags=re.I):
+        return "source_check"
+    return "directional"
+
+
+def _topic_relevance(item: Dict[str, Any]) -> str:
+    text = " ".join(
+        str(item.get(key) or "")
+        for key in ("fact", "clean_fact", "content", "summary", "title", "source_title", "metric", "indicator")
+    )
+    has_agent = bool(re.search(r"\bAI\s*Agent\b|agentic|智能体|企业级智能体|AI智能体", text, flags=re.I))
+    has_general_ai = bool(re.search(r"人工智能|大模型|生成式AI|AI\s+", text, flags=re.I))
+    if has_agent:
+        return "strong"
+    if has_general_ai:
+        return "medium"
+    return "weak"
+
+
+def _distill_fact(item: Dict[str, Any], *, max_chars: int = 220) -> str:
+    fact = _fact_text(item)
+    fact = re.sub(r"<[^>]+>", "", fact)
+    fact = re.sub(r"\[[Pp][Dd][Ff]\]\s*", "", fact)
+    fact = re.sub(r"https?://\S+", "", fact)
+    fact = re.sub(r"\b(?:Read page|content description)[:：]?\s*", "", fact, flags=re.I)
+    fact = re.sub(r"^(?:摘要|标题|来源|事实|关键事实)[:：\s]*", "", fact).strip()
+    fact = re.sub(r"^.{0,140}?（\s*）[:：]\s*", "", fact)
+    fact = re.sub(r"^#{1,6}\s*", "", fact)
+    fact = re.sub(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:[+-]\d{2}:\d{2})?", "", fact)
+    fact = re.sub(r"\s+", " ", fact).strip(" ；;，,。")
+    if not fact or _bad_fact_text(fact):
+        metric = _compact(item.get("metric") or item.get("indicator"), 80)
+        value = _compact(item.get("value") or item.get("display_value") or item.get("numeric_value"), 80)
+        if metric and value and not _invalid_metric(item):
+            fact = f"{metric}: {value}"
+        else:
+            return ""
+    parts: List[str] = []
+    seen = set()
+    for part in re.split(r"[。；;\n]+", fact):
+        part = _compact(part.strip(), max_chars)
+        if not part or _bad_fact_text(part):
+            continue
+        if len(part) > 80 and re.search(r"登录|首页|上一篇|下一篇|分享到|Product|Solutions|Resources", part, flags=re.I):
+            continue
+        key = re.sub(r"\W+", "", part.lower())[:100]
+        if key in seen:
+            continue
+        seen.add(key)
+        parts.append(part)
+        if len(parts) >= 2:
+            break
+    return "；".join(parts)[:max_chars].rstrip("；;，,。")
+
+
+def _report_fact_sentence(item: Dict[str, Any], text: str, *, max_chars: int = 150) -> str:
+    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    value = re.sub(r"https?://\S+", "", value)
+    value = re.sub(r"\[[Pp][Dd][Ff]\]\s*", "", value)
+    value = re.sub(r"\b(?:Read page|content description)[:：]?\s*", "", value, flags=re.I)
+    value = value.strip(" \t\r\n：:；;，,。")
+    metric = _compact(item.get("metric") or item.get("indicator"), 50)
+    metric_value = _compact(item.get("value") or item.get("display_value") or item.get("numeric_value"), 40)
+    unit = _compact(item.get("unit") or item.get("numeric_unit"), 20)
+    scope = _compact(item.get("scope") or item.get("market_scope") or _time_or_scope(value), 40)
+    subject = _compact(item.get("subject") or item.get("company") or item.get("entity"), 60)
+    if metric and metric_value and not _invalid_metric(item):
+        prefix = f"{subject}的" if subject else ""
+        normalized_unit = {
+            "percent": "%",
+            "ratio": "",
+            "count": "",
+            "currency_cny": "",
+            "unknown": "",
+        }.get(unit.lower(), unit)
+        suffix = normalized_unit if normalized_unit and normalized_unit not in metric_value else ""
+        tail = f"（{scope}）" if scope else ""
+        return _compact(f"{prefix}{metric}为{metric_value}{suffix}{tail}", max_chars)
+    for separator in ("：", ":"):
+        if separator not in value:
+            continue
+        head, rest = value.split(separator, 1)
+        head = head.strip()
+        rest = rest.strip(" ：:；;，,。")
+        if len(rest) >= 18 and (
+            len(head) >= 6
+            or re.search(r"报告|专题|研究|网站|Archives|Page|IDC|Gartner|政府|新闻|动态|快讯|虎嗅|研报|PDF", head, flags=re.I)
+        ):
+            value = rest
+            break
+    value = re.sub(r"\s*\|\s*", "，", value)
+    value = re.sub(r"\.{2,}", "...", value)
+    candidates = [
+        part.strip(" ：:；;，,。")
+        for part in re.split(r"[。；;\n]+", value)
+        if part and part.strip(" ：:；;，,。")
+    ]
+    for part in candidates:
+        if _bad_fact_text(part) or _navigation_or_search_text(part):
+            continue
+        if len(part) < 12:
+            continue
+        return _compact(part, max_chars)
+    return _compact(value, max_chars)
+
+
+def _time_or_scope(text: str) -> str:
+    matches = re.findall(r"(?:20\d{2}|19\d{2})(?:[-/年]\d{1,2}(?:[-/月]\d{1,2}日?)?)?", text or "")
+    if matches:
+        return matches[0]
+    if re.search(r"\u5168\u7403", text):
+        return "\u5168\u7403"
+    if re.search(r"\u4e2d\u56fd|\u56fd\u5185", text):
+        return "\u4e2d\u56fd"
+    return ""
+
+
+PUBLISHER_TITLE_TOKENS = {
+    "ijiwei",
+    "36kr",
+    "36氪",
+    "sina",
+    "sohu",
+    "baidu",
+    "zhihu",
+    "爱集微",
+    "财联社",
+    "界面",
+    "新浪",
+    "腾讯",
+    "网易",
+    "搜狐",
+    "百度",
+    "知乎",
+    "雪球",
+    "虎嗅",
+    "钛媒体",
+    "亿欧",
+    "证券时报",
+    "证券日报",
+    "中国证券网",
+    "人民网",
+    "新华社",
+    "央视",
+    "凤凰网",
+    "公众号",
+}
+PUBLISHER_DOMAIN_RE = re.compile(
+    r"\b(?:ijiwei|36kr|sina|qq|sohu|baidu|zhihu|caixin|cls|stcn|cnstock|xinhuanet|people|ifeng|netease)\b|[a-z0-9-]+\.(?:com|cn|net|org)",
+    re.I,
+)
+METRIC_VARIABLE_ALLOWED_RE = re.compile(
+    r"规模|增速|收入|利润|价格|成本|订单|采购|续约|复购|渗透率|份额|占比|ROI|客户|部署|流程|安全|治理|权限|可靠|竞争|玩家|场景|落地|商业化|技术",
+    re.I,
+)
+
+
+def _looks_like_publisher_or_domain(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    if any(token.lower() in lowered for token in PUBLISHER_TITLE_TOKENS):
+        return True
+    if PUBLISHER_DOMAIN_RE.search(lowered):
+        return True
+    return bool(re.search(r"[\u4e00-\u9fff]+-[a-z][a-z0-9-]{2,}", text, flags=re.I))
+
+
+def _fact_subject(text: str, item: Dict[str, Any]) -> str:
+    for key in ("subject", "company", "entity", "actor"):
+        title = _compact(item.get(key), 60)
+        if title and not _looks_like_publisher_or_domain(title):
+            return title
+    text = re.sub(r"^[#\s]+", "", text or "")
+    for sep in ("：", ":", "，", ",", "。"):
+        if sep in text:
+            candidate = _compact(text.split(sep, 1)[0], 60)
+            if 2 <= len(candidate) <= 60 and not _bad_fact_text(candidate) and not _looks_like_publisher_or_domain(candidate):
+                return candidate
+    candidate = _compact(text, 40)
+    return "" if _looks_like_publisher_or_domain(candidate) else candidate
+
+
+def _fact_action(text: str, fact_type: str) -> str:
+    if fact_type == "metric":
+        return "\u663e\u793a"
+    if fact_type == "counter":
+        return "\u63d0\u793a\u98ce\u9669"
+    if re.search(r"\u53d1\u5e03|\u63a8\u51fa|\u4e0a\u7ebf|\u90e8\u7f72|\u91c7\u8d2d|\u4e2d\u6807|\u6295\u8d44", text or ""):
+        return "\u843d\u5730"
+    if fact_type == "technology":
+        return "\u4f53\u73b0"
+    if fact_type == "case":
+        return "\u9a8c\u8bc1"
+    return "\u8868\u660e"
+
+
+def _fact_variable(fact_type: str) -> str:
+    return {
+        "metric": "\u89c4\u6a21\u4e0e\u589e\u901f",
+        "case": "\u5ba2\u6237\u4e0e\u843d\u5730",
+        "technology": "\u6280\u672f\u6210\u719f\u5ea6",
+        "counter": "\u98ce\u9669\u8fb9\u754c",
+        "source_check": "\u6765\u6e90\u6838\u9a8c",
+    }.get(fact_type, "\u65b9\u5411\u6027\u4fe1\u53f7")
+
+
+def _analysis_variable(item: Dict[str, Any], fact_type: str, text: str) -> str:
+    metric = str(item.get("metric") or item.get("indicator") or "").strip()
+    if metric and METRIC_VARIABLE_ALLOWED_RE.search(metric):
+        return _compact(metric, 40)
+    if fact_type == "case":
+        return "\u5ba2\u6237\u843d\u5730\u4e0e\u5e94\u7528\u573a\u666f"
+    if fact_type == "counter":
+        if re.search(r"\u6210\u672c|ROI|\u4ef7\u503c|\u5546\u4e1a", text, flags=re.I):
+            return "\u6210\u672c\u4e0e\u5546\u4e1a\u4ef7\u503c\u98ce\u9669"
+        if re.search(r"\u5b89\u5168|\u6cbb\u7406|\u8d23\u4efb|\u53ef\u9760", text, flags=re.I):
+            return "\u5b89\u5168\u6cbb\u7406\u4e0e\u8d23\u4efb\u8fb9\u754c"
+        return "\u98ce\u9669\u89e6\u53d1\u6761\u4ef6"
+    if fact_type == "technology":
+        return "\u6280\u672f\u6210\u719f\u5ea6\u4e0e\u90e8\u7f72\u7ea6\u675f"
+    if fact_type == "metric":
+        return "\u6307\u6807\u53e3\u5f84\u4e0e\u53ef\u6bd4\u6027"
+    if fact_type == "source_check":
+        return "\u6765\u6e90\u53ef\u6838\u9a8c\u6027"
+    if re.search(r"\u7ade\u4e89|\u73a9\u5bb6|\u6e20\u9053|\u5e73\u53f0|\u4f9b\u7ed9", text, flags=re.I):
+        return "\u7ade\u4e89\u4e0e\u4f9b\u7ed9\u53d8\u91cf"
+    if re.search(r"\u9700\u6c42|\u5ba2\u6237|\u4ed8\u8d39|\u4f7f\u7528", text, flags=re.I):
+        return "\u9700\u6c42\u4e0e\u4ed8\u8d39\u53d8\u91cf"
+    return _fact_variable(fact_type)
+
+
+def _block_affinity(item: Dict[str, Any], fact_type: str, text: str) -> List[str]:
+    role_text = _role_text(item)
+    combined = f"{role_text} {text}"
+    affinity: List[str] = []
+    if fact_type == "metric" or re.search(r"\u89c4\u6a21|\u589e\u901f|ROI|\u6210\u672c|\u4ef7\u683c|\u8425\u6536|\u5229\u6da6|%|\u4ebf|\u4e07", combined, flags=re.I):
+        affinity.extend(["metric_reconciliation", "unit_economics"])
+    if fact_type == "technology" or re.search(r"\u6280\u672f|\u6807\u51c6|\u67b6\u6784|\u6a21\u578b|\u5de5\u5177|\u5e73\u53f0|\u90e8\u7f72|\u53ef\u9760|\u5b89\u5168|\u6cbb\u7406", combined, flags=re.I):
+        affinity.append("technology_maturity")
+    if fact_type == "counter" or re.search(r"\u98ce\u9669|\u5931\u8d25|\u53d6\u6d88|\u6210\u672c|\u8d23\u4efb|\u8fb9\u754c|guardrail|risk", combined, flags=re.I):
+        affinity.extend(["risk_trigger", "scenario_analysis", "verification_checklist"])
+    if fact_type == "case" or re.search(r"\u5ba2\u6237|\u6848\u4f8b|\u8ba2\u5355|\u4e2d\u6807|\u91c7\u8d2d|\u843d\u5730|\u5e94\u7528|\u5de5\u4f5c\u6d41|workflow|customer|case", combined, flags=re.I):
+        affinity.extend(["customer_painpoint_matrix", "case_comparison", "competitive_positioning"])
+    if re.search(r"\u7ade\u4e89|\u73a9\u5bb6|\u4f9b\u7ed9|\u6e20\u9053|\u5e73\u53f0|vendor|platform", combined, flags=re.I):
+        affinity.append("competitive_positioning")
+    if not affinity:
+        affinity.extend(["thesis", "evidence_matrix"])
+    result: List[str] = []
+    for item_value in affinity:
+        if item_value not in result:
+            result.append(item_value)
+    return result
+
+
+def _claim_strength_hint(item: Dict[str, Any]) -> str:
+    level = _source_level(item)
+    verified = str(item.get("source_verification_status") or item.get("verification_status") or "").strip().lower()
+    if level in {"A", "B"} and verified in {"readpage_verified", "document_verified"}:
+        return "strong"
+    if level in {"A", "B"}:
+        return "moderate"
+    if level == "C" and _traceable(item):
+        return "directional"
+    return "weak"
+
+
+def _public_fact_card(item: Dict[str, Any], distilled: str) -> Dict[str, Any]:
+    text = _report_fact_sentence(item, distilled, max_chars=150)
+    if not text or len(text) < 18 or _bad_fact_text(text):
+        return {}
+    if re.search(r"\u4ec0\u4e48\u662f|\u6700\u65b0\u62a5\u9053|\u641c\u7d22|\u9996\u9875|Google\s+Patents|^\s*#", text, flags=re.I):
+        return {}
+    fact_type = _fact_type(item)
+    ref = _evidence_ref(item) or str(item.get("source_ref") or item.get("citation_ref") or "").strip()
+    source_level = _source_level(item)
+    variable = _analysis_variable(item, fact_type, text)
+    affinity = _block_affinity(item, fact_type, text)
+    return {
+        "subject": _fact_subject(text, item),
+        "action": _fact_action(text, fact_type),
+        "action_or_signal": _fact_action(text, fact_type),
+        "object": text,
+        "fact": text,
+        "distilled_fact": text,
+        "time_or_scope": _time_or_scope(text),
+        "variable": variable,
+        "analysis_variable": variable,
+        "block_affinity": affinity,
+        "fact_type": fact_type,
+        "source_ref": ref,
+        "source_level": source_level,
+        "claim_strength_hint": _claim_strength_hint(item),
+        "directional_only": source_level == "C" or _claim_strength_hint(item) in {"directional", "weak"},
+    }
+
+
+def _public_fact_quality(item: Dict[str, Any]) -> Dict[str, Any]:
+    fact = _fact_text(item)
+    distilled = _distill_fact(item)
+    level = _source_level(item)
+    url = _source_url(item)
+    host = _source_host(url)
+    traceable = _traceable(item)
+    rejection: List[str] = []
+    if not distilled:
+        rejection.append("empty_or_bad_fact")
+    if _invalid_metric(item):
+        rejection.append("invalid_metric")
+    if _fact_type(item) == "metric" and (
+        not str(item.get("subject") or item.get("company") or item.get("entity") or "").strip()
+        or not (str(item.get("scope") or item.get("market_scope") or "").strip() or _time_or_scope(distilled))
+    ):
+        rejection.append("no_subject_or_scope")
+    if _navigation_or_search_text(fact):
+        rejection.append("navigation_text")
+    if _bad_fact_text(fact):
+        rejection.append("bad_fact_pattern")
+    if _source_identity_bad(item):
+        rejection.append("source_identity_bad")
+    if _low_quality_source(item):
+        rejection.append("low_quality_source")
+    if _topic_relevance(item) == "weak":
+        rejection.append("weak_topic_relevance")
+    if level == "D":
+        rejection.append("source_level_d")
+    if not traceable:
+        rejection.append("not_traceable")
+    if host and re.search(r"(?:twitter|x|instagram|facebook|baike|baijiahao|csdn|cnblogs|juejin)\.", host, flags=re.I):
+        rejection.append("blocked_host")
+    fact_card = _public_fact_card(item, distilled) if not rejection else {}
+    if fact_card:
+        required_missing = [
+            key
+            for key in ("subject", "action_or_signal", "variable", "distilled_fact", "source_ref", "source_level", "block_affinity")
+            if not fact_card.get(key)
+        ]
+        if required_missing:
+            rejection.append("fact_card_required_field_missing")
+        if fact_card.get("fact_type") == "metric" and not fact_card.get("time_or_scope"):
+            rejection.append("no_subject_or_scope")
+    if not fact_card:
+        rejection.append("fact_card_missing")
+    eligible = not rejection and bool(fact_card)
+    eligible_for_citation = bool(eligible and traceable and level in {"A", "B", "C"})
+    return {
+        "eligible_for_report": eligible,
+        "eligible_for_citation": eligible_for_citation,
+        "fact_type": _fact_type(item),
+        "topic_relevance": _topic_relevance(item),
+        "rejection_reason": rejection,
+        "distilled_fact": distilled,
+        "public_fact_card": fact_card,
+    }
 
 
 def _source_url(item: Dict[str, Any]) -> str:
@@ -172,9 +579,12 @@ def _low_quality_source(item: Dict[str, Any]) -> bool:
 def _invalid_metric(item: Dict[str, Any]) -> bool:
     metric = str(item.get("metric") or item.get("indicator") or "").strip()
     value = str(item.get("value") or item.get("display_value") or item.get("numeric_value") or "").strip()
+    unit = str(item.get("unit") or item.get("numeric_unit") or "").strip().lower()
     fact = _fact_text(item)
     metric_lower = metric.lower()
     if str(item.get("metric_validation_status") or "").strip().lower() == "invalid":
+        return True
+    if unit == "unknown":
         return True
     if metric_lower in {"source_check", "status", "http_status", "response_code"} and re.fullmatch(r"[1-5]\d{2}", value):
         return True
@@ -312,21 +722,72 @@ def _normalize_item(item: Dict[str, Any], source_lookup: Optional[Dict[str, Dict
     copied.setdefault("source_level", _source_level(copied))
     copied["source_traceable"] = _traceable(copied)
     copied["metric_ready"] = _metric_ready(copied)
+    quality = _public_fact_quality(copied)
+    copied["public_fact_quality"] = quality
+    copied["distilled_fact"] = quality.get("distilled_fact") or ""
+    copied["public_fact_card"] = _as_dict(quality.get("public_fact_card"))
+    copied["eligible_for_report"] = bool(quality.get("eligible_for_report"))
+    copied["eligible_for_citation"] = bool(quality.get("eligible_for_citation"))
+    copied["fact_type"] = quality.get("fact_type")
     return copied
 
 
-def _seed_items(evidence_package: Dict[str, Any], source_lookup: Optional[Dict[str, Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
-    seeds: List[Dict[str, Any]] = []
+def _normalized_seed_candidates(evidence_package: Dict[str, Any], source_lookup: Optional[Dict[str, Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
     for key in ("analysis_ready_evidence", "clean_evidence_list", "normalized_evidence", "raw_data_points"):
         for item in _as_list(evidence_package.get(key)):
             if not isinstance(item, dict):
                 continue
             normalized = _normalize_item(item, source_lookup)
-            fact = _fact_text(normalized)
-            if _bad_fact_text(fact) or _invalid_metric(normalized) or _low_quality_source(normalized):
-                continue
-            seeds.append(normalized)
-    return _dedupe_items(seeds)
+            normalized["source_collection"] = key
+            candidates.append(normalized)
+    return _dedupe_items(candidates)
+
+
+def _seed_items(evidence_package: Dict[str, Any], source_lookup: Optional[Dict[str, Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+    return [
+        item
+        for item in _normalized_seed_candidates(evidence_package, source_lookup)
+        if bool(_as_dict(item.get("public_fact_quality")).get("eligible_for_report"))
+    ]
+
+
+def _public_filter_summary(candidates: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    total = 0
+    eligible = 0
+    citation_eligible = 0
+    fact_cards = 0
+    invalid_metric = 0
+    reasons: Dict[str, int] = {}
+    fact_types: Dict[str, int] = {}
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        total += 1
+        quality = _as_dict(item.get("public_fact_quality"))
+        if quality.get("eligible_for_report"):
+            eligible += 1
+        if quality.get("eligible_for_citation"):
+            citation_eligible += 1
+        if _as_dict(quality.get("public_fact_card")):
+            fact_cards += 1
+        if "invalid_metric" in _as_list(quality.get("rejection_reason")):
+            invalid_metric += 1
+        fact_type = str(quality.get("fact_type") or "unknown")
+        fact_types[fact_type] = fact_types.get(fact_type, 0) + 1
+        for reason in _as_list(quality.get("rejection_reason")):
+            reason_text = str(reason or "").strip() or "unknown"
+            reasons[reason_text] = reasons.get(reason_text, 0) + 1
+    return {
+        "candidate_fact_count": total,
+        "eligible_fact_count": eligible,
+        "eligible_citation_count": citation_eligible,
+        "fact_card_count": fact_cards,
+        "filtered_fact_count": max(0, total - eligible),
+        "invalid_metric_filtered_count": invalid_metric,
+        "rejection_reasons": reasons,
+        "fact_type_distribution": fact_types,
+    }
 
 
 def _items_from_existing_chapter(
@@ -353,7 +814,8 @@ def _items_from_existing_chapter(
             copied = dict(item)
             copied.setdefault("chapter_id", chapter_id)
             normalized = _normalize_item(copied, source_lookup)
-            if _low_quality_source(normalized):
+            quality = _as_dict(normalized.get("public_fact_quality"))
+            if not bool(quality.get("eligible_for_report")):
                 continue
             items.append(normalized)
     return _dedupe_items(items)
@@ -550,6 +1012,75 @@ def _layer_evidence(items: Sequence[Dict[str, Any]]) -> Dict[str, List[Dict[str,
     }
 
 
+def _fact_cards_from_layers(layered: Dict[str, List[Dict[str, Any]]], *, limit: int = 8) -> List[Dict[str, Any]]:
+    cards: List[Dict[str, Any]] = []
+    seen = set()
+    for key in ("core_evidence", "metric_evidence", "case_evidence", "counter_evidence", "supporting_evidence", "directional_evidence"):
+        for item in _as_list(layered.get(key)):
+            if not isinstance(item, dict):
+                continue
+            card = _as_dict(item.get("public_fact_card") or _as_dict(item.get("public_fact_quality")).get("public_fact_card"))
+            if not card:
+                continue
+            card = dict(card)
+            card.setdefault("evidence_layer", key)
+            ref = str(card.get("source_ref") or _evidence_ref(item) or "").strip()
+            card["source_ref"] = ref
+            dedupe_key = (ref, re.sub(r"\W+", "", str(card.get("fact") or "").lower())[:120])
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            cards.append(card)
+            if len(cards) >= limit:
+                return cards
+    return cards
+
+
+def _chapter_analysis_from_fact_cards(chapter: Dict[str, Any], layered: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+    cards = _fact_cards_from_layers(layered, limit=8)
+    if not cards:
+        return {
+            "chapter_analysis_valid": False,
+            "fact_card_count": 0,
+            "dropped_template_fallback_count": 1,
+            "fact_cards": [],
+        }
+    strong_cards = [card for card in cards if str(card.get("claim_strength_hint") or "") in {"strong", "moderate"}]
+    directional_cards = [card for card in cards if str(card.get("claim_strength_hint") or "") in {"directional", "weak"}]
+    basis_cards = cards[:4]
+    evidence_basis = [
+        _compact(str(card.get("fact") or card.get("object") or ""), 180)
+        for card in basis_cards
+        if str(card.get("fact") or card.get("object") or "").strip()
+    ]
+    thesis_strength = "moderate" if strong_cards else "directional"
+    variables: List[str] = []
+    block_counts: Dict[str, int] = {}
+    for card in cards:
+        variable = str(card.get("analysis_variable") or card.get("variable") or "").strip()
+        if variable and variable not in variables:
+            variables.append(variable)
+        for block in _as_list(card.get("block_affinity")):
+            block_text = str(block or "").strip()
+            if block_text:
+                block_counts[block_text] = block_counts.get(block_text, 0) + 1
+    return {
+        "chapter_analysis_valid": True,
+        "fact_card_count": len(cards),
+        "directional_fact_card_count": len(directional_cards),
+        "strong_fact_card_count": len(strong_cards),
+        "chapter_thesis": "",
+        "evidence_basis": evidence_basis,
+        "mechanism": "",
+        "boundary": "",
+        "analysis_variables": variables[:4],
+        "block_fact_card_counts": block_counts,
+        "used_fact_refs": [card.get("source_ref") for card in cards if card.get("source_ref")],
+        "claim_strength": thesis_strength,
+        "fact_cards": cards,
+    }
+
+
 def _existing_chapters(report_blueprint: Dict[str, Any], existing: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     existing_by_id = {
         str(item.get("chapter_id") or "").strip(): dict(item)
@@ -586,7 +1117,13 @@ def build_chapter_evidence_packages_from_evidence_package(
     evidence_package = _as_dict(evidence_package)
     source_lookup = _source_registry_lookup(source_registry)
     evidence_analysis_by_chapter = _as_dict(evidence_package.get("evidence_analysis_by_chapter"))
-    seeds = _seed_items(evidence_package, source_lookup)
+    seed_candidates = _normalized_seed_candidates(evidence_package, source_lookup)
+    public_filter_summary = _public_filter_summary(seed_candidates)
+    seeds = [
+        item
+        for item in seed_candidates
+        if bool(_as_dict(item.get("public_fact_quality")).get("eligible_for_report"))
+    ]
     lookup = _lookup_by_ref(seeds)
     chapters = _existing_chapters(_as_dict(report_blueprint), list(existing_chapter_evidence_packages or []))
     if not chapters:
@@ -618,7 +1155,11 @@ def build_chapter_evidence_packages_from_evidence_package(
         ]
         matched = _dedupe_items([*resolved, *existing_items, *[item for _, item in scored]])
         layered = _layer_evidence(matched)
+        chapter_analysis = _chapter_analysis_from_fact_cards(chapter, layered)
         hydrated_count = sum(len(layered.get(key, [])) for key in EVIDENCE_LAYER_KEYS)
+        chapter_public_filter_summary = _public_filter_summary(matched)
+        writable_fact_count = int(chapter_public_filter_summary.get("eligible_fact_count") or 0)
+        eligible_citation_count = int(chapter_public_filter_summary.get("eligible_citation_count") or 0)
         binding_reasons: Dict[str, int] = {}
         for item in matched:
             reason = str(item.get("binding_reason") or "unknown")
@@ -628,6 +1169,12 @@ def build_chapter_evidence_packages_from_evidence_package(
         metadata["hydrated_evidence"] = bool(hydrated_count)
         metadata["hydrated_evidence_count"] = hydrated_count
         metadata["source_pool_size"] = len(seeds)
+        metadata["public_fact_filter_summary"] = chapter_public_filter_summary
+        metadata["global_public_fact_filter_summary"] = public_filter_summary
+        metadata["writable_fact_count"] = writable_fact_count
+        metadata["eligible_citation_count"] = eligible_citation_count
+        metadata["fact_card_count"] = int(chapter_analysis.get("fact_card_count") or 0)
+        metadata["chapter_analysis_valid"] = bool(chapter_analysis.get("chapter_analysis_valid"))
         metadata["existing_chapter_evidence_count"] = len(existing_items)
         metadata["matched_evidence_count"] = len(matched)
         metadata["binding_reasons"] = binding_reasons
@@ -655,6 +1202,13 @@ def build_chapter_evidence_packages_from_evidence_package(
                 "case_evidence_count": len(layered["case_evidence"]),
                 "directional_evidence_count": len(layered["directional_evidence"]),
                 "unresolved_evidence_ref_count": len(unresolved_refs),
+                "public_fact_filter_summary": chapter_public_filter_summary,
+                "global_public_fact_filter_summary": public_filter_summary,
+                "writable_fact_count": writable_fact_count,
+                "eligible_citation_count": eligible_citation_count,
+                "chapter_analysis": chapter_analysis,
+                "fact_card_count": int(chapter_analysis.get("fact_card_count") or 0),
+                "chapter_analysis_valid": bool(chapter_analysis.get("chapter_analysis_valid")),
             }
         )
         result.append(chapter)

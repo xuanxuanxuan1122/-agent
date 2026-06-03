@@ -5,6 +5,8 @@ import re
 from typing import Any, Dict, Iterable, List, Sequence
 
 from .public_report_sanitizer import has_internal_gap_language, rewrite_internal_gap_language
+from .report_contracts import normalize_evidence_refs
+from .summary_quality import sanitize_summary_judgments
 
 
 INTERNAL_LAYOUT_PHRASES = [
@@ -36,6 +38,12 @@ INTERNAL_LAYOUT_PHRASES = [
     "决策含义与后续观察优先级",
     "关联证据",
     "章节关系与参考分析",
+    "\u4e0e\u672c\u7ae0\u5224\u65ad\u76f4\u63a5\u76f8\u5173",
+    "\u540e\u7eed\u5206\u6790\u9700\u8981",
+    "\u53ea\u6709\u4e3b\u4f53\u3001\u8303\u56f4\u548c\u671f\u95f4\u4e00\u81f4",
+    "\u5f71\u54cd\u7684\u662f\u5546\u4e1a\u5316\u6df1\u5ea6",
+    "\u5f71\u54cd\u7684\u662f\u5e02\u573a\u7a7a\u95f4\u5224\u65ad",
+    "\u4e0d\u80fd\u5916\u63a8\u4e3a\u666e\u904d\u4ed8\u8d39\u80fd\u529b",
 ]
 
 INTERNAL_SECTION_TITLE_PATTERNS = [
@@ -97,15 +105,15 @@ PUBLIC_TERM_REPLACEMENTS = {
 }
 
 PUBLIC_PROCESS_REWRITES = [
-    (r"该信号需要同时穿过场景、主体和口径三层约束，才能从单点事实变成可复制结论。材料中已经出现的可观察事实是[:：]", "公开材料显示："),
-    (r"当前可用事实包括[:：]", "公开材料显示："),
+    (r"该信号需要同时穿过场景、主体和口径三层约束，才能从单点事实变成可复制结论。材料中已经出现的可观察事实是[:：]", "事实依据："),
+    (r"当前可用事实包括[:：]", "事实依据："),
     (r"把反向触发器写入验证清单，并在新增证据改变口径时重新排序(?:章节)?结论。?", "后续应重点观察反向信号，并在口径变化时校准判断。"),
     (r"建议动作[:：]", "策略建议："),
-    (r"材料中最有解释力的事实组合是[:：]", "公开材料显示："),
-    (r"当前事实组合是[:：]", "公开材料显示："),
+    (r"材料中最有解释力的事实组合是[:：]", "事实依据："),
+    (r"当前事实组合是[:：]", "事实依据："),
     (r"这些事实需要按供应链层级拆开理解[:：]", "可按供应链层级理解："),
     (r"围绕“([^”]+)”，讨论应从", r"围绕“\1”，分析可从"),
-    (r"围绕“([^”]+)”，讨论从事实组合开始，再转入成立条件和相反情形。公开材料显示[:：]", r"围绕“\1”，分析先看已经出现的产业信号，再看成立条件和反向情形。公开材料显示："),
+    (r"围绕“([^”]+)”，讨论从事实组合开始，再转入成立条件和相反情形。公开材料显示[:：]", r"围绕“\1”，分析先看已经出现的产业信号，再看成立条件和反向情形。事实依据："),
     (r"后续跟踪应集中在", "后续重点观察"),
     (r"后续跟踪的重点落在", "后续重点观察"),
     (r"后续跟踪集中在", "后续重点观察"),
@@ -118,7 +126,7 @@ PUBLIC_PROCESS_REWRITES = [
     (r"来源层级分布为[^。；\n]*[。；]?", ""),
     (r"本章写作时应", ""),
     (r"分析需要先", ""),
-    (r"当前最直接的支持点是[:：]", "材料显示："),
+    (r"当前最直接的支持点是[:：]", "事实依据："),
     (r"当前可用于判断的事实组合包括[:：]", "可以放在一起观察的事实包括："),
     (r"围绕“([^”]+)”形成可验证判断", r"\1"),
     (r"进入总判断", "进入全篇主线"),
@@ -144,8 +152,56 @@ def _compact(value: Any, max_chars: int = 500) -> str:
     return text[: max(0, max_chars - 1)].rstrip() + "..."
 
 
+TRADITIONAL_TO_SIMPLIFIED = str.maketrans(
+    {
+        "發": "发",
+        "佈": "布",
+        "體": "体",
+        "團": "团",
+        "業": "业",
+        "務": "务",
+        "軟": "软",
+        "硬": "硬",
+        "證": "证",
+        "據": "据",
+        "場": "场",
+        "景": "景",
+        "應": "应",
+        "與": "与",
+        "實": "实",
+        "驗": "验",
+        "轉": "转",
+        "進": "进",
+        "階": "阶",
+        "段": "段",
+        "價": "价",
+        "為": "为",
+        "單": "单",
+        "個": "个",
+        "對": "对",
+        "雲": "云",
+        "數": "数",
+        "據": "据",
+        "電": "电",
+        "費": "费",
+        "戶": "户",
+        "產": "产",
+        "鏈": "链",
+    }
+)
+
+
+def _normalize_public_text(value: Any) -> str:
+    text = str(value or "").translate(TRADITIONAL_TO_SIMPLIFIED)
+    text = re.sub(r"[（(]\s*[）)]", "", text)
+    text = re.sub(r"\.{1,}\s*。", "。", text)
+    text = re.sub(r"…+\s*。", "。", text)
+    text = re.sub(r"。\s*\.{1,}", "。", text)
+    return text
+
+
 def _public_text(value: Any, max_chars: int = 500) -> str:
-    text = rewrite_internal_gap_language(_compact(value, max_chars))
+    text = rewrite_internal_gap_language(_compact(_normalize_public_text(value), max_chars))
     for old, new in PUBLIC_TERM_REPLACEMENTS.items():
         text = text.replace(old, new)
     for pattern, replacement in PUBLIC_PROCESS_REWRITES:
@@ -156,23 +212,178 @@ def _public_text(value: Any, max_chars: int = 500) -> str:
     return "" if has_internal_gap_language(text) else text
 
 
+def _metric_sentence_from_block(block: Dict[str, Any], text: str) -> str:
+    metric = _public_text(block.get("metric") or block.get("metric_name") or block.get("variable"), 60)
+    value = _public_text(block.get("value") or block.get("numeric_value"), 60)
+    unit = _public_text(block.get("unit") or block.get("numeric_unit"), 40)
+    period = _public_text(block.get("period") or block.get("time_or_scope"), 80)
+    scope = _public_text(block.get("scope") or block.get("subject"), 100)
+    if not (metric and value):
+        match = re.match(r"^([^:：]{2,40})[:：]\s*([^。；;\n]{1,80})", text)
+        if match:
+            metric = metric or _public_text(match.group(1), 60)
+            value = value or _public_text(match.group(2), 80)
+    if not (metric and value):
+        return text
+    value = value.rstrip("。；;")
+    value_text = value if not unit or unit in value else f"{value}{unit}"
+    prefix = metric
+    if scope:
+        prefix = f"{scope}{metric}"
+    if period:
+        return f"{prefix}在{period}为{value_text}。"
+    if re.match(r"^(?:达|达到|超|超过|约|近|突破)", value_text):
+        return f"{prefix}{value_text}。"
+    return f"{prefix}为{value_text}。"
+
+
+def _looks_like_bare_metric_text(value: Any) -> bool:
+    text = str(value or "").strip()
+    match = re.match(r"^([^:：]{2,40})[:：]\s*([^。；;\n]{1,80})", text)
+    if not match:
+        return False
+    label = match.group(1).strip()
+    return bool(
+        re.search(
+            r"规模|出货|部署|渗透|份额|收入|利润|成本|价格|订单|采购|客户|占比|增速|融资|市场|金额|数量",
+            label,
+        )
+    )
+
+
+def _looks_like_render_snippet(value: Any) -> bool:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    text = re.sub(r"^[\-•·]\s*", "", text)
+    if not text:
+        return False
+    if re.search(r"字体\s*[:：]\s*大\s*中\s*小", text):
+        return True
+    if re.search(r"国内垂直领域研报服务|以下为本次访谈实录|电子工程专辑|爱分析访谈", text):
+        return True
+    if re.search(r"AI\s*时代，唯一确定的是数据", text, flags=re.I):
+        return True
+    if re.match(r"^[^。；;]{6,90}[｜|][^。；;]{2,90}\s*-\s*[^:：。]{2,50}(?:[（(]20\d{2}[^）)]*[）)])?[:：]", text):
+        return True
+    if re.match(r"^[^。；;]{6,90}\s*-\s*[^:：。]{2,50}(?:[（(]20\d{2}[^）)]*[）)])?[:：]", text):
+        return True
+    if re.match(r"^(?:显示|为此|因此|当前|相关|本文)[，,：:]", text):
+        return True
+    if "..." in text or "…" in text:
+        return True
+    if re.search(r"[（(]\s*[）)]", text):
+        return True
+    if re.match(r"^(?:近日|今日|日前|今年\s*\d+\s*月份?|过去\s*\d+\s*[天周月年]|一盆|一场|一句|一篇)", text):
+        return True
+    if re.match(r"^[^。；;]{6,48}-[^:：。]{2,24}[:：]\s*", text):
+        return True
+    if re.search(r"(?:^|[；。])\s*(?:一盆|一场|一句|一篇|今年\s*\d+\s*月份?|近日|日前)", text):
+        return True
+    if re.match(r"^[一二三四五六七八九十]+[、.．]", text):
+        return True
+    if re.match(r"^[^。]*[“\"][^”\"。]{8,}[”\"][^。]*[:：]", text):
+        return True
+    if re.match(r"^同的", text):
+        return True
+    if re.search(r"赛道[^。]{0,20}(?:爆发|加速|火热|红利)", text):
+        return True
+    if re.match(r"^(?:构建|打造|推出|发布|上线).{4,60}$", text) and not re.search(r"[。；;]", text):
+        return True
+    return False
+
+
 PUBLIC_TEMPLATE_PHRASES = [
+    "只能形成初步信号",
+    "暂不宜外推",
+    "低强度判断",
+    "更多独立来源复核",
+    "更多客户样本或反向案例",
+    "代表性案例对比",
+    "反向信号与失效条件",
+    "后续影响",
+    "使用边界",
+    "该指标须",
+    "须同时披露",
+    "材料指向",
+    "相关材料",
+    "adoption:",
+    "\u8be5\u5224\u65ad\u7684\u8fb9\u754c\u5728\u4e8e\u539f\u6587\u6838\u9a8c",
+    "\u540e\u7eed\u89c2\u5bdf\u672c\u7ae0\u76f8\u5173",
+    "\u540e\u7eed\u8865\u5145\u540c\u53e3\u5f84\u6307\u6807",
     "目前只保留为观察项",
     "目前只适合作为低强度观察项",
     "从概念讨论推进到可观察变量",
     "后续重点跟踪同口径指标",
     "后续重点跟踪",
+    "事实链",
+    "事实锚点",
+    "交叉信号",
+    "仅有 C 级",
+    "更适合留在观察层",
+    "共同构成本章判断的事实基础",
+    "可用事实包括",
+    "这些信息需要放回",
+    "If later A/B sources",
+    "downgrade the claim",
+    "策略影响是把已有材料转成",
+    "把已有事实拆成",
+    "可作为观察产业优先级",
+    "从行业判断看",
+    "如果弱来源",
+    "在评估结论时同步检查",
+    "当前只能形成待验证方向",
+    "后续优先追踪",
+    "如果后续同口径指标走弱",
+    "没有反证并不等于风险不存在",
+    "该信号可作为本章的审慎结论",
+    "边界在于样本是否代表主流需求",
+    "本章信号集中在",
+    "事实依据包括",
+    "可复核事实显示",
+    "可核验事实显示",
+    "若相反样本或口径差异扩大",
+    "分析重点是这些事实之间是否指向同一变量",
+    "本段判断需要收窄",
 ]
+
+INLINE_PARAGRAPH_LABELS = {
+    "关键判断",
+    "观察判断",
+    "事实依据",
+    "证据依据",
+    "边界",
+    "含义",
+}
 
 
 def _clean_render_text(value: Any, max_chars: int = 500) -> str:
     text = _public_text(value, max_chars)
     if not text:
         return ""
-    text = text.replace("事实锚点显示：", "可用事实包括：")
-    text = text.replace("事实锚点显示", "可用事实包括")
+    if _looks_like_render_snippet(text):
+        return ""
+    text = re.sub(r"(?<=[\u4e00-\u9fff])\.\s*(?=[\u4e00-\u9fff])", "", text)
+    text = re.sub(r"[^。\n]*该信号可作为本章的审慎结论[^。\n]*(?:。|$)", "", text)
+    text = re.sub(r"[^。\n]*这些信息对应[^。\n]*变量[^。\n]*(?:。|$)", "", text)
+    text = re.sub(r"[^。\n]*边界在于样本是否代表主流需求[^。\n]*(?:。|$)", "", text)
+    text = re.sub(r"[^。\n]*本章信号集中在[^。\n]*(?:。|$)", "", text)
+    text = re.sub(r"[^。\n]*可复核事实显示[^。\n]*(?:。|$)", "", text)
+    text = re.sub(r"[^。\n]*可核验事实显示[^。\n]*(?:。|$)", "", text)
+    text = re.sub(r"[^。\n]*若相反样本或口径差异扩大[^。\n]*(?:。|$)", "", text)
+    text = re.sub(r"[^。\n]*分析重点是这些事实之间是否指向同一变量[^。\n]*(?:。|$)", "", text)
+    text = re.sub(r"[^。\n]*本段判断需要收窄[^。\n]*(?:。|$)", "", text)
+    text = re.sub(r"事实依据包括[:：]?", "", text)
+    text = text.replace("事实锚点显示：", "")
+    text = text.replace("事实锚点显示", "")
     text = text.replace("后续重点跟踪", "后续可观察")
-    if any(phrase in text for phrase in PUBLIC_TEMPLATE_PHRASES[:3]):
+    public_template_phrases = [
+        "事实依据包括",
+        "材料指向",
+        "相关材料",
+        "后续重点跟踪",
+        "该信号可作为本章的审慎结论",
+        "边界在于样本是否代表主流需求",
+    ]
+    if any(phrase in text for phrase in PUBLIC_TEMPLATE_PHRASES) or any(phrase in text for phrase in public_template_phrases):
         return ""
     return text.strip()
 
@@ -187,7 +398,74 @@ def _section_should_skip(section: Dict[str, Any]) -> bool:
 
 def _is_internal_section_title(value: Any) -> bool:
     text = _compact(value, 160)
+    generic_titles = {
+        "事实依据",
+        "商业化证据",
+        "核心观察",
+        "本章结论",
+        "关键事实与判断依据",
+        "判断边界与后续验证",
+    }
+    if text in generic_titles:
+        return True
+    if text in {"代表性案例对比", "反向信号与失效条件", "市场空间是否成立", "付费转化是否成立"}:
+        return True
+    lowered = text.lower()
+    if any(token in lowered for token in ("official_me", "source_check", "proof_role", "block_type")):
+        return True
+    if re.search(r"\b(?:metric|counter|case_comparison|risk_trigger|unit_economics|metric_reconciliation)\b", lowered):
+        return True
+    if re.fullmatch(r"[a-z]+(?:_[a-z0-9]+){1,4}.*", lowered):
+        return True
+    if any(term in text for term in ("证据", "口径", "变量", "判断依据", "可验证信号")):
+        return True
     return bool(text and any(re.search(pattern, text) for pattern in INTERNAL_SECTION_TITLE_PATTERNS))
+
+
+def _section_public_title(section: Dict[str, Any]) -> str:
+    plan = _as_dict(section.get("section_plan"))
+    for value in (plan.get("public_title"), section.get("dynamic_section_title"), section.get("section_title")):
+        title = _compact(value, 120)
+        if title and not _is_internal_section_title(title):
+            return title
+    return ""
+
+
+def _section_title_key(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value or "").strip().lower())
+
+
+def _title_from_section_claim(section: Dict[str, Any], *, max_chars: int = 24) -> str:
+    text = _public_text(section.get("claim") or section.get("paragraph") or section.get("reasoning"), 120)
+    if not text:
+        return ""
+    head = re.split(r"[\u3002\uff1b\uff0c\uff1a;,:，。；：]", text, 1)[0].strip()
+    head = re.sub(r"^(?:机会判断|方向性判断|核心判断)\s*[:：]\s*", "", head).strip()
+    if len(head) < 4:
+        return ""
+    title = _compact(head, max_chars).strip(" ，,。；;：:")
+    if len(title) < 4 or _is_internal_section_title(title):
+        return ""
+    return title
+
+
+def _unique_section_title(section: Dict[str, Any], seen_titles: set[str], *, section_index: int) -> str:
+    title = _section_public_title(section)
+    key = _section_title_key(title)
+    if title and key and key not in seen_titles:
+        seen_titles.add(key)
+        return title
+    claim_title = _title_from_section_claim(section)
+    claim_key = _section_title_key(claim_title)
+    if claim_title and claim_key and claim_key not in seen_titles:
+        seen_titles.add(claim_key)
+        return claim_title
+    if title:
+        suffix = f"{title}（{section_index}）"
+        suffix_key = _section_title_key(suffix)
+        seen_titles.add(suffix_key)
+        return suffix
+    return ""
 
 
 def _natural_transition(prefix: str, text: str) -> str:
@@ -382,13 +660,27 @@ def _public_tables(table_packages: Sequence[Dict[str, Any]]) -> List[Dict[str, A
         if isinstance(table, dict)
         and table.get("should_render")
         and not table.get("appendix_only")
-        and len(_as_list(table.get("rows"))) >= 3
+        and len(_as_list(table.get("rows"))) >= 2
     ]
+
+
+def _summary_judgment_needs_citation(value: Any) -> bool:
+    text = str(value or "")
+    return bool(
+        re.search(
+            r"(?:\d{4}\s*年|\d+(?:\.\d+)?\s*(?:%|亿|万|亿美元|亿元|家公司|个项目|项)|"
+            r"CAGR|近\s*\d+|资本市场|高估值|估值|IPO|独角兽|递表|港股|上市|"
+            r"多家厂商|推出相关产品|入选|产业图谱|标杆案例|市场空间)",
+            text,
+            re.I,
+        )
+    )
 
 
 def render_executive_summary(decision_package: Dict[str, Any], table_packages: Sequence[Dict[str, Any]]) -> str:
     lines: List[str] = []
     judgments = [_as_dict(item) for item in _as_list(decision_package.get("core_judgments"))]
+    judgments, _summary_diag = sanitize_summary_judgments(judgments, max_items=5)
     judgment_lines = []
     for item in judgments[:5]:
         judgment = _public_text(item.get("judgment"), 260)
@@ -396,6 +688,11 @@ def render_executive_summary(decision_package: Dict[str, Any], table_packages: S
         if label in INTERNAL_BLOCK_LABELS or _is_internal_section_title(label):
             label = ""
         if judgment:
+            suffix = _citation_suffix(normalize_evidence_refs(item))
+            if _summary_judgment_needs_citation(judgment) and not suffix:
+                continue
+            if suffix and not re.search(r"(?:\[\d{1,5}\])+\s*$", judgment):
+                judgment = judgment.rstrip("。；; ") + "。" + suffix
             judgment_lines.append(f"- {label + '：' if label else ''}{judgment}")
     if judgment_lines:
         lines.extend(["## 核心观点与主要结论", *judgment_lines])
@@ -405,10 +702,22 @@ def render_executive_summary(decision_package: Dict[str, Any], table_packages: S
         for row in _as_list(table.get("rows"))[:1]:
             row = _as_dict(row)
             cells = _as_list(row.get("cells"))
-            if cells:
-                text = "；".join(_compact(cell, 60) for cell in cells[:3] if str(cell).strip())
-                text = _public_text(text, 220)
-                if text:
+            if not cells:
+                continue
+            # Prefer the first three NON-EMPTY cells so we don't emit orphan
+            # bullets like ``CAGR；2028年`` (metric + period but no value) when
+            # the upstream table places its value column past position 2.
+            non_empty = [_compact(cell, 60) for cell in cells if str(cell).strip()]
+            if len(non_empty) < 2:
+                # Only one informative cell — not enough for a "key data" bullet.
+                continue
+            text = "；".join(non_empty[:3])
+            text = _public_text(text, 220)
+            # Require the bullet to carry at least one quantitative or date token
+            # so we never list a bare metric name.
+            if text and re.search(r"\d|%|亿|万|元|美元|CAGR.{0,8}\d", text):
+                # And require at least one token beyond a year/period reference.
+                if not re.fullmatch(r"[A-Za-z一-鿿]+\s*[；;,，]\s*\d{4}\s*年?", text):
                     key_rows.append(text)
     if key_rows:
         if lines:
@@ -440,7 +749,7 @@ def _markdown_table(headers: Sequence[Any], rows: Sequence[Sequence[Any]]) -> st
         cells = (cells + [""] * len(headers))[: len(headers)]
         if any(cell.strip() for cell in cells):
             cleaned_rows.append(cells)
-    if len(cleaned_rows) < 3:
+    if len(cleaned_rows) < 2:
         return ""
     lines = ["| " + " | ".join(headers) + " |", "| " + " | ".join(["---"] * len(headers)) + " |"]
     for cells in cleaned_rows:
@@ -450,7 +759,14 @@ def _markdown_table(headers: Sequence[Any], rows: Sequence[Sequence[Any]]) -> st
 
 def _is_internal_table_header(header: Any) -> bool:
     text = str(header or "").strip().lower()
-    return bool(re.search(r"(来源|引用|证据|evidence|source|ref)", text))
+    return bool(
+        re.search(
+            r"(来源|引用|证据|后续影响|使用边界|进入判断|验证方法|观察指标|"
+            r"competitive\s+signal|risk\s+boundary|implication|boundary|"
+            r"evidence|source|ref)",
+            text,
+        )
+    )
 
 
 def _public_table_shape(headers: Sequence[Any], rows: Sequence[Sequence[Any]]) -> tuple[List[Any], List[List[Any]]]:
@@ -463,6 +779,54 @@ def _public_table_shape(headers: Sequence[Any], rows: Sequence[Sequence[Any]]) -
     return public_headers, public_rows
 
 
+DIAGNOSTIC_TABLE_PATTERNS = [
+    r"后续影响",
+    r"使用边界",
+    r"该指标须",
+    r"须同时披露",
+    r"不会凭空补齐",
+    r"进入正文判断",
+    r"缺口数据",
+    r"后续验证项",
+    r"Competitive signal",
+    r"Risk boundary",
+]
+
+
+def _has_diagnostic_table_language(values: Sequence[Any]) -> bool:
+    text = "\n".join(str(value or "") for value in values)
+    return any(re.search(pattern, text, flags=re.I) for pattern in DIAGNOSTIC_TABLE_PATTERNS)
+
+
+def _header_index(headers: Sequence[Any], *patterns: str) -> int:
+    for index, header in enumerate(headers):
+        text = str(header or "").strip()
+        if any(re.search(pattern, text, flags=re.I) for pattern in patterns):
+            return index
+    return -1
+
+
+def _filter_valid_metric_rows(headers: Sequence[Any], rows: Sequence[Sequence[Any]]) -> List[List[Any]]:
+    metric_idx = _header_index(headers, r"指标", r"\bmetric\b")
+    value_idx = _header_index(headers, r"数值", r"\bvalue\b")
+    unit_idx = _header_index(headers, r"单位", r"\bunit\b")
+    period_idx = _header_index(headers, r"期间", r"时间", r"\bperiod\b")
+    scope_idx = _header_index(headers, r"范围", r"主体", r"对象", r"\bscope\b", r"\bsubject\b")
+    if metric_idx < 0 or value_idx < 0 or unit_idx < 0:
+        return [list(row) for row in rows]
+    required_indices = [idx for idx in (metric_idx, value_idx, unit_idx, period_idx, scope_idx) if idx >= 0]
+    valid_rows: List[List[Any]] = []
+    for row in rows:
+        row_values = list(row)
+        padded = (row_values + [""] * len(headers))[: len(headers)]
+        if any(not str(padded[idx] or "").strip() for idx in required_indices):
+            continue
+        if _has_diagnostic_table_language(padded):
+            continue
+        valid_rows.append(padded)
+    return valid_rows
+
+
 def _line_with_citations(text: str, evidence_refs: Sequence[Any]) -> str:
     suffix = _citation_suffix(evidence_refs)
     if not suffix or re.search(r"\[\d{1,3}\]\s*$", text):
@@ -470,16 +834,69 @@ def _line_with_citations(text: str, evidence_refs: Sequence[Any]) -> str:
     return text.rstrip("。；;，,") + "。" + suffix
 
 
+def _table_validation_passed(table: Dict[str, Any]) -> bool:
+    validation = _as_dict(table.get("validation") or table.get("table_validation_for_clean"))
+    if validation and validation.get("passed") is False:
+        return False
+    if table.get("validation_error") or table.get("table_validation_error"):
+        return False
+    if _as_list(table.get("reject_reasons")):
+        return False
+    if str(table.get("metric_validation_status") or "").strip().lower() == "invalid":
+        return False
+    for row in _as_list(table.get("rows")):
+        payload = _as_dict(row)
+        if str(payload.get("metric_validation_status") or "").strip().lower() == "invalid":
+            return False
+    return True
+
+
+def _invalid_metric_appendix_row(item: Dict[str, Any]) -> bool:
+    metric = str(item.get("metric_name") or item.get("metric") or item.get("indicator") or "").strip()
+    value = str(item.get("value") or item.get("display_value") or item.get("numeric_value") or "").strip()
+    unit = str(item.get("unit") or "").strip()
+    status = str(item.get("metric_validation_status") or item.get("validation_status") or "").strip().lower()
+    context = " ".join(str(item.get(key) or "") for key in ("period", "source_title", "fact", "clean_fact"))
+    if status == "invalid":
+        return True
+    if not metric or not value:
+        return True
+    if metric in {"关键事实", "政策监管", "政策目标", "source_check", "status", "http_status"}:
+        return True
+    if re.search(r"政策|目标|监管", metric) and re.match(r"-\d", value):
+        return True
+    if re.search(r"成本", metric) and re.search(r"家$", value):
+        return True
+    if re.search(r"市场规模|融资", metric) and ("%" in value or "%" in unit):
+        return True
+    if re.fullmatch(r"-?\d{1,3}(?:\.0)?", value) and re.search(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", context):
+        return True
+    return False
+
+
 def render_table_package(table: Dict[str, Any]) -> str:
     if not table.get("should_render") or table.get("appendix_only"):
+        return ""
+    if not _table_validation_passed(table):
         return ""
     headers = _as_list(table.get("headers"))
     row_objects = [_as_dict(row) for row in _as_list(table.get("rows")) if isinstance(row, dict)]
     rows = [_as_list(row.get("cells")) for row in row_objects]
     headers, rows = _public_table_shape(headers, rows)
+    table_text_values: List[Any] = [
+        table.get("title"),
+        table.get("takeaway"),
+        table.get("decision_implication"),
+        *_as_list(table.get("limitations")),
+        *headers,
+        *[cell for row in rows for cell in row],
+    ]
+    if _has_diagnostic_table_language(table_text_values):
+        return ""
+    rows = _filter_valid_metric_rows(headers, rows)
     if len(headers) < 2:
         return ""
-    minimum_rows = 3
+    minimum_rows = 2
     if len(rows) < minimum_rows:
         return ""
     table_md = _markdown_table(headers, rows)
@@ -501,9 +918,9 @@ def render_table_package(table: Dict[str, Any]) -> str:
     if takeaway:
         parts.extend(["", _line_with_citations(f"这张表显示，{takeaway}", citation_refs)])
     if decision_implication and decision_implication != takeaway:
-        parts.extend(["", f"判断含义：{decision_implication}"])
+        parts.extend(["", _line_with_citations(f"判断含义：{decision_implication}", citation_refs)])
     if limitations:
-        parts.extend(["", f"使用边界：{limitations[0]}"])
+        parts.extend(["", _line_with_citations(f"使用边界：{limitations[0]}", citation_refs)])
     return "\n".join(parts)
 
 
@@ -533,14 +950,48 @@ def _append_citation_to_last_paragraph(lines: List[str], evidence_refs: Sequence
     suffix = _citation_suffix(evidence_refs)
     if not suffix:
         return
+    suffix_refs = re.findall(r"\[\d{1,5}\]", suffix)
     for index in range(len(lines) - 1, -1, -1):
         line = str(lines[index] or "").rstrip()
         if not line or line.startswith("#") or line.startswith("|") or re.match(r"^[:\-\s|]+$", line):
             continue
-        if re.search(r"\[\d{1,3}\]\s*$", line):
+        line_refs = re.findall(r"\[\d{1,5}\]", line)
+        if line_refs and line_refs == suffix_refs and re.search(r"(?:\[\d{1,5}\])+\s*$", line):
             return
+        if line_refs:
+            line = re.sub(r"\s*\[\d{1,5}\]", "", line).rstrip()
         lines[index] = line.rstrip("。；;，,") + "。" + suffix
         return
+
+
+def _first_section_citation_refs(chapter: Dict[str, Any]) -> List[Any]:
+    for section in _as_list(chapter.get("sections")):
+        section = _as_dict(section)
+        refs = _as_list(section.get("citation_refs")) or _as_list(section.get("evidence_refs"))
+        if refs:
+            return refs
+    return []
+
+
+def _paragraph_chunks_with_citations(
+    text: str,
+    evidence_refs: Sequence[Any],
+    *,
+    max_chars: int = 720,
+    max_chunks: int = 5,
+) -> List[str]:
+    chunks = _paragraph_chunks(text, max_chars=max_chars, max_chunks=max_chunks)
+    suffix = _citation_suffix(evidence_refs)
+    if not suffix:
+        return chunks
+    result: List[str] = []
+    for chunk in chunks:
+        line = str(chunk or "").rstrip()
+        if not line or re.search(r"(?:\[\d{1,5}\])+\s*$", line):
+            result.append(line)
+            continue
+        result.append(line.rstrip("\u3002\uff1b;； ") + "\u3002" + suffix)
+    return result
 
 
 def render_dynamic_table(block: Dict[str, Any]) -> List[str]:
@@ -631,11 +1082,58 @@ def render_chapter_deep_synthesis(chapter: Dict[str, Any]) -> List[str]:
     return lines
 
 
+def _compact_char_count(text: str) -> int:
+    return len(re.sub(r"\s+", "", str(text or "")))
+
+
+def _public_section_expansion_sentences(section: Dict[str, Any]) -> List[str]:
+    title = _public_text(section.get("section_title") or section.get("title"), 80) or "这一判断"
+    block_type = str(section.get("block_type") or "").strip().lower()
+    if block_type in {"case_comparison", "customer_painpoint_matrix", "integrated_signal"}:
+        mechanism = "从机制上看，这类信号的价值不在于单点案例本身，而在于它是否进入真实业务流程，并要求客户在权限、系统集成、流程责任和交付结果之间形成稳定安排。"
+        implication = "行业含义在于，部署动作一旦从试用界面进入日常工作流，需求判断就会从概念热度转向可复用的业务场景，但商业化深度仍取决于客户是否愿意为持续使用、效率改善或风险降低付费。"
+    elif block_type == "metric_reconciliation":
+        mechanism = "从机制上看，指标只有放回主体、范围、期间和口径中解释，才适合支撑市场空间或商业化节奏判断；孤立数值只能说明局部信号，不能直接推出行业总量。"
+        implication = "行业含义在于，口径越清晰，越能区分真实需求扩张、短期主题交易和单一来源估算之间的差异，也越能判断相关机会是否具备持续验证价值。"
+    elif block_type in {"risk_trigger", "boundary"}:
+        mechanism = "从机制上看，风险信号的作用不是否定全部机会，而是指出结论失效的触发条件；当安全、成本、责任或可靠性约束放大时，原有增长判断需要随之降级。"
+        implication = "行业含义在于，边界条件越清楚，报告越能区分已经被事实支撑的机会和仍停留在假设层面的机会，从而避免把局部乐观样本写成确定性趋势。"
+    elif block_type == "technology_maturity":
+        mechanism = "从机制上看，技术成熟度会同时影响可靠性、权限治理、安全边界和集成成本；这些变量决定相关能力能否从演示环境进入生产流程。"
+        implication = "行业含义在于，技术事实只有与部署深度、客户流程和持续运维要求相连，才能真正解释商业化速度，而不是只停留在功能展示层面。"
+    else:
+        mechanism = "从机制上看，公开事实需要被放进需求、供给、商业化、竞争和风险变量之间理解；只有这些变量形成连续关系，章节判断才具备分析厚度。"
+        implication = "行业含义在于，同一事实在不同场景下可能对应不同强度的结论，报告需要把可确认部分、方向性部分和仍需保留的边界分别写清。"
+    return [
+        f"对“{title}”这一判断而言，关键不只是事实是否出现，而是它如何改变需求兑现、商业化节奏、技术约束或竞争位置。",
+        mechanism,
+        implication,
+        "如果把它放在报告主线中，较稳妥的写法是先确认事实能够支撑的最低结论，再讨论它向更大范围外推时需要满足的关键条件。",
+        "这种处理方式可以让读者同时看到机会信号和约束条件：前者说明为什么值得关注，后者说明为什么不能把局部样本直接写成行业定论。",
+        "因此，这一段更适合作为有边界的分析信号来使用：它可以提高对相关机会的判断密度，但仍需要和同章其他来源共同构成证据链，避免单一材料承担过强结论。",
+    ]
+
+
+def _expand_short_public_paragraph(text: str, section: Dict[str, Any], citation_refs: Sequence[Any]) -> str:
+    target = _env_int("REPORT_RENDER_MIN_SECTION_CHARS", 0, min_value=0, max_value=2000)
+    if target <= 0 or _compact_char_count(text) >= target:
+        return text
+    if not citation_refs or not bool(section.get("evidence_backed")):
+        return text
+    parts = [text]
+    for sentence in _public_section_expansion_sentences(section):
+        if sentence and sentence not in parts:
+            parts.append(sentence)
+        if _compact_char_count(" ".join(parts)) >= target:
+            break
+    return " ".join(part.strip() for part in parts if part.strip()).strip()
+
+
 def render_section(section: Dict[str, Any]) -> List[str]:
     if _section_should_skip(section):
         return []
     if section.get("observation_only") and section.get("force_render_observation") and not section.get("evidence_backed"):
-        title = _compact(section.get("section_title"), 120)
+        title = _section_public_title(section)
         claim = _clean_render_text(section.get("claim") or section.get("reasoning"), 360)
         lines = []
         if title and not _is_internal_section_title(title):
@@ -644,25 +1142,37 @@ def render_section(section: Dict[str, Any]) -> List[str]:
             lines.extend(_paragraph_chunks(claim, max_chars=360, max_chunks=1))
         return [line for line in lines if line.strip()]
     lines: List[str] = []
-    title = _compact(section.get("section_title"), 120)
+    title = _section_public_title(section)
     if title and not _is_internal_section_title(title):
         lines.append(f"### {title}")
+    section_citation_refs = _as_list(section.get("citation_refs")) or _as_list(section.get("evidence_refs"))
     for block in _as_list(section.get("render_blocks")):
         block = _as_dict(block)
         block_type = str(block.get("type") or "").strip()
         raw_label = _compact(block.get("label"), 80)
         label = _public_text(block.get("label"), 80)
         text = _clean_render_text(block.get("text"), _env_int("REPORT_RENDER_BLOCK_MAX_CHARS", 3200, min_value=800, max_value=8000))
+        block_fact_type = str(block.get("fact_type") or section.get("fact_type") or "").strip().lower()
+        if text and (
+            (
+                block_fact_type == "metric"
+                or str(section.get("block_type") or "") == "metric_reconciliation"
+            )
+            and re.match(r"^[^:：]{2,40}[:：]\s*[^。；;\n]{1,80}", text)
+            or _looks_like_bare_metric_text(text)
+        ):
+            text = _metric_sentence_from_block(block, text)
         is_internal_label = raw_label in INTERNAL_BLOCK_LABELS or _is_internal_section_title(raw_label)
         if block_type == "paragraph":
             if not text:
                 continue
-            if label and not is_internal_label:
+            text = _expand_short_public_paragraph(text, section, section_citation_refs)
+            if label and not is_internal_label and label not in INLINE_PARAGRAPH_LABELS:
                 lines.extend(["", f"#### {label}"])
-                lines.extend(_paragraph_chunks(text))
+                lines.extend(_paragraph_chunks_with_citations(text, section_citation_refs))
                 continue
             else:
-                lines.extend(_paragraph_chunks(text))
+                lines.extend(_paragraph_chunks_with_citations(text, section_citation_refs))
         elif block_type == "evidence_list":
             continue
         elif block_type == "table":
@@ -692,42 +1202,10 @@ def render_chapter_fact_digest(chapter: Dict[str, Any]) -> List[str]:
     if not chunks:
         return []
     lines: List[str] = []
-    if len(chunks) >= 1:
-        lines.append(
-            "本章首先需要合并观察这些事实："
-            + "；".join(chunks[0])
-            + "。它们共同决定本章判断的起点，而不是只作为材料罗列。"
-        )
-    if len(chunks) >= 2:
-        lines.append(
-            "进一步看，第二组事实用于校准时间、口径和适用范围："
-            + "；".join(chunks[1])
-            + "。如果这些信号在时间窗口和统计口径上可比，判断强度会提高；如果口径分化，正文只保留方向性结论。"
-        )
-    if len(chunks) >= 3:
-        lines.append(
-            "第三组事实更适合用来判断后续变化是否可持续："
-            + "；".join(chunks[2])
-            + "。这组组合越能被反复验证，本章越适合进入行动判断；否则应作为观察线索。"
-        )
-    if len(chunks) >= 4:
-        lines.append(
-            "剩余线索需要放在约束条件中理解："
-            + "；".join(chunks[3])
-            + "。它们未必能单独推出强结论，但可以帮助识别结论的适用范围、验证顺序和失效信号。"
-        )
-    if len(chunks) >= 5:
-        lines.append(
-            "如果把这些材料落到经营或产业链层面，还需要回答谁承担成本、谁形成预算、谁获得收益："
-            + "；".join(chunks[4])
-            + "。只有事实链同时覆盖需求、供给、价格或订单以及反向样本，正文才适合写成较强判断。"
-        )
-    if len(chunks) >= 6:
-        lines.append(
-            "因此，本章把事实分成两类处理：一类直接改变判断权重，另一类限定判断边界。"
-            + "；".join(chunks[5])
-            + "。前者决定结论能否上升为行动建议，后者决定建议需要附带哪些条件和验证动作。"
-        )
+    for chunk in chunks[:3]:
+        text = "；".join(chunk)
+        if text:
+            lines.append(text)
     return [line for line in lines if line.strip()]
 
 
@@ -750,7 +1228,7 @@ def _chapter_flow_intro(
     """
     if os.environ.get("REPORT_DISABLE_CHAPTER_INTRO", "").strip() in {"1", "true", "True"}:
         return ""
-    lead = _public_text(chapter.get("lead"), 360)
+    lead = _clean_render_text(chapter.get("lead"), 360)
     if lead:
         # The chapter already carries its own opening narrative; do not append a template.
         return ""
@@ -837,6 +1315,37 @@ def _slot_matches_section(slot: str, section: Dict[str, Any]) -> bool:
     return False
 
 
+def _compact_chapter_heading(value: Any, *, max_chars: int = 28) -> str:
+    text = _public_text(value, 180).strip(" ？?！!。.；;")
+    if not text:
+        return ""
+    text = (
+        text.replace("商业化证据", "商业化信号")
+        .replace("事实依据", "事实信号")
+        .replace("判断依据", "判断信号")
+    )
+    for marker in (
+        "是否存在真实需求",
+        "哪些环节已",
+        "竞争格局",
+        "需求变化",
+        "主要玩家",
+        "技术路线",
+        "技术、供应、监管",
+    ):
+        idx = text.find(marker)
+        if idx > 0:
+            text = text[idx:]
+            break
+    text = re.sub(r"^是否", "", text)
+    text = re.sub(r"^的", "", text)
+    if len(text) > max_chars:
+        head = re.split(r"[，,；;：:？?]", text, 1)[0].strip()
+        if 4 <= len(head) <= max_chars:
+            text = head
+    return _compact(text, max_chars).strip(" ？?！!。.；;")
+
+
 def render_chapter_package(
     chapter: Dict[str, Any],
     index: int,
@@ -844,14 +1353,21 @@ def render_chapter_package(
     previous_chapter: Dict[str, Any] | None = None,
     next_chapter: Dict[str, Any] | None = None,
 ) -> str:
-    title = _compact(chapter.get("chapter_title") or f"章节 {index}", 120)
+    if chapter.get("omit_from_report") or chapter.get("chapter_omitted_no_evidence"):
+        return ""
+    if not _as_list(chapter.get("sections")) and not _as_list(chapter.get("table_packages")) and not chapter.get("lead"):
+        return ""
+    title = _compact_chapter_heading(chapter.get("chapter_title") or f"章节 {index}")
+    if not title:
+        title = f"章节 {index}"
     lines = [f"## {index}. {title}"]
-    lead = _public_text(chapter.get("lead"), 360)
+    lead = _clean_render_text(chapter.get("lead"), 360)
     flow_intro = _chapter_flow_intro(chapter, index=index, previous_chapter=previous_chapter)
     if flow_intro:
         lines.append(flow_intro)
     if lead and lead != flow_intro:
         lines.append(lead)
+        _append_citation_to_last_paragraph(lines, _first_section_citation_refs(chapter))
     chapter_tables = [
         {"table": table, "rendered": rendered}
         for table in _as_list(chapter.get("table_packages"))
@@ -880,10 +1396,16 @@ def render_chapter_package(
             if appended >= limit:
                 return
 
+    seen_section_titles: set[str] = set()
     for section_index, section in enumerate(_as_list(chapter.get("sections")), start=1):
         section = _as_dict(section)
         if _section_should_skip(section):
             continue
+        unique_title = _unique_section_title(section, seen_section_titles, section_index=section_index)
+        if unique_title:
+            section = dict(section)
+            section["section_title"] = unique_title
+            section["dynamic_section_title"] = unique_title
         if _slot_matches_section("before_risk", section):
             append_tables("before_risk", section=section, limit=1)
         if _slot_matches_section("before_decision", section):
@@ -891,7 +1413,7 @@ def render_chapter_package(
         if _as_list(section.get("render_blocks")):
             rendered_section = render_section(section)
             if rendered_section:
-                _append_citation_to_last_paragraph(rendered_section, _as_list(section.get("evidence_refs")))
+                _append_citation_to_last_paragraph(rendered_section, _as_list(section.get("citation_refs")) or _as_list(section.get("evidence_refs")))
                 lines.append("")
                 lines.extend(rendered_section)
                 for slot in ("after_thesis", "after_evidence_matrix", "after_mechanism"):
@@ -899,7 +1421,7 @@ def render_chapter_package(
                         append_tables(slot, section=section, limit=1)
                         break
             continue
-        section_title = _compact(section.get("section_title"), 120)
+        section_title = _section_public_title(section)
         if section_title and not _is_internal_section_title(section_title):
             lines.extend(["", f"### {section_title}"])
         claim = _clean_render_text(section.get("claim"), _env_int("REPORT_SECTION_CLAIM_MAX_CHARS", 1100, min_value=300, max_value=3000))
@@ -908,12 +1430,18 @@ def render_chapter_package(
         actionable = _clean_render_text(section.get("actionable"), _env_int("REPORT_SECTION_ACTION_MAX_CHARS", 1600, min_value=400, max_value=5000))
         mechanism = _clean_render_text(section.get("mechanism") or section.get("reasoning"), _env_int("REPORT_SECTION_MECHANISM_MAX_CHARS", 2400, min_value=600, max_value=6000))
         decision_implication = _clean_render_text(section.get("decision_implication") or actionable, _env_int("REPORT_SECTION_ACTION_MAX_CHARS", 1600, min_value=400, max_value=5000))
+        if _looks_like_bare_metric_text(claim):
+            claim = _metric_sentence_from_block(section, claim)
+        if _looks_like_bare_metric_text(reasoning):
+            reasoning = _metric_sentence_from_block(section, reasoning)
+        if _looks_like_bare_metric_text(mechanism):
+            mechanism = _metric_sentence_from_block(section, mechanism)
         before_section_len = len(lines)
         if section.get("observation_only") and section.get("force_render_observation") and not section.get("evidence_backed"):
             if claim:
                 lines.extend(_paragraph_chunks(claim, max_chars=360, max_chunks=1))
             if len(lines) > before_section_len:
-                _append_citation_to_last_paragraph(lines, _as_list(section.get("evidence_refs")))
+                _append_citation_to_last_paragraph(lines, _as_list(section.get("citation_refs")) or _as_list(section.get("evidence_refs")))
             continue
         if claim:
             lines.extend(_paragraph_chunks(claim, max_chars=700, max_chunks=2))
@@ -928,7 +1456,7 @@ def render_chapter_package(
         if decision_implication:
             lines.extend(_paragraph_chunks(_natural_transition("落到行业含义上，", decision_implication), max_chars=680, max_chunks=2))
         if len(lines) > before_section_len:
-            _append_citation_to_last_paragraph(lines, _as_list(section.get("evidence_refs")))
+            _append_citation_to_last_paragraph(lines, _as_list(section.get("citation_refs")) or _as_list(section.get("evidence_refs")))
             for slot in ("after_thesis", "after_evidence_matrix", "after_mechanism"):
                 if _slot_matches_section(slot, section):
                     append_tables(slot, section=section, limit=1)
@@ -1106,7 +1634,21 @@ def render_risk_package(risk_package: Dict[str, Any]) -> str:
 
 
 def render_appendix(source_registry: Sequence[Dict[str, Any]], appendix_package: Dict[str, Any]) -> str:
-    lines = ["## 研究口径与来源"]
+    if not _env_flag("REPORT_RENDER_DIAGNOSTIC_APPENDIX_TABLES", False):
+        if not source_registry:
+            return ""
+        lines = ["## 来源附录"]
+        for source in list(source_registry)[:50]:
+            source = _as_dict(source)
+            ref = str(source.get("ref") or "").strip()
+            title = str(source.get("title") or "未命名来源").strip()
+            date = str(source.get("date") or "").strip()
+            url = str(source.get("url") or "").strip()
+            suffix = " | ".join(part for part in [date, url] if part)
+            lines.append(f"- {ref} {title}" + (f" | {suffix}" if suffix else ""))
+        return "\n".join(lines)
+
+    lines = ["## 来源附录"]
     scope = _public_text(_as_dict(appendix_package).get("scope_note"), 260)
     if scope:
         lines.append(scope)
@@ -1127,7 +1669,11 @@ def render_appendix(source_registry: Sequence[Dict[str, Any]], appendix_package:
         table_md = _markdown_table(["假设", "A/B来源", "反证", "指标口径", "可下判断", "待补"], rows)
         if table_md:
             lines.extend(["", "### 证据覆盖矩阵", table_md])
-    metric_rows = [_as_dict(item) for item in _as_list(_as_dict(appendix_package).get("metric_normalization_table")) if isinstance(item, dict)]
+    metric_rows = [
+        _as_dict(item)
+        for item in _as_list(_as_dict(appendix_package).get("metric_normalization_table"))
+        if isinstance(item, dict) and not _invalid_metric_appendix_row(_as_dict(item))
+    ]
     if metric_rows:
         rows = []
         for item in metric_rows[:12]:
@@ -1149,15 +1695,15 @@ def render_appendix(source_registry: Sequence[Dict[str, Any]], appendix_package:
         _as_dict(item)
         for item in _as_list(_as_dict(appendix_package).get("table_appendix_rows"))
         if isinstance(item, dict)
-        and item.get("should_render") is True
-        and not item.get("appendix_only")
+        and item.get("should_render") is not False
+        and _table_validation_passed(item)
     ]
     if appendix_tables:
         for table in appendix_tables[:6]:
             headers = _as_list(table.get("headers"))
             rows = [_as_list(row) for row in _as_list(table.get("rows"))[:12]]
             headers, rows = _public_table_shape(headers, rows)
-            if len(headers) < 2 or len(rows) < 3:
+            if len(headers) < 2 or len(rows) < 2:
                 continue
             table_md = _markdown_table(headers, rows)
             if not table_md:
@@ -1166,6 +1712,7 @@ def render_appendix(source_registry: Sequence[Dict[str, Any]], appendix_package:
             lines.extend(["", f"### {title}（附录明细）", table_md])
     if not source_registry:
         return "\n".join(lines) if len(lines) > 1 else ""
+    lines.extend(["", "## 来源附录"])
     for source in list(source_registry)[:50]:
         source = _as_dict(source)
         ref = str(source.get("ref") or "").strip()

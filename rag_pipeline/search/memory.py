@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import hashlib
 import time
@@ -11,6 +12,11 @@ from typing import Any, Dict, Iterable, List, Optional
 from uuid import uuid4
 
 from ..config.search_config import DEFAULT_EXTERNAL_API_TRUST_ENV, DEFAULT_LLM_DISABLE_THINKING
+from ..telemetry.context_budget import (
+    ContextBudgetExceededError,
+    assert_llm_input_budget,
+    compact_json,
+)
 from ..telemetry.token_usage import record_llm_usage
 from .models import Turn
 
@@ -60,14 +66,24 @@ def normalize_llm_config(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         max_output_tokens = max(0, int(config.get("max_output_tokens") or 0))
     except (TypeError, ValueError):
         max_output_tokens = 0
+    model = str(config.get("model") or "").strip()
+    disable_thinking = _normalize_bool_flag(config.get("disable_thinking"), DEFAULT_LLM_DISABLE_THINKING)
+    if max_output_tokens <= 0 and model.lower().startswith("deepseek-v4-pro"):
+        try:
+            max_output_tokens = max(
+                512,
+                int(os.getenv("RAG_DEEPSEEK_V4_PRO_DEFAULT_MAX_OUTPUT_TOKENS", "2048")),
+            )
+        except ValueError:
+            max_output_tokens = 2048
     return {
         "provider": str(config.get("provider") or "openai_compatible").strip().lower() or "openai_compatible",
         "url": str(config.get("url") or "").strip(),
         "api_key": str(config.get("api_key") or "").strip(),
-        "model": str(config.get("model") or "").strip(),
+        "model": model,
         "timeout": float(config.get("timeout") or 30.0),
         "trust_env": _normalize_bool_flag(config.get("trust_env"), DEFAULT_EXTERNAL_API_TRUST_ENV),
-        "disable_thinking": _normalize_bool_flag(config.get("disable_thinking"), DEFAULT_LLM_DISABLE_THINKING),
+        "disable_thinking": disable_thinking,
         "reasoning_effort": str(config.get("reasoning_effort") or "").strip().lower(),
         "max_output_tokens": max_output_tokens,
         "api_mode": str(config.get("api_mode") or "").strip().lower(),
@@ -338,6 +354,86 @@ def collect_openai_response_text(response: Dict[str, Any]) -> str:
     return "\n".join(part.strip() for part in parts if str(part or "").strip()).strip()
 
 
+def _chat_message_text(message: Dict[str, Any]) -> str:
+    content = message.get("content", "")
+    if isinstance(content, list):
+        content = "\n".join(str(item.get("text", item)) if isinstance(item, dict) else str(item) for item in content)
+    return str(content or "").strip()
+
+
+def _deepseek_reasoning_content_chars(message: Dict[str, Any]) -> int:
+    reasoning = message.get("reasoning_content")
+    if isinstance(reasoning, list):
+        reasoning = "\n".join(str(item.get("text", item)) if isinstance(item, dict) else str(item) for item in reasoning)
+    return len(str(reasoning or "").strip())
+
+
+def _should_retry_deepseek_empty_content(normalized: Dict[str, Any], message: Dict[str, Any]) -> bool:
+    model = str(normalized.get("model") or "").strip().lower()
+    return (
+        model.startswith("deepseek-v4-pro")
+        and not bool(normalized.get("disable_thinking"))
+        and _deepseek_reasoning_content_chars(message) > 0
+    )
+
+
+def _empty_chat_content_error(normalized: Dict[str, Any], message: Dict[str, Any], choice: Dict[str, Any]) -> str:
+    model = str(normalized.get("model") or "")
+    reasoning_chars = _deepseek_reasoning_content_chars(message)
+    finish_reason = str(choice.get("finish_reason") or "")
+    if model.lower().startswith("deepseek-v4-pro") and reasoning_chars > 0:
+        return (
+            "LLM response content is empty after DeepSeek returned reasoning_content. "
+            "Increase max_output_tokens or disable thinking for this call. "
+            f"finish_reason={finish_reason}; reasoning_content_chars={reasoning_chars}"
+        )
+    return "LLM response content is empty."
+
+
+def _retry_deepseek_with_disabled_thinking(
+    *,
+    normalized: Dict[str, Any],
+    payload: Dict[str, Any],
+    api: str,
+    started_at: float,
+    first_choice: Dict[str, Any],
+) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    retry_normalized = dict(normalized)
+    retry_normalized["disable_thinking"] = True
+    retry_payload = dict(payload)
+    retry_payload["thinking"] = {"type": "disabled"}
+    first_message = first_choice.get("message") or {}
+    first_reasoning_chars = _deepseek_reasoning_content_chars(first_message)
+    data = _post_llm_json(
+        normalized=retry_normalized,
+        url=normalize_openai_compatible_chat_url(retry_normalized["url"]),
+        payload=retry_payload,
+        error_prefix="LLM request",
+    )
+    _record_llm_usage_event(
+        normalized=retry_normalized,
+        usage=data.get("usage", {}),
+        api=f"{api}_empty_content_retry",
+        started_at=started_at,
+    )
+    llm_call = _llm_call_diagnostic(
+        normalized=retry_normalized,
+        api=api,
+        started_at=started_at,
+        status="success",
+        usage=data.get("usage", {}),
+    )
+    llm_call.update(
+        {
+            "retry_after_empty_content": True,
+            "retry_disable_thinking": True,
+            "first_finish_reason": str(first_choice.get("finish_reason") or ""),
+            "first_reasoning_content_chars": first_reasoning_chars,
+        }
+    )
+    return data, retry_normalized, llm_call
+
+
 def call_openai_responses_json(
     *,
     normalized: Dict[str, Any],
@@ -349,14 +445,23 @@ def call_openai_responses_json(
         "response_format_instruction": "Return a valid JSON object. The response must be json.",
         "payload": user_payload,
     }
+    user_content = compact_json(input_payload)
+    max_output_tokens = int(normalized.get("max_output_tokens") or 0)
+    context_budget = assert_llm_input_budget(
+        normalized_config=normalized,
+        system_prompt=system_prompt,
+        user_content=user_content,
+        api=api,
+        max_output_tokens=max_output_tokens,
+    )
     payload: Dict[str, Any] = {
         "model": normalized["model"],
         "instructions": system_prompt,
-        "input": json.dumps(input_payload, ensure_ascii=False),
+        "input": user_content,
         "text": {"format": {"type": "json_object"}},
     }
-    if int(normalized.get("max_output_tokens") or 0) > 0:
-        payload["max_output_tokens"] = int(normalized["max_output_tokens"])
+    if max_output_tokens > 0:
+        payload["max_output_tokens"] = max_output_tokens
     _apply_openai_responses_reasoning(payload, normalized)
     started_at = time.perf_counter()
     try:
@@ -381,6 +486,7 @@ def call_openai_responses_json(
         status="success",
         usage=data.get("usage", {}),
     )
+    llm_call["context_budget"] = context_budget
     content = collect_openai_response_text(data)
     if not content:
         diagnostic = {**llm_call, "status": "failed", "error": "OpenAI Responses content is empty."}
@@ -419,6 +525,13 @@ def _call_openai_compatible_text_once(
     max_output_tokens = int(normalized.get("max_output_tokens") or 0) or int(max_tokens or 0)
     if should_use_openai_responses_api(normalized):
         api = "openai_responses_text"
+        context_budget = assert_llm_input_budget(
+            normalized_config=normalized,
+            system_prompt=system_prompt,
+            user_content=user_content,
+            api=api,
+            max_output_tokens=max_output_tokens,
+        )
         payload: Dict[str, Any] = {
             "model": normalized["model"],
             "instructions": system_prompt,
@@ -450,12 +563,21 @@ def _call_openai_compatible_text_once(
             status="success",
             usage=data.get("usage", {}),
         )
+        llm_call["context_budget"] = context_budget
         text = collect_openai_response_text(data)
         if not text:
             diagnostic = {**llm_call, "status": "failed", "error": "OpenAI Responses content is empty."}
             raise LLMCallError("OpenAI Responses content is empty.", diagnostic=diagnostic)
         return {"text": text, "usage": data.get("usage", {}), "raw_response": data, "llm_call": llm_call}
 
+    api = "openai_compatible_chat_text"
+    context_budget = assert_llm_input_budget(
+        normalized_config=normalized,
+        system_prompt=system_prompt,
+        user_content=user_content,
+        api=api,
+        max_output_tokens=max_output_tokens,
+    )
     payload = {
         "model": normalized["model"],
         "messages": [
@@ -468,7 +590,6 @@ def _call_openai_compatible_text_once(
     if not model_uses_default_temperature_only(normalized["model"]):
         payload["temperature"] = temperature
     apply_openai_compatible_reasoning_flags(payload, normalized)
-    api = "openai_compatible_chat_text"
     started_at = time.perf_counter()
     try:
         data = _post_llm_json(
@@ -492,17 +613,35 @@ def _call_openai_compatible_text_once(
         status="success",
         usage=data.get("usage", {}),
     )
+    llm_call["context_budget"] = context_budget
     choices = data.get("choices") or []
     if not choices:
         raise RuntimeError("LLM response did not include choices.")
-    message = choices[0].get("message") or {}
-    content = message.get("content", "")
-    if isinstance(content, list):
-        content = "\n".join(str(item.get("text", item)) if isinstance(item, dict) else str(item) for item in content)
-    text = str(content or "").strip()
+    choice = choices[0]
+    message = choice.get("message") or {}
+    text = _chat_message_text(message)
     if not text:
-        diagnostic = {**llm_call, "status": "failed", "error": "LLM response content is empty."}
-        raise LLMCallError("LLM response content is empty.", diagnostic=diagnostic)
+        if _should_retry_deepseek_empty_content(normalized, message):
+            try:
+                data, normalized, llm_call = _retry_deepseek_with_disabled_thinking(
+                    normalized=normalized,
+                    payload=payload,
+                    api=api,
+                    started_at=started_at,
+                    first_choice=choice,
+                )
+            except Exception as exc:
+                _raise_llm_call_error(exc, normalized=normalized, api=api, started_at=started_at)
+            choices = data.get("choices") or []
+            if not choices:
+                raise RuntimeError("LLM response did not include choices.")
+            choice = choices[0]
+            message = choice.get("message") or {}
+            text = _chat_message_text(message)
+        if not text:
+            error = _empty_chat_content_error(normalized, message, choice)
+            diagnostic = {**llm_call, "status": "failed", "error": error}
+            raise LLMCallError(error, diagnostic=diagnostic)
     return {"text": text, "usage": data.get("usage", {}), "raw_response": data, "llm_call": llm_call}
 
 
@@ -541,6 +680,8 @@ def call_openai_compatible_text(
             temperature=temperature,
             max_tokens=max_tokens,
         )
+    except ContextBudgetExceededError:
+        raise
     except Exception as primary_exc:
         if not fallback_config:
             raise
@@ -581,11 +722,20 @@ def _call_openai_compatible_json_once(
             user_payload=user_payload,
         )
 
+    api = "openai_compatible_chat_json"
+    user_content = compact_json(user_payload)
+    context_budget = assert_llm_input_budget(
+        normalized_config=normalized,
+        system_prompt=system_prompt,
+        user_content=user_content,
+        api=api,
+        max_output_tokens=int(normalized.get("max_output_tokens") or 0),
+    )
     payload = {
         "model": normalized["model"],
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+            {"role": "user", "content": user_content},
         ],
         "response_format": {"type": "json_object"},
     }
@@ -594,7 +744,6 @@ def _call_openai_compatible_json_once(
     if not model_uses_default_temperature_only(normalized["model"]):
         payload["temperature"] = 0.1
     apply_openai_compatible_reasoning_flags(payload, normalized)
-    api = "openai_compatible_chat_json"
     started_at = time.perf_counter()
     try:
         data = _post_llm_json(
@@ -618,17 +767,35 @@ def _call_openai_compatible_json_once(
         status="success",
         usage=data.get("usage", {}),
     )
+    llm_call["context_budget"] = context_budget
     choices = data.get("choices") or []
     if not choices:
         raise RuntimeError("LLM response did not include choices.")
-    message = choices[0].get("message") or {}
-    content = message.get("content", "")
-    if isinstance(content, list):
-        content = "\n".join(str(item.get("text", item)) if isinstance(item, dict) else str(item) for item in content)
-    content = str(content or "").strip()
+    choice = choices[0]
+    message = choice.get("message") or {}
+    content = _chat_message_text(message)
     if not content:
-        diagnostic = {**llm_call, "status": "failed", "error": "LLM response content is empty."}
-        raise LLMCallError("LLM response content is empty.", diagnostic=diagnostic)
+        if _should_retry_deepseek_empty_content(normalized, message):
+            try:
+                data, normalized, llm_call = _retry_deepseek_with_disabled_thinking(
+                    normalized=normalized,
+                    payload=payload,
+                    api=api,
+                    started_at=started_at,
+                    first_choice=choice,
+                )
+            except Exception as exc:
+                _raise_llm_call_error(exc, normalized=normalized, api=api, started_at=started_at)
+            choices = data.get("choices") or []
+            if not choices:
+                raise RuntimeError("LLM response did not include choices.")
+            choice = choices[0]
+            message = choice.get("message") or {}
+            content = _chat_message_text(message)
+        if not content:
+            error = _empty_chat_content_error(normalized, message, choice)
+            diagnostic = {**llm_call, "status": "failed", "error": error}
+            raise LLMCallError(error, diagnostic=diagnostic)
     try:
         payload = json.loads(content)
     except json.JSONDecodeError as exc:
@@ -675,6 +842,8 @@ def call_openai_compatible_json(
             system_prompt=system_prompt,
             user_payload=user_payload,
         )
+    except ContextBudgetExceededError:
+        raise
     except Exception as primary_exc:
         if not fallback_config:
             raise

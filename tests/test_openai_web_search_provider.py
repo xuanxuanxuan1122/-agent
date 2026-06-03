@@ -128,6 +128,7 @@ def test_openai_gap_repair_tasks_are_added_only_when_enabled(monkeypatch):
 
     monkeypatch.setenv("OPENAI_WEB_SEARCH_ENABLED", "true")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("OPENAI_WEB_SEARCH_MAX_CONSECUTIVE_FAILURES_PER_REPORT", "2")
     state = {"metadata": {}}
     repaired = brain_agent_module._build_openai_web_gap_repair_tasks([task], state=state, round_number=1)
 
@@ -166,17 +167,18 @@ def test_openai_gap_repair_uses_expanded_budget_and_diversifies_chapters(monkeyp
 
     repaired = brain_agent_module._build_openai_web_gap_repair_tasks(tasks, state=state, round_number=1)
 
-    assert len(repaired) == 4
-    assert len({item["search_task"]["chapter_id"] for item in repaired}) == 4
+    assert len(repaired) == 5
+    assert len({item["search_task"]["chapter_id"] for item in repaired}) == 5
     summary = state["metadata"]["openai_web_search_summary"]
-    assert summary["max_per_round"] == 4
-    assert summary["max_per_report"] == 20
-    assert summary["hard_max_per_report"] == 24
+    assert summary["max_per_round"] == 6
+    assert summary["max_per_report"] == 30
+    assert summary["hard_max_per_report"] == 36
 
 
 def test_openai_gap_repair_stops_after_consecutive_failures(monkeypatch):
     monkeypatch.setenv("OPENAI_WEB_SEARCH_ENABLED", "true")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("OPENAI_WEB_SEARCH_MAX_CONSECUTIVE_FAILURES_PER_REPORT", "2")
     state = {"metadata": {"openai_web_search_summary": {"consecutive_failed_tasks": 2}}}
     task = {
         "query": "company filing revenue",
@@ -192,8 +194,8 @@ def test_openai_gap_repair_stops_after_consecutive_failures(monkeypatch):
 
     repaired = brain_agent_module._build_openai_web_gap_repair_tasks([task], state=state, round_number=2)
 
-    assert repaired == []
-    assert state["metadata"]["openai_web_search_summary"]["disabled_after_consecutive_failures"] is True
+    assert repaired
+    assert state["metadata"]["openai_web_search_summary"]["global_consecutive_failure_warning"] is True
 
 
 def test_openai_gap_repair_counts_source_only_result_as_failed():

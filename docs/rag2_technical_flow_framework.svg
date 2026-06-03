@@ -1,0 +1,418 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1900" height="1240" viewBox="0 0 1900 1240" role="img" aria-labelledby="title desc">
+  <title id="title">行业研究报告生成技术流程框架图</title>
+  <desc id="desc">展示当前项目的研究任务编排、联网证据采集、证据治理、写作质检、报告输出与技术栈。</desc>
+  <defs>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#0b8bd8"/>
+    </marker>
+    <marker id="arrow-dark" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+    </marker>
+    <marker id="arrow-orange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#f97316"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#10b981"/>
+    </marker>
+    <marker id="arrow-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#ef4444"/>
+    </marker>
+    <filter id="soft-shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#8aa0b8" flood-opacity="0.18"/>
+    </filter>
+    <style>
+      .canvas { fill: #ffffff; }
+      .title { font-family: "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif; font-size: 30px; font-weight: 800; fill: #07152f; letter-spacing: 0; }
+      .subtitle { font-family: "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif; font-size: 14px; fill: #21324c; letter-spacing: 0; }
+      .panel { fill: #f8fbff; stroke: #cbd8e8; stroke-width: 1.4; }
+      .panel-green { fill: #f3fcf8; stroke: #b7e2cd; }
+      .panel-yellow { fill: #fffaf0; stroke: #f3d39b; }
+      .panel-purple { fill: #f7f7ff; stroke: #c9c9ff; }
+      .panel-title { font-family: "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif; font-size: 14px; font-weight: 700; fill: #13203a; letter-spacing: 0; }
+      .node { stroke-width: 2; rx: 6; filter: url(#soft-shadow); }
+      .blue { fill: #e1f3ff; stroke: #0b8bd8; }
+      .blue2 { fill: #eef7ff; stroke: #2563eb; }
+      .purple { fill: #f0edff; stroke: #6655ff; }
+      .green { fill: #eafbf4; stroke: #10a979; }
+      .orange { fill: #fff7e8; stroke: #f97316; }
+      .red { fill: #fff1f1; stroke: #ef4444; }
+      .gray { fill: #f8fafc; stroke: #334155; }
+      .yellow { fill: #fff9db; stroke: #f59e0b; }
+      .node-text { font-family: "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif; font-size: 12px; font-weight: 650; fill: #07152f; text-anchor: middle; dominant-baseline: middle; letter-spacing: 0; }
+      .node-small { font-size: 11px; font-weight: 600; }
+      .node-mini { font-size: 10px; font-weight: 600; }
+      .mono { font-family: Consolas, "Microsoft YaHei", monospace; font-weight: 600; }
+      .caption { font-family: "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif; font-size: 11px; fill: #5b6b83; letter-spacing: 0; }
+      .arrow { fill: none; stroke-width: 2.2; }
+      .arrow-thin { fill: none; stroke-width: 1.6; }
+      .dark-line { stroke: #334155; marker-end: url(#arrow-dark); }
+      .blue-line { stroke: #0b8bd8; marker-end: url(#arrow-blue); }
+      .orange-line { stroke: #f97316; marker-end: url(#arrow-orange); }
+      .green-line { stroke: #10b981; marker-end: url(#arrow-green); }
+      .red-line { stroke: #ef4444; marker-end: url(#arrow-red); }
+      .dash-red { stroke: #ef4444; stroke-dasharray: 9 7; marker-end: url(#arrow-red); }
+      .dash-blue { stroke: #38bdf8; stroke-dasharray: 8 8; marker-end: url(#arrow-blue); }
+      .flow-label { font-family: "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif; font-size: 10px; font-weight: 650; fill: #2563eb; letter-spacing: 0; }
+      .legend-text { font-family: "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif; font-size: 11px; fill: #394b64; letter-spacing: 0; }
+    </style>
+  </defs>
+
+  <rect class="canvas" x="0" y="0" width="1900" height="1240"/>
+
+  <text class="title" x="950" y="42" text-anchor="middle">行业研究报告生成技术流程框架图</text>
+  <text class="subtitle" x="950" y="74" text-anchor="middle">主链路：业务问题 -&gt; Brain Agent 研究规划 -&gt; 联网 IQS 多通道取证 -&gt; 证据治理 -&gt; Writer/QA/Reformatter -&gt; Markdown 产物</text>
+
+  <!-- Top main chain -->
+  <rect class="panel" x="40" y="88" width="1820" height="286" rx="20"/>
+  <text class="panel-title" x="56" y="116">主链路：从业务输入到可发布报告</text>
+
+  <rect class="node blue" x="70" y="154" width="180" height="56"/>
+  <text class="node-text" x="160" y="177">
+    <tspan x="160" dy="0">用户 / 业务方</tspan>
+    <tspan x="160" dy="17">问题或报告主题</tspan>
+  </text>
+
+  <rect class="node blue" x="280" y="154" width="180" height="56"/>
+  <text class="node-text" x="370" y="177">
+    <tspan x="370" dy="0">统一运行入口</tspan>
+    <tspan x="370" dy="17" class="mono">Web / start / full_report</tspan>
+  </text>
+
+  <rect class="node orange" x="490" y="154" width="190" height="56"/>
+  <text class="node-text" x="585" y="177">
+    <tspan x="585" dy="0">配置与缓存</tspan>
+    <tspan x="585" dy="17" class="mono">.env / profile / cache</tspan>
+  </text>
+
+  <rect class="node purple" x="720" y="154" width="190" height="56"/>
+  <text class="node-text" x="815" y="177">
+    <tspan x="815" dy="0">Brain Agent 主图</tspan>
+    <tspan x="815" dy="17">LangGraph Supervisor</tspan>
+  </text>
+
+  <rect class="node purple" x="950" y="154" width="190" height="56"/>
+  <text class="node-text" x="1045" y="176">
+    <tspan x="1045" dy="0">研究规划与路由</tspan>
+    <tspan x="1045" dy="16">假设 / 章节 / search tasks</tspan>
+  </text>
+
+  <rect class="node green" x="1180" y="154" width="190" height="56"/>
+  <text class="node-text" x="1275" y="176">
+    <tspan x="1275" dy="0">并行取证</tspan>
+    <tspan x="1275" dy="16">IQS lanes + 页面读取</tspan>
+  </text>
+
+  <rect class="node yellow" x="1410" y="154" width="190" height="56"/>
+  <text class="node-text" x="1505" y="176">
+    <tspan x="1505" dy="0">证据治理闭环</tspan>
+    <tspan x="1505" dy="16">标准化 / 覆盖率 / 补证</tspan>
+  </text>
+
+  <rect class="node blue2" x="1640" y="154" width="180" height="56"/>
+  <text class="node-text" x="1730" y="176">
+    <tspan x="1730" dy="0">报告产物输出</tspan>
+    <tspan x="1730" dy="16">clean.md / state / trace</tspan>
+  </text>
+
+  <path class="arrow blue-line" d="M 250 182 H 280"/>
+  <path class="arrow dark-line" d="M 460 182 H 490"/>
+  <path class="arrow orange-line" d="M 680 182 H 720"/>
+  <path class="arrow dark-line" d="M 910 182 H 950"/>
+  <path class="arrow green-line" d="M 1140 182 H 1180"/>
+  <path class="arrow green-line" d="M 1370 182 H 1410"/>
+  <path class="arrow blue-line" d="M 1600 182 H 1640"/>
+
+  <rect class="node orange" x="510" y="258" width="170" height="54"/>
+  <text class="node-text node-small" x="595" y="279">
+    <tspan x="595" dy="0">统一配置</tspan>
+    <tspan x="595" dy="15">模型 / IQS / QA / 输出</tspan>
+  </text>
+  <path class="arrow-thin orange-line" d="M 585 210 V 258"/>
+  <text class="flow-label" x="600" y="242">环境注入</text>
+
+  <rect class="node green" x="1190" y="258" width="180" height="54"/>
+  <text class="node-text node-small" x="1280" y="279">
+    <tspan x="1280" dy="0">证据通道</tspan>
+    <tspan x="1280" dy="15">IQS + ReadPage</tspan>
+  </text>
+  <path class="arrow-thin green-line" d="M 1275 210 V 258"/>
+
+  <rect class="node red" x="1420" y="258" width="180" height="54"/>
+  <text class="node-text node-small" x="1510" y="279">
+    <tspan x="1510" dy="0">缺口补证</tspan>
+    <tspan x="1510" dy="15">follow-up loop / 降级</tspan>
+  </text>
+  <path class="arrow-thin red-line" d="M 1505 210 V 258"/>
+
+  <rect class="node blue2" x="1640" y="258" width="180" height="54"/>
+  <text class="node-text node-small" x="1730" y="279">
+    <tspan x="1730" dy="0">阶段快照</tspan>
+    <tspan x="1730" dy="15">writer_package / logs</tspan>
+  </text>
+  <path class="arrow-thin blue-line" d="M 1730 210 V 258"/>
+
+  <text class="caption" x="56" y="346">核心约束：Writer 只消费结构化证据包；证据不足时优先补检索、降级表达或输出诊断稿，不凭空补事实。</text>
+
+  <!-- Middle panels -->
+  <rect class="panel panel-green" x="40" y="402" width="560" height="238" rx="16"/>
+  <text class="panel-title" x="56" y="430">A. 资料整理链路：形成研究上下文与运行产物</text>
+
+  <rect class="node green" x="70" y="462" width="150" height="48"/>
+  <text class="node-text node-small" x="145" y="481">
+    <tspan x="145" dy="0">资料导入</tspan>
+    <tspan x="145" dy="15">样本 / 主题 / 历史输出</tspan>
+  </text>
+  <rect class="node green" x="245" y="462" width="150" height="48"/>
+  <text class="node-text node-small" x="320" y="481">
+    <tspan x="320" dy="0">原始文本清洗</tspan>
+    <tspan x="320" dy="15">去噪 / 去重 / 表格规范</tspan>
+  </text>
+  <rect class="node green" x="420" y="462" width="150" height="48"/>
+  <text class="node-text node-small" x="495" y="481">
+    <tspan x="495" dy="0">结构识别</tspan>
+    <tspan x="495" dy="15">章节 / 表格 / 指标线索</tspan>
+  </text>
+  <path class="arrow-thin green-line" d="M 220 486 H 245"/>
+  <path class="arrow-thin green-line" d="M 395 486 H 420"/>
+
+  <rect class="node orange" x="70" y="548" width="150" height="48"/>
+  <text class="node-text node-small" x="145" y="567">
+    <tspan x="145" dy="0">任务上下文</tspan>
+    <tspan x="145" dy="15">对象 / 行业 / 输出约束</tspan>
+  </text>
+  <rect class="node orange" x="245" y="548" width="150" height="48"/>
+  <text class="node-text node-small" x="320" y="567">
+    <tspan x="320" dy="0">证据缓存</tspan>
+    <tspan x="320" dy="15">TopicBundle / source cache</tspan>
+  </text>
+  <rect class="node blue2" x="420" y="548" width="150" height="48"/>
+  <text class="node-text node-small" x="495" y="567">
+    <tspan x="495" dy="0">中间产物</tspan>
+    <tspan x="495" dy="15" class="mono">state / package / snapshots</tspan>
+  </text>
+  <path class="arrow-thin green-line" d="M 495 510 V 530 H 145 V 548"/>
+  <path class="arrow-thin orange-line" d="M 220 572 H 245"/>
+  <path class="arrow-thin blue-line" d="M 395 572 H 420"/>
+  <text class="caption" x="70" y="620">对应：topic_bundle_cache、stage_snapshot_cache、reporting_templates、flows/report</text>
+
+  <rect class="panel panel-yellow" x="620" y="402" width="560" height="238" rx="16"/>
+  <text class="panel-title" x="636" y="430">B. 研究任务编排链路：从问题到可执行证据任务</text>
+
+  <rect class="node blue" x="650" y="462" width="150" height="48"/>
+  <text class="node-text node-small" x="725" y="481">
+    <tspan x="725" dy="0">Query Plan</tspan>
+    <tspan x="725" dy="15">上下文改写 / 关键词</tspan>
+  </text>
+  <rect class="node green" x="825" y="462" width="150" height="48"/>
+  <text class="node-text node-small" x="900" y="481">
+    <tspan x="900" dy="0">Problem Framing</tspan>
+    <tspan x="900" dy="15">研究对象 / 约束 / 口径</tspan>
+  </text>
+  <rect class="node orange" x="1000" y="462" width="150" height="48"/>
+  <text class="node-text node-small" x="1075" y="481">
+    <tspan x="1075" dy="0">Research Planner</tspan>
+    <tspan x="1075" dy="15">假设 / 章节 / 证据目标</tspan>
+  </text>
+  <path class="arrow-thin blue-line" d="M 800 486 H 825"/>
+  <path class="arrow-thin orange-line" d="M 975 486 H 1000"/>
+
+  <rect class="node green" x="650" y="548" width="150" height="48"/>
+  <text class="node-text node-small" x="725" y="567">
+    <tspan x="725" dy="0">搜索任务</tspan>
+    <tspan x="725" dy="15">来源类型 / 关键词 / 时间</tspan>
+  </text>
+  <rect class="node red" x="825" y="548" width="150" height="48"/>
+  <text class="node-text node-small" x="900" y="567">
+    <tspan x="900" dy="0">补证迭代</tspan>
+    <tspan x="900" dy="15">缺口驱动 follow-up</tspan>
+  </text>
+  <rect class="node blue2" x="1000" y="548" width="150" height="48"/>
+  <text class="node-text node-small" x="1075" y="567">
+    <tspan x="1075" dy="0">任务包输出</tspan>
+    <tspan x="1075" dy="15">search tasks / trace</tspan>
+  </text>
+  <path class="arrow-thin orange-line" d="M 1075 510 V 528 H 725 V 548"/>
+  <path class="arrow-thin red-line" d="M 800 572 H 825"/>
+  <path class="arrow-thin blue-line" d="M 975 572 H 1000"/>
+  <path class="arrow-thin dash-red" d="M 900 548 V 532 H 725 V 510"/>
+  <text class="caption" x="650" y="620">对应：brain_agent、research_planner、problem_framing_agent、dynamic_search_schema</text>
+
+  <rect class="panel panel-green" x="1200" y="402" width="660" height="238" rx="16"/>
+  <text class="panel-title" x="1216" y="430">C. 联网 IQS 多通道链路：补齐实时与外部来源</text>
+
+  <rect class="node purple" x="1230" y="456" width="145" height="46"/>
+  <text class="node-text node-small" x="1302.5" y="474">
+    <tspan x="1302.5" dy="0">搜索任务</tspan>
+    <tspan x="1302.5" dy="15">章节 / 假设 / 证据目标</tspan>
+  </text>
+  <rect class="node blue" x="1400" y="456" width="145" height="46"/>
+  <text class="node-text node-small" x="1472.5" y="474">
+    <tspan x="1472.5" dy="0">Web Analysis</tspan>
+    <tspan x="1472.5" dy="15">查询扩展 / 页面读取</tspan>
+  </text>
+  <rect class="node green" x="1570" y="456" width="250" height="46"/>
+  <text class="node-text node-small" x="1695" y="474">
+    <tspan x="1695" dy="0">6 个 IQS lane</tspan>
+    <tspan x="1695" dy="15">官方 / 公司 / 市场 / 新闻 / 技术 / 案例</tspan>
+  </text>
+  <path class="arrow-thin blue-line" d="M 1375 479 H 1400"/>
+  <path class="arrow-thin green-line" d="M 1545 479 H 1570"/>
+
+  <rect class="node orange" x="1230" y="535" width="170" height="46"/>
+  <text class="node-text node-small" x="1315" y="553">
+    <tspan x="1315" dy="0">来源分层</tspan>
+    <tspan x="1315" dy="15">权威优先 / 去重过滤</tspan>
+  </text>
+  <rect class="node green" x="1432" y="535" width="170" height="46"/>
+  <text class="node-text node-small" x="1517" y="553">
+    <tspan x="1517" dy="0">事实抽取</tspan>
+    <tspan x="1517" dy="15">关键数据 / 摘要 / 链接</tspan>
+  </text>
+  <rect class="node blue2" x="1634" y="535" width="186" height="46"/>
+  <text class="node-text node-small" x="1727" y="553">
+    <tspan x="1727" dy="0">联网证据项</tspan>
+    <tspan x="1727" dy="15">title / url / date / source grade</tspan>
+  </text>
+  <path class="arrow-thin green-line" d="M 1695 502 V 516 H 1315 V 535"/>
+  <path class="arrow-thin orange-line" d="M 1400 558 H 1432"/>
+  <path class="arrow-thin blue-line" d="M 1602 558 H 1634"/>
+  <text class="caption" x="1230" y="620">边界：IQS Key 与服务地址只经 .env 注入；网页结果先入证据池，不直接写进最终报告。</text>
+
+  <!-- Evidence and writing panel -->
+  <rect class="panel" x="40" y="670" width="1820" height="250" rx="20"/>
+  <text class="panel-title" x="56" y="698">证据治理与写作质量门禁：问答、报告、Web 入口共用</text>
+
+  <rect class="node green" x="80" y="760" width="160" height="54"/>
+  <text class="node-text node-small" x="160" y="781">
+    <tspan x="160" dy="0">统一证据池</tspan>
+    <tspan x="160" dy="15">web + structured evidence</tspan>
+  </text>
+  <rect class="node green" x="270" y="760" width="160" height="54"/>
+  <text class="node-text node-small" x="350" y="781">
+    <tspan x="350" dy="0">Evidence Binder</tspan>
+    <tspan x="350" dy="15">章节 / 假设 / 来源绑定</tspan>
+  </text>
+  <polygon class="node yellow" points="545,742 625,787 545,832 465,787"/>
+  <text class="node-text node-small" x="545" y="782">
+    <tspan x="545" dy="0">覆盖</tspan>
+    <tspan x="545" dy="15">足够?</tspan>
+  </text>
+  <rect class="node purple" x="675" y="760" width="165" height="54"/>
+  <text class="node-text node-small" x="757.5" y="781">
+    <tspan x="757.5" dy="0">Analysis Agent</tspan>
+    <tspan x="757.5" dy="15">洞察 / 冲突 / 边界</tspan>
+  </text>
+  <rect class="node purple" x="870" y="760" width="190" height="54"/>
+  <text class="node-text node-small" x="965" y="779">
+    <tspan x="965" dy="0">Writer Pipeline</tspan>
+    <tspan x="965" dy="15">Pre-layout / Table / Claim</tspan>
+  </text>
+  <rect class="node red" x="1090" y="760" width="170" height="54"/>
+  <text class="node-text node-small" x="1175" y="781">
+    <tspan x="1175" dy="0">Public Sanitizer</tspan>
+    <tspan x="1175" dy="15">清理内部标签</tspan>
+  </text>
+  <polygon class="node red" points="1355,742 1435,787 1355,832 1275,787"/>
+  <text class="node-text node-small" x="1355" y="782">
+    <tspan x="1355" dy="0">QA</tspan>
+    <tspan x="1355" dy="15">通过?</tspan>
+  </text>
+  <rect class="node orange" x="1480" y="760" width="165" height="54"/>
+  <text class="node-text node-small" x="1562.5" y="781">
+    <tspan x="1562.5" dy="0">Reformatter</tspan>
+    <tspan x="1562.5" dy="15">引用规范 / Clean Report</tspan>
+  </text>
+  <rect class="node blue2" x="1680" y="760" width="150" height="54"/>
+  <text class="node-text node-small" x="1755" y="781">
+    <tspan x="1755" dy="0">最终交付</tspan>
+    <tspan x="1755" dy="15">可发布 Markdown</tspan>
+  </text>
+
+  <path class="arrow green-line" d="M 240 787 H 270"/>
+  <path class="arrow green-line" d="M 430 787 H 465"/>
+  <path class="arrow orange-line" d="M 625 787 H 675"/>
+  <path class="arrow dark-line" d="M 840 787 H 870"/>
+  <path class="arrow red-line" d="M 1060 787 H 1090"/>
+  <path class="arrow red-line" d="M 1260 787 H 1275"/>
+  <path class="arrow orange-line" d="M 1435 787 H 1480"/>
+  <path class="arrow blue-line" d="M 1645 787 H 1680"/>
+  <text class="flow-label" x="640" y="776">足够</text>
+  <text class="flow-label" x="1445" y="776">通过</text>
+
+  <rect class="node red" x="455" y="850" width="180" height="42"/>
+  <text class="node-text node-small" x="545" y="866">
+    <tspan x="545" dy="0">follow-up 查询</tspan>
+    <tspan x="545" dy="14">回到 IQS / 页面读取补证</tspan>
+  </text>
+  <path class="arrow-thin dash-red" d="M 545 832 V 850"/>
+  <path class="arrow-thin dash-red" d="M 455 871 H 120 V 642"/>
+  <path class="arrow-thin dash-red" d="M 635 871 H 1740 V 642"/>
+  <text class="flow-label" x="500" y="842" fill="#ef4444">不足</text>
+
+  <rect class="node red" x="1280" y="850" width="150" height="42"/>
+  <text class="node-text node-small" x="1355" y="866">
+    <tspan x="1355" dy="0">Rewrite / Review</tspan>
+    <tspan x="1355" dy="14">评分稿 / 诊断稿</tspan>
+  </text>
+  <path class="arrow-thin dash-red" d="M 1355 832 V 850"/>
+  <text class="flow-label" x="1368" y="842" fill="#ef4444">未通过</text>
+
+  <text class="caption" x="80" y="900">质量门禁：来源分层、覆盖率矩阵、指标口径、冲突识别、无来源结论拦截、内部过程语言清理、失败兜底。</text>
+
+  <!-- Tech stack and rules -->
+  <rect class="panel panel-purple" x="40" y="948" width="1820" height="244" rx="20"/>
+  <text class="panel-title" x="56" y="976">技术栈与关键规则</text>
+
+  <rect class="node blue" x="70" y="1018" width="250" height="94"/>
+  <text class="node-text node-small" x="195" y="1047">
+    <tspan x="195" dy="0">启动 / 服务</tspan>
+    <tspan x="195" dy="17">PowerShell 脚本</tspan>
+    <tspan x="195" dy="17">FastAPI report_web_app</tspan>
+    <tspan x="195" dy="17">后台 ReportJob</tspan>
+  </text>
+
+  <rect class="node purple" x="360" y="1018" width="250" height="94"/>
+  <text class="node-text node-small" x="485" y="1047">
+    <tspan x="485" dy="0">编排 / Agent</tspan>
+    <tspan x="485" dy="17">LangGraph StateGraph</tspan>
+    <tspan x="485" dy="17">Brain Agent Supervisor</tspan>
+    <tspan x="485" dy="17">Web / IQS 多通道并发</tspan>
+  </text>
+
+  <rect class="node green" x="650" y="1018" width="250" height="94"/>
+  <text class="node-text node-small" x="775" y="1047">
+    <tspan x="775" dy="0">缓存 / 产物</tspan>
+    <tspan x="775" dy="17">TopicBundle Cache</tspan>
+    <tspan x="775" dy="17">writer package / state</tspan>
+    <tspan x="775" dy="17">TopicBundle / StageSnapshot</tspan>
+  </text>
+
+  <rect class="node orange" x="940" y="1018" width="250" height="94"/>
+  <text class="node-text node-small" x="1065" y="1047">
+    <tspan x="1065" dy="0">模型 / 联网检索</tspan>
+    <tspan x="1065" dy="17">LLM profiles</tspan>
+    <tspan x="1065" dy="17">IQS search / ReadPage</tspan>
+    <tspan x="1065" dy="17">rerank / fact extraction</tspan>
+  </text>
+
+  <rect class="node red" x="1230" y="1018" width="250" height="94"/>
+  <text class="node-text node-small" x="1355" y="1047">
+    <tspan x="1355" dy="0">质量治理</tspan>
+    <tspan x="1355" dy="17">source registry / ledger</tspan>
+    <tspan x="1355" dy="17">quality gate / final audit</tspan>
+    <tspan x="1355" dy="17">QA / rewrite / reformatter</tspan>
+  </text>
+
+  <rect class="node gray" x="1520" y="1018" width="250" height="94"/>
+  <text class="node-text node-small" x="1645" y="1047">
+    <tspan x="1645" dy="0">安全 / 运维</tspan>
+    <tspan x="1645" dy="17">密钥仅 .env / 环境变量</tspan>
+    <tspan x="1645" dy="17">logs / traces / token usage</tspan>
+    <tspan x="1645" dy="17">失败降级与可复盘产物</tspan>
+  </text>
+
+  <rect class="node yellow" x="100" y="1142" width="1700" height="34"/>
+  <text class="node-text node-small" x="950" y="1159">核心规则：联网 IQS 负责实时补证；所有证据必须先标准化进入证据池，报告输出前必须经过 QA、引用规范化和公开表达清理。</text>
+
+  <text class="caption" x="56" y="1222">根据当前项目结构、功能流程文档与技术说明整理。</text>
+</svg>

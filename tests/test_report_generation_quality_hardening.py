@@ -6,7 +6,7 @@ from rag_pipeline.agents.brain_agent import _lane_coverage_from_state
 from rag_pipeline.agents.evidence_binder import _report_proof_mode
 from rag_pipeline.agents.evidence_merger import _source_traceability_payload
 from rag_pipeline.agents.final_writer_agent import run_final_writer_agent
-from rag_pipeline.agents.public_report_sanitizer import sanitize_public_markdown
+from rag_pipeline.agents.public_report_sanitizer import public_narrative_leak_audit, sanitize_public_markdown
 from rag_pipeline.agents.qa_agent import run_qa_agent, validate_no_internal_gap_language
 from rag_pipeline.agents.report_profile_registry import select_report_profile
 from rag_pipeline.flows.report import full_report
@@ -140,12 +140,81 @@ def test_final_writer_forces_source_appendix_when_body_has_citations(monkeypatch
                 ],
             }
         ],
-        source_registry=[{"ref": "[1]", "title": "来源一", "url": "https://example.com/1"}],
+        source_registry=[{"ref": "[1]", "title": "来源一", "url": "https://www.stats.gov.cn/1"}],
     )
 
     markdown = result["report_markdown"]
-    assert "https://example.com/1" in markdown
+    assert "https://www.stats.gov.cn/1" in markdown
     assert markdown.count("[1]") >= 2
+
+
+def test_public_sanitizer_removes_soft_internal_narrative_language():
+    markdown = (
+        "# 报告\n\n"
+        "研究主线：先界定研究对象，再判断需求、供给、机会与风险。\n\n"
+        "## 1. 需求是否成立\n"
+        "### 本节技术观察\n"
+        "该证据来自公司官方问答，披露了具体的Agent产品功能和覆盖场景。\n"
+        "该证据仅反映单一公司的产品部署情况，未提供用户规模。[1]\n\n"
+        "## 来源附录\n"
+        "- [1] 来源 | https://example.com/source\n"
+    )
+
+    cleaned = sanitize_public_markdown(markdown)
+    body = cleaned.split("## 来源附录", 1)[0]
+
+    for phrase in ["研究主线", "本节技术观察", "该证据来自", "该证据仅反映"]:
+        assert phrase not in body
+    assert "## 来源附录" in cleaned
+    assert public_narrative_leak_audit(cleaned)["blocker_count"] == 0
+
+
+def test_final_writer_excludes_diagnostic_global_blocks_from_public_report():
+    result = run_final_writer_agent(
+        query="AI Agent企业级落地与商业化验证",
+        report_blueprint={
+            "report_family": "industry_deep_report",
+            "report_shell": {
+                "front_blocks": ["policy_summary"],
+                "back_blocks": ["execution_risks", "monitoring_indicators", "appendix"],
+            },
+        },
+        chapter_packages=[
+            {
+                "chapter_id": "ch_01",
+                "chapter_title": "需求是否成立",
+                "sections": [
+                    {
+                        "section_id": "ch_01_s1",
+                        "section_title": "客户部署是否出现",
+                        "claim": "企业已经披露AI Agent在客户服务流程中的部署样本。[1]",
+                        "reasoning": "该样本说明企业级部署开始从试点进入具体流程。",
+                        "citation_refs": ["[1]"],
+                        "evidence_refs": ["E1"],
+                        "evidence_backed": True,
+                    }
+                ],
+            }
+        ],
+        decision_package={
+            "core_judgments": [{"judgment": "企业级AI Agent部署开始进入客户服务流程。"}],
+            "watchlist": [{"metric": "后续观察本章相关的指标口径、企业披露和客户案例。"}],
+        },
+        risk_package={
+            "risk_items": [
+                {"risk_type": "执行边界风险", "severity": "high", "description": "样本数量不足。"}
+            ]
+        },
+        source_registry=[{"ref": "[1]", "title": "来源一", "url": "https://www.stats.gov.cn/source"}],
+    )
+
+    markdown = result["report_markdown"]
+
+    for phrase in ["政策摘要", "政策影响：", "执行风险", "监测指标", "应对：", "执行边界风险", "后续观察本章"]:
+        assert phrase not in markdown
+    assert "企业已经披露AI Agent在客户服务流程中的部署样本" in markdown
+    assert "来源一" in markdown
+    assert result["public_narrative_leak_audit"]["blocker_count"] == 0
 
 
 def test_deep_report_quick_proof_mode_auto_upgrades(monkeypatch):
@@ -162,7 +231,7 @@ def test_title_only_source_is_not_traceable():
     title_only = _source_traceability_payload({"source": {"title": "只有标题"}})
     assert title_only["has_source_ref"] is False
 
-    url_source = _source_traceability_payload({"source": {"title": "有URL", "url": "https://example.com"}})
+    url_source = _source_traceability_payload({"source": {"title": "有URL", "url": "https://www.stats.gov.cn/source"}})
     assert url_source["has_source_ref"] is True
 
 

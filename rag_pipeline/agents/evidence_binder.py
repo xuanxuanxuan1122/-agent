@@ -241,6 +241,22 @@ def _distinct_source_count(items: Sequence[Dict[str, Any]]) -> int:
     return len({key for key in keys if key})
 
 
+def _evidence_source_domain_key(item: Dict[str, Any]) -> str:
+    source = _as_dict(item.get("source"))
+    raw_url = str(source.get("url") or source.get("source_url") or item.get("source_url") or item.get("url") or "").strip()
+    if raw_url:
+        parsed = urlparse(raw_url)
+        domain = parsed.netloc.lower().removeprefix("www.")
+        if domain:
+            return f"domain:{domain}"
+    return _evidence_source_key(item)
+
+
+def _distinct_source_domain_count(items: Sequence[Dict[str, Any]]) -> int:
+    keys = {_evidence_source_domain_key(item) for item in items if isinstance(item, dict)}
+    return len({key for key in keys if key})
+
+
 VERIFIED_SOURCE_STATUSES = {"readpage_verified", "document_verified"}
 DOCUMENT_SOURCE_RE = re.compile(
     r"(\.pdf(?:$|\?)|annual[-_ ]?report|financial[-_ ]?report|filing|prospectus|"
@@ -1469,7 +1485,7 @@ def build_coverage_matrix(
             ]
         )
         directional_count = len(directional)
-        directional_distinct_count = _distinct_source_count(directional)
+        directional_distinct_count = _distinct_source_domain_count(directional)
         claim_type = _claim_type_for_hypothesis(hypothesis, goals)
         hard_metric_claim = claim_type == "hard_metric"
         strict_mode = _strict_quality_mode()

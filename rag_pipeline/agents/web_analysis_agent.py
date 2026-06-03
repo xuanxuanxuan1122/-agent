@@ -33,6 +33,7 @@ from ..config.search_config import (
 from ..search.engine import call_external_rerank_api
 from ..search.memory import call_openai_compatible_json, llm_config_is_ready, normalize_llm_config
 from ..runtime_cache import TTLCache, make_cache_key
+from .readpage_fact_extractor_agent import extract_fact_cards_from_pages
 from rag_pipeline.cache.evidence_cache import lookup_search as lookup_persistent_search_cache
 from rag_pipeline.cache.evidence_cache import store_search as store_persistent_search_cache
 
@@ -173,6 +174,8 @@ class WebAnalysisAgentState(TypedDict, total=False):
     enable_llm_analysis: bool
     search_results: List[Dict[str, Any]]
     page_results: List[Dict[str, Any]]
+    extracted_fact_cards: List[Dict[str, Any]]
+    fact_extractor: Dict[str, Any]
     answer_text: str
     raw_output: Dict[str, Any]
     metadata: Dict[str, Any]
@@ -723,6 +726,120 @@ def _as_list(value: Any) -> List[Any]:
     return list(value) if isinstance(value, list) else []
 
 
+_QUERY_REWRITE_BUDGET_STATE: Dict[str, Dict[str, Any]] = {}
+_QUERY_REWRITE_CACHE: Dict[str, List[Dict[str, Any]]] = {}
+
+
+def _query_rewrite_run_id(options: Optional[Dict[str, Any]]) -> str:
+    opts = _as_dict(options)
+    for key in ("run_id", "report_run_id", "stage_snapshot_run_id", "session_id"):
+        value = str(opts.get(key) or "").strip()
+        if value:
+            return value
+    return str(os.getenv("REPORT_STAGE_SNAPSHOT_RUN_ID") or os.getenv("RUN_ID") or "default").strip() or "default"
+
+
+def reset_query_rewrite_budget(run_id: str = "") -> None:
+    if run_id:
+        _QUERY_REWRITE_BUDGET_STATE.pop(str(run_id), None)
+        for key in [key for key in _QUERY_REWRITE_CACHE if key.startswith(f"{run_id}:")]:
+            _QUERY_REWRITE_CACHE.pop(key, None)
+        return
+    _QUERY_REWRITE_BUDGET_STATE.clear()
+    _QUERY_REWRITE_CACHE.clear()
+
+
+def _query_rewrite_state(run_id: str) -> Dict[str, Any]:
+    state = _QUERY_REWRITE_BUDGET_STATE.setdefault(
+        run_id,
+        {
+            "query_rewrite_call_count": 0,
+            "query_rewrite_input_chars_total": 0,
+            "query_rewrite_cache_hit_count": 0,
+            "query_rewrite_budget_exhausted": False,
+            "query_rewrite_max_calls": _env_int("QUERY_REWRITE_MAX_CALLS_PER_REPORT", 4, min_value=1, max_value=100),
+            "query_rewrite_max_input_chars": _env_int("QUERY_REWRITE_MAX_INPUT_CHARS", 6000, min_value=500, max_value=50000),
+            "query_rewrite_model": "",
+        },
+    )
+    state["query_rewrite_max_calls"] = _env_int("QUERY_REWRITE_MAX_CALLS_PER_REPORT", 4, min_value=1, max_value=100)
+    state["query_rewrite_max_input_chars"] = _env_int("QUERY_REWRITE_MAX_INPUT_CHARS", 6000, min_value=500, max_value=50000)
+    return state
+
+
+def query_rewrite_diagnostics(run_id: str = "") -> Dict[str, Any]:
+    run_key = str(run_id or _query_rewrite_run_id({})).strip() or "default"
+    return dict(_query_rewrite_state(run_key))
+
+
+def _short_list(value: Any, *, limit: int = 8, item_chars: int = 80) -> List[str]:
+    result: List[str] = []
+    for item in _as_list(value):
+        text = _compact_text(item, item_chars)
+        if text and text not in result:
+            result.append(text)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _compact_query_rewrite_task(task: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "task_id": str(task.get("task_id") or task.get("id") or "").strip(),
+        "dimension_id": str(task.get("dimension_id") or task.get("hypothesis_id") or "").strip(),
+        "dimension_name": _compact_text(task.get("dimension_name") or task.get("chapter_title"), 120),
+        "proof_role": str(task.get("proof_role") or task.get("evidence_type") or "").strip(),
+        "evidence_goal": _compact_text(task.get("evidence_goal") or task.get("goal"), 300),
+        "must_have_terms": _short_list(task.get("must_have_terms"), limit=8, item_chars=60),
+        "forbidden_terms": _short_list(task.get("forbidden_terms"), limit=8, item_chars=60),
+        "source_priority": _short_list(task.get("source_priority"), limit=8, item_chars=80),
+    }
+
+
+def _compact_research_context(research_plan: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "research_type": str(research_plan.get("research_type") or "").strip(),
+        "report_type": str(research_plan.get("report_type") or research_plan.get("report_family") or "").strip(),
+        "topic": _compact_text(research_plan.get("topic") or research_plan.get("query"), 160),
+    }
+
+
+def _query_rewrite_payload(
+    *,
+    query: str,
+    base_options: Dict[str, Any],
+    research_plan: Optional[Dict[str, Any]],
+    search_task: Optional[Dict[str, Any]],
+    max_chars: int,
+) -> Dict[str, Any]:
+    task = _as_dict(search_task or base_options.get("search_task"))
+    plan = _as_dict(research_plan or base_options.get("research_plan"))
+    payload: Dict[str, Any] = {
+        "query": _compact_text(query, 300),
+        "current_year": datetime.now().year,
+        "search_task": _compact_query_rewrite_task(task) if task else {},
+        "research_context": _compact_research_context(plan) if plan else {},
+    }
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    if len(serialized) <= max_chars:
+        return payload
+    payload["research_context"] = {}
+    if payload["search_task"]:
+        compact_task = dict(payload["search_task"])
+        compact_task["evidence_goal"] = _compact_text(compact_task.get("evidence_goal"), 120)
+        compact_task["must_have_terms"] = compact_task.get("must_have_terms", [])[:4]
+        compact_task["forbidden_terms"] = compact_task.get("forbidden_terms", [])[:4]
+        compact_task["source_priority"] = compact_task.get("source_priority", [])[:4]
+        payload["search_task"] = compact_task
+    payload["query"] = _compact_text(payload.get("query"), 160)
+    return payload
+
+
+def _query_rewrite_cache_key(run_id: str, payload: Dict[str, Any]) -> str:
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return f"{run_id}:{make_cache_key('llm_query_rewrite_v2', {'payload': raw})}"
+
+
 def _web_cache_allowed(search_options: Optional[Dict[str, Any]]) -> bool:
     options = _as_dict(search_options)
     if str(options.get("disable_cache") or "").strip().lower() in {"1", "true", "yes", "on"}:
@@ -1088,8 +1205,35 @@ def build_llm_query_plan(
 ) -> List[Dict[str, Any]]:
     if not _env_flag("IQS_ENABLE_LLM_QUERY_REWRITE", False):
         return []
+    run_id = _query_rewrite_run_id(base_options)
+    budget = _query_rewrite_state(run_id)
     llm_config = build_llm_config("query_rewrite")
     if not llm_config_is_ready(llm_config):
+        return []
+    budget["query_rewrite_model"] = normalize_llm_config(llm_config).get("model", "") or str(llm_config.get("model") or "")
+    user_payload = _query_rewrite_payload(
+        query=query,
+        base_options=base_options,
+        research_plan=research_plan,
+        search_task=search_task,
+        max_chars=int(budget.get("query_rewrite_max_input_chars") or 6000),
+    )
+    serialized_payload = json.dumps(user_payload, ensure_ascii=False, sort_keys=True)
+    if len(serialized_payload) > int(budget.get("query_rewrite_max_input_chars") or 6000):
+        budget["query_rewrite_budget_exhausted"] = True
+        budget["query_rewrite_last_skip_reason"] = "input_too_large"
+        base_options["query_rewrite_diagnostics"] = dict(budget)
+        return []
+    cache_enabled = _env_flag("QUERY_REWRITE_CACHE_ENABLED", True)
+    cache_key = _query_rewrite_cache_key(run_id, user_payload)
+    if cache_enabled and cache_key in _QUERY_REWRITE_CACHE:
+        budget["query_rewrite_cache_hit_count"] = int(budget.get("query_rewrite_cache_hit_count") or 0) + 1
+        base_options["query_rewrite_diagnostics"] = dict(budget)
+        return copy.deepcopy(_QUERY_REWRITE_CACHE[cache_key])
+    if int(budget.get("query_rewrite_call_count") or 0) >= int(budget.get("query_rewrite_max_calls") or 4):
+        budget["query_rewrite_budget_exhausted"] = True
+        budget["query_rewrite_last_skip_reason"] = "max_calls_exhausted"
+        base_options["query_rewrite_diagnostics"] = dict(budget)
         return []
     dynamic_mode = bool(research_plan or search_task or base_options.get("research_plan") or base_options.get("search_task"))
     system_prompt = """
@@ -1136,18 +1280,16 @@ def build_llm_query_plan(
 只返回 JSON。
 """.strip()
     try:
+        budget["query_rewrite_call_count"] = int(budget.get("query_rewrite_call_count") or 0) + 1
+        budget["query_rewrite_input_chars_total"] = int(budget.get("query_rewrite_input_chars_total") or 0) + len(serialized_payload)
         response = call_openai_compatible_json(
             config=llm_config,
             system_prompt=system_prompt,
-            user_payload={
-                "query": query,
-                "current_year": datetime.now().year,
-                "research_plan": research_plan or base_options.get("research_plan"),
-                "search_task": search_task or base_options.get("search_task"),
-            },
+            user_payload=user_payload,
         )
     except Exception:
         logger.exception("LLM query rewrite failed", extra={"query": query})
+        base_options["query_rewrite_diagnostics"] = dict(budget)
         return []
     payload = response.get("payload") or {}
     values = payload.get("queries") if isinstance(payload, dict) else []
@@ -1185,7 +1327,7 @@ def build_llm_query_plan(
                 "search_task": task,
             }
         )
-    return plan[
+    plan = plan[
         : _profile_int(
             base_options,
             ["maxQueries", "max_queries"],
@@ -1199,6 +1341,10 @@ def build_llm_query_plan(
             max_value=8,
         )
     ]
+    if cache_enabled:
+        _QUERY_REWRITE_CACHE[cache_key] = copy.deepcopy(plan)
+    base_options["query_rewrite_diagnostics"] = dict(budget)
+    return plan
 
 
 def build_hyde_query(query: str, base_options: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1836,12 +1982,14 @@ def task_acceptance_filter(item: Dict[str, Any], options: Optional[Dict[str, Any
             "matched_terms": [],
         }
 
+    opts = _as_dict(options)
+    task_query = task.get("query") or task.get("evidence_goal") or opts.get("query")
     text = _result_text(item, max_chars=2000).lower()
     domain = _domain(str(item.get("url") or "")).lower()
     must_terms = _task_terms(task.get("must_have_terms"))
     forbidden_terms = _task_terms(task.get("forbidden_terms"))
     source_priority = _task_terms(task.get("source_priority"))
-    lexical = lexical_relevance_score(str(task.get("query") or task.get("evidence_goal") or ""), item)
+    lexical = lexical_relevance_score(str(task_query or ""), item)
     matched_must = [term for term in must_terms if term in text]
     forbidden_hit = [term for term in forbidden_terms if term in text]
     missing_topic_groups = _missing_topic_anchor_groups(task, options, text)
@@ -1899,6 +2047,8 @@ def task_acceptance_filter(item: Dict[str, Any], options: Optional[Dict[str, Any
     threshold = 0.45
     if source_priority:
         threshold = 0.40
+    if not must_terms and lexical >= 0.75:
+        threshold = min(threshold, 0.40)
     if has_number and (goal_hit or dimension_hit):
         threshold = 0.35
     if must_terms and not matched_must:
@@ -2125,13 +2275,14 @@ def process_web_results(
 ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
     normalized: List[Dict[str, Any]] = []
     task_filter_reasons: Dict[str, int] = {}
+    filter_options = {**_as_dict(options), "query": query}
     for index, raw in enumerate(raw_results):
         if not isinstance(raw, dict):
             continue
         item = dict(raw)
         item["raw_rank"] = index + 1
         item["credibility_score"] = credibility_score(item)
-        acceptance = task_acceptance_filter(item, options)
+        acceptance = task_acceptance_filter(item, filter_options)
         item["task_filter"] = acceptance
         item["task_relevance_score"] = acceptance.get("relevance_score", 0.0)
         if not acceptance.get("accepted", False):
@@ -2160,13 +2311,14 @@ def process_web_results_with_top_k(
 ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
     normalized: List[Dict[str, Any]] = []
     task_filter_reasons: Dict[str, int] = {}
+    filter_options = {**_as_dict(options), "query": query}
     for index, raw in enumerate(raw_results):
         if not isinstance(raw, dict):
             continue
         item = dict(raw)
         item["raw_rank"] = index + 1
         item["credibility_score"] = credibility_score(item)
-        acceptance = task_acceptance_filter(item, options)
+        acceptance = task_acceptance_filter(item, filter_options)
         item["task_filter"] = acceptance
         item["task_relevance_score"] = acceptance.get("relevance_score", 0.0)
         if not acceptance.get("accepted", False):
@@ -2281,6 +2433,7 @@ def run_iqs_optimized_search(query: str, options: Optional[Dict[str, Any]] = Non
                     "query": query,
                     "search_options": base_options,
                     "query_plan": query_plan,
+                    "query_rewrite_diagnostics": dict(base_options.get("query_rewrite_diagnostics") or {}),
                     "search_tasks": search_tasks,
                     "search_trace": search_trace,
                     "quality_processing": quality_meta,
@@ -2336,6 +2489,7 @@ def run_iqs_optimized_search(query: str, options: Optional[Dict[str, Any]] = Non
         "query": query,
         "search_options": base_options,
         "query_plan": query_plan,
+        "query_rewrite_diagnostics": dict(base_options.get("query_rewrite_diagnostics") or {}),
         "search_tasks": search_tasks,
         "search_trace": search_trace,
         "quality_processing": quality_meta,
@@ -3045,15 +3199,34 @@ def iqs_research_node(state: WebAnalysisAgentState) -> WebAnalysisAgentState:
                 readpage_errors.append(message)
 
     search_results, page_results = assign_source_ids(search_results, page_results)
+    search_task = _as_dict(search_options.get("search_task"))
+    fact_extractor = extract_fact_cards_from_pages(
+        query=query,
+        page_results=page_results,
+        search_task=search_task,
+    )
+    extracted_fact_cards = [item for item in _as_list(fact_extractor.get("fact_cards")) if isinstance(item, dict)]
     output: WebAnalysisAgentState = {
         "search_results": search_results,
         "page_results": page_results,
+        "extracted_fact_cards": extracted_fact_cards,
+        "fact_extractor": {
+            key: value
+            for key, value in dict(fact_extractor).items()
+            if key not in {"fact_cards", "rejected_spans"}
+        },
         "metadata": {
             **dict(state.get("metadata") or {}),
             "agent_stage": "iqs_research",
             "result_count": len(search_results),
             "page_count": len(page_results),
+            "readpage_fact_extractor": {
+                key: value
+                for key, value in dict(fact_extractor).items()
+                if key not in {"fact_cards", "rejected_spans"}
+            },
             "query_plan": optimized_search.get("query_plan", []),
+            "query_rewrite_diagnostics": optimized_search.get("query_rewrite_diagnostics", {}),
             "search_tasks": optimized_search.get("search_tasks", []),
             "search_trace": optimized_search.get("search_trace", []),
             "quality_processing": optimized_search.get("quality_processing", {}),
@@ -3089,6 +3262,8 @@ def synthesize_analysis_node(state: WebAnalysisAgentState) -> WebAnalysisAgentSt
     query = str(state.get("query") or "").strip()
     search_results = list(state.get("search_results") or [])
     page_results = list(state.get("page_results") or [])
+    extracted_fact_cards = [item for item in list(state.get("extracted_fact_cards") or []) if isinstance(item, dict)]
+    fact_extractor = dict(state.get("fact_extractor") or _as_dict(_as_dict(state.get("metadata")).get("readpage_fact_extractor")))
     search_options = dict(state.get("search_options") or {})
     enable_llm = bool(state.get("enable_llm_analysis", True))
 
@@ -3234,6 +3409,8 @@ def synthesize_analysis_node(state: WebAnalysisAgentState) -> WebAnalysisAgentSt
             "quality_processing": (state.get("metadata") or {}).get("quality_processing", {}),
             "search_results": search_results,
             "page_results": page_results,
+            "extracted_fact_cards": extracted_fact_cards,
+            "fact_extractor": fact_extractor,
             "synthesis": llm_meta,
             "self_refinement": refinement_meta,
         },
@@ -3242,6 +3419,7 @@ def synthesize_analysis_node(state: WebAnalysisAgentState) -> WebAnalysisAgentSt
             "agent_stage": "synthesize_analysis",
             "grounding_mode": llm_meta.get("source", "fallback_extractive"),
             "llm_model": llm_meta.get("model", ""),
+            "readpage_fact_extractor": fact_extractor,
             "self_refinement": refinement_meta,
         },
     }

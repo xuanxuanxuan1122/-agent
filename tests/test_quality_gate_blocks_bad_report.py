@@ -7,7 +7,7 @@ from rag_pipeline.agents.writer_agent_clean import (
 )
 from rag_pipeline.agents.markdown_renderer import render_appendix, render_decision_package
 from rag_pipeline.agents.qa_agent import run_qa_agent, validate_no_internal_gap_language
-from rag_pipeline.flows.report.full_report import reformatter_structure_loss_reason
+from rag_pipeline.flows.report.full_report import render_score_markdown, reformatter_structure_loss_reason
 
 
 def test_quality_gate_blocks_final_status():
@@ -161,6 +161,150 @@ def test_qa_failed_stays_clean_blocker_but_allows_formal_render(monkeypatch):
     assert qa["render_gate"]["can_render_formal_report"] is True
     assert not qa["render_blocking_followups"]
     assert any(item.get("type") == "missing_sources_appendix" for item in qa["quality_findings"])
+
+
+def test_qa_retrieval_gap_is_not_clean_blocker_when_evidence_exists(monkeypatch):
+    monkeypatch.setenv("QA_SCORING_MODE", "score")
+    monkeypatch.setenv("QA_DEEP_EVALUATOR_BLOCKING", "true")
+    report = (
+        "# AI Agent report\n\n"
+        "## Market signal\n\n"
+        "Enterprise adoption is evidenced by verified deployment signals [1].\n\n"
+        "## 来源附录\n- [1] Source | https://www.stats.gov.cn/source"
+    )
+    qa = run_qa_agent(
+        report_markdown=report,
+        report_blueprint={"report_family": "industry_deep_report"},
+        chapter_packages=[
+            {
+                "chapter_id": "ch_01",
+                "chapter_fact_digest": ["verified fact"],
+                "sections": [
+                    {
+                        "section_id": "s1",
+                        "claim": "Enterprise adoption has early evidence.",
+                        "reasoning": "Verified deployment signals support a cautious view.",
+                        "counter_evidence": "Scale remains uneven.",
+                        "actionable": "Track renewals.",
+                        "evidence_refs": ["[1]"],
+                    }
+                ],
+            }
+        ],
+        lane_coverage={"news_event": {"scheduled": 1, "succeeded": 0, "page_results": 0}},
+        evidence_health_summary={"analysis_ready_count": 3, "distinct_verified_ab_source_count": 1},
+    )
+
+    assert qa["render_gate"]["can_render_formal_report"] is True
+    assert not any(
+        item.get("type") == "deep_report_blocking_gap"
+        and item.get("detail", {}).get("type") in {"iqs_lane_no_success", "page_results_zero"}
+        for item in qa["clean_gate"]["clean_blockers"]
+    )
+    assert any(
+        item.get("type") == "deep_report_blocking_gap"
+        and item.get("detail", {}).get("type") in {"iqs_lane_no_success", "page_results_zero"}
+        and item.get("finding_category") == "readability_finding"
+        for item in qa["quality_findings"]
+    )
+
+
+def test_qa_clean_candidate_gate_for_short_directional_report(monkeypatch):
+    monkeypatch.setenv("QA_SCORING_MODE", "score")
+    monkeypatch.setenv("QA_CLEAN_CANDIDATE_MIN_SCORE", "0")
+    report = (
+        "# AI Agent report\n\n"
+        "## Directional signal\n\n"
+        "Available B/C evidence supports only a directional view [1].\n\n"
+        "## 来源附录\n- [1] Source | https://example.org/source"
+    )
+    qa = run_qa_agent(
+        report_markdown=report,
+        report_blueprint={"report_family": "industry_deep_report"},
+        chapter_packages=[
+            {
+                "chapter_id": "ch_01",
+                "sections": [
+                    {
+                        "section_id": "s1",
+                        "claim": "Available B/C evidence supports only a directional view.",
+                        "claim_strength": "directional",
+                        "evidence_refs": ["[1]"],
+                    }
+                ],
+            }
+        ],
+        evidence_health_summary={"analysis_ready_count": 1, "distinct_verified_ab_source_count": 0},
+    )
+
+    assert qa["passed"] is False
+    assert qa["clean_gate"]["clean_content_eligible"] is False
+    assert qa["clean_gate"]["clean_candidate_eligible"] is True
+
+
+def test_score_report_separates_clean_content_from_output_switch():
+    markdown = render_score_markdown(
+        query="AI Agent",
+        writer_report={
+            "quality_score": 80,
+            "quality_grade": "高质量但需人工复核",
+            "clean_content_eligible": True,
+            "clean_output_enabled": False,
+            "clean_report_written": False,
+            "clean_report_eligible": False,
+            "clean_standard": "balanced",
+            "report_status": "final_clean",
+            "delivery_tier": "publishable_clean",
+        },
+        writer_package={},
+        final_audit_result={"blocked": False, "status": "pass"},
+        reformatter_result={"enabled": False, "status": "skipped"},
+    )
+
+    assert "Clean 资格：否" in markdown
+    assert "Clean 内容资格：是" in markdown
+    assert "Clean 标准：balanced" in markdown
+    assert "Clean 输出开关：关闭" in markdown
+    assert "Clean 文件已写出：否" in markdown
+
+
+def test_score_report_exposes_analysis_llm_contract_diagnostics():
+    markdown = render_score_markdown(
+        query="AI Agent",
+        writer_report={"quality_score": 60, "report_status": "formal_scored"},
+        writer_package={
+            "writer_report": {
+                "render_artifacts": {
+                    "payload_mode": "full",
+                    "argument_units": [{"claim": "x"}],
+                    "chapter_packages": [{"chapter_id": "ch_01"}],
+                    "structured_analysis": {
+                        "analysis_stage_diagnostics": {
+                            "uses_llm_analysis": False,
+                            "llm_analysis_status": "success_then_rebuilt",
+                            "final_analysis_source": "deterministic_rebuild",
+                            "deterministic_synthesis_used": True,
+                            "llm_validation_status": "valid",
+                            "llm_input_valid_ref_count": 4,
+                            "llm_usable_claim_count": 2,
+                            "llm_dropped_claim_count": 1,
+                            "llm_usable_chapter_count": 1,
+                        },
+                        "analysis_contract_status": {"structured_analysis_valid": True},
+                        "claim_units": [{"claim": "x"}],
+                        "evidence_analyses": [{"evidence_id": "EV-1"}],
+                    },
+                }
+            }
+        },
+        final_audit_result={"blocked": False, "status": "pass"},
+        reformatter_result={"enabled": False, "status": "skipped"},
+    )
+
+    assert "final_analysis_source: deterministic_rebuild" in markdown
+    assert "deterministic_synthesis_used: True" in markdown
+    assert "llm_usable_claim_count: 2" in markdown
+    assert "llm_dropped_claim_count: 1" in markdown
 
 
 def test_public_renderer_hides_internal_reference_analysis_and_coverage_matrix(monkeypatch):

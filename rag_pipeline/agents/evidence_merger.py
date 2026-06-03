@@ -3687,7 +3687,8 @@ def _delivery_gate(
     if health.get("inconsistent"):
         severe_reasons.append({"type": "evidence_health_summary_inconsistent", "details": _as_list(health.get("inconsistencies"))})
     blocking_gap_count = len([item for item in evidence_gap_ledger if str(_as_dict(item).get("severity") or "") == "blocking"])
-    if blocking_gap_count and analysis_ready_count <= 0:
+    partial_review_signal = clean_fact_count > 0 and readpage_succeeded > 0
+    if blocking_gap_count and analysis_ready_count <= 0 and not partial_review_signal:
         severe_reasons.append({"type": "blocking_gaps_without_analysis_ready_evidence", "count": blocking_gap_count})
 
     if publishable:

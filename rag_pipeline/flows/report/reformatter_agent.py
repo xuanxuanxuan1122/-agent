@@ -36,6 +36,41 @@ def _env_int(name: str, default: int, *, min_value: int = 0, max_value: int = 1_
     return min(max_value, max(min_value, value))
 
 
+class ReformatterPayloadTooLargeError(RuntimeError):
+    def __init__(self, diagnostic: Dict[str, Any]) -> None:
+        self.diagnostic = dict(diagnostic)
+        stage = str(diagnostic.get("stage") or "reformatter")
+        payload_chars = int(diagnostic.get("payload_chars") or 0)
+        max_payload_chars = int(diagnostic.get("max_payload_chars") or 0)
+        super().__init__(
+            f"reformatter_context_too_large: stage={stage} payload_chars={payload_chars} "
+            f"max_payload_chars={max_payload_chars}"
+        )
+
+
+def _compact_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def _reformatter_payload_char_limit() -> int:
+    return _env_int("REPORT_REFORMATTER_MAX_PAYLOAD_CHARS", 180_000, min_value=0, max_value=2_000_000)
+
+
+def _assert_reformatter_payload_budget(*, stage: str, system_prompt: str, user_content: str) -> Dict[str, Any]:
+    max_payload_chars = _reformatter_payload_char_limit()
+    payload_chars = len(str(system_prompt or "")) + len(str(user_content or ""))
+    diagnostic = {
+        "type": "reformatter_payload_budget",
+        "stage": stage,
+        "payload_chars": payload_chars,
+        "max_payload_chars": max_payload_chars,
+        "policy": "block_before_llm",
+    }
+    if max_payload_chars > 0 and payload_chars > max_payload_chars:
+        raise ReformatterPayloadTooLargeError(diagnostic)
+    return diagnostic
+
+
 def _source_appendix_mode() -> str:
     mode = os.environ.get("REPORT_REFORMATTER_SOURCE_APPENDIX", "cited").strip().lower()
     if mode in {"all", "cited"}:
@@ -100,6 +135,18 @@ REFORMATTER_POLISH_USER_TEMPLATE = """
 {validation_json}
 
 请按系统要求重写为终稿。
+""".strip()
+
+REFORMATTER_LIGHT_POLISH_USER_TEMPLATE = """
+## Current report
+{report_markdown}
+
+## Validation diff
+{validation_json}
+
+Rewrite only the sections needed to fix the validation diff. Do not add facts
+that are not already in the report. Keep existing source ids, preserve factual
+boundaries, and do not output a source appendix.
 """.strip()
 
 CITATION_DENSITY_RULES = """
@@ -198,7 +245,7 @@ FIXED_TEMPLATE_LABEL_RE = re.compile(
     r"章节判断|关键事实速览|证据深读|本章结论|"
     r"可引用事实|进入综合决策章的变量|核心判断|机制拆解|反证边界|决策含义"
 )
-SOURCE_APPENDIX_HEADING_RE = re.compile(r"(?m)^##\s*(?:数据来源列表|数据来源|研究口径与来源|附录|参考来源)(?:\s|$|[:：])")
+SOURCE_APPENDIX_HEADING_RE = re.compile(r"(?m)^##\s*(?:数据来源列表|数据来源|研究口径与来源|附录|参考来源|参考资料)(?:\s|$|[:：])")
 SCHEMA_LIKE_BULLET_RE = re.compile(r"(?m)^\s*[-*]\s*[^。；;\n]{1,16}[；;][^。；;\n]{0,16}[；;][^。；;\n]{0,50}\s*$")
 TEMPLATE_HEADING_LABEL_RE = re.compile(
     r"章节判断|关键事实速览|证据深读|本章结论|全球口径|中国口径|增速口径|"
@@ -296,9 +343,10 @@ def _source_line(source: Dict[str, Any], *, include_date: bool = True) -> str:
     date = str(source.get("date") or "未标注日期").strip()
     credibility = str(source.get("credibility") or source.get("credibility_level") or "").strip().upper()
     quality = f"，来源级别{credibility}" if credibility in {"A", "B", "C", "D"} else ""
+    url_text = url or "URL缺失，需复核"
     if include_date:
-        return f"[{source_id}] {title}，{url}{quality}，{date}"
-    return f"[{source_id}] {title}，{url}{quality}".rstrip("，")
+        return f"[{source_id}] {title}，{url_text}{quality}，{date}"
+    return f"[{source_id}] {title}，{url_text}{quality}".rstrip("，")
 
 
 def _selected_source_ids(evidence_items: List[Dict[str, Any]]) -> Set[str]:
@@ -307,6 +355,27 @@ def _selected_source_ids(evidence_items: List[Dict[str, Any]]) -> Set[str]:
         for item in evidence_items
         if str(item.get("source") or "").strip()
     }
+
+
+def _interleave_dimension_evidence(dimension_items: List[List[Dict[str, Any]]], *, max_items: int) -> List[Dict[str, Any]]:
+    if max_items <= 0:
+        return []
+    selected: List[Dict[str, Any]] = []
+    offsets = [0 for _ in dimension_items]
+    while len(selected) < max_items:
+        progressed = False
+        for index, items in enumerate(dimension_items):
+            offset = offsets[index]
+            if offset >= len(items):
+                continue
+            selected.append(items[offset])
+            offsets[index] = offset + 1
+            progressed = True
+            if len(selected) >= max_items:
+                break
+        if not progressed:
+            break
+    return selected
 
 
 def _target_body_chars(clean_evidence: Dict[str, Any]) -> int:
@@ -347,24 +416,31 @@ def _reformatter_length_mode() -> str:
 
 def build_reformatter_payload(clean_evidence: Dict[str, Any], *, max_facts_per_dimension: Optional[int] = None) -> Dict[str, str]:
     topic = str(clean_evidence.get("topic") or "行业").strip()
-    evidence_items: List[Dict[str, Any]] = []
+    display_title = str(clean_evidence.get("report_title") or "").strip()
+    display_subtitle = str(
+        clean_evidence.get("report_subtitle") or clean_evidence.get("planning_query") or ""
+    ).strip()
     max_items = (
         int(max_facts_per_dimension)
         if max_facts_per_dimension is not None
         else _env_int("REPORT_REFORMATTER_MAX_FACTS_PER_DIMENSION", 42, min_value=8, max_value=80)
     )
+    max_total_items = _env_int("REPORT_REFORMATTER_MAX_EVIDENCE_ITEMS", 240, min_value=1, max_value=5_000)
     raw_dimensions = _as_dict(clean_evidence.get("dimensions"))
     ordered_dimensions = [
         *[dimension for dimension in REPORT_DIMENSIONS if dimension in raw_dimensions],
         *[dimension for dimension in raw_dimensions if dimension not in REPORT_DIMENSIONS],
     ]
+    dimension_items: List[List[Dict[str, Any]]] = []
     for dimension in ordered_dimensions:
         selected = _select_dimension_facts(
             [item for item in _as_list(raw_dimensions.get(dimension)) if isinstance(item, dict)],
             max_items,
         )
-        for item in selected:
-            evidence_items.append({"evidence_group": dimension, **item})
+        grouped_items = [{"evidence_group": dimension, **item} for item in selected]
+        if grouped_items:
+            dimension_items.append(grouped_items)
+    evidence_items = _interleave_dimension_evidence(dimension_items, max_items=max_total_items)
 
     selected_source_ids = _selected_source_ids(evidence_items)
     selected_sources = [
@@ -376,7 +452,9 @@ def build_reformatter_payload(clean_evidence: Dict[str, Any], *, max_facts_per_d
     target_body_chars = _target_body_chars(clean_evidence)
     return {
         "topic": topic,
-        "evidence_json": json.dumps({"evidence_items": evidence_items}, ensure_ascii=False, indent=2),
+        "display_title": display_title,
+        "display_subtitle": display_subtitle,
+        "evidence_json": _compact_json({"evidence_items": evidence_items}),
         "sources_text": sources_text or "来源信息待补充",
         "chapter_specific_guide": (
             f"{CHAPTER_SPECIFIC_GUIDE}\n"
@@ -492,7 +570,7 @@ def append_sources_appendix(markdown: str, sources: List[Dict[str, Any]]) -> str
     else:
         selected_sources = [by_id[source_id] for source_id in cited_order if source_id in by_id]
     source_lines = [_source_line(source, include_date=False) for source in selected_sources]
-    return (body + "\n\n## 数据来源\n" + "\n".join(source_lines)).strip()
+    return (body + "\n\n## 参考资料\n" + "\n".join(source_lines)).strip()
 
 
 CHAPTER_OPENER_FORBIDDEN_RE = re.compile(r"^\s*(?:数据显示|数据表明|据统计|证据表明|根据数据|公开数据显示)")
@@ -1051,38 +1129,49 @@ def _citation_density_issues(markdown: str, clean_evidence: Optional[Dict[str, A
     issues: List[Dict[str, Any]] = []
 
     if available_fact_count >= 30:
-        dynamic_total = min(110, max(45, available_fact_count // 8))
-        dynamic_unique = min(45, max(16, (len(available_total_sources) + 3) // 4))
-        required_total = _env_int(
+        strict_total = min(110, max(45, available_fact_count // 8))
+        strict_unique = min(45, max(16, (len(available_total_sources) + 3) // 4))
+        configured_total = _env_int(
             "REPORT_REFORMATTER_MIN_BODY_CITATIONS",
-            dynamic_total,
-            min_value=10,
+            strict_total,
+            min_value=0,
             max_value=200,
         )
-        required_unique = _env_int(
+        configured_unique = _env_int(
             "REPORT_REFORMATTER_MIN_UNIQUE_BODY_SOURCES",
-            dynamic_unique,
-            min_value=5,
+            strict_unique,
+            min_value=0,
             max_value=120,
         )
+        if _env_flag("REPORT_REFORMATTER_ADAPTIVE_GATES", False):
+            adaptive_total = min(110, max(10, available_fact_count // 8))
+            adaptive_unique = min(45, max(5, (len(available_total_sources) * 2 + 2) // 3))
+            required_total = min(configured_total or adaptive_total, adaptive_total)
+            required_unique = min(configured_unique or adaptive_unique, adaptive_unique)
+        else:
+            required_total = max(10, configured_total)
+            required_unique = max(5, configured_unique)
         if len(all_citations) < required_total:
-            issues.append(
-                {
-                    "scope": "report",
-                    "reason": "total citation count is too low",
-                    "actual": len(all_citations),
-                    "required": required_total,
-                }
-            )
+            issue = {
+                "scope": "report",
+                "reason": "total citation count is too low",
+                "actual": len(all_citations),
+                "required": required_total,
+            }
+            if configured_total != required_total:
+                issue["configured_required"] = configured_total
+            issues.append(issue)
         if len(set(all_citations)) < min(required_unique, len(available_total_sources)):
-            issues.append(
-                {
-                    "scope": "report",
-                    "reason": "unique cited source count is too low",
-                    "actual": len(set(all_citations)),
-                    "required": min(required_unique, len(available_total_sources)),
-                }
-            )
+            required_unique_capped = min(required_unique, len(available_total_sources))
+            issue = {
+                "scope": "report",
+                "reason": "unique cited source count is too low",
+                "actual": len(set(all_citations)),
+                "required": required_unique_capped,
+            }
+            if configured_unique != required_unique_capped:
+                issue["configured_required"] = configured_unique
+            issues.append(issue)
         long_paragraphs = [paragraph for block in _chapter_blocks(body) for paragraph in _body_paragraphs(block["body"]) if len(paragraph) >= 120]
         uncited_long = [paragraph for paragraph in long_paragraphs if not re.search(r"\[\d{1,3}\]", paragraph)]
         max_uncited = max(10, int(len(long_paragraphs) * 0.35))
@@ -1097,6 +1186,85 @@ def _citation_density_issues(markdown: str, clean_evidence: Optional[Dict[str, A
                 }
             )
 
+    return issues
+
+
+_GENERIC_TOPIC_TERMS = {
+    "ai",
+    "人工智能",
+    "行业",
+    "产业",
+    "市场",
+    "技术",
+    "工具",
+    "应用",
+}
+
+
+def _topic_terms(subject: str) -> List[str]:
+    terms: List[str] = []
+    for raw in re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]{2,}", str(subject or "")):
+        term = raw.strip()
+        if not term:
+            continue
+        normalized = term.lower()
+        if normalized in _GENERIC_TOPIC_TERMS or term in _GENERIC_TOPIC_TERMS:
+            continue
+        if term not in terms:
+            terms.append(term)
+    return terms
+
+
+def _topic_drift_issues(markdown: str, clean_evidence: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    payload = _as_dict(clean_evidence)
+    subject = str(payload.get("research_object") or "").strip()
+    if len(subject) < 3:
+        return []
+    body = re.sub(r"\s+", "", _body_without_sources(markdown)).lower()
+    compact_subject = re.sub(r"\s+", "", subject).lower()
+    if compact_subject and compact_subject in body:
+        return []
+    terms = _topic_terms(subject)
+    if not terms:
+        return []
+    matched = [term for term in terms if term.lower() in body]
+    required = max(1, min(2, len(terms)))
+    if len(matched) >= required:
+        return []
+    return [
+        {
+            "scope": "report",
+            "subject": subject,
+            "matched_terms": matched,
+            "required_terms": required,
+            "reason": "report body drifts from the requested research object",
+            "type": "topic_drift",
+        }
+    ]
+
+
+def _cited_source_url_issues(citation_distribution: Dict[str, int], sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    min_citations = _env_int("REPORT_REFORMATTER_MISSING_URL_CITATION_MIN", 0, min_value=0, max_value=1000)
+    if min_citations <= 0 or not citation_distribution:
+        return []
+    by_id = {str(source.get("id") or "").strip(): source for source in sources if str(source.get("id") or "").strip()}
+    issues: List[Dict[str, Any]] = []
+    for source_id, count in citation_distribution.items():
+        if int(count or 0) < min_citations:
+            continue
+        source = _as_dict(by_id.get(str(source_id)))
+        if str(source.get("url") or "").strip():
+            continue
+        issues.append(
+            {
+                "scope": "source",
+                "type": "cited_source_url_missing",
+                "source_id": str(source_id),
+                "citation_count": int(count or 0),
+                "required_min_citations": min_citations,
+                "reason": "high-frequency cited source is missing url",
+            }
+        )
     return issues
 
 
@@ -1262,6 +1430,8 @@ def validate_reformatted_report(
         + len(quality["repeated_boilerplate_issues"])
     )
     citation_density_issues = _citation_density_issues(markdown, clean_evidence)
+    topic_drift_issues = _topic_drift_issues(markdown, clean_evidence)
+    cited_source_url_issues = _cited_source_url_issues(citation_distribution, sources or [])
     repair_blockers: List[Dict[str, Any]] = []
     for issue in quality["body_length_issues"]:
         repair_blockers.append({"type": "body_length", **issue})
@@ -1269,6 +1439,10 @@ def validate_reformatted_report(
         repair_blockers.append({"type": "citation_density", **issue})
     for issue in quality["repeated_boilerplate_issues"]:
         repair_blockers.append({"type": "repeated_boilerplate", **issue})
+    for issue in topic_drift_issues:
+        repair_blockers.append({"type": "topic_drift", **issue})
+    for issue in cited_source_url_issues:
+        repair_blockers.append({"type": "cited_source_url_missing", **issue})
     if has_sources_appendix and not source_appendix_required and _source_appendix_mode() == "none":
         repair_blockers.append({"type": "unexpected_sources_appendix"})
     fatal_blockers: List[Dict[str, Any]] = []
@@ -1284,7 +1458,7 @@ def validate_reformatted_report(
         fatal_blockers.append({"type": "malformed_numeric", "items": malformed_numeric[:10]})
     if schema_like_bullets:
         fatal_blockers.append({"type": "schema_like_bullets", "items": schema_like_bullets[:10]})
-    if source_appendix_required and has_expected_sources and not has_sources_appendix:
+    if source_appendix_required and has_expected_sources and not has_sources_appendix and _source_appendix_mode() == "none":
         fatal_blockers.append({"type": "missing_sources_appendix"})
     validation_mode = _reformatter_validation_mode()
     min_score = _env_int("REPORT_REFORMATTER_MIN_PASS_SCORE", 60, min_value=0, max_value=100)
@@ -1319,7 +1493,7 @@ def validate_reformatted_report(
         "hard_pass": hard_pass,
         "fatal_blockers": fatal_blockers,
         "score_breakdown": score_payload["penalties"],
-        "soft_issue_count": max(0, quality_issue_count + len(empty_sections) + len(citation_density_issues)),
+        "soft_issue_count": max(0, quality_issue_count + len(empty_sections) + len(citation_density_issues) + len(topic_drift_issues) + len(cited_source_url_issues)),
         "repair_blockers": repair_blockers,
         "forbidden_hits": hits[:10],
         "publication_blockers": publication_blockers[:20],
@@ -1335,6 +1509,8 @@ def validate_reformatted_report(
         "source_registry_count": len(valid_ids),
         "citation_distribution": citation_distribution,
         "citation_density_issues": citation_density_issues,
+        "topic_drift_issues": topic_drift_issues,
+        "cited_source_url_issues": cited_source_url_issues,
         "bad_chapter_openers": quality["bad_chapter_openers"],
         "weak_chapter_judgments": quality["weak_chapter_judgments"],
         "thin_analysis_issues": quality["thin_analysis_issues"],
@@ -1472,6 +1648,21 @@ def build_reformatter_repair_plan(
     }
 
 
+def _build_reformatter_polish_content(*, markdown: str, payload: Dict[str, str], validation: Dict[str, Any]) -> str:
+    validation_json = _compact_json(validation)
+    if _env_flag("REPORT_REFORMATTER_POLISH_INCLUDE_FULL_EVIDENCE", False):
+        return REFORMATTER_POLISH_USER_TEMPLATE.format(
+            report_markdown=markdown,
+            evidence_json=payload["evidence_json"],
+            sources_text=payload["sources_text"],
+            validation_json=validation_json,
+        )
+    return REFORMATTER_LIGHT_POLISH_USER_TEMPLATE.format(
+        report_markdown=markdown,
+        validation_json=validation_json,
+    )
+
+
 async def run_reformatter(
     clean_evidence: Dict[str, Any],
     llm_client: Optional[Any] = None,
@@ -1491,6 +1682,11 @@ async def run_reformatter(
     payload = build_reformatter_payload(clean_evidence)
     system_prompt = REFORMATTER_SYSTEM_PROMPT.format(topic=payload["topic"])
     user_content = REFORMATTER_USER_TEMPLATE.format(**payload)
+    _assert_reformatter_payload_budget(
+        stage="initial_rewrite",
+        system_prompt=system_prompt,
+        user_content=user_content,
+    )
 
     markdown = await _generate_reformatter_text(
         system_prompt=system_prompt,
@@ -1524,11 +1720,15 @@ async def run_reformatter(
                     best_validation = validation
                 if not _reformatter_needs_repair(validation):
                     break
-        polish_content = REFORMATTER_POLISH_USER_TEMPLATE.format(
-            report_markdown=markdown,
-            evidence_json=payload["evidence_json"],
-            sources_text=payload["sources_text"],
-            validation_json=json.dumps(validation, ensure_ascii=False, indent=2),
+        polish_content = _build_reformatter_polish_content(
+            markdown=markdown,
+            payload=payload,
+            validation=validation,
+        )
+        _assert_reformatter_payload_budget(
+            stage="polish",
+            system_prompt=REFORMATTER_POLISH_SYSTEM_PROMPT,
+            user_content=polish_content,
         )
         polished = await _generate_reformatter_text(
             system_prompt=REFORMATTER_POLISH_SYSTEM_PROMPT,

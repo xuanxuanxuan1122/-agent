@@ -39,7 +39,7 @@ def _contract_repair_reasons(contract: Dict[str, Any]) -> List[str]:
         issue = _as_dict(issue)
         issue_type = str(issue.get("type") or "").strip()
         severity = str(issue.get("severity") or "").strip()
-        if issue_type and severity in {"error", "fatal"}:
+        if issue_type and severity in {"error", "fatal", "rewrite"}:
             reasons.append(issue_type)
     return _dedupe(reasons)
 

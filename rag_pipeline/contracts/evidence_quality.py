@@ -403,6 +403,13 @@ def _metric_unit_present(item: Dict[str, Any], fact: str) -> bool:
     )
 
 
+def _metric_explicit_unit_present(item: Dict[str, Any]) -> bool:
+    if str(item.get("unit") or item.get("numeric_unit") or "").strip():
+        return True
+    completeness = _as_dict(item.get("metric_completeness"))
+    return bool(str(completeness.get("unit") or "").strip())
+
+
 def _metric_proof_gaps(item: Dict[str, Any], claim_type: str, fact: str, period: str) -> List[str]:
     if claim_type != "hard_metric":
         return []
@@ -417,7 +424,7 @@ def _metric_proof_gaps(item: Dict[str, Any], claim_type: str, fact: str, period:
         gaps.append("period")
     if not str(item.get("scope") or "").strip():
         gaps.append("scope")
-    if not _metric_unit_present(item, fact):
+    if not _metric_explicit_unit_present(item):
         gaps.append("unit")
     if not _has_traceable_source(item):
         gaps.append("source")
@@ -828,5 +835,65 @@ def apply_evidence_quality_contract(
         directional_c_min_confidence=directional_c_min_confidence,
     )
     merged = {**normalized, **classification}
+    admission = _analysis_admission_fields(merged)
+    merged.update(admission)
+    if isinstance(merged.get("evidence_card"), dict):
+        merged["evidence_card"] = {**merged["evidence_card"], **admission}
     merged["quality_contract_version"] = QUALITY_CONTRACT_VERSION
     return merged
+
+
+def _analysis_admission_fields(item: Dict[str, Any]) -> Dict[str, Any]:
+    semantic_status = str(item.get("semantic_status") or "").strip().lower()
+    allowed_use = str(item.get("allowed_use") or "").strip().lower()
+    proof_role = str(item.get("proof_role") or "").strip().lower()
+    claim_type = str(item.get("claim_type") or infer_claim_type(item)).strip().lower()
+    source_level = str(item.get("source_level") or "").strip().upper()
+    traceable = _has_traceable_source(item)
+    metric_gaps = _as_list(item.get("metric_proof_gaps"))
+
+    if semantic_status in REJECTED_STATUSES or allowed_use == "rejected":
+        return {
+            "analysis_eligible": False,
+            "analysis_role": "rejected",
+            "evidence_admission_reason": "semantic_rejected",
+        }
+    if source_level == "D" or allowed_use in {"appendix_only", "clue"}:
+        return {
+            "analysis_eligible": False,
+            "analysis_role": "rejected",
+            "evidence_admission_reason": "appendix_only" if allowed_use == "appendix_only" else "untraceable_or_low_quality",
+        }
+    if not traceable:
+        return {
+            "analysis_eligible": False,
+            "analysis_role": "rejected",
+            "evidence_admission_reason": "missing_source_ref",
+        }
+    if claim_type == "hard_metric" and metric_gaps:
+        return {
+            "analysis_eligible": True,
+            "analysis_role": "contextual",
+            "evidence_admission_reason": "metric_scope_period_unit_incomplete",
+        }
+    if source_level == "C" and allowed_use == "directional_signal":
+        role = "directional"
+    elif proof_role == "counter":
+        role = "counter"
+    elif proof_role in {"technology_product", "technology", "standard"}:
+        role = "technology"
+    elif proof_role in {"case", "customer_case"} or claim_type == "case_signal":
+        role = "case"
+    elif claim_type == "hard_metric" or proof_role == "metric":
+        role = "metric"
+    elif allowed_use == "directional_signal":
+        role = "directional"
+    elif allowed_use in {"core_claim", "supporting"}:
+        role = "claimable"
+    else:
+        role = "contextual"
+    return {
+        "analysis_eligible": True,
+        "analysis_role": role,
+        "evidence_admission_reason": allowed_use or role,
+    }

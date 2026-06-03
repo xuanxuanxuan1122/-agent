@@ -2,6 +2,7 @@
 
 import os
 import re
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
 from rag_pipeline.config.search_config import build_llm_config_for_task
@@ -177,6 +178,57 @@ def _source_candidates(package: Dict[str, Any], clean_evidence: Optional[Dict[st
     return candidates
 
 
+def _normalize_source_ref(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    # Allow up to 5 digits so deep reports with >999 cited sources still
+    # normalize correctly. Bracketed and bare-number forms are both accepted.
+    match = re.fullmatch(r"\[?\s*(\d{1,5})\s*\]?", text)
+    if match:
+        return f"[{match.group(1)}]"
+    return text
+
+
+def _cited_refs(markdown: str) -> set[str]:
+    return {f"[{match}]" for match in re.findall(r"\[(\d{1,5})\]", str(markdown or ""))}
+
+
+def _source_ref_candidates(source: Dict[str, Any]) -> set[str]:
+    refs: set[str] = set()
+    for key in ("ref", "id", "source_id", "source_ref", "citation_ref"):
+        ref = _normalize_source_ref(source.get(key))
+        if ref:
+            refs.add(ref)
+    return refs
+
+
+def _source_is_cited(source: Dict[str, Any], cited: set[str]) -> bool:
+    refs = _source_ref_candidates(source)
+    return bool(refs and cited and refs.intersection(cited))
+
+
+def _source_supports_core_claim(source: Dict[str, Any]) -> bool:
+    text = " ".join(
+        str(source.get(key) or "").strip().lower()
+        for key in (
+            "allowed_use",
+            "judgment_use",
+            "claim_role",
+            "evidence_role",
+            "role",
+            "usage_tier",
+            "claim_strength",
+        )
+    )
+    if any(token in text for token in ("core_claim", "core", "decision_ready", "strong")):
+        return True
+    for key in ("used_for_core_claim", "core_supporting_source", "supports_core_claim"):
+        if bool(source.get(key)):
+            return True
+    return False
+
+
 def _empty_markdown_table_lines(markdown: str) -> List[int]:
     lines = str(markdown or "").splitlines()
     empty_tables: List[int] = []
@@ -227,6 +279,8 @@ def run_deterministic_audit(
     text = str(report_markdown or "")
     package = _as_dict(writer_package_payload)
     writer_report = _as_dict(package.get("writer_report"))
+    citation_manifest = _as_dict(package.get("citation_manifest") or writer_report.get("citation_manifest"))
+    final_citation_audit = _as_dict(package.get("final_citation_audit") or writer_report.get("final_citation_audit"))
     report_family = str(
         writer_report.get("report_type")
         or _as_dict(package.get("report_blueprint")).get("report_family")
@@ -259,6 +313,45 @@ def run_deterministic_audit(
     if empty_tables:
         findings.append({"type": "empty_markdown_table", "severity": "fatal", "message": "Markdown table has a header/separator but no data rows.", "lines": empty_tables[:8]})
 
+    if citation_manifest:
+        manifest_status = str(citation_manifest.get("citation_manifest_status") or "").strip().lower()
+        if manifest_status == "blocked":
+            findings.append(
+                {
+                    "type": "citation_manifest_blocked",
+                    "severity": "fatal",
+                    "message": "Citation manifest has unresolved or excluded cited sources.",
+                    "missing_evidence_refs": _as_list(citation_manifest.get("missing_evidence_refs"))[:10],
+                    "excluded_cited_sources": _as_list(citation_manifest.get("excluded_cited_sources"))[:8],
+                    "orphan_citation_count": citation_manifest.get("orphan_citation_count") or 0,
+                }
+            )
+    if final_citation_audit:
+        final_missing = _as_list(final_citation_audit.get("final_missing_appendix_refs"))
+        final_status = str(final_citation_audit.get("final_citation_reconciliation_status") or "").strip().lower()
+        citationless_count = int(final_citation_audit.get("factual_body_without_citations_count") or 0)
+        if citationless_count:
+            findings.append(
+                {
+                    "type": "citationless_factual_body",
+                    "severity": "fatal",
+                    "message": "Final rendered body contains factual claims without public citations.",
+                    "count": citationless_count,
+                    "examples": _as_list(final_citation_audit.get("citationless_fact_examples"))[:5],
+                }
+            )
+        if final_missing or final_status == "blocked":
+            findings.append(
+                {
+                    "type": "final_citation_gap",
+                    "severity": "fatal",
+                    "message": "Final rendered body citations and source appendix are inconsistent.",
+                    "final_missing_appendix_refs": final_missing[:10],
+                    "final_body_citation_refs": _as_list(final_citation_audit.get("final_body_citation_refs"))[:20],
+                    "final_appendix_refs": _as_list(final_citation_audit.get("final_appendix_refs"))[:20],
+                }
+            )
+
     if re.search(r"\[\d{1,3}\]", text) and not SOURCE_APPENDIX_RE.search(text):
         findings.append({"type": "missing_sources_appendix", "severity": "fatal", "message": "Report cites numbered sources but has no source appendix."})
 
@@ -266,7 +359,9 @@ def run_deterministic_audit(
         findings.append({"type": "fake_or_placeholder_evidence", "severity": "fatal", "message": "Report contains placeholder source URLs or fake example evidence text."})
 
     title_only_sources = []
+    title_only_candidates = []
     fake_sources = []
+    cited = _cited_refs(text)
     for source in _source_candidates(package, clean_evidence):
         if _is_fake_or_placeholder_source(source):
             fake_sources.append(
@@ -283,9 +378,15 @@ def run_deterministic_audit(
         date = str(source.get("date") or source.get("published_at") or "").strip()
         stable_local = bool(doc_id and sum(bool(item) for item in [publisher, title, date]) >= 2)
         if title and not url and not stable_local:
-            title_only_sources.append({"ref": source.get("ref") or source.get("id"), "title": _compact_text(title, 160)})
+            item = {"ref": source.get("ref") or source.get("id"), "title": _compact_text(title, 160)}
+            if _source_is_cited(source, cited) or _source_supports_core_claim(source):
+                title_only_sources.append(item)
+            else:
+                title_only_candidates.append(item)
     if title_only_sources:
-        findings.append({"type": "title_only_source", "severity": "fatal", "message": "Source registry contains title-only sources that are not independently traceable.", "examples": title_only_sources[:8]})
+        findings.append({"type": "title_only_source", "severity": "fatal", "message": "Cited or core-supporting source is title-only and not independently traceable.", "examples": title_only_sources[:8]})
+    if title_only_candidates:
+        findings.append({"type": "title_only_source_candidate", "severity": "medium", "message": "Source registry contains unused title-only candidates; they were not treated as clean blockers.", "examples": title_only_candidates[:8]})
     if fake_sources:
         findings.append({"type": "fake_or_placeholder_source", "severity": "fatal", "message": "Source registry contains placeholder or fake sources.", "examples": fake_sources[:8]})
 
@@ -323,6 +424,73 @@ def _normalize_audit_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     ):
         result[key] = _as_list(result.get(key))
     result["summary"] = _compact_text(result.get("summary"), 1200)
+    return result
+
+
+def _current_audit_date() -> date:
+    raw = str(os.getenv("REPORT_FINAL_AUDIT_CURRENT_DATE") or "").strip()
+    if raw:
+        try:
+            return datetime.strptime(raw[:10], "%Y-%m-%d").date()
+        except ValueError:
+            pass
+    return date.today()
+
+
+def _extract_iso_dates(text: str) -> List[date]:
+    dates: List[date] = []
+    for match in re.findall(r"\b(20\d{2}-\d{1,2}-\d{1,2})\b", str(text or "")):
+        try:
+            dates.append(datetime.strptime(match, "%Y-%m-%d").date())
+        except ValueError:
+            continue
+    return dates
+
+
+def _false_future_date_finding(item: Dict[str, Any], *, current_date: date) -> bool:
+    text = " ".join(str(value or "") for value in item.values())
+    if not re.search(r"future[-\s]?dated|future date|in the future|未来|未来日期", text, flags=re.I):
+        return False
+    dates = _extract_iso_dates(text)
+    if not dates:
+        return False
+    return all(value <= current_date for value in dates)
+
+
+def _apply_final_audit_date_sanity(payload: Dict[str, Any], *, current_date: date) -> Dict[str, Any]:
+    result = dict(payload or {})
+    removed = 0
+    for key in ("critical_findings", "citation_issues"):
+        kept: List[Any] = []
+        for item in _as_list(result.get(key)):
+            finding = _as_dict(item)
+            if finding and _false_future_date_finding(finding, current_date=current_date):
+                removed += 1
+                continue
+            kept.append(item)
+        result[key] = kept
+    result["date_sanity_current_date"] = current_date.isoformat()
+    result["date_sanity_removed_findings_count"] = removed
+    if removed:
+        fatal_findings = any(
+            str(_as_dict(item).get("severity") or "").strip().lower() == "fatal"
+            for item in [*_as_list(result.get("critical_findings")), *_as_list(result.get("citation_issues"))]
+        )
+        if not fatal_findings:
+            has_findings = any(
+                _as_list(result.get(key))
+                for key in (
+                    "critical_findings",
+                    "unsupported_claims",
+                    "citation_issues",
+                    "scope_or_method_issues",
+                    "risk_section_feedback",
+                )
+            )
+            result["status"] = "warning" if has_findings else "pass"
+            result["publish_recommendation"] = "publish_with_caveats" if has_findings else "publish"
+            if not has_findings:
+                result["summary"] = "Audit date sanity removed false future-date findings."
     return result
 
 
@@ -379,8 +547,10 @@ def run_final_audit(
 
     max_chars = _env_int("REPORT_FINAL_AUDIT_MAX_CHARS", 200000, min_value=4000, max_value=1_000_000)
     report_payload = _truncate_report(report_markdown, max_chars)
+    current_audit_date = _current_audit_date()
     user_payload = {
         "query": query,
+        "current_date": current_audit_date.isoformat(),
         "report_markdown": report_payload["text"],
         "report_truncation": {
             "truncated": report_payload["truncated"],
@@ -399,7 +569,10 @@ def run_final_audit(
             system_prompt=FINAL_AUDIT_SYSTEM_PROMPT,
             user_payload=user_payload,
         )
-        audit_payload = _normalize_audit_payload(_as_dict(response.get("payload")))
+        audit_payload = _apply_final_audit_date_sanity(
+            _normalize_audit_payload(_as_dict(response.get("payload"))),
+            current_date=current_audit_date,
+        )
         fatal = _is_fatal_audit(audit_payload) or bool(deterministic_audit.get("fatal"))
         return {
             "enabled": True,

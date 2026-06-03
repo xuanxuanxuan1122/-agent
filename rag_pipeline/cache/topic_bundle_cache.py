@@ -43,6 +43,17 @@ def _env_int(name: str, default: int, *, min_value: int = 1, max_value: int = 36
     return max(min_value, min(max_value, value))
 
 
+def _project_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _resolve_cache_path(raw_path: str, default: str) -> Path:
+    path = Path((raw_path or default).strip() or default)
+    if path.is_absolute():
+        return path
+    return _project_root() / path
+
+
 def _as_dict(value: Any) -> Dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
@@ -84,6 +95,42 @@ def _normalize_topic_text(value: Any) -> str:
     return text
 
 
+def _topic_tokens(value: str) -> List[str]:
+    return [token for token in re.split(r"\s+", _normalize_topic_text(value)) if token]
+
+
+def _topic_alias_score(query_norm: str, manifest: Dict[str, Any], bundle_dir: Path) -> int:
+    candidate_values = [
+        str(manifest.get("query_normalized") or ""),
+        str(manifest.get("query") or ""),
+        str(manifest.get("topic_key") or ""),
+        bundle_dir.name,
+    ]
+    candidate_norms = [_normalize_topic_text(value) for value in candidate_values if str(value or "").strip()]
+    if not query_norm or not candidate_norms:
+        return 0
+    for candidate_norm in candidate_norms:
+        if candidate_norm == query_norm:
+            return 100
+    for candidate_norm in candidate_norms:
+        shorter = min(len(query_norm), len(candidate_norm))
+        if shorter >= 12 and (query_norm in candidate_norm or candidate_norm in query_norm):
+            return 80
+    query_tokens = set(_topic_tokens(query_norm))
+    if not query_tokens or len("".join(query_tokens)) < 12:
+        return 0
+    best_overlap = 0.0
+    for candidate_norm in candidate_norms:
+        candidate_tokens = set(_topic_tokens(candidate_norm))
+        if not candidate_tokens:
+            continue
+        overlap = len(query_tokens & candidate_tokens) / max(1, len(query_tokens))
+        best_overlap = max(best_overlap, overlap)
+    if best_overlap >= 0.75:
+        return 65
+    return 0
+
+
 def _slug(value: Any, *, max_chars: int = 48) -> str:
     text = _normalize_topic_text(value)
     text = re.sub(r"\s+", "_", text)
@@ -114,10 +161,7 @@ def topic_bundle_require_hydrated_evidence() -> bool:
 
 def topic_bundle_cache_root() -> Path:
     raw = os.getenv("TOPIC_BUNDLE_CACHE_PATH", DEFAULT_CACHE_PATH).strip() or DEFAULT_CACHE_PATH
-    path = Path(raw)
-    if not path.is_absolute():
-        path = Path.cwd() / path
-    return path
+    return _resolve_cache_path(raw, DEFAULT_CACHE_PATH)
 
 
 def build_topic_key(
@@ -707,6 +751,7 @@ def _candidate_bundle_dirs(query: str, topic_key: str) -> List[Path]:
     root = topic_bundle_cache_root()
     exact = root / topic_key
     candidates: List[Path] = []
+    scored_candidates: List[tuple[int, Path]] = []
     if exact.exists():
         candidates.append(exact)
     query_norm = _normalize_topic_text(query)
@@ -719,15 +764,19 @@ def _candidate_bundle_dirs(query: str, topic_key: str) -> List[Path]:
                 manifest = _as_dict(_json_read(manifest_path))
             except Exception:
                 continue
-            if str(manifest.get("query_normalized") or "") == query_norm:
-                candidates.append(bundle_dir)
+            score = _topic_alias_score(query_norm, manifest, bundle_dir)
+            if score > 0:
+                scored_candidates.append((score, bundle_dir))
+    for _, bundle_dir in sorted(scored_candidates, key=lambda pair: pair[0], reverse=True):
+        if bundle_dir not in candidates:
+            candidates.append(bundle_dir)
     def _candidate_updated_at(path: Path) -> str:
         try:
             return str(_as_dict(_json_read(path / "manifest.json")).get("updated_at") or "")
         except Exception:
             return ""
 
-    candidates.sort(key=_candidate_updated_at, reverse=True)
+    candidates.sort(key=lambda path: (_candidate_updated_at(path), 1 if path == exact else 0), reverse=True)
     return candidates
 
 

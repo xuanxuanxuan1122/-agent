@@ -1,6 +1,10 @@
+import asyncio
 import inspect
+import json
 
+import pytest
 import run_full_report
+from rag_pipeline.flows.report import reformatter_agent as reformatter_module
 from reformatter_agent import (
     CITATION_DENSITY_RULES,
     _quality_issues,
@@ -120,3 +124,105 @@ def test_reformatter_payload_omits_empty_legacy_dimensions():
 
     assert "市场规模与增速" not in payload["evidence_json"]
     assert "定价与渠道验证" in payload["evidence_json"]
+
+def test_reformatter_payload_uses_compact_json():
+    payload = build_reformatter_payload(
+        {
+            "topic": "payload compactness",
+            "dimensions": {
+                "market": [
+                    {"text": "fact one with a numeric signal 10%", "source": "1"},
+                    {"text": "fact two with a numeric signal 20%", "source": "2"},
+                ],
+            },
+            "sources": [
+                {"id": "1", "title": "Source One", "url": "https://example.com/1"},
+                {"id": "2", "title": "Source Two", "url": "https://example.com/2"},
+            ],
+        },
+        max_facts_per_dimension=2,
+    )
+
+    assert "\n" not in payload["evidence_json"]
+    assert json.loads(payload["evidence_json"])["evidence_items"]
+
+
+def test_reformatter_payload_applies_global_evidence_cap(monkeypatch):
+    monkeypatch.setenv("REPORT_REFORMATTER_MAX_EVIDENCE_ITEMS", "3")
+    clean_evidence = {
+        "topic": "global cap",
+        "dimensions": {
+            "market": [{"text": f"market fact {index} 10%", "source": str(index)} for index in range(1, 5)],
+            "policy": [{"text": f"policy fact {index} 20%", "source": str(index + 10)} for index in range(1, 5)],
+        },
+        "sources": [{"id": str(index), "title": f"Source {index}", "url": "https://example.com"} for index in range(1, 20)],
+    }
+
+    payload = build_reformatter_payload(clean_evidence, max_facts_per_dimension=4)
+    evidence_items = json.loads(payload["evidence_json"])["evidence_items"]
+
+    assert len(evidence_items) == 3
+
+
+def test_reformatter_blocks_oversized_initial_payload_before_llm(monkeypatch):
+    monkeypatch.setenv("REPORT_REFORMATTER_MAX_PAYLOAD_CHARS", "500")
+    called = False
+
+    async def fail_if_called(**kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("LLM should not be called for an oversized reformatter payload")
+
+    monkeypatch.setattr(reformatter_module, "_generate_reformatter_text", fail_if_called)
+    clean_evidence = {
+        "topic": "oversized reformatter payload",
+        "dimensions": {
+            "market": [
+                {
+                    "text": "very long evidence " * 80,
+                    "source": "1",
+                }
+            ],
+        },
+        "sources": [{"id": "1", "title": "Source One", "url": "https://example.com/1"}],
+    }
+
+    with pytest.raises(RuntimeError, match="reformatter_context_too_large"):
+        asyncio.run(reformatter_module.run_reformatter(clean_evidence))
+    assert called is False
+
+
+def test_reformatter_polish_omits_full_evidence_by_default(monkeypatch):
+    monkeypatch.setenv("REPORT_REFORMATTER_MIN_BODY_CHARS", "1000")
+    monkeypatch.setenv("REPORT_REFORMATTER_AUTO_EXPAND_ANALYSIS", "false")
+    monkeypatch.setenv("REPORT_REFORMATTER_QUALITY_PASSES", "1")
+    monkeypatch.delenv("REPORT_REFORMATTER_POLISH_INCLUDE_FULL_EVIDENCE", raising=False)
+    secret_evidence = "UNIQUE_EVIDENCE_SHOULD_NOT_BE_REPEATED_IN_POLISH"
+    calls = []
+
+    async def fake_generate(**kwargs):
+        calls.append(kwargs["user_content"])
+        if len(calls) == 1:
+            return "# Report\n\n## Body\nShort body [1]."
+        return "# Report\n\n## Body\n" + ("Expanded analysis with the existing citation [1]. " * 80)
+
+    monkeypatch.setattr(reformatter_module, "_generate_reformatter_text", fake_generate)
+    clean_evidence = {
+        "topic": "light polish",
+        "dimensions": {
+            "market": [
+                {
+                    "text": secret_evidence,
+                    "source": "1",
+                }
+            ],
+        },
+        "sources": [{"id": "1", "title": "Source One", "url": "https://example.com/1"}],
+    }
+
+    asyncio.run(reformatter_module.run_reformatter(clean_evidence, quality_passes=1, max_tokens=8000))
+
+    assert len(calls) == 2
+    assert secret_evidence in calls[0]
+    assert secret_evidence not in calls[1]
+    assert "evidence_items" not in calls[1]

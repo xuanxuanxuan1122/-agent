@@ -12,6 +12,7 @@ try:
     from rag_pipeline.contracts.source_registry import pick_refs as _contract_pick_refs
     from .analytics import run_analytics_agents
     from .chapter_evidence_builder import build_chapter_evidence_packages_from_evidence_package
+    from .chapter_narrative_agent import run_chapter_narrative
     from .chapter_argument_agent import run_chapter_argument_agent
     from .claim_builder_agent import run_claim_builder_agent
     from .decision_synthesis_agent import run_decision_synthesis_agent
@@ -38,6 +39,7 @@ except Exception:  # pragma: no cover - direct script mode fallback
         _contract_pick_refs = None  # type: ignore
     from analytics import run_analytics_agents  # type: ignore
     from chapter_evidence_builder import build_chapter_evidence_packages_from_evidence_package  # type: ignore
+    from chapter_narrative_agent import run_chapter_narrative  # type: ignore
     from chapter_argument_agent import run_chapter_argument_agent  # type: ignore
     from claim_builder_agent import run_claim_builder_agent  # type: ignore
     from decision_synthesis_agent import run_decision_synthesis_agent  # type: ignore
@@ -130,6 +132,18 @@ def _as_list(value: Any) -> List[Any]:
     return list(value) if isinstance(value, list) else []
 
 
+def _renumber_public_chapter_headings(markdown: str) -> str:
+    chapter_index = 0
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal chapter_index
+        chapter_index += 1
+        title = re.sub(r"^\d+\.\s*", "", match.group(1).strip())
+        return f"## {chapter_index}. {title}"
+
+    return re.sub(r"^##\s+\d+\.\s+(.+?)\s*$", replace, markdown or "", flags=re.M)
+
+
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None or value == "":
@@ -144,6 +158,13 @@ def _env_flag(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _clean_standard() -> str:
+    value = str(os.getenv("REPORT_CLEAN_STANDARD", "balanced") or "").strip().lower()
+    if value in {"strict", "balanced", "relaxed"}:
+        return value
+    return "balanced"
 
 
 def _count_value(value: Any) -> int:
@@ -545,6 +566,27 @@ def _chapter_evidence_signal_count(packages: Optional[Sequence[Dict[str, Any]]])
     return total
 
 
+def _chapter_evidence_layered_count(packages: Optional[Sequence[Dict[str, Any]]]) -> int:
+    total = 0
+    for package in list(packages or []):
+        if not isinstance(package, dict):
+            continue
+        for key in ("metric_evidence", "case_evidence", "counter_evidence", "directional_evidence"):
+            total += _safe_len(package.get(key))
+            try:
+                total += int(float(package.get(f"{key}_count") or 0))
+            except (TypeError, ValueError):
+                pass
+    return total
+
+
+def _chapter_evidence_selection_score(packages: Optional[Sequence[Dict[str, Any]]]) -> int:
+    layered = _chapter_evidence_layered_count(packages)
+    signal = _chapter_evidence_signal_count(packages)
+    hydrated = _chapter_evidence_hydrated_count(packages)
+    return layered * 3 + signal * 2 + hydrated
+
+
 def _fill_section_from_unit(section: Dict[str, Any], unit: Dict[str, Any], fallback_refs: Sequence[str]) -> Dict[str, Any]:
     result = dict(section)
     if not str(result.get("section_title") or "").strip():
@@ -612,8 +654,21 @@ def _sanitize_table_for_public(table: Dict[str, Any], diagnostics: Dict[str, Any
 
 
 def _demote_invalid_table(table: Dict[str, Any], diagnostics: Dict[str, Any], *, nested: bool = False) -> Dict[str, Any]:
+    was_renderable = bool(table.get("should_render")) and not table.get("appendix_only")
     result = _sanitize_table_for_public(dict(table), diagnostics)
     if not result.get("should_render") or result.get("appendix_only"):
+        if was_renderable and not result.get("appendix_only") and not result.get("demoted_from_clean_report"):
+            result["demoted_from_clean_report"] = True
+            diagnostics["demoted_table_count"] = int(diagnostics.get("demoted_table_count") or 0) + 1
+            if len(diagnostics.setdefault("demoted_tables", [])) < 8:
+                diagnostics["demoted_tables"].append(
+                    {
+                        "table_id": result.get("table_id"),
+                        "chapter_id": result.get("chapter_id"),
+                        "nested": nested,
+                        "error_types": _as_list(result.get("reject_reasons"))[:6],
+                    }
+                )
         return result
     validation = validate_table_package(result)
     if validation.get("passed"):
@@ -2080,8 +2135,14 @@ def _quality_score_from_findings(
     if _as_dict(delivery_gate).get("publishable"):
         score = max(score, 90)
 
-    finding_count = len(list(quality_findings or []))
-    score -= min(25, finding_count * 2)
+    clean_blockers = [
+        _as_dict(item) for item in list(quality_findings or [])
+        if str(_as_dict(item).get("finding_category") or _as_dict(item).get("qa_category") or "").strip()
+        in {"clean_blocker", "render_blocker"}
+    ]
+    soft_findings = max(0, len(list(quality_findings or [])) - len(clean_blockers))
+    score -= min(20, len(clean_blockers) * 4)
+    score -= min(12, soft_findings)
     if _count_value(_as_dict(evidence_health_summary).get("distinct_verified_ab_source_count")) <= 0:
         score -= 12
     if _count_value(_as_dict(evidence_health_summary).get("readpage_succeeded")) <= 0:
@@ -2377,6 +2438,12 @@ def _render_not_ready_report(
 def _expand_chapter_packages_for_body_target(chapter_packages: Sequence[Dict[str, Any]], *, target_chars: int) -> List[Dict[str, Any]]:
     packages = [dict(chapter) for chapter in list(chapter_packages or []) if isinstance(chapter, dict)]
     if not target_chars or not _env_flag("REPORT_ENABLE_BODY_EXPANSION", True):
+        return packages
+    mode = str(os.getenv("REPORT_QUALITY_MODE") or os.getenv("QUALITY_MODE") or "").strip().lower()
+    if mode in {"high", "strict", "deep_strict", "due_diligence", "investment_due_diligence"} and not _env_flag(
+        "REPORT_ENABLE_DETERMINISTIC_BODY_EXPANSION",
+        False,
+    ):
         return packages
     current = _estimated_public_body_chars(packages)
     target = int(target_chars * _env_float("REPORT_BODY_EXPANSION_TARGET_RATIO", 0.95, min_value=0.5, max_value=2.0))
@@ -2692,8 +2759,11 @@ def render_dynamic_report(
     risk_package: Optional[Dict[str, Any]] = None,
     appendix_package: Optional[Dict[str, Any]] = None,
     source_registry: Optional[Sequence[Dict[str, Any]]] = None,
+    evidence_package: Optional[Dict[str, Any]] = None,
+    chapter_evidence_packages: Optional[Sequence[Dict[str, Any]]] = None,
     **_: Any,
 ) -> Dict[str, Any]:
+    extra = _as_dict(_)
     return run_final_writer_agent(
         query=query,
         report_blueprint=report_blueprint,
@@ -2703,6 +2773,10 @@ def render_dynamic_report(
         risk_package=risk_package,
         appendix_package=appendix_package,
         source_registry=source_registry,
+        evidence_package=evidence_package,
+        chapter_evidence_packages=chapter_evidence_packages,
+        claim_units=_as_list(extra.get("argument_units")),
+        analysis_claim_units=_as_list(_as_dict(extra.get("structured_analysis")).get("claim_units")),
     )
 
 
@@ -2908,21 +2982,45 @@ def build_writer_report(
     existing_signal_count = _chapter_evidence_signal_count(chapter_evidence_packages)
     rebuilt_hydrated_count = _chapter_evidence_hydrated_count(rebuilt_chapter_evidence_packages)
     existing_hydrated_count = _chapter_evidence_hydrated_count(chapter_evidence_packages)
-    if rebuilt_chapter_evidence_packages and (
-        rebuilt_hydrated_count > 0
-        and (rebuilt_hydrated_count >= existing_hydrated_count or existing_hydrated_count <= 0)
+    rebuilt_layered_count = _chapter_evidence_layered_count(rebuilt_chapter_evidence_packages)
+    existing_layered_count = _chapter_evidence_layered_count(chapter_evidence_packages)
+    rebuilt_selection_score = _chapter_evidence_selection_score(rebuilt_chapter_evidence_packages)
+    existing_selection_score = _chapter_evidence_selection_score(chapter_evidence_packages)
+    prefer_rebuilt_for_layers = rebuilt_layered_count > 0 and existing_layered_count <= 0
+    prefer_rebuilt_for_score = rebuilt_selection_score > existing_selection_score
+    if rebuilt_chapter_evidence_packages and rebuilt_hydrated_count > 0 and (
+        prefer_rebuilt_for_layers
+        or prefer_rebuilt_for_score
+        or (rebuilt_hydrated_count >= existing_hydrated_count and rebuilt_signal_count >= existing_signal_count)
+        or existing_hydrated_count <= 0
     ):
         chapter_evidence_packages = rebuilt_chapter_evidence_packages
         evidence_package["chapter_evidence_packages"] = list(chapter_evidence_packages)
-    elif rebuilt_chapter_evidence_packages:
-        evidence_package.setdefault("chapter_evidence_rebuild_diagnostics", {})
         evidence_package["chapter_evidence_rebuild_diagnostics"] = {
-            "status": "kept_existing_packages",
-            "reason": "rebuilt_package_had_less_hydrated_evidence",
+            "status": "used_rebuilt_packages",
+            "reason": "layered_or_scored_package_preferred",
             "rebuilt_signal_count": rebuilt_signal_count,
             "existing_signal_count": existing_signal_count,
             "rebuilt_hydrated_count": rebuilt_hydrated_count,
             "existing_hydrated_count": existing_hydrated_count,
+            "rebuilt_layered_count": rebuilt_layered_count,
+            "existing_layered_count": existing_layered_count,
+            "rebuilt_selection_score": rebuilt_selection_score,
+            "existing_selection_score": existing_selection_score,
+        }
+    elif rebuilt_chapter_evidence_packages:
+        evidence_package.setdefault("chapter_evidence_rebuild_diagnostics", {})
+        evidence_package["chapter_evidence_rebuild_diagnostics"] = {
+            "status": "kept_existing_packages",
+            "reason": "rebuilt_package_had_lower_selection_score",
+            "rebuilt_signal_count": rebuilt_signal_count,
+            "existing_signal_count": existing_signal_count,
+            "rebuilt_hydrated_count": rebuilt_hydrated_count,
+            "existing_hydrated_count": existing_hydrated_count,
+            "rebuilt_layered_count": rebuilt_layered_count,
+            "existing_layered_count": existing_layered_count,
+            "rebuilt_selection_score": rebuilt_selection_score,
+            "existing_selection_score": existing_selection_score,
         }
 
     evidence_graph = run_evidence_synthesizer(
@@ -2940,6 +3038,7 @@ def build_writer_report(
     micro_layouts = list(micro_layouts or run_micro_layout_agent(
         report_blueprint=report_blueprint,
         chapter_evidence_packages=chapter_evidence_packages,
+        structured_analysis=structured_analysis,
         llm_client=llm_client,
     ))
     table_packages = copy.deepcopy(list(table_packages or run_table_agent(
@@ -3026,6 +3125,30 @@ def build_writer_report(
     ]
     target_body_chars = _env_int("REPORT_TARGET_BODY_CHARS", 20000, min_value=0, max_value=100000)
     public_chapter_packages = _expand_chapter_packages_for_body_target(public_chapter_packages, target_chars=target_body_chars)
+    chapter_narrative_diagnostics: Dict[str, Any] = {
+        "enabled": False,
+        "status": "skipped",
+        "skipped_reason": "not_run",
+    }
+    try:
+        public_chapter_packages, chapter_narrative_diagnostics = run_chapter_narrative(
+            chapter_packages=public_chapter_packages,
+            report_blueprint=report_blueprint,
+            llm_config=None,
+            quality_context=_as_dict(_as_dict(structured_analysis).get("analysis_stage_diagnostics")),
+        )
+    except Exception as exc:
+        chapter_narrative_diagnostics = {
+            "enabled": True,
+            "status": "yellow",
+            "skipped_reason": "",
+            "attempted_count": 0,
+            "success_count": 0,
+            "fallback_count": len(public_chapter_packages),
+            "rejected_count": 0,
+            "rejected_reasons": {},
+            "failure_reasons": {f"runtime_error:{type(exc).__name__}": 1},
+        }
     expanded_public_by_id = {str(chapter.get("chapter_id") or ""): chapter for chapter in public_chapter_packages}
     chapter_packages = [
         expanded_public_by_id.get(str(chapter.get("chapter_id") or ""), chapter)
@@ -3073,8 +3196,11 @@ def build_writer_report(
         risk_package=risk_package,
         appendix_package=appendix_payload,
         source_registry=source_registry,
+        evidence_package=evidence_package,
+        chapter_evidence_packages=chapter_evidence_packages,
+        claim_units=argument_units,
     )
-    writer_output["report_markdown"] = sanitize_public_markdown(writer_output.get("report_markdown") or "")
+    writer_output["report_markdown"] = str(writer_output.get("report_markdown") or "")
     rendered_source_registry = _as_list(writer_output.get("source_registry")) or list(source_registry or [])
     rendered_footnotes = [
         f"{source.get('ref')} "
@@ -3221,6 +3347,10 @@ def build_writer_report(
     )
     fatal_delivery_blockers = _fatal_delivery_blockers(delivery_blockers, markdown=public_markdown)
     clean_report_eligible = False
+    clean_content_eligible = False
+    clean_output_enabled = _env_flag("REPORT_WRITE_CLEAN_REPORT", False)
+    clean_candidate_gate = _as_dict(_as_dict(qa_result).get("clean_gate"))
+    clean_candidate_eligible = bool(clean_candidate_gate.get("clean_candidate_eligible"))
     claim_strength = _claim_strength_from_gate(delivery_gate, evidence_health_summary)
     quality_score = _quality_score_from_findings(
         qa_result=qa_result,
@@ -3259,8 +3389,31 @@ def build_writer_report(
             package_passed=package_passed,
             package_warning_blocked=package_warning_blocked,
         ) and delivery_tier == "publishable_clean"
-        clean_report_eligible = bool(report_ready and not delivery_blockers)
-        report_status = "final_clean" if clean_report_eligible else "formal_scored"
+        clean_standard = _clean_standard()
+        strict_clean_content_eligible = bool(report_ready and not delivery_blockers)
+        render_gate = _as_dict(_as_dict(qa_result).get("render_gate"))
+        balanced_clean_content_eligible = bool(
+            clean_candidate_eligible
+            and public_markdown.strip()
+            and not bool(render_gate.get("blocked"))
+            and not bool(_as_dict(delivery_gate).get("diagnostic_only"))
+            and str(delivery_tier or "").strip() != "diagnostic_only"
+            and not has_internal_gap_language(public_markdown)
+        )
+        if clean_standard == "strict":
+            clean_content_eligible = strict_clean_content_eligible
+        elif clean_standard == "relaxed":
+            clean_content_eligible = bool(
+                public_markdown.strip()
+                and not bool(render_gate.get("blocked"))
+                and not bool(_as_dict(delivery_gate).get("diagnostic_only"))
+                and not has_internal_gap_language(public_markdown)
+            )
+        else:
+            clean_content_eligible = bool(strict_clean_content_eligible or balanced_clean_content_eligible)
+        clean_report_eligible = clean_content_eligible
+        clean_candidate_eligible = bool(clean_candidate_eligible or clean_content_eligible)
+        report_status = "final_clean" if clean_content_eligible else "formal_scored"
         if report_status == "final_clean":
             message = ""
         elif qa_pending_repair:
@@ -3341,8 +3494,38 @@ def build_writer_report(
     analysis_stage_diagnostics = _as_dict(structured_analysis.get("analysis_stage_diagnostics"))
     llm_analysis_synthesis = _as_dict(structured_analysis.get("llm_analysis_synthesis"))
     claim_binding_feedback_summary = _as_dict(structured_analysis.get("claim_binding_feedback_summary"))
+    render_artifacts = {
+        "payload_mode": "full",
+        "structured_analysis": structured_analysis,
+        "chapter_evidence_packages": [
+            item for item in list(chapter_evidence_packages or []) if isinstance(item, dict)
+        ],
+        "chapter_packages": [
+            item for item in list(chapter_packages or []) if isinstance(item, dict)
+        ],
+        "table_packages": [
+            item for item in list(table_packages or []) if isinstance(item, dict)
+        ],
+        "source_registry": [
+            item for item in list(rendered_source_registry or []) if isinstance(item, dict)
+        ],
+        "micro_layouts": [
+            item for item in list(micro_layouts or []) if isinstance(item, dict)
+        ],
+        "argument_units": [
+            item for item in list(argument_units or []) if isinstance(item, dict)
+        ],
+        "evidence_package": evidence_package,
+        "citation_manifest": _as_dict(writer_output.get("citation_manifest")),
+        "final_citation_audit": _as_dict(writer_output.get("final_citation_audit")),
+        "source_claim_support": _as_dict(writer_output.get("source_claim_support")),
+        "analysis_transfer": _as_dict(writer_output.get("analysis_transfer")),
+        "ref_lineage_diagnostics": _as_dict(writer_output.get("ref_lineage_diagnostics")),
+        "chapter_narrative": chapter_narrative_diagnostics,
+    }
     return {
         **writer_output,
+        "chapter_narrative": chapter_narrative_diagnostics,
         "report_type": report_blueprint.get("report_family") or select_report_layout(report_plan).report_type,
         "report_status": report_status,
         "delivery_tier": delivery_tier,
@@ -3357,6 +3540,10 @@ def build_writer_report(
         "quality_score": quality_score,
         "quality_grade": _quality_grade(quality_score),
         "clean_report_eligible": clean_report_eligible,
+        "clean_content_eligible": clean_content_eligible,
+        "clean_candidate_eligible": clean_candidate_eligible,
+        "clean_output_enabled": clean_output_enabled,
+        "clean_standard": _clean_standard(),
         "claim_strength": claim_strength,
         "delivery_gate_mode": _delivery_gate_mode(),
         "skip_reformatter": report_status == "diagnostic_only",
@@ -3386,6 +3573,7 @@ def build_writer_report(
         "llm_analysis_synthesis": llm_analysis_synthesis,
         "claim_binding_feedback_summary": claim_binding_feedback_summary,
         **artifact_payload,
+        "render_artifacts": render_artifacts,
         "source_registry": list(rendered_source_registry or []),
         "footnotes": rendered_footnotes,
         "validation": {
@@ -3422,6 +3610,7 @@ def build_writer_report(
             "analysis_depth_quality": analysis_depth_quality,
             "analysis_stage_diagnostics": analysis_stage_diagnostics,
             "claim_binding_feedback_summary": claim_binding_feedback_summary,
+            "chapter_narrative": chapter_narrative_diagnostics,
         },
     }
 

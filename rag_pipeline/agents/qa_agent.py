@@ -753,6 +753,10 @@ HIGH_QA_ERROR_TYPES = {
     "table_quality",
     "package_contract",
     "deep_report_blocking_gap",
+    "traceable_ab_sources_missing",
+    "verified_ab_sources_missing",
+    "publishable_evidence_gate_failed",
+    "evidence_health_summary_inconsistent",
 }
 
 RENDER_FATAL_QA_TYPES = {
@@ -789,6 +793,36 @@ EVIDENCE_REPAIR_FOLLOWUP_TYPES = {
     "search_tasks_dropped",
     "page_results_zero",
     "iqs_lane_timeout_without_signal",
+}
+
+RETRIEVAL_GAP_TYPES = {
+    "search_tasks_dropped",
+    "iqs_lane_no_success",
+    "iqs_lane_partial_failure",
+    "iqs_lane_timeout_without_signal",
+    "page_results_zero",
+    "openai_web_repair_failed",
+    "openai_web_repair_disabled",
+}
+
+CANDIDATE_ONLY_GAP_TYPES = {
+    "report_body_below_target_chars",
+    "counter_evidence_weak",
+    "mechanism_explanation_weak",
+    "chapter_counter_evidence_advisory",
+}
+
+STRICT_CLEAN_GAP_TYPES = {
+    "missing_proof_standards",
+    "missing_proof_standard",
+    "mandatory_proof_missing",
+    "no_ab_sources_for_core_hypotheses",
+    "insufficient_core_evidence_refs",
+    "insufficient_ab_sources",
+    "public_chapter_without_ab_sources",
+    "traceable_ab_sources_missing",
+    "verified_ab_sources_missing",
+    "publishable_evidence_gate_failed",
 }
 
 
@@ -929,6 +963,8 @@ def _qa_issue_severity(issue: Dict[str, Any], *, strict_mode: bool) -> str:
     category = _qa_finding_category(issue)
     if category == "readability_finding":
         return "medium"
+    if category == "clean_candidate_blocker":
+        return "medium"
     if strict_mode and issue_type in HIGH_QA_ERROR_TYPES:
         return "fatal"
     if issue_type in FATAL_QA_ERROR_TYPES:
@@ -971,6 +1007,45 @@ def _score_qa_result(
     }
 
 
+def _has_core_evidence_signal(
+    *,
+    chapter_packages: Sequence[Dict[str, Any]],
+    evidence_health_summary: Dict[str, Any],
+) -> bool:
+    health = _as_dict(evidence_health_summary)
+    for key in (
+        "analysis_ready_count",
+        "clean_fact_count",
+        "traceable_ab_source_count",
+        "distinct_traceable_ab_source_count",
+        "distinct_verified_ab_source_count",
+        "verified_source_count",
+    ):
+        if _count_value(health.get(key)) > 0:
+            return True
+    return any(_chapter_has_hydrated_signal(_as_dict(chapter)) for chapter in list(chapter_packages or []))
+
+
+def _deep_gap_category(
+    gap: Dict[str, Any],
+    *,
+    chapter_packages: Sequence[Dict[str, Any]],
+    evidence_health_summary: Dict[str, Any],
+) -> str:
+    payload = _as_dict(gap)
+    gap_type = str(payload.get("type") or payload.get("gap_type") or "").strip()
+    if gap_type in RETRIEVAL_GAP_TYPES:
+        return "clean_blocker" if not _has_core_evidence_signal(
+            chapter_packages=chapter_packages,
+            evidence_health_summary=evidence_health_summary,
+        ) else "readability_finding"
+    if gap_type in CANDIDATE_ONLY_GAP_TYPES:
+        return "clean_candidate_blocker"
+    if gap_type in STRICT_CLEAN_GAP_TYPES:
+        return "clean_blocker"
+    return "clean_blocker"
+
+
 def _qa_render_gate(errors: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     blockers = [
         _as_dict(item)
@@ -992,14 +1067,59 @@ def _qa_clean_gate(
     deep_evaluation: Dict[str, Any],
     score: int,
     min_pass_score: int,
+    clean_blocking_deep_gaps: Optional[Sequence[Dict[str, Any]]] = None,
+    candidate_findings: Optional[Sequence[Dict[str, Any]]] = None,
+    render_gate: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    """Return the multi-tier QA gate decision.
+
+    There are three publication tiers, increasing in strictness:
+
+    * **`can_render_formal_report`** (`render_gate.blocked is False`) — the
+      writer is allowed to produce the formal markdown at all. Only fatal
+      render-blockers (missing required sections, structural contract failures)
+      veto this.
+    * **`clean_candidate_eligible`** — the report is good enough to publish as
+      a *candidate*: score ≥ `QA_CLEAN_CANDIDATE_MIN_SCORE` (default 60), no
+      fatal blockers, no render-blockers. Soft findings like
+      `report_body_below_target_chars`, `counter_evidence_weak`, or chapter
+      counter-evidence advisory may still be present and surface as
+      `candidate_blockers` but do NOT veto candidate status.
+    * **`clean_content_eligible`** (alias `eligible`/`passed`) — the strictest
+      tier. Requires the candidate-tier gates AND zero clean-blockers
+      (missing proof standards, no A/B sources, publishable-evidence gate,
+      etc.). This is what downstream `final_writer` checks before treating
+      the output as a deliverable clean report rather than a draft.
+
+    `STRICT_CLEAN_GAP_TYPES` lists the gap types that force a clean-blocker;
+    `CANDIDATE_ONLY_GAP_TYPES` lists the gaps that demote a report from
+    clean to candidate but don't block candidate publication. Adding a new
+    gap type? Decide which set it belongs in by asking: "would I let a sales
+    person send this report to a client over weekend?" If yes → candidate;
+    if no → clean-blocker.
+    """
     blockers = [_as_dict(item) for item in list(errors or []) if _as_dict(item)]
-    for gap in _as_list(_as_dict(deep_evaluation).get("blocking_gaps")):
+    for gap in list(clean_blocking_deep_gaps or []):
         payload = _as_dict(gap)
         blockers.append({"type": payload.get("type") or "deep_report_blocking_gap", "source": "deep_evaluator", "detail": payload})
+    candidate_min_score = _env_int("QA_CLEAN_CANDIDATE_MIN_SCORE", 60, min_value=0, max_value=100)
+    candidate_blockers = list(blockers)
+    candidate_blockers.extend(_as_dict(item) for item in list(candidate_findings or []) if _as_dict(item))
+    fatal_blockers = [
+        item for item in blockers
+        if _qa_issue_type(item) in FATAL_QA_ERROR_TYPES
+        or _qa_finding_category(item) == "render_blocker"
+    ]
+    render_blocked = bool(_as_dict(render_gate).get("blocked"))
+    candidate_eligible = bool(score >= candidate_min_score and not fatal_blockers and not render_blocked)
     return {
         "eligible": bool(passed),
+        "clean_content_eligible": bool(passed),
+        "clean_candidate_eligible": candidate_eligible,
+        "candidate_minimum_score": candidate_min_score,
         "blockers": blockers,
+        "clean_blockers": blockers,
+        "candidate_blockers": candidate_blockers,
         "warnings": [_as_dict(item) for item in list(warnings or []) if _as_dict(item)],
         "quality_score": score,
         "minimum_pass_score": min_pass_score,
@@ -1169,10 +1289,7 @@ def run_qa_agent(
                     "claim_strength": _section_claim_strength(section),
                     "qa_category": "readability_finding" if limited_section else "clean_blocker",
                 }
-                if limited_section:
-                    warnings.append(issue)
-                else:
-                    errors.append(issue)
+                errors.append(issue)
 
     for table in list(table_packages or []):
         if not isinstance(table, dict):
@@ -1221,7 +1338,10 @@ def run_qa_agent(
                     "evidence_health_summary": evidence_health_summary,
                 }
             )
-        if deep_report and _count_value(evidence_health_summary.get("analysis_ready_ab_count")) > 0 and _count_value(evidence_health_summary.get("distinct_verified_ab_source_count")) <= 0:
+        if deep_report and (
+            _count_value(evidence_health_summary.get("analysis_ready_ab_count")) > 0
+            or _count_value(evidence_health_summary.get("analysis_ready_count")) > 0
+        ) and _count_value(evidence_health_summary.get("distinct_verified_ab_source_count")) <= 0:
             errors.append(
                 {
                     "type": "verified_ab_sources_missing",
@@ -1293,9 +1413,25 @@ def run_qa_agent(
         missing_proof_standards=missing_proof_standards,
     )
     deep_blocking = strict_mode or deep_report or _env_flag("QA_DEEP_EVALUATOR_BLOCKING", True)
+    deep_clean_blocking_gaps: List[Dict[str, Any]] = []
+    deep_candidate_findings: List[Dict[str, Any]] = []
     if deep_blocking:
         for gap in _as_list(deep_evaluation.get("blocking_gaps")):
-            errors.append({"type": "deep_report_blocking_gap", "detail": gap})
+            payload = _as_dict(gap)
+            category = _deep_gap_category(
+                payload,
+                chapter_packages=chapter_packages,
+                evidence_health_summary=evidence_health_summary,
+            )
+            if strict_mode and str(payload.get("type") or payload.get("gap_type") or "").strip() == "report_body_below_target_chars":
+                category = "clean_blocker"
+            issue = {"type": "deep_report_blocking_gap", "detail": payload, "qa_category": category}
+            if category == "clean_blocker":
+                errors.append(issue)
+                deep_clean_blocking_gaps.append(payload)
+            else:
+                warnings.append(issue)
+                deep_candidate_findings.append(issue)
 
     scoring_mode = _qa_scoring_mode()
     min_pass_score = _env_int("QA_MIN_PASS_SCORE", 75 if (strict_mode or deep_report) else 60, min_value=0, max_value=100)
@@ -1307,10 +1443,14 @@ def run_qa_agent(
     )
     score = int(score_payload["score"])
     fatal_errors = _as_list(score_payload.get("fatal_errors"))
+    clean_blocker_errors = [
+        item for item in errors
+        if _qa_finding_category(item) == "clean_blocker"
+    ]
     if scoring_mode in {"legacy", "hard"}:
-        passed = not errors and score >= min_pass_score and (bool(deep_evaluation.get("publishable")) if deep_blocking else True)
+        passed = not errors and score >= min_pass_score and not deep_clean_blocking_gaps
     else:
-        passed = not fatal_errors and score >= min_pass_score and (bool(deep_evaluation.get("publishable")) if deep_blocking else True)
+        passed = not fatal_errors and not clean_blocker_errors and score >= min_pass_score and not deep_clean_blocking_gaps
     soft_errors = _as_list(score_payload.get("high_errors")) + _as_list(score_payload.get("medium_errors"))
     deep_followups = [
         *_as_list(_as_dict(deep_evaluation).get("required_followups")),
@@ -1332,7 +1472,7 @@ def run_qa_agent(
         for item in warnings:
             blocking_followups.append({"type": _qa_issue_type(item) or "qa_warning", "source": "qa_warning", "detail": item})
     if deep_blocking:
-        blocking_followups.extend(_as_dict(item) for item in _as_list(deep_evaluation.get("blocking_gaps")))
+        blocking_followups.extend(_as_dict(item) for item in deep_clean_blocking_gaps)
 
     blocking_evidence_repair_followups = [item for item in blocking_followups if _is_evidence_repair_followup(item)]
     blocking_content_repair_followups = [item for item in blocking_followups if not _is_evidence_repair_followup(item)]
@@ -1351,6 +1491,9 @@ def run_qa_agent(
         deep_evaluation=deep_evaluation,
         score=score,
         min_pass_score=min_pass_score,
+        clean_blocking_deep_gaps=deep_clean_blocking_gaps,
+        candidate_findings=deep_candidate_findings,
+        render_gate=render_gate,
     )
     qa_quality_findings = _qa_quality_findings(
         errors=errors,

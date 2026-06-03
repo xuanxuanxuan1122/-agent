@@ -180,6 +180,7 @@ def test_build_llm_config_for_task_falls_back_to_legacy_synthesis(monkeypatch):
     for name in list(os.environ):
         if name.startswith("RAG_MODEL_"):
             monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("RAG_FORCE_GPT55_QUALITY_TASKS", "false")
     monkeypatch.setenv("RAG_MODEL_QA_PROFILE", "deepseek-v4-pro")
     monkeypatch.setenv("RAG_LLM_PROFILE_DEEPSEEK_V4_PRO_URL", "")
     monkeypatch.setenv("RAG_LLM_PROFILE_DEEPSEEK_V4_PRO_API_KEY", "")

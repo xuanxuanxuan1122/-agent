@@ -233,6 +233,10 @@ class BrainAgentState(TypedDict, total=False):
     output_mode: str
     parallel_raw_output: bool
     topic_bundle_seed: Dict[str, Any]
+    deadline_ts: float
+    timeout_context: Dict[str, Any]
+    fail_open_on_timeout: bool
+    max_wall_seconds: int
     local_state: Dict[str, Any]
     web_state: Dict[str, Any]
     iqs_lane_1_state: Dict[str, Any]
@@ -2174,6 +2178,11 @@ def run_web_analysis_agent_node(state: BrainAgentState) -> BrainAgentState:
     evidence_gaps: List[Any] = []
 
     for index, query in enumerate(queries, start=1):
+        if _deadline_exceeded(state, min_remaining=1.0):
+            timeout_payload = _deadline_timeout_payload(state, stage="web_analysis_agent")
+            errors.append("联网分析达到报告墙钟预算，已停止提交新的 IQS 子问题。")
+            outputs.setdefault("metadata", {})["live_timeout"] = timeout_payload
+            break
         query_started = time.perf_counter()
         _progress("iqs", "通用联网检索开始", index=f"{index}/{len(queries)}", query=query)
         try:
@@ -2273,6 +2282,14 @@ def _run_iqs_lane_task(
         role=task.get("proof_role") or task.get("evidence_type"),
         query=query,
     )
+    if _deadline_exceeded(state, min_remaining=1.0):
+        return {
+            "index": index,
+            "status": "cancelled",
+            "cancel_reason": "deadline_exceeded",
+            "errors": [f"{config['label']} skipped because the report deadline was reached"],
+            "live_timeout": _deadline_timeout_payload(state, stage=f"{role_key}_task"),
+        }
     try:
         child_state = run_web_analysis_agent(
             query,
@@ -2389,12 +2406,57 @@ def _run_iqs_role_agent_node(state: BrainAgentState, role_key: str) -> BrainAgen
         for index, task in enumerate(work_items, start=1)
         if str(task.get("query") or "").strip()
     ]
+    if _deadline_exceeded(state, min_remaining=1.0):
+        timeout_payload = _deadline_timeout_payload(state, stage=f"{role_key}_lane")
+        return {
+            config["state"]: {
+                "answer_text": "",
+                "query_results": [],
+                "raw_output": {
+                    "query": str(state.get("query") or ""),
+                    "role_key": role_key,
+                    "dynamic_tasks": work_items,
+                    "task_results": [],
+                    "raw_data_points": [],
+                    "lane_coverage": {
+                        "scheduled": len(work_items),
+                        "completed_task_count": 0,
+                        "cancelled_task_count": len(indexed_tasks),
+                        "execution_status": "deadline_exceeded",
+                        "status": "deadline_exceeded",
+                    },
+                    "live_timeout": timeout_payload,
+                },
+                "metadata": {
+                    "role_key": role_key,
+                    "role_label": config["label"],
+                    "status": "deadline_exceeded",
+                    "live_timeout": timeout_payload,
+                },
+                "raw_data_points": [],
+            },
+            "errors": [f"{config['label']} skipped because the report deadline was reached"],
+        }
     lane_workers = max(1, min(_env_int("BRAIN_IQS_LANE_PARALLEL_WORKERS", 4), len(indexed_tasks) or 1))
     task_timeout = max(0.0, _env_float("BRAIN_IQS_LANE_TASK_TIMEOUT_SECONDS", 180.0))
+    remaining_for_lane = _deadline_remaining_seconds(state)
+    if remaining_for_lane != float("inf"):
+        task_timeout = max(1.0, min(task_timeout or remaining_for_lane, remaining_for_lane))
     task_payloads: List[Dict[str, Any]] = []
     early_stop_state: Dict[str, Any] = {"early_stopped": False, "early_stop_reason": ""}
     if lane_workers <= 1 or len(indexed_tasks) <= 1:
         for position, (index, task) in enumerate(indexed_tasks):
+            if _deadline_exceeded(state, min_remaining=1.0):
+                for cancelled_index, _ in indexed_tasks[position:]:
+                    task_payloads.append(
+                        {
+                            "index": cancelled_index,
+                            "status": "cancelled",
+                            "cancel_reason": "deadline_exceeded",
+                            "errors": [f"{config['label']} skipped because the report deadline was reached"],
+                        }
+                    )
+                break
             if not task_timeout:
                 task_payloads.append(
                     _run_iqs_lane_task(
@@ -2907,11 +2969,162 @@ def _store_topic_bundle_from_brain(
         return {"enabled": True, "stored": False, "reason": "store_failed", "error": str(exc), "stored_from": stage}
 
 
+def _write_stage_snapshot_from_brain(
+    *,
+    state: Dict[str, Any],
+    stage_name: str,
+    payload: Any,
+    summary: Optional[Dict[str, Any]] = None,
+    diagnostics: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    run_id = str(state.get("stage_snapshot_run_id") or os.getenv("REPORT_STAGE_SNAPSHOT_RUN_ID") or "").strip()
+    if not run_id:
+        return {"enabled": False, "stored": False, "reason": "missing_run_id", "stage_name": stage_name}
+    try:
+        from rag_pipeline.cache.stage_snapshot_cache import write_stage_snapshot
+
+        return write_stage_snapshot(
+            stage_name=stage_name,
+            run_id=run_id,
+            payload=payload,
+            summary=summary,
+            diagnostics=diagnostics,
+        )
+    except Exception as exc:  # pragma: no cover - snapshots are diagnostic only.
+        return {"enabled": True, "stored": False, "reason": "store_failed", "stage_name": stage_name, "error": str(exc)}
+
+
+def _emit_pre_writer_snapshots(
+    state: Dict[str, Any],
+    evidence_package: Dict[str, Any],
+    structured_analysis: Dict[str, Any],
+) -> None:
+    """Persist the pre-writer evidence + analysis snapshots and attach the result to evidence_package.metadata.
+
+    Centralised here so that `merge_outputs_node` does not have to repeat the
+    same six-line snapshot recipe in each of its branches. Mutates
+    `evidence_package` in place.
+    """
+
+    chapter_evidence_packages = _as_list(evidence_package.get("chapter_evidence_packages"))
+    if not chapter_evidence_packages:
+        try:
+            from rag_pipeline.agents.chapter_evidence_builder import build_chapter_evidence_packages_from_evidence_package
+
+            report_blueprint = (
+                _as_dict(state.get("report_blueprint"))
+                or _as_dict(_as_dict(state.get("query_analysis")).get("report_blueprint"))
+                or _as_dict(evidence_package.get("report_blueprint"))
+                or _as_dict(_as_dict(evidence_package.get("metadata")).get("report_blueprint"))
+                or _as_dict(evidence_package.get("report_plan"))
+                or _as_dict(_as_dict(evidence_package.get("metadata")).get("report_plan"))
+            )
+            source_registry = _as_list(evidence_package.get("source_registry")) or _as_list(evidence_package.get("sources"))
+            if report_blueprint:
+                chapter_evidence_packages = build_chapter_evidence_packages_from_evidence_package(
+                    report_blueprint=report_blueprint,
+                    evidence_package=evidence_package,
+                    existing_chapter_evidence_packages=[],
+                    source_registry=source_registry,
+                )
+                if chapter_evidence_packages:
+                    evidence_package["chapter_evidence_packages"] = chapter_evidence_packages
+        except Exception as exc:  # pragma: no cover - snapshot rebuild must never block live runs.
+            evidence_package.setdefault("metadata", {})["chapter_evidence_snapshot_error"] = str(exc)
+
+    evidence_snapshot_store = _write_stage_snapshot_from_brain(
+        state=state,
+        stage_name="evidence_package",
+        payload=evidence_package,
+        summary={"stored_from": "brain_full_payload", "phase": "pre_writer"},
+    )
+    chapter_snapshot_store = _write_stage_snapshot_from_brain(
+        state=state,
+        stage_name="chapter_evidence_packages",
+        payload=chapter_evidence_packages,
+        summary={
+            "stored_from": "brain_full_payload",
+            "phase": "pre_writer",
+            "chapter_evidence_package_count": len(chapter_evidence_packages),
+        },
+        diagnostics={
+            "chapter_binding_status": "available" if chapter_evidence_packages else "missing_or_unrebuildable",
+        },
+    )
+    analysis_snapshot_store = _write_stage_snapshot_from_brain(
+        state=state,
+        stage_name="structured_analysis",
+        payload=structured_analysis,
+        summary={
+            "stored_from": "brain_full_payload",
+            "phase": "pre_writer",
+            "chapter_evidence_package_count": len(chapter_evidence_packages),
+        },
+        diagnostics={
+            "chapter_binding_status": "available" if chapter_evidence_packages else "missing_or_unrebuildable",
+        },
+    )
+    if evidence_snapshot_store.get("stored") or chapter_snapshot_store.get("stored") or analysis_snapshot_store.get("stored"):
+        evidence_package.setdefault("metadata", {})["stage_snapshot_store"] = {
+            "evidence_package": evidence_snapshot_store,
+            "chapter_evidence_packages": chapter_snapshot_store,
+            "structured_analysis": analysis_snapshot_store,
+        }
+
+
+def _emit_post_writer_snapshot(state: Dict[str, Any], writer_report: Dict[str, Any]) -> None:
+    """Persist the writer-output snapshot and attach the result to writer_report.
+
+    Mutates `writer_report` in place.
+    """
+
+    writer_snapshot_store = _write_stage_snapshot_from_brain(
+        state=state,
+        stage_name="writer_report",
+        payload=writer_report,
+        summary={"stored_from": "writer_full_payload", "phase": "post_writer"},
+    )
+    if writer_snapshot_store.get("stored"):
+        writer_report["stage_snapshot_store"] = writer_snapshot_store
+
+
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _deadline_ts_from_state(state: Dict[str, Any]) -> float:
+    value = _as_dict(state.get("timeout_context")).get("deadline_ts") or state.get("deadline_ts")
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _deadline_remaining_seconds(state: Dict[str, Any]) -> float:
+    deadline_ts = _deadline_ts_from_state(state)
+    if deadline_ts <= 0:
+        return float("inf")
+    return deadline_ts - time.perf_counter()
+
+
+def _deadline_exceeded(state: Dict[str, Any], *, min_remaining: float = 0.0) -> bool:
+    remaining = _deadline_remaining_seconds(state)
+    return remaining != float("inf") and remaining <= float(min_remaining or 0.0)
+
+
+def _deadline_timeout_payload(state: Dict[str, Any], *, stage: str) -> Dict[str, Any]:
+    context = _as_dict(state.get("timeout_context"))
+    return {
+        "timeout_triggered": True,
+        "timeout_stage": stage,
+        "deadline_ts": _deadline_ts_from_state(state),
+        "remaining_seconds": max(0.0, _deadline_remaining_seconds(state)),
+        "live_deadline_seconds": int(context.get("max_seconds") or state.get("max_wall_seconds") or 0),
+        "fail_open_on_timeout": bool(context.get("fail_open_on_timeout", state.get("fail_open_on_timeout", True))),
+    }
 
 
 def _stable_short_hash(*values: Any, length: int = 16) -> str:
@@ -3211,6 +3424,7 @@ def _compact_writer_report_for_state(writer_report: Dict[str, Any]) -> Dict[str,
         "reformatter_preflight",
         "post_qa_repair",
         "topic_bundle_cache_store",
+        "render_artifacts",
         "metadata",
     ]
     compacted = {key: writer_report.get(key) for key in keep_keys if key in writer_report}
@@ -3990,12 +4204,36 @@ def normalize_web_child_output(
         }
     if answer_payload.get("evidence_gap"):
         limitations = {**limitations, "evidence_gap": answer_payload.get("evidence_gap")}
-    limitations = {**limitations, "errors": child_errors, "partial_errors": partial_errors}
     search_options = _as_dict(raw_output.get("search_options"))
     search_task = _as_dict(search_options.get("search_task"))
     normalized_sources = _normalize_web_sources(raw_output, payload)
+    extracted_fact_cards = [dict(item) for item in _as_list(raw_output.get("extracted_fact_cards")) if isinstance(item, dict)]
+    fact_extractor = _as_dict(raw_output.get("fact_extractor"))
+    regex_fallback_point_count = 0
+    regex_fallback_used = False
+    extractor_empty_without_regex_points = False
     if status == "failed" or failure_answer:
         raw_data_points = []
+    elif extracted_fact_cards:
+        raw_data_points = []
+        for index, item in enumerate(extracted_fact_cards, start=1):
+            point = dict(item)
+            point.setdefault("evidence_origin", "readpage_fact_extractor")
+            point.setdefault("extraction_schema_version", "readpage_fact_card_v1")
+            point.setdefault("confidence", confidence)
+            point.setdefault("evidence", point.get("distilled_fact") or point.get("fact") or point.get("clean_fact"))
+            point.setdefault("content", point.get("distilled_fact") or point.get("fact") or point.get("clean_fact"))
+            point.setdefault("clean_fact", point.get("distilled_fact") or point.get("fact") or point.get("content"))
+            point.setdefault("fact", point.get("clean_fact") or point.get("content"))
+            point.setdefault("metric", point.get("metric") or point.get("variable") or point.get("fact_type") or point.get("proof_role"))
+            point.setdefault("source", point.get("source_title") or point.get("source_url") or point.get("source_ref") or "readpage_fact_extractor")
+            point.setdefault("source_title", point.get("source_title") or point.get("title") or "")
+            point.setdefault("source_url", point.get("source_url") or point.get("url") or "")
+            point.setdefault("source_verification_status", point.get("source_verification_status") or "readpage_verified")
+            point.setdefault("source_verified", str(point.get("source_verification_status") or "").strip() in {"readpage_verified", "document_verified"})
+            point.setdefault("ref", point.get("ref") or point.get("evidence_id") or f"RFC-{index}")
+            point.setdefault("evidence_id", point.get("evidence_id") or point.get("ref") or f"RFC-{index}")
+            raw_data_points.append(point)
     else:
         raw_data_points = _structured_evidence_to_raw_points(
             answer_payload.get("evidence") or answer_text,
@@ -4004,6 +4242,25 @@ def normalize_web_child_output(
             confidence=confidence,
             proof_role=str(search_task.get("proof_role") or search_task.get("evidence_type") or "").strip(),
         )
+        regex_fallback_point_count = len(raw_data_points)
+        regex_fallback_used = regex_fallback_point_count > 0
+        extractor_empty_without_regex_points = not regex_fallback_used
+    limitations = {
+        **limitations,
+        "fact_extractor": {
+            **fact_extractor,
+            "regex_fallback_used": regex_fallback_used,
+            "regex_fallback_point_count": regex_fallback_point_count,
+            "extractor_empty_without_regex_points": bool(
+                status != "failed"
+                and not failure_answer
+                and not extracted_fact_cards
+                and extractor_empty_without_regex_points
+            ),
+        },
+        "errors": child_errors,
+        "partial_errors": partial_errors,
+    }
     if search_task:
         for point in raw_data_points:
             point["task_id"] = search_task.get("task_id")
@@ -6750,6 +7007,131 @@ def _attach_lane_health_to_writer_report(
     return copied
 
 
+_FACT_EXTRACTOR_SUM_KEYS = (
+    "attempted",
+    "success_count",
+    "fact_card_count",
+    "rejected_span_count",
+    "invalid_metric_count",
+    "cache_hit_count",
+    "llm_error_count",
+    "regex_fallback_point_count",
+    "budget_used",
+)
+_FACT_EXTRACTOR_BOOL_KEYS = (
+    "regex_fallback_used",
+    "fallback_used",
+    "budget_exhausted",
+    "extractor_empty_without_regex_points",
+)
+
+
+def _looks_like_fact_extractor_diagnostics(payload: Any) -> bool:
+    payload = _as_dict(payload)
+    if not payload:
+        return False
+    return any(key in payload for key in (*_FACT_EXTRACTOR_SUM_KEYS, *_FACT_EXTRACTOR_BOOL_KEYS, "budget_limit"))
+
+
+def _fact_extractor_payload_from_container(container: Any) -> Dict[str, Any]:
+    payload = _as_dict(container)
+    if not payload:
+        return {}
+    candidates = (
+        payload,
+        payload.get("fact_extractor"),
+        payload.get("readpage_fact_extractor"),
+        _as_dict(payload.get("metadata")).get("readpage_fact_extractor"),
+        _as_dict(payload.get("metadata")).get("fact_extractor"),
+        _as_dict(payload.get("raw_output")).get("fact_extractor"),
+        _as_dict(payload.get("raw_output")).get("readpage_fact_extractor"),
+        _as_dict(_as_dict(payload.get("raw_output")).get("metadata")).get("readpage_fact_extractor"),
+        _as_dict(_as_dict(payload.get("raw_output")).get("metadata")).get("fact_extractor"),
+        _as_dict(payload.get("limitations")).get("fact_extractor"),
+        _as_dict(payload.get("limitations")).get("readpage_fact_extractor"),
+    )
+    for candidate in candidates:
+        candidate_dict = _as_dict(candidate)
+        if _looks_like_fact_extractor_diagnostics(candidate_dict):
+            return candidate_dict
+    return {}
+
+
+def _aggregate_readpage_fact_extractor_diagnostics(
+    children: Optional[Dict[str, Any]] = None,
+    *,
+    extra_payloads: Optional[Sequence[Any]] = None,
+) -> Dict[str, Any]:
+    """Aggregate one diagnostics payload per child/container.
+
+    The score report intentionally reads fixed diagnostics paths only. This
+    helper closes the production gap by lifting per-child extractor telemetry
+    into the evidence package / writer report without recursively counting
+    chapter-level fact-card summaries.
+    """
+
+    payloads: List[Dict[str, Any]] = []
+    for child in _as_dict(children).values():
+        candidate = _fact_extractor_payload_from_container(child)
+        if candidate:
+            payloads.append(candidate)
+    for payload in _as_list(extra_payloads):
+        candidate = _fact_extractor_payload_from_container(payload)
+        if candidate:
+            payloads.append(candidate)
+    if not payloads:
+        return {}
+
+    totals: Dict[str, Any] = {
+        "attempted": 0,
+        "success_count": 0,
+        "fact_card_count": 0,
+        "rejected_span_count": 0,
+        "invalid_metric_count": 0,
+        "cache_hit_count": 0,
+        "llm_error_count": 0,
+        "regex_fallback_point_count": 0,
+        "budget_used": 0,
+        "budget_limit": 0,
+        "regex_fallback_used": False,
+        "fallback_used": False,
+        "budget_exhausted": False,
+        "extractor_empty_without_regex_points": False,
+        "statuses": [],
+        "models": [],
+    }
+    for payload in payloads:
+        for key in _FACT_EXTRACTOR_SUM_KEYS:
+            totals[key] = int(totals.get(key) or 0) + int(_safe_float(payload.get(key), 0.0))
+        if payload.get("budget_limit") not in (None, ""):
+            totals["budget_limit"] = max(int(totals.get("budget_limit") or 0), int(_safe_float(payload.get("budget_limit"), 0.0)))
+        for key in _FACT_EXTRACTOR_BOOL_KEYS:
+            totals[key] = bool(totals.get(key) or payload.get(key))
+        status = str(payload.get("status") or "").strip()
+        if status and status not in totals["statuses"]:
+            totals["statuses"].append(status)
+        model = str(payload.get("model") or "").strip()
+        if model and model not in totals["models"]:
+            totals["models"].append(model)
+    return totals
+
+
+def _attach_readpage_fact_extractor_diagnostics(
+    evidence_package: Dict[str, Any],
+    writer_report: Optional[Dict[str, Any]] = None,
+    diagnostics: Optional[Dict[str, Any]] = None,
+) -> None:
+    diagnostics = _as_dict(diagnostics)
+    if not diagnostics:
+        return
+    evidence_package.setdefault("metadata", {})["readpage_fact_extractor"] = dict(diagnostics)
+    if writer_report is None:
+        return
+    writer_report["fact_extractor"] = dict(diagnostics)
+    writer_report.setdefault("metadata", {})["readpage_fact_extractor"] = dict(diagnostics)
+    writer_report.setdefault("render_artifacts", {}).setdefault("metadata", {})["readpage_fact_extractor"] = dict(diagnostics)
+
+
 def _writer_pipeline_state_fields(writer_report: Dict[str, Any]) -> Dict[str, Any]:
     writer_report = _as_dict(writer_report)
     report_blueprint = _as_dict(writer_report.get("report_blueprint"))
@@ -6766,6 +7148,7 @@ def _writer_pipeline_state_fields(writer_report: Dict[str, Any]) -> Dict[str, An
             "table_packages": _as_list(writer_report.get("table_packages")),
             "argument_units": _as_list(writer_report.get("argument_units")),
             "chapter_packages": _as_list(writer_report.get("chapter_packages")),
+            "render_artifacts": _as_dict(writer_report.get("render_artifacts")),
             "decision_package": _as_dict(writer_report.get("decision_package")),
             "risk_package": _as_dict(writer_report.get("risk_package")),
             "appendix_package": _as_dict(writer_report.get("appendix_package")),
@@ -6793,6 +7176,7 @@ def _writer_pipeline_state_fields(writer_report: Dict[str, Any]) -> Dict[str, An
         "table_packages": _as_list(writer_report.get("table_packages")),
         "argument_units": _as_list(writer_report.get("argument_units")),
         "chapter_packages": _as_list(writer_report.get("chapter_packages")),
+        "render_artifacts": _as_dict(writer_report.get("render_artifacts")),
         "decision_package": _as_dict(writer_report.get("decision_package")),
         "risk_package": _as_dict(writer_report.get("risk_package")),
         "appendix_package": _as_dict(writer_report.get("appendix_package")),
@@ -8660,8 +9044,8 @@ def _repair_task_summary(tasks: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def _post_qa_repair_needed(writer_report: Dict[str, Any]) -> bool:
-    if not _env_flag("BRAIN_ENABLE_POST_QA_REPAIR", False):
+def _post_qa_repair_needed(writer_report: Dict[str, Any], *, respect_env: bool = True) -> bool:
+    if respect_env and not _env_flag("BRAIN_ENABLE_POST_QA_REPAIR", False):
         return False
     report = _as_dict(writer_report)
     if str(report.get("report_status") or "").strip().lower() in {"final", "final_clean"}:
@@ -8674,7 +9058,10 @@ def _post_qa_repair_needed(writer_report: Dict[str, Any]) -> bool:
     return any(
         [
             bool(_as_list(report.get("required_followups"))),
+            bool(_as_list(qa.get("repair_followups"))),
             bool(_as_list(qa.get("evidence_repair_followups"))),
+            bool(_as_list(qa.get("content_repair_followups"))),
+            bool(_as_list(deep.get("required_followups"))),
             bool(_as_list(report.get("review_evidence_followups"))),
             bool(_as_list(report.get("review_logic_issues"))),
         ]
@@ -8867,7 +9254,7 @@ def _post_qa_repair_followup_payload(item: Dict[str, Any]) -> Dict[str, Any]:
         normalized.setdefault("evidence_type", "source_check")
     elif needs_metric_fields:
         normalized["lane_targets"] = ["official_data", "market_research", "filing_company"]
-        normalized["source_priority"] = ["统计", "协会", "财报", "公告", "权威研报"]
+        normalized["source_priority"] = ["官方", "统计", "协会", "财报", "公告", "权威研报"]
         normalized.setdefault("proof_role", "metric")
         normalized.setdefault("evidence_type", "market_data")
     elif needs_mandatory_proof and not _as_list(normalized.get("source_priority")):
@@ -9197,12 +9584,13 @@ def _run_post_qa_repair_round(
     lane_coverage: Dict[str, Any],
     max_followups: int,
     started: float,
+    respect_env: bool = False,
 ) -> Dict[str, Any]:
     best_report = _as_dict(best.get("writer_report"))
     trace: Dict[str, Any] = {
         "round": "post_qa",
         "source": "post_qa_repair",
-        "enabled": _env_flag("BRAIN_ENABLE_POST_QA_REPAIR", False),
+        "enabled": True if not respect_env else _env_flag("BRAIN_ENABLE_POST_QA_REPAIR", False),
         "has_signal": None,
         "quality_before": _writer_quality_snapshot(best_report),
     }
@@ -9211,7 +9599,7 @@ def _run_post_qa_repair_round(
         trace["stop_reason"] = "disabled_by_default"
         best["writer_report"] = _attach_post_qa_repair(best_report, trace)
         return {**best, "post_qa_repair_trace": [trace]}
-    if not _post_qa_repair_needed(best_report):
+    if not _post_qa_repair_needed(best_report, respect_env=respect_env):
         trace["status"] = "not_needed"
         return {**best, "post_qa_repair_trace": [trace]}
 
@@ -9292,7 +9680,12 @@ def _run_post_qa_repair_round(
             current_evidence_package["report_plan"] = report_plan
             current_evidence_package.setdefault("metadata", {})
             current_evidence_package["metadata"]["report_plan"] = report_plan
-        current_analysis_state = run_analysis_agent(current_evidence_package, query=query, llm_config=build_llm_config("decision"))
+        try:
+            current_analysis_state = run_analysis_agent(current_evidence_package, query=query, llm_config=build_llm_config("decision"))
+        except TypeError as exc:
+            if "llm_config" not in str(exc):
+                raise
+            current_analysis_state = run_analysis_agent(current_evidence_package, query=query)
         current_structured_analysis = _as_dict(current_analysis_state.get("structured_analysis"))
         _attach_report_plan(current_evidence_package, current_structured_analysis, report_plan)
         _attach_research_plan(current_evidence_package, current_structured_analysis, _research_plan_from_state(state))
@@ -9505,17 +9898,28 @@ def run_writer_with_layout_refinement(
             max(supervisor_followups, layout_followups),
         ),
     )
-    preflight_result = _run_evidence_preflight_round(
-        state=state,
-        children=children,
-        evidence_pool=current_evidence_pool,
-        evidence_package=current_evidence_package,
-        structured_analysis=current_structured_analysis,
-        report_plan=report_plan,
-        query=query,
-        max_followups=max_followups,
-        started=started,
-    )
+    if _deadline_exceeded(state, min_remaining=1.0):
+        preflight_result = {
+            "updated": False,
+            "evidence_preflight_trace": [
+                {
+                    "stop_reason": "deadline_exceeded",
+                    "live_timeout": _deadline_timeout_payload(state, stage="writer_preflight"),
+                }
+            ],
+        }
+    else:
+        preflight_result = _run_evidence_preflight_round(
+            state=state,
+            children=children,
+            evidence_pool=current_evidence_pool,
+            evidence_package=current_evidence_package,
+            structured_analysis=current_structured_analysis,
+            report_plan=report_plan,
+            query=query,
+            max_followups=max_followups,
+            started=started,
+        )
     evidence_preflight_trace = _as_list(preflight_result.get("evidence_preflight_trace"))
     if preflight_result.get("updated"):
         current_evidence_pool = [item for item in _as_list(preflight_result.get("evidence_pool")) if isinstance(item, dict)]
@@ -9596,6 +10000,16 @@ def run_writer_with_layout_refinement(
             "max_followups_per_round": max_followups,
         }
     ]
+    if _deadline_exceeded(state, min_remaining=1.0):
+        trace[0]["stop_reason"] = "deadline_exceeded"
+        trace[0]["live_timeout"] = _deadline_timeout_payload(state, stage="writer_layout_refinement")
+        _progress("writer", "Layout 补证跳过", reason="deadline_exceeded", elapsed=f"{time.perf_counter() - started:.1f}s")
+        return {
+            **best,
+            "layout_refinement_trace": trace,
+            "initial_writer_report": initial_writer_report,
+            "evidence_preflight_trace": evidence_preflight_trace,
+        }
     if not enable_layout_followup or not new_followups or max_rounds <= 0:
         trace[0]["stop_reason"] = "layout_followup_disabled_or_no_queries"
         _progress("writer", "Layout 补证跳过", reason=trace[0]["stop_reason"], elapsed=f"{time.perf_counter() - started:.1f}s")
@@ -9615,6 +10029,7 @@ def run_writer_with_layout_refinement(
             lane_coverage=lane_coverage,
             max_followups=max_followups,
             started=started,
+            respect_env=True,
         )
         _progress("writer", "Writer 流水线结束", stop=trace[0]["stop_reason"], elapsed=f"{time.perf_counter() - started:.1f}s")
         return repaired
@@ -9622,6 +10037,21 @@ def run_writer_with_layout_refinement(
     pending_followups = new_followups
     stop_reason = "max_rounds_reached"
     for round_number in range(1, max_rounds + 1):
+        if _deadline_exceeded(state, min_remaining=1.0):
+            trace.append(
+                {
+                    "round": round_number,
+                    "source": "layout_followup",
+                    "quality": _writer_quality_snapshot(_as_dict(best.get("writer_report"))),
+                    "is_best": False,
+                    "attempted_task_count": 0,
+                    "follow_up_queries": [],
+                    "stop_reason": "deadline_exceeded",
+                    "live_timeout": _deadline_timeout_payload(state, stage="writer_layout_followup"),
+                }
+            )
+            stop_reason = "deadline_exceeded"
+            break
         round_started = time.perf_counter()
         _progress("writer", "Layout 补证轮次开始", round=round_number, followups=len(pending_followups))
         before_pool_size = len(current_evidence_pool)
@@ -9802,6 +10232,7 @@ def run_writer_with_layout_refinement(
         lane_coverage=lane_coverage,
         max_followups=max_followups,
         started=started,
+        respect_env=True,
     )
     _progress("writer", "Writer 流水线结束", stop=stop_reason, elapsed=f"{time.perf_counter() - started:.1f}s")
     return repaired
@@ -11013,6 +11444,28 @@ def run_supervisor_evidence_loop(
     )
 
     for loop_number in range(1, max_loops + 1):
+        if _deadline_exceeded(state, min_remaining=1.0):
+            timeout_payload = _deadline_timeout_payload(state, stage="supervisor_evidence_loop")
+            loop_trace.append(
+                {
+                    "round": loop_number,
+                    "coverage_score": prev_coverage,
+                    "is_sufficient": False,
+                    "stop_reason": "deadline_exceeded",
+                    "knowledge_gaps": [],
+                    "follow_up_queries": [],
+                    "evidence_count": len(evidence_pool),
+                    "live_timeout": timeout_payload,
+                }
+            )
+            final_evaluation = {
+                **_as_dict(final_evaluation),
+                "is_sufficient": False,
+                "stop_reason": "deadline_exceeded",
+                "live_timeout": timeout_payload,
+            }
+            _progress("coverage", "覆盖率闭环停止", reason="deadline_exceeded")
+            break
         final_summary = summarize_evidence_pool(evidence_pool)
         fallback_eval = evaluate_coverage_fallback(
             original_query=original_query,
@@ -11127,6 +11580,14 @@ def run_supervisor_evidence_loop(
             trace_item["stop_reason"] = evaluation["stop_reason"]
             _progress("coverage", "覆盖率闭环停止", reason=evaluation["stop_reason"])
             loop_trace.append(trace_item)
+            break
+        if _deadline_exceeded(state, min_remaining=1.0):
+            timeout_payload = _deadline_timeout_payload(state, stage="supervisor_followup_queries")
+            trace_item["stop_reason"] = "deadline_exceeded"
+            trace_item["live_timeout"] = timeout_payload
+            loop_trace.append(trace_item)
+            final_evaluation = {**_as_dict(final_evaluation), "is_sufficient": False, "stop_reason": "deadline_exceeded", "live_timeout": timeout_payload}
+            _progress("coverage", "覆盖率闭环停止", reason="deadline_exceeded")
             break
         before_pool_size = len(evidence_pool)
         followup_results = run_followup_queries(follow_up_queries=followups, round_number=loop_number + 1, state=state)
@@ -11753,6 +12214,7 @@ def merge_outputs_node(state: BrainAgentState) -> BrainAgentState:
     if output_mode == "agent_text":
         loop_result = run_supervisor_evidence_loop(state=state, initial_children=children, route=route)
         children = loop_result["children"]
+        fact_extractor_diagnostics = _aggregate_readpage_fact_extractor_diagnostics(children)
         loop_errors = list(loop_result.get("evaluation_errors") or [])
         new_errors.extend(loop_errors)
         all_errors = errors + new_errors
@@ -11770,6 +12232,7 @@ def merge_outputs_node(state: BrainAgentState) -> BrainAgentState:
         if topic_seed_summary:
             evidence_package.setdefault("metadata", {})["topic_bundle_seed"] = topic_seed_summary
         evidence_package = _annotate_evidence_package_runtime(evidence_package, lane_coverage=lane_coverage, state=state)
+        _attach_readpage_fact_extractor_diagnostics(evidence_package, diagnostics=fact_extractor_diagnostics)
         if report_plan:
             evidence_package["report_plan"] = report_plan
             evidence_package.setdefault("metadata", {})
@@ -11779,6 +12242,7 @@ def merge_outputs_node(state: BrainAgentState) -> BrainAgentState:
         if report_plan:
             structured_analysis["report_plan"] = report_plan
         _attach_research_plan(evidence_package, structured_analysis, research_plan)
+        _emit_pre_writer_snapshots(state, evidence_package, structured_analysis)
         topic_bundle_store = _store_topic_bundle_from_brain(
             state=state,
             evidence_package=evidence_package,
@@ -11805,6 +12269,7 @@ def merge_outputs_node(state: BrainAgentState) -> BrainAgentState:
         evidence_pool = [item for item in _as_list(writer_bundle.get("evidence_pool")) if isinstance(item, dict)]
         evidence_package = _as_dict(writer_bundle.get("evidence_package")) or evidence_package
         structured_analysis = _as_dict(writer_bundle.get("structured_analysis")) or structured_analysis
+        _attach_readpage_fact_extractor_diagnostics(evidence_package, writer_report, fact_extractor_diagnostics)
         writer_topic_bundle_store = _store_topic_bundle_from_brain(
             state=state,
             evidence_package=evidence_package,
@@ -11815,6 +12280,7 @@ def merge_outputs_node(state: BrainAgentState) -> BrainAgentState:
         if writer_topic_bundle_store:
             writer_report["topic_bundle_cache_store"] = writer_topic_bundle_store
             evidence_package.setdefault("metadata", {})["topic_bundle_cache_store_writer"] = writer_topic_bundle_store
+        _emit_post_writer_snapshot(state, writer_report)
         analysis_state = _as_dict(writer_bundle.get("analysis_state")) or analysis_state
         layout_refinement_trace = _as_list(writer_bundle.get("layout_refinement_trace"))
         evidence_preflight_trace = _as_list(writer_bundle.get("evidence_preflight_trace"))
@@ -11905,6 +12371,9 @@ def merge_outputs_node(state: BrainAgentState) -> BrainAgentState:
             "output_mode": output_mode,
             "payload_mode": "full" if _brain_full_payloads() else "summary",
         }
+        if fact_extractor_diagnostics:
+            raw_output["fact_extractor"] = fact_extractor_diagnostics
+            raw_output.setdefault("metadata", {})["readpage_fact_extractor"] = fact_extractor_diagnostics
         if parallel_raw_output:
             raw_output["local_state"] = state.get("local_state", {})
             raw_output["web_state"] = state.get("web_state", {})
@@ -11938,6 +12407,7 @@ def merge_outputs_node(state: BrainAgentState) -> BrainAgentState:
                 "merge_source": "agent_text_structured_processing",
                 "analysis_source": analysis_meta.get("source"),
                 "writer_source": writer_meta.get("source"),
+                "readpage_fact_extractor": fact_extractor_diagnostics,
             "layout_refinement_rounds": _layout_refinement_round_count(layout_refinement_trace),
             "evidence_preflight_rounds": len(evidence_preflight_trace),
             "post_qa_repair_rounds": len(post_qa_repair_trace),
@@ -11948,6 +12418,7 @@ def merge_outputs_node(state: BrainAgentState) -> BrainAgentState:
 
     loop_result = run_supervisor_evidence_loop(state=state, initial_children=children, route=route)
     children = loop_result["children"]
+    fact_extractor_diagnostics = _aggregate_readpage_fact_extractor_diagnostics(children)
     loop_errors = list(loop_result.get("evaluation_errors") or [])
     new_errors.extend(loop_errors)
     all_errors = errors + new_errors
@@ -11965,6 +12436,7 @@ def merge_outputs_node(state: BrainAgentState) -> BrainAgentState:
     if topic_seed_summary:
         evidence_package.setdefault("metadata", {})["topic_bundle_seed"] = topic_seed_summary
     evidence_package = _annotate_evidence_package_runtime(evidence_package, lane_coverage=lane_coverage, state=state)
+    _attach_readpage_fact_extractor_diagnostics(evidence_package, diagnostics=fact_extractor_diagnostics)
     if report_plan:
         evidence_package["report_plan"] = report_plan
         evidence_package.setdefault("metadata", {})
@@ -11974,6 +12446,37 @@ def merge_outputs_node(state: BrainAgentState) -> BrainAgentState:
     if report_plan:
         structured_analysis["report_plan"] = report_plan
     _attach_research_plan(evidence_package, structured_analysis, research_plan)
+    _emit_pre_writer_snapshots(state, evidence_package, structured_analysis)
+    if _deadline_exceeded(state, min_remaining=1.0):
+        timeout_payload = _deadline_timeout_payload(state, stage="merge_outputs_pre_writer")
+        return {
+            "answer_text": "",
+            "raw_output": {
+                "query": state.get("query", ""),
+                "route": route,
+                "route_reason": route_reason,
+                "query_analysis": _as_dict(state.get("query_analysis")),
+                "search_task_schedule": _as_dict(state.get("search_task_schedule")) or _as_dict(query_analysis.get("search_task_schedule")),
+                "lane_coverage": lane_coverage,
+                "child_outputs": _state_payload(children, "children"),
+                "evidence_pool": _state_payload(loop_evidence_pool, "evidence_pool"),
+                "evidence_package": evidence_package,
+                "structured_analysis": structured_analysis,
+                "output_mode": output_mode,
+                "payload_mode": "deadline_partial",
+                "live_timeout": timeout_payload,
+            },
+            "evidence_package": evidence_package,
+            "structured_analysis": structured_analysis,
+            "errors": [*new_errors, "Report deadline reached after evidence_package; fail-open rebuild is required."],
+            "metadata": {
+                **dict(state.get("metadata") or {}),
+                "agent_stage": "merge_outputs",
+                "merge_source": "deadline_partial_after_evidence_package",
+                "live_timeout": timeout_payload,
+                "readpage_fact_extractor": fact_extractor_diagnostics,
+            },
+        }
     topic_bundle_store = _store_topic_bundle_from_brain(
         state=state,
         evidence_package=evidence_package,
@@ -12042,6 +12545,7 @@ def merge_outputs_node(state: BrainAgentState) -> BrainAgentState:
     evidence_pool = [item for item in _as_list(writer_bundle.get("evidence_pool")) if isinstance(item, dict)]
     evidence_package = _as_dict(writer_bundle.get("evidence_package")) or evidence_package
     structured_analysis = _as_dict(writer_bundle.get("structured_analysis")) or structured_analysis
+    _attach_readpage_fact_extractor_diagnostics(evidence_package, writer_report, fact_extractor_diagnostics)
     writer_topic_bundle_store = _store_topic_bundle_from_brain(
         state=state,
         evidence_package=evidence_package,
@@ -12052,6 +12556,7 @@ def merge_outputs_node(state: BrainAgentState) -> BrainAgentState:
     if writer_topic_bundle_store:
         writer_report["topic_bundle_cache_store"] = writer_topic_bundle_store
         evidence_package.setdefault("metadata", {})["topic_bundle_cache_store_writer"] = writer_topic_bundle_store
+    _emit_post_writer_snapshot(state, writer_report)
     analysis_state = _as_dict(writer_bundle.get("analysis_state")) or analysis_state
     layout_refinement_trace = _as_list(writer_bundle.get("layout_refinement_trace"))
     evidence_preflight_trace = _as_list(writer_bundle.get("evidence_preflight_trace"))
@@ -12135,6 +12640,9 @@ def merge_outputs_node(state: BrainAgentState) -> BrainAgentState:
         "output_mode": output_mode,
         "payload_mode": "full" if _brain_full_payloads() else "summary",
     }
+    if fact_extractor_diagnostics:
+        raw_output["fact_extractor"] = fact_extractor_diagnostics
+        raw_output.setdefault("metadata", {})["readpage_fact_extractor"] = fact_extractor_diagnostics
     if parallel_raw_output:
         raw_output["local_state"] = state.get("local_state", {})
         raw_output["web_state"] = state.get("web_state", {})
@@ -12174,6 +12682,7 @@ def merge_outputs_node(state: BrainAgentState) -> BrainAgentState:
             "merge_source": merge_meta.get("source", "fallback"),
             "analysis_source": _as_dict(_as_dict(analysis_state.get("raw_output")).get("analysis")).get("source"),
             "writer_source": writer_meta.get("source"),
+            "readpage_fact_extractor": fact_extractor_diagnostics,
             "layout_refinement_rounds": _layout_refinement_round_count(layout_refinement_trace),
             "evidence_preflight_rounds": len(evidence_preflight_trace),
             "post_qa_repair_rounds": len(post_qa_repair_trace),
@@ -12266,6 +12775,9 @@ def run_brain_agent(
     output_mode: Optional[str] = None,
     parallel_raw_output: Optional[bool] = None,
     topic_bundle_seed: Optional[Dict[str, Any]] = None,
+    deadline_ts: Optional[float] = None,
+    timeout_context: Optional[Dict[str, Any]] = None,
+    fail_open_on_timeout: Optional[bool] = None,
 ) -> BrainAgentState:
     configure_pipeline_logging()
     started = time.perf_counter()
@@ -12286,6 +12798,12 @@ def run_brain_agent(
     }
     if topic_bundle_seed:
         state["topic_bundle_seed"] = dict(topic_bundle_seed)
+    if deadline_ts is not None:
+        state["deadline_ts"] = float(deadline_ts)
+    if timeout_context:
+        state["timeout_context"] = dict(timeout_context)
+    if fail_open_on_timeout is not None:
+        state["fail_open_on_timeout"] = bool(fail_open_on_timeout)
     if enable_web_analysis is not None:
         state["enable_web_analysis"] = bool(enable_web_analysis)
     if enable_llm_merge is not None:
@@ -12454,4 +12972,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

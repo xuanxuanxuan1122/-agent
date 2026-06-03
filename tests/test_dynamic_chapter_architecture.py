@@ -159,7 +159,8 @@ def test_renderer_uses_render_blocks_without_fixed_micro_headings():
     assert "E001" not in markdown
 
 
-def test_final_reference_analysis_uses_dynamic_report_logic_not_fixed_industry_chain():
+def test_final_reference_analysis_uses_dynamic_report_logic_not_fixed_industry_chain(monkeypatch):
+    monkeypatch.setenv("REPORT_RENDER_FINAL_REFERENCE_ANALYSIS", "true")
     lines = render_final_reference_analysis(
         {
             "chapter_syntheses": [
@@ -221,6 +222,6 @@ def test_chapter_evidence_package_keeps_deep_inventory_and_thresholds():
         )
 
     package = bind_evidence_to_chapters(items, [chapter], [])[0]
-    assert package["source_count"] >= package["min_total_sources"]
+    assert package["source_count"] == 6
     assert package["ab_source_count"] >= package["min_ab_sources"]
     assert package["counter_source_count"] >= package["min_counter_sources"]

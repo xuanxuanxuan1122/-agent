@@ -57,6 +57,65 @@ def _qa_instructions(qa_result: Optional[Dict[str, Any]], rewrite_instructions: 
     return _dedupe(instructions, limit=30)
 
 
+def _compact_issue(issue: Any, *, message_chars: int = 240) -> Dict[str, Any]:
+    payload = _as_dict(issue)
+    message = str(payload.get("message") or payload.get("detail") or payload.get("text") or "").strip()
+    if len(message) > message_chars:
+        message = message[: message_chars - 1].rstrip() + "..."
+    compact: Dict[str, Any] = {}
+    for key in ("type", "code", "severity", "qa_category", "chapter_id", "section_id"):
+        value = payload.get(key)
+        if value:
+            compact[key] = value
+    if message:
+        compact["message"] = message
+    return compact
+
+
+def _compact_qa_for_llm(qa_result: Dict[str, Any], *, item_limit: int = 30) -> Dict[str, Any]:
+    """Strip qa_result to the fields the rewriter actually needs.
+
+    Full qa_result carries evidence_health_summary, chapter_packages, dimension
+    scores, etc., which can push the LLM input past the context budget (observed
+    ~360k tokens vs ~113k cap). The rewriter only needs the actionable findings
+    plus rewrite_instructions, so this returns a compacted shell.
+    """
+    payload = _as_dict(qa_result)
+    deep = _as_dict(payload.get("deep_evaluation"))
+    deep_instructions = [
+        str(item or "").strip()
+        for item in _as_list(deep.get("rewrite_instructions"))
+        if str(item or "").strip()
+    ]
+    deep_compact: Dict[str, Any] = {}
+    if deep_instructions:
+        deep_compact["rewrite_instructions"] = deep_instructions[:item_limit]
+    deep_findings = [
+        _compact_issue(item)
+        for item in _as_list(deep.get("issues"))[:item_limit]
+        if isinstance(item, dict)
+    ]
+    if deep_findings:
+        deep_compact["issues"] = deep_findings
+    compact: Dict[str, Any] = {
+        "errors": [_compact_issue(item) for item in _as_list(payload.get("errors"))[:item_limit]],
+        "warnings": [_compact_issue(item) for item in _as_list(payload.get("warnings"))[:item_limit]],
+        "rewrite_instructions": [
+            str(item or "").strip()
+            for item in _as_list(payload.get("rewrite_instructions"))
+            if str(item or "").strip()
+        ][:item_limit],
+    }
+    quality_findings = _as_list(payload.get("quality_findings"))
+    if quality_findings:
+        compact["quality_findings"] = [
+            _compact_issue(item) for item in quality_findings[:item_limit]
+        ]
+    if deep_compact:
+        compact["deep_evaluation"] = deep_compact
+    return compact
+
+
 def _dedupe(values: Iterable[str], *, limit: int = 30) -> List[str]:
     result: List[str] = []
     seen = set()
@@ -165,14 +224,21 @@ def _llm_rewrite(
 3. 删除内部过程标签、QA 标记、证据缺口黑话和空标题。
 4. 输出 JSON：{"markdown":"...","change_summary":["..."]}。
 """.strip()
+    # qa_result is the dominant source of payload bloat (it can carry the full
+    # evidence_health_summary, chapter packages and dimension scores). The
+    # rewriter only needs the actionable findings + instructions, so we send a
+    # compacted shell and leave the markdown intact. If the markdown alone still
+    # exceeds the LLM's context budget, the upstream context_budget guard will
+    # block the call deterministically rather than producing a partial rewrite.
+    compact_qa = _compact_qa_for_llm(qa_result)
     try:
         response = call_openai_compatible_json(
             config=config,
             system_prompt=system_prompt,
             user_payload={
                 "markdown": markdown,
-                "qa_result": qa_result,
-                "rewrite_instructions": list(instructions),
+                "qa_result": compact_qa,
+                "rewrite_instructions": list(instructions)[:30],
             },
         )
     except Exception:

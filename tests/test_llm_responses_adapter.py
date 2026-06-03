@@ -71,6 +71,62 @@ def test_deepseek_v4_disable_thinking_uses_thinking_object(monkeypatch):
     assert "enable_thinking" not in captured["payload"]
 
 
+def test_deepseek_v4_pro_defaults_to_safe_output_budget(monkeypatch):
+    monkeypatch.delenv("RAG_DEEPSEEK_V4_PRO_DEFAULT_MAX_OUTPUT_TOKENS", raising=False)
+
+    normalized = memory.normalize_llm_config(
+        {
+            "provider": "openai_compatible",
+            "url": "https://api.deepseek.com/chat/completions",
+            "api_key": "ds-test",
+            "model": "deepseek-v4-pro",
+            "disable_thinking": False,
+        }
+    )
+
+    assert normalized["max_output_tokens"] == 2048
+
+
+def test_deepseek_v4_empty_content_retries_with_thinking_disabled(monkeypatch):
+    calls = []
+
+    def fake_post_llm_json(*, normalized, url, payload, error_prefix):
+        calls.append({"normalized": dict(normalized), "payload": dict(payload)})
+        if len(calls) == 1:
+            return {
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "message": {"content": "", "reasoning_content": "thinking consumed the small budget"},
+                    }
+                ],
+                "usage": {"total_tokens": 12},
+            }
+        return {"choices": [{"message": {"content": '{"ok":true}'}}], "usage": {"total_tokens": 5}}
+
+    monkeypatch.setattr(memory, "_post_llm_json", fake_post_llm_json)
+
+    result = memory.call_openai_compatible_json(
+        config={
+            "provider": "openai_compatible",
+            "url": "https://api.deepseek.com/chat/completions",
+            "api_key": "ds-test",
+            "model": "deepseek-v4-pro",
+            "disable_thinking": False,
+            "max_output_tokens": 512,
+        },
+        system_prompt="Return JSON.",
+        user_payload={"task": "test"},
+    )
+
+    assert result["payload"]["ok"] is True
+    assert len(calls) == 2
+    assert calls[0]["payload"]["max_tokens"] == 512
+    assert calls[1]["payload"]["thinking"] == {"type": "disabled"}
+    assert result["llm_call"]["retry_after_empty_content"] is True
+    assert result["llm_call"]["retry_disable_thinking"] is True
+
+
 def test_gpt55_json_falls_back_to_deepseek_and_circuits(monkeypatch):
     memory._UNAVAILABLE_LLM_KEYS.clear()
     calls = []

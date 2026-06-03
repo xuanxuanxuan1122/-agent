@@ -22,6 +22,13 @@ _SUMMARY: Dict[str, Any] = {
     "by_model": {},
     "by_task": {},
     "by_profile": {},
+    "context_budget": {
+        "event_count": 0,
+        "blocked_count": 0,
+        "peak_estimated_input_tokens": 0,
+        "peak_input_chars": 0,
+        "by_task": {},
+    },
 }
 
 
@@ -134,6 +141,99 @@ def _print_event(event: Dict[str, Any]) -> None:
     print(message, file=sys.stderr, flush=True)
 
 
+def _print_context_budget_event(event: Dict[str, Any]) -> None:
+    if not _env_flag("RAG_TOKEN_MONITOR_PRINT_CONTEXT_BUDGET", True):
+        return
+    status = str(event.get("status") or "")
+    estimated = int(event.get("estimated_input_tokens") or 0)
+    max_tokens = int(event.get("max_input_tokens") or 0)
+    ratio = (estimated / max_tokens) if max_tokens > 0 else 0.0
+    try:
+        configured_warn_ratio = float(os.getenv("RAG_TOKEN_MONITOR_CONTEXT_WARN_RATIO", "0.85"))
+    except ValueError:
+        configured_warn_ratio = 0.85
+    warn_ratio = min(0.99, max(0.10, configured_warn_ratio))
+    if status != "blocked" and ratio < warn_ratio:
+        return
+    task = event.get("task") or "unknown"
+    model = event.get("model") or "unknown"
+    message = (
+        f"[TOKEN-BUDGET] task={task} model={model} status={status or 'ok'} "
+        f"estimated_input={estimated} max_input={max_tokens} ratio={ratio:.2f}"
+    )
+    print(message, file=sys.stderr, flush=True)
+
+
+def record_llm_context_budget(diagnostic: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not token_monitor_enabled():
+        return None
+    event = {
+        "sequence": 0,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "event_type": "context_budget",
+        "provider": str(diagnostic.get("provider") or "openai_compatible").strip() or "openai_compatible",
+        "model": str(diagnostic.get("model") or "").strip() or "unknown",
+        "task": str(diagnostic.get("task") or "").strip() or "unknown",
+        "profile": str(diagnostic.get("profile") or "").strip() or "unknown",
+        "api": str(diagnostic.get("api") or "").strip() or "unknown",
+        "status": str(diagnostic.get("status") or "ok").strip() or "ok",
+        "input_chars": _coerce_int(diagnostic.get("input_chars")) or 0,
+        "max_input_chars": _coerce_int(diagnostic.get("max_input_chars")) or 0,
+        "estimated_input_tokens": _coerce_int(diagnostic.get("estimated_input_tokens")) or 0,
+        "max_input_tokens": _coerce_int(diagnostic.get("max_input_tokens")) or 0,
+        "context_window_tokens": _coerce_int(diagnostic.get("context_window_tokens")) or 0,
+        "reserve_output_tokens": _coerce_int(diagnostic.get("reserve_output_tokens")) or 0,
+        "reasons": list(diagnostic.get("reasons") or []),
+    }
+    with _LOCK:
+        budget_summary = _SUMMARY.setdefault(
+            "context_budget",
+            {
+                "event_count": 0,
+                "blocked_count": 0,
+                "peak_estimated_input_tokens": 0,
+                "peak_input_chars": 0,
+                "by_task": {},
+            },
+        )
+        budget_summary["event_count"] += 1
+        if event["status"] == "blocked":
+            budget_summary["blocked_count"] += 1
+        budget_summary["peak_estimated_input_tokens"] = max(
+            int(budget_summary.get("peak_estimated_input_tokens") or 0),
+            int(event["estimated_input_tokens"]),
+        )
+        budget_summary["peak_input_chars"] = max(
+            int(budget_summary.get("peak_input_chars") or 0),
+            int(event["input_chars"]),
+        )
+        by_task = budget_summary.setdefault("by_task", {})
+        task_item = by_task.setdefault(
+            event["task"],
+            {
+                "event_count": 0,
+                "blocked_count": 0,
+                "peak_estimated_input_tokens": 0,
+                "peak_input_chars": 0,
+            },
+        )
+        task_item["event_count"] += 1
+        if event["status"] == "blocked":
+            task_item["blocked_count"] += 1
+        task_item["peak_estimated_input_tokens"] = max(
+            int(task_item.get("peak_estimated_input_tokens") or 0),
+            int(event["estimated_input_tokens"]),
+        )
+        task_item["peak_input_chars"] = max(
+            int(task_item.get("peak_input_chars") or 0),
+            int(event["input_chars"]),
+        )
+        event["sequence"] = int(budget_summary["event_count"])
+    _print_context_budget_event(event)
+    _write_jsonl(event)
+    return event
+
+
 def record_llm_usage(
     *,
     usage: Any,
@@ -213,4 +313,3 @@ def token_usage_payload() -> Dict[str, Any]:
         "token_usage_summary": token_usage_summary(),
         "token_usage_events": token_usage_events(),
     }
-

@@ -13,7 +13,7 @@ def test_persistent_search_cache_roundtrip(tmp_path, monkeypatch):
     task = {"proof_role": "source_check"}
     payload = {
         "query": query,
-        "results": [{"title": "Official filing", "url": "https://example.com/filing", "snippet": "hinge"}],
+        "results": [{"title": "Official filing", "url": "https://www.sec.gov/filing", "snippet": "hinge"}],
         "search_trace": [{"primary_engine": "Deep"}],
         "errors": [],
     }
@@ -23,7 +23,7 @@ def test_persistent_search_cache_roundtrip(tmp_path, monkeypatch):
 
     assert cached["cache"]["hit"] is True
     assert cached["cache"]["layer"] == "search_cache"
-    assert cached["results"][0]["url"] == "https://example.com/filing"
+    assert cached["results"][0]["url"] == "https://www.sec.gov/filing"
 
 
 def test_negative_search_cache_is_query_specific(tmp_path, monkeypatch):
@@ -61,7 +61,7 @@ def test_search_cache_key_includes_request_size(tmp_path, monkeypatch):
         query,
         small_options,
         task,
-        {"query": query, "results": [{"title": "A", "url": "https://example.com/a"}], "search_trace": [], "errors": []},
+        {"query": query, "results": [{"title": "A", "url": "https://www.sec.gov/a"}], "search_trace": [], "errors": []},
     )
 
     assert lookup_search(query, small_options, task)
@@ -74,7 +74,7 @@ def test_search_cache_respects_iqs_cache_flag(tmp_path, monkeypatch):
     monkeypatch.setenv("IQS_SEARCH_CACHE_ENABLED", "true")
     query = "cache disable probe"
     options = {"engineType": "LiteAdvanced", "timeRange": "NoLimit", "contents": "mainText"}
-    store_search(query, options, {}, {"query": query, "results": [{"title": "x", "url": "https://example.com"}], "errors": []})
+    store_search(query, options, {}, {"query": query, "results": [{"title": "x", "url": "https://www.sec.gov"}], "errors": []})
 
     monkeypatch.setenv("IQS_SEARCH_CACHE_ENABLED", "false")
 
@@ -111,7 +111,7 @@ def test_evidence_cache_satisfies_ab_repair_task(tmp_path, monkeypatch):
                 "confidence": 0.82,
                 "source": {
                     "title": "Company filing",
-                    "url": "https://example.com/filing",
+                    "url": "https://www.sec.gov/filing",
                     "source_type": "financial_report",
                     "date": "2025",
                 },
@@ -171,7 +171,7 @@ def test_metric_cache_hit_requires_complete_metric_fields(tmp_path, monkeypatch)
                     "value": "12",
                     "source_level": "B",
                     "proof_role": "metric",
-                    "source": {"title": "Industry research", "url": "https://example.com/report", "source_type": "research"},
+                    "source": {"title": "Industry research", "url": "https://www.idc.com/report", "source_type": "research"},
                 }
             ]
         },
@@ -198,7 +198,7 @@ def test_evidence_cache_respects_lane_source_type(tmp_path, monkeypatch):
                     "fact": "Supplier qualification is discussed in an industry research note.",
                     "source_level": "B",
                     "proof_role": "source_check",
-                    "source": {"title": "Industry research", "url": "https://example.com/research", "source_type": "research"},
+                    "source": {"title": "Industry research", "url": "https://www.idc.com/research", "source_type": "research"},
                 }
             ]
         },
@@ -232,7 +232,7 @@ def test_brain_core_cache_hit_becomes_seed_and_keeps_live_task(tmp_path, monkeyp
                     "source_level": "A",
                     "proof_role": "source_check",
                     "confidence": 0.8,
-                    "source": {"title": "Company filing", "url": "https://example.com/filing", "source_type": "financial_report"},
+                    "source": {"title": "Company filing", "url": "https://www.sec.gov/filing", "source_type": "financial_report"},
                 }
             ]
         },
@@ -277,7 +277,7 @@ def test_brain_non_core_cache_hit_skips_network(tmp_path, monkeypatch):
                     "source_level": "B",
                     "proof_role": "support",
                     "confidence": 0.7,
-                    "source": {"title": "Industry research", "url": "https://example.com/support", "source_type": "research"},
+                    "source": {"title": "Industry research", "url": "https://www.idc.com/support", "source_type": "research"},
                 }
             ]
         },
