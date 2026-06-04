@@ -365,13 +365,7 @@ def _repair_diagnostics(
         writer_package.get("repair_task_selection_summary"),
         render_artifacts.get("repair_task_selection_summary"),
     )
-    planned = _first_existing_dict(
-        raw_metadata.get("openai_web_search_summary"),
-        raw_output.get("openai_web_search_summary"),
-        metadata.get("openai_web_search_summary"),
-        writer_package.get("openai_web_search_summary"),
-        render_artifacts.get("openai_web_search_summary"),
-    )
+    planned: Dict[str, Any] = {}
     if not selected and not planned:
         return {}
     selected_by_reason = _as_dict(selected.get("by_proof_role")) or _as_dict(selected.get("by_reason"))

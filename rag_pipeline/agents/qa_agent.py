@@ -441,7 +441,7 @@ def evaluate_deep_report(
 ) -> Dict[str, Any]:
     text = str(report_markdown or "")
     body_text = re.split(r"\n##\s*(?:\u9644\u5f55|附錄|研究口径|研究口徑)", text, maxsplit=1)[0]
-    target_body_chars = _env_int("REPORT_TARGET_BODY_CHARS", 20000, min_value=0, max_value=100000)
+    target_body_chars = _env_int("REPORT_TARGET_BODY_CHARS", 0, min_value=0, max_value=100000)
     strict_mode = _strict_quality_mode()
     deep_report = _is_deep_report_family(report_blueprint)
     target_body_blocking = strict_mode or deep_report or _env_flag("REPORT_TARGET_BODY_CHARS_BLOCKING", True)
@@ -801,8 +801,6 @@ RETRIEVAL_GAP_TYPES = {
     "iqs_lane_partial_failure",
     "iqs_lane_timeout_without_signal",
     "page_results_zero",
-    "openai_web_repair_failed",
-    "openai_web_repair_disabled",
 }
 
 CANDIDATE_ONLY_GAP_TYPES = {
@@ -1379,18 +1377,6 @@ def run_qa_agent(
             and int(coverage.get("usable_source_count") or coverage.get("key_sources") or 0) == 0
         ):
             warnings.append({"type": "iqs_lane_timeout_without_signal", "lane": lane, "coverage": coverage})
-
-    openai_repair_summary = _as_dict(retrieval_strategy_summary.get("openai_web_repair_summary"))
-    if openai_repair_summary.get("disabled_after_consecutive_failures"):
-        warnings.append(
-            {
-                "type": "openai_web_repair_disabled",
-                "reason": openai_repair_summary.get("last_skip_reason") or openai_repair_summary.get("last_failure_reason"),
-                "summary": openai_repair_summary,
-            }
-        )
-    if _count_value(openai_repair_summary.get("failed_count")) > 0 and _count_value(openai_repair_summary.get("success_count")) <= 0:
-        warnings.append({"type": "openai_web_repair_failed", "summary": openai_repair_summary})
 
     if report_blueprint.get("report_family") and decision_package.get("report_family"):
         if str(report_blueprint.get("report_family")) != str(decision_package.get("report_family")):

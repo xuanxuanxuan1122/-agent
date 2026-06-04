@@ -1,6 +1,7 @@
 import copy
 
 from rag_pipeline.agents.chapter_narrative_agent import run_chapter_narrative
+from rag_pipeline.agents.final_writer_agent import run_final_writer_agent
 
 
 def _section(section_id: str = "s1", *, paragraph: str | None = None):
@@ -299,3 +300,62 @@ def test_chapter_narrative_skips_when_cited_sections_below_minimum(monkeypatch):
     assert rewritten == chapters
     assert diagnostics["enabled"] is True
     assert diagnostics["skipped_reason"] == "insufficient_cited_sections"
+
+
+def test_final_writer_invokes_chapter_narrative_for_llm_quality_path(monkeypatch):
+    monkeypatch.setenv("REPORT_ENABLE_LLM_CHAPTER_NARRATIVE", "true")
+    monkeypatch.setenv("REPORT_CHAPTER_NARRATIVE_MIN_EVIDENCE_SECTIONS", "1")
+    monkeypatch.setenv("REPORT_CHAPTER_NARRATIVE_CACHE_ENABLED", "false")
+    monkeypatch.setattr("rag_pipeline.agents.chapter_narrative_agent.llm_config_is_ready", lambda config: True)
+    def final_writer_response(**kwargs):
+        return {
+            "payload": {
+                "sections": [
+                    {
+                            "section_id": "s1",
+                            "paragraph": "Workflow deployment is becoming an operating-process signal rather than only a trial signal [1].",
+                            "used_fact_refs": ["[1]"],
+                            "citation_refs": ["[1]"],
+                        },
+                        {
+                            "section_id": "s2",
+                            "paragraph": "The same signal also shows that repeatability and operating ownership matter for adoption [1].",
+                            "used_fact_refs": ["[1]"],
+                            "citation_refs": ["[1]"],
+                        },
+                ]
+            }
+        }
+
+    monkeypatch.setattr("rag_pipeline.agents.chapter_narrative_agent.call_openai_compatible_json", final_writer_response)
+    section_one = _section("s1", paragraph="Workflow deployment signal is visible [1].")
+    section_two = _section("s2", paragraph="Operating-process repeatability is the adoption variable [1].")
+    for section in (section_one, section_two):
+        section["claim"] = section["render_blocks"][0]["text"]
+        section["reasoning"] = section["render_blocks"][0]["text"]
+        section["mechanism"] = section["render_blocks"][0]["text"]
+        section["supporting_facts"] = ["Workflow deployment signal is visible."]
+
+    output = run_final_writer_agent(
+        query="AI Agent workflow demand",
+        report_blueprint={"report_title": "AI Agent report", "report_shell": {"front_blocks": [], "back_blocks": ["appendix"]}},
+        chapter_packages=[_chapter(section_one, section_two)],
+        source_registry=[
+                {
+                    "evidence_id": "EV-1",
+                    "original_ref": "EV-1",
+                    "ref": "[1]",
+                    "source_ref": "[1]",
+                "title": "Salesforce Agentforce disclosure",
+                "url": "https://example.com/agentforce",
+                "source_url": "https://example.com/agentforce",
+            }
+        ],
+        claim_units=[],
+        analysis_claim_units=[{"claim_id": "ch_01_llm_1", "chapter_id": "ch_01", "evidence_refs": ["EV-1"]}],
+        analysis_stage_diagnostics={"final_analysis_source": "llm_evidence_analysis"},
+    )
+
+    assert output["chapter_narrative"]["attempted_count"] == 1
+    assert output["chapter_narrative"]["success_count"] == 1
+    assert "operating-process signal" in output["report_markdown"]

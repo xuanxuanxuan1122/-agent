@@ -1982,6 +1982,13 @@ def _evidence_cards_for_llm(
     max_chapters: int,
     max_per_chapter: int,
 ) -> List[Dict[str, Any]]:
+    ledger_cards = _ledger_evidence_cards_for_llm(
+        evidence_package,
+        max_chapters=max_chapters,
+        max_per_chapter=max_per_chapter,
+    )
+    if ledger_cards:
+        return ledger_cards
     chapter_filter = _chapter_filter_for_llm(evidence_package, max_chapters=max_chapters)
     buckets: Dict[str, int] = {}
     cards: List[Dict[str, Any]] = []
@@ -2017,10 +2024,50 @@ def _evidence_cards_for_llm(
         card = _as_dict(item.get("evidence_card"))
         fact_card = _public_fact_card(item)
         fact = _distilled_public_fact(item)
+        search_task = _as_dict(item.get("search_task"))
+        requirement_id = str(
+            item.get("requirement_id")
+            or item.get("evidence_requirement_id")
+            or search_task.get("requirement_id")
+            or search_task.get("evidence_requirement_id")
+            or search_task.get("slot_id")
+            or ""
+        ).strip()
+        hypothesis_id = str(item.get("hypothesis_id") or search_task.get("hypothesis_id") or "").strip()
+        source_id = str(
+            item.get("source_id")
+            or item.get("source_ref")
+            or item.get("citation_ref")
+            or source.get("source_ref")
+            or source.get("document_id")
+            or source.get("url")
+            or ""
+        ).strip()
+        search_task_id = str(item.get("search_task_id") or search_task.get("task_id") or search_task.get("id") or "").strip()
+        lineage = {
+            key: value
+            for key, value in {
+                "chapter_id": chapter_id,
+                "hypothesis_id": hypothesis_id,
+                "requirement_id": requirement_id,
+                "fact_id": evidence_id,
+                "source_id": source_id,
+                "search_task_id": search_task_id,
+            }.items()
+            if value
+        }
         cards.append(
             {
                 "evidence_id": evidence_id,
                 "chapter_id": chapter_id,
+                "hypothesis_id": hypothesis_id,
+                "requirement_id": requirement_id,
+                "analysis_role": str(item.get("analysis_role") or card.get("analysis_role") or "").strip(),
+                "analysis_eligible": bool(item.get("analysis_eligible") if "analysis_eligible" in item else card.get("analysis_eligible")),
+                "allowed_use": str(item.get("allowed_use") or card.get("allowed_use") or "").strip(),
+                "source_id": source_id,
+                "search_task_id": search_task_id,
+                "lineage": lineage,
                 "public_fact_card": fact_card,
                 "distilled_fact": _compact(fact, 360),
                 "fact": _compact(fact, 360),
@@ -2043,6 +2090,141 @@ def _evidence_cards_for_llm(
         seen_refs.add(evidence_id)
         buckets[chapter_id] = buckets.get(chapter_id, 0) + 1
     return [item for item in cards if item.get("evidence_id") and item.get("fact")]
+
+
+def _artifact_ledger_run_id_for_analysis(evidence_package: Dict[str, Any]) -> str:
+    return str(
+        evidence_package.get("artifact_ledger_run_id")
+        or evidence_package.get("stage_snapshot_run_id")
+        or evidence_package.get("run_id")
+        or os.getenv("REPORT_STAGE_SNAPSHOT_RUN_ID")
+        or ""
+    ).strip()
+
+
+def _ledger_evidence_cards_for_llm(
+    evidence_package: Dict[str, Any],
+    *,
+    max_chapters: int,
+    max_per_chapter: int,
+) -> List[Dict[str, Any]]:
+    if not _env_flag("ARTIFACT_LEDGER_ANALYSIS_CONTEXT_ENABLED", True):
+        return []
+    run_id = _artifact_ledger_run_id_for_analysis(evidence_package)
+    if not run_id:
+        return []
+    try:
+        from rag_pipeline.context.context_view_builder import build_analysis_context_view
+    except Exception:
+        return []
+
+    requirements_by_chapter = _requirements_by_chapter_for_llm(evidence_package)
+    requirement_chapter_lookup = {
+        str(requirement.get("requirement_id") or "").strip(): chapter_id
+        for chapter_id, requirements in requirements_by_chapter.items()
+        for requirement in requirements
+        if str(requirement.get("requirement_id") or "").strip()
+    }
+    requirement_ids = list(requirement_chapter_lookup.keys())
+    views: List[Dict[str, Any]] = []
+    try:
+        if requirement_ids:
+            for requirement_id in requirement_ids[: max_chapters * max_per_chapter]:
+                view = build_analysis_context_view(run_id, requirement_id=requirement_id)
+                if view.get("status") == "ready":
+                    views.append(view)
+        else:
+            view = build_analysis_context_view(run_id)
+            if view.get("status") == "ready":
+                views.append(view)
+    except Exception:
+        return []
+    if not views:
+        return []
+
+    chapter_filter = _chapter_filter_for_llm(evidence_package, max_chapters=max_chapters)
+    source_lookup: Dict[str, Dict[str, Any]] = {}
+    cards: List[Dict[str, Any]] = []
+    buckets: Dict[str, int] = {}
+    seen_refs: set[str] = set()
+    for view in views:
+        for source in _as_list(view.get("source_registry_slice")):
+            if isinstance(source, dict):
+                source_id = str(source.get("run_source_id") or source.get("source_id") or "").strip()
+                if source_id:
+                    source_lookup[source_id] = source
+        for fact in _as_list(view.get("usable_fact_cards")):
+            if not isinstance(fact, dict):
+                continue
+            evidence_id = str(fact.get("fact_id") or fact.get("evidence_id") or "").strip()
+            if not evidence_id or evidence_id in seen_refs:
+                continue
+            requirement_id = str(fact.get("requirement_id") or "").strip()
+            chapter_id = requirement_chapter_lookup.get(requirement_id) or str(fact.get("chapter_id") or "").strip()
+            if chapter_filter:
+                resolved_chapter_id = resolve_chapter_id(chapter_filter, chapter_id)
+                if not resolved_chapter_id:
+                    continue
+                chapter_id = resolved_chapter_id
+            if not chapter_id:
+                chapter_id = "artifact_ledger"
+            if buckets.get(chapter_id, 0) >= max_per_chapter:
+                continue
+            source_id = str(fact.get("source_id") or "").strip()
+            source = source_lookup.get(source_id, {})
+            fact_text = _compact(fact.get("fact"), 360)
+            if not fact_text:
+                continue
+            lineage = {
+                key: value
+                for key, value in {
+                    "chapter_id": chapter_id,
+                    "requirement_id": requirement_id,
+                    "fact_id": evidence_id,
+                    "source_id": source_id,
+                    "artifact_ledger_run_id": run_id,
+                }.items()
+                if value
+            }
+            cards.append(
+                {
+                    "evidence_id": evidence_id,
+                    "chapter_id": chapter_id,
+                    "hypothesis_id": "",
+                    "requirement_id": requirement_id,
+                    "analysis_role": str(fact.get("analysis_role") or "").strip(),
+                    "analysis_eligible": True,
+                    "allowed_use": str(fact.get("allowed_use") or "").strip(),
+                    "source_id": source_id,
+                    "search_task_id": "",
+                    "lineage": lineage,
+                    "public_fact_card": {
+                        "fact": fact_text,
+                        "fact_type": str(fact.get("analysis_role") or fact.get("allowed_use") or "").strip(),
+                        "source_level": str(fact.get("source_level") or source.get("source_level") or "").strip(),
+                    },
+                    "distilled_fact": fact_text,
+                    "fact": fact_text,
+                    "metric": _compact(fact.get("metric"), 100),
+                    "value": _compact(fact.get("value"), 100),
+                    "unit": _compact(fact.get("unit"), 60),
+                    "period": _compact(fact.get("period") or source.get("published_at"), 80),
+                    "source_level": str(fact.get("source_level") or source.get("source_level") or "").strip().upper(),
+                    "proof_role": str(fact.get("analysis_role") or "").strip().lower(),
+                    "source_verification_status": str(source.get("verification_status") or "").strip(),
+                    "can_support": [],
+                    "cannot_support": [],
+                    "proof_strength": "",
+                    "repair_need": [],
+                    "source_title": _compact(source.get("title"), 160),
+                    "source_url": str(source.get("canonical_url") or source.get("url") or "").strip(),
+                }
+            )
+            seen_refs.add(evidence_id)
+            buckets[chapter_id] = buckets.get(chapter_id, 0) + 1
+            if len(buckets) >= max_chapters and all(count >= max_per_chapter for count in buckets.values()):
+                break
+    return cards
 
 
 def build_llm_analysis_input(evidence_package: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[str, Any]:
@@ -2110,6 +2292,12 @@ def _compact_llm_fact_card(card: Dict[str, Any], *, max_fact_chars: int) -> Dict
     fact_type = str(public_card.get("fact_type") or card.get("fact_type") or card.get("proof_role") or "").strip()
     return {
         "evidence_id": str(card.get("evidence_id") or "").strip(),
+        "hypothesis_id": str(card.get("hypothesis_id") or "").strip(),
+        "requirement_id": str(card.get("requirement_id") or "").strip(),
+        "analysis_role": str(card.get("analysis_role") or "").strip(),
+        "analysis_eligible": bool(card.get("analysis_eligible")),
+        "allowed_use": str(card.get("allowed_use") or "").strip(),
+        "lineage": _as_dict(card.get("lineage")),
         "distilled_fact": _compact(card.get("distilled_fact") or card.get("fact"), max_fact_chars),
         "fact_type": fact_type,
         "source_level": str(card.get("source_level") or "").strip().upper(),
@@ -2125,6 +2313,29 @@ def _compact_llm_fact_card(card: Dict[str, Any], *, max_fact_chars: int) -> Dict
     }
 
 
+def _requirements_by_chapter_for_llm(evidence_package: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
+    contract = _as_dict(evidence_package.get("report_contract")) or _as_dict(evidence_package.get("report_plan"))
+    requirements = _as_list(_as_dict(contract.get("evidence_requirements")).get("requirements"))
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for item in requirements:
+        requirement = _as_dict(item)
+        chapter_id = str(requirement.get("chapter_id") or "").strip()
+        requirement_id = str(requirement.get("requirement_id") or "").strip()
+        if not chapter_id or not requirement_id:
+            continue
+        grouped.setdefault(chapter_id, []).append(
+            {
+                "requirement_id": requirement_id,
+                "hypothesis_id": str(requirement.get("hypothesis_id") or "").strip(),
+                "proof_role": str(requirement.get("proof_role") or "").strip(),
+                "required_fields": _as_list(requirement.get("required_fields")),
+                "min_source_level": str(requirement.get("min_source_level") or "").strip(),
+                "claim_strength_ceiling": str(requirement.get("claim_strength_ceiling") or "").strip(),
+            }
+        )
+    return grouped
+
+
 def build_llm_analysis_input_v2(evidence_package: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[str, Any]:
     max_chapters = _env_int("BRAIN_LLM_ANALYSIS_MAX_CHAPTERS", 8, min_value=1, max_value=30)
     max_per_chapter = _env_int("BRAIN_LLM_ANALYSIS_MAX_FACTS_PER_CHAPTER", 8, min_value=1, max_value=30)
@@ -2135,6 +2346,7 @@ def build_llm_analysis_input_v2(evidence_package: Dict[str, Any], fallback: Dict
         max_chapters=max_chapters,
         max_per_chapter=max_per_chapter,
     )
+    requirements_by_chapter = _requirements_by_chapter_for_llm(evidence_package)
     grouped: Dict[str, List[Dict[str, Any]]] = {}
     chapter_order: List[str] = []
     for card in cards:
@@ -2157,6 +2369,7 @@ def build_llm_analysis_input_v2(evidence_package: Dict[str, Any], fallback: Dict
         chapters.append(
             {
                 **metadata,
+                "evidence_requirements": requirements_by_chapter.get(chapter_id, []),
                 "allowed_evidence_ids": [item["evidence_id"] for item in fact_cards],
                 "fact_cards": fact_cards,
             }
@@ -2222,11 +2435,14 @@ Return strict JSON with: chapter_id, claim_units, analysis_limits.
 
 Each claim_unit must include:
 - claim: one complete Chinese judgment sentence;
+- requirement_ids: requirement_id values from the input fact_cards when available;
+- hypothesis_id: hypothesis_id from the chapter or input fact_cards when available;
 - used_evidence_ids: exact evidence_id values from the input;
 - evidence_basis: concise evidence sentences derived only from input facts;
 - reasoning_chain: mechanism explanation sentences;
 - limitation_boundary: specific boundary conditions;
 - claim_strength: strong, moderate, directional, or limited_evidence;
+- claim_strength_ceiling: maximum claim strength allowed by the cited fact cards;
 - analysis_role: claimable, directional, contextual, counter, metric, case, or technology;
 - source_support_map: object mapping claim/mechanism/boundary to used evidence ids;
 - paragraph_seed: one concise paragraph seed for downstream composition;
@@ -2432,15 +2648,17 @@ def _refs_from_llm_chapter(chapter: Dict[str, Any], valid_refs: set[str]) -> Lis
 
 
 def validate_llm_analysis_output(payload: Dict[str, Any], evidence_package: Dict[str, Any]) -> Dict[str, Any]:
-    valid_refs = {
-        str(item.get("evidence_id") or "").strip()
-        for item in _evidence_cards_for_llm(
-            evidence_package,
-            max_chapters=_env_int("BRAIN_LLM_ANALYSIS_MAX_CHAPTERS", 12, min_value=1, max_value=100),
-            max_per_chapter=_env_int("BRAIN_LLM_ANALYSIS_MAX_EVIDENCE_PER_CHAPTER", 30, min_value=1, max_value=200),
-        )
+    input_cards = _evidence_cards_for_llm(
+        evidence_package,
+        max_chapters=_env_int("BRAIN_LLM_ANALYSIS_MAX_CHAPTERS", 12, min_value=1, max_value=100),
+        max_per_chapter=_env_int("BRAIN_LLM_ANALYSIS_MAX_EVIDENCE_PER_CHAPTER", 30, min_value=1, max_value=200),
+    )
+    card_by_ref = {
+        str(item.get("evidence_id") or "").strip(): item
+        for item in input_cards
         if str(item.get("evidence_id") or "").strip()
     }
+    valid_refs = set(card_by_ref.keys())
     issues: List[Dict[str, Any]] = []
     chapters: List[Dict[str, Any]] = []
     valid_examples: List[Dict[str, Any]] = []
@@ -2601,6 +2819,65 @@ def validate_llm_analysis_output(payload: Dict[str, Any], evidence_package: Dict
                 unit["claim_status"] = "directional"
                 unit["missing_binding_reason"] = unit.get("missing_binding_reason") or "decision_ready claim lacked valid evidence refs"
                 issues.append({"type": "decision_claim_downgraded_no_valid_ref", "chapter_id": chapter.get("chapter_id")})
+            cited_cards = [_as_dict(card_by_ref.get(ref)) for ref in refs if _as_dict(card_by_ref.get(ref))]
+            inferred_requirement_ids = _dedupe(
+                [
+                    *[
+                        str(req or "").strip()
+                        for req in _as_list(unit.get("requirement_ids"))
+                        if str(req or "").strip()
+                    ],
+                    *[
+                        str(card.get("requirement_id") or "").strip()
+                        for card in cited_cards
+                        if str(card.get("requirement_id") or "").strip()
+                    ],
+                ]
+            )
+            unit["requirement_ids"] = inferred_requirement_ids
+            hypothesis_id = str(unit.get("hypothesis_id") or chapter.get("hypothesis_id") or "").strip()
+            if not hypothesis_id:
+                hypothesis_id = next(
+                    (
+                        str(card.get("hypothesis_id") or "").strip()
+                        for card in cited_cards
+                        if str(card.get("hypothesis_id") or "").strip()
+                    ),
+                    "",
+                )
+            if hypothesis_id:
+                unit["hypothesis_id"] = hypothesis_id
+            if not str(unit.get("claim_strength_ceiling") or "").strip():
+                source_levels = {str(card.get("source_level") or "").strip().upper() for card in cited_cards}
+                allowed_uses = {str(card.get("allowed_use") or "").strip().lower() for card in cited_cards}
+                if source_levels & {"A", "B"} and not {"directional_signal", "clue", "appendix_only"} & allowed_uses:
+                    unit["claim_strength_ceiling"] = "moderate"
+                else:
+                    unit["claim_strength_ceiling"] = "directional"
+            unit["lineage"] = {
+                key: value
+                for key, value in {
+                    "chapter_id": chapter.get("chapter_id"),
+                    "hypothesis_id": unit.get("hypothesis_id"),
+                    "requirement_ids": inferred_requirement_ids,
+                    "fact_ids": refs,
+                    "source_ids": _dedupe(
+                        [
+                            str(card.get("source_id") or _as_dict(card.get("lineage")).get("source_id") or "").strip()
+                            for card in cited_cards
+                            if str(card.get("source_id") or _as_dict(card.get("lineage")).get("source_id") or "").strip()
+                        ]
+                    ),
+                    "search_task_ids": _dedupe(
+                        [
+                            str(card.get("search_task_id") or _as_dict(card.get("lineage")).get("search_task_id") or "").strip()
+                            for card in cited_cards
+                            if str(card.get("search_task_id") or _as_dict(card.get("lineage")).get("search_task_id") or "").strip()
+                        ]
+                    ),
+                }.items()
+                if value not in (None, "", [])
+            }
             cleaned_units.append(unit)
             if len(valid_examples) < 5:
                 valid_examples.append(

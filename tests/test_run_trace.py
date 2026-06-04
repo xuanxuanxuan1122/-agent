@@ -105,11 +105,6 @@ def test_write_run_trace_from_package_extracts_core_pipeline_events(tmp_path, mo
                     "by_proof_role": {"metric": 1, "counter": 1, "case": 1},
                     "deep_budget_exhausted_count": 0,
                 },
-                "openai_web_search_summary": {
-                    "gap_repair_task_count": 2,
-                    "last_planned_by_proof_role": {"metric": 1, "counter": 1},
-                    "last_skip_reason": "",
-                },
                 "query_rewrite_diagnostics": {
                     "query_rewrite_call_count": 0,
                     "query_rewrite_input_chars_total": 0,
@@ -215,7 +210,7 @@ def test_write_run_trace_from_package_extracts_core_pipeline_events(tmp_path, mo
     assert query_rewrite_event["diagnostics"]["self_refine_disabled_reason"] == "quality_posture"
     repair_event = next(event for event in events if event["stage"] == "evidence_repair")
     assert repair_event["input_count"] == 3
-    assert repair_event["output_count"] == 2
+    assert repair_event["output_count"] == 3
     assert repair_event["reason_counts"]["metric"] == 1
     assert repair_event["diagnostics"]["selected_repair_task_count_by_reason"] == {
         "metric": 1,

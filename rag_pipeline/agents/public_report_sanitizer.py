@@ -347,6 +347,9 @@ PUBLIC_NARRATIVE_BLOCK_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"可用事实|正文需要|观察顺序|原文核验|后续观察本章", "writing_process_language"),
     (r"事实锚点|事实起点|后续重点跟踪|可复核材料指向", "analysis_scaffold_language"),
     (r"这些事实来自不同类型来源|来源集中、口径不一致", "analysis_scaffold_language"),
+    (r"商业化证据主要集中|其他行业缺乏明确案例|多数证据为20\d{2}[-—至到]\s*20\d{2}年报告", "evidence_repair_signal"),
+    (r"来源多为[ABCD]级|来源多为B级或C级|可靠性中等|时效性有限", "evidence_repair_signal"),
+    (r"证据主要集中在[^。；;\n]{1,80}少数行业|缺乏明确案例", "evidence_repair_signal"),
     (r"待验证方向|尚不足以支撑强结论", "fallback_claim_language"),
     (r"这张表显示|后续影响\s*[:：]|使用边界\s*[:：]|表内信号", "diagnostic_table_commentary"),
     (r"需要按连续指标|避免把单点信号直接外推|更适合作为背景条件|结论强度取决", "analysis_scaffold_language"),
@@ -401,6 +404,11 @@ def _line_without_public_narrative_leak(line: str) -> str:
         return ""
     if re.search(
         r"事实锚点|事实起点|后续重点跟踪|这些事实来自不同类型来源|来源集中、口径不一致|待验证方向|尚不足以支撑强结论",
+        raw,
+    ):
+        return ""
+    if re.search(
+        r"商业化证据主要集中|其他行业缺乏明确案例|多数证据为20\d{2}[-—至到]\s*20\d{2}年报告|来源多为[ABCD]级|来源多为B级或C级|可靠性中等|时效性有限|证据主要集中在[^。；;\n]{1,80}少数行业|缺乏明确案例",
         raw,
     ):
         return ""

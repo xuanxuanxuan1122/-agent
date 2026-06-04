@@ -2277,10 +2277,6 @@ def _render_quality_scorecard(
         clean_text = "否，本报告按证据强度降级生成"
     health = _as_dict(evidence_health_summary)
     source_dist = _as_dict(health.get("source_level_distribution"))
-    openai_summary = (
-        _as_dict(_as_dict(evidence_package).get("metadata")).get("openai_web_search_summary")
-        or _as_dict(_as_dict(evidence_package).get("summary")).get("openai_web_search_summary")
-    )
     review_reasons = _as_list(_as_dict(delivery_gate).get("review_reasons")) + _as_list(_as_dict(delivery_gate).get("blocking_reasons"))
     lines = [
         "## 报告质量评分与证据限制",
@@ -2303,19 +2299,6 @@ def _render_quality_scorecard(
             f"D={_count_value(source_dist.get('D'))}"
         ),
     ]
-    if openai_summary:
-        openai_status = str(openai_summary.get("openai_web_status") or "").strip()
-        if not openai_status:
-            openai_status = "quota_blocked" if openai_summary.get("quota_blocked") else (
-                "available" if _count_value(openai_summary.get("success_count")) > 0 else "no_valid_evidence"
-            )
-        lines.append(
-            "- 辅助联网检索："
-            f"计划 {_count_value(openai_summary.get('planned_count') or openai_summary.get('gap_repair_task_count'))} 项，"
-            f"有效 {_count_value(openai_summary.get('success_count'))} 项，"
-            f"失败 {_count_value(openai_summary.get('failed_count'))} 项，"
-            f"状态 {openai_status}"
-        )
     if review_reasons or quality_findings:
         lines.extend(["", "### 主要未达标项"])
         for item in list(review_reasons)[:6]:
@@ -3123,7 +3106,7 @@ def build_writer_report(
         for table in table_packages
         if tables_enabled and isinstance(table, dict) and table.get("should_render") and not table.get("appendix_only")
     ]
-    target_body_chars = _env_int("REPORT_TARGET_BODY_CHARS", 20000, min_value=0, max_value=100000)
+    target_body_chars = _env_int("REPORT_TARGET_BODY_CHARS", 0, min_value=0, max_value=100000)
     public_chapter_packages = _expand_chapter_packages_for_body_target(public_chapter_packages, target_chars=target_body_chars)
     chapter_narrative_diagnostics: Dict[str, Any] = {
         "enabled": False,

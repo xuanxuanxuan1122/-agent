@@ -47,8 +47,6 @@ AGENT_LABELS = {
     "industry_rag_agent": "RAG",
     "iqs": "IQS",
     "web_analysis_agent": "IQS",
-    "openai_web": "OPENAI_WEB",
-    "openai_web_search_agent": "OPENAI_WEB",
     **{f"iqs_lane_{index}": f"IQS Lane {index}" for index in range(1, 7)},
     **{f"iqs_lane_{index}_agent": f"IQS Lane {index}" for index in range(1, 7)},
     "fin": "FIN",
@@ -3246,7 +3244,7 @@ def _gap_payload(
     root_cause: str = "",
     affected_metric_fields: Optional[Sequence[str]] = None,
     repair_priority: str = "",
-    can_openai_repair: Optional[bool] = None,
+    can_iqs_repair: Optional[bool] = None,
 ) -> Dict[str, Any]:
     chapter_id = str(chapter.get("chapter_id") or "unmapped")
     query_terms = _gap_terms_from_text(chapter.get("chapter_title"), gap_type)
@@ -3272,7 +3270,7 @@ def _gap_payload(
         "root_cause": root_cause or gap_type,
         "affected_metric_fields": list(affected_metric_fields or []),
         "repair_priority": repair_priority or ("high" if severity == "blocking" else "medium"),
-        "can_openai_repair": bool(can_openai_repair) if can_openai_repair is not None else severity in {"blocking", "advisory"},
+        "can_iqs_repair": bool(can_iqs_repair) if can_iqs_repair is not None else severity in {"blocking", "advisory"},
     }
 
 
@@ -3772,7 +3770,7 @@ def _build_evidence_preflight_summary(
                     "actual_traceable_ab": actual_traceable_ab,
                     "actual_verified_ab": actual_ab,
                     "missing_proof_roles": sorted(set(missing_roles)),
-                    "repairable_by_openai": True,
+                    "repairable_by_search": True,
                 }
             )
         by_chapter[chapter_id] = {
@@ -3785,7 +3783,7 @@ def _build_evidence_preflight_summary(
             "metric_ready_count": int(_safe_float(payload.get("metric_ready_count"), 0.0)),
             "case_signal_count": int(_safe_float(payload.get("case_signal_count"), 0.0)),
             "missing_proof_roles": sorted(set(missing_roles)),
-            "repairable_by_openai": bool(missing_roles),
+            "repairable_by_search": bool(missing_roles),
         }
     min_counter = _report_env_int("REPORT_MIN_COUNTER_SOURCES_PER_REPORT", 2, min_value=0, max_value=20)
     actual_counter = int(_safe_float(analysis_summary.get("total_verified_counter_source_count"), 0.0))
@@ -3799,7 +3797,7 @@ def _build_evidence_preflight_summary(
                 "required": min_counter,
                 "actual": actual_counter,
                 "actual_traceable": actual_traceable_counter,
-                "repairable_by_openai": True,
+                "repairable_by_search": True,
             }
         )
     for reason in _as_list(_as_dict(publishable_evidence_gate).get("blocking_reasons")):
@@ -3807,11 +3805,11 @@ def _build_evidence_preflight_summary(
         reason_type = str(payload.get("type") or "").strip()
         if reason_type in {"chapter_core_ab_below_minimum", "report_counter_sources_below_minimum"}:
             continue
-        clean_blocking_reasons.append({**payload, "repairable_by_openai": reason_type in {"readpage_evidence_missing", "blocking_evidence_gaps"}})
+        clean_blocking_reasons.append({**payload, "repairable_by_search": reason_type in {"readpage_evidence_missing", "blocking_evidence_gaps"}})
     analysis_ready_count = int(_safe_float(health.get("analysis_ready_count"), 0.0))
     clean_fact_count = int(_safe_float(health.get("clean_fact_count"), 0.0))
     health_inconsistent = bool(health.get("inconsistent"))
-    repairable = [item for item in clean_blocking_reasons if bool(_as_dict(item).get("repairable_by_openai"))]
+    repairable = [item for item in clean_blocking_reasons if bool(_as_dict(item).get("repairable_by_search"))]
     diagnostic_only = bool(health_inconsistent or (analysis_ready_count <= 0 and clean_fact_count <= 0))
     return {
         "enabled": _report_env_flag("REPORT_ENABLE_EVIDENCE_PREFLIGHT", True),
@@ -3822,7 +3820,6 @@ def _build_evidence_preflight_summary(
         "by_chapter": by_chapter,
         "clean_blocking_reasons": clean_blocking_reasons,
         "repair_attempts": _as_dict(metadata).get("gap_attempt_summary") or {},
-        "openai_web_repair_summary": _as_dict(metadata).get("openai_web_search_summary") or {},
         "counter_scope": os.getenv("REPORT_COUNTER_SCOPE", "report_level") or "report_level",
         "required_counter_sources_per_report": min_counter,
         "actual_counter_sources_per_report": actual_counter,
@@ -4277,7 +4274,6 @@ def build_evidence_package(
             "readpage_coverage": readpage_coverage,
             "evidence_health_summary": evidence_health_summary,
             "source_registry_summary": _source_registry_summary(source_registry),
-            "openai_web_repair_summary": _as_dict(metadata).get("openai_web_search_summary", {}),
             "publishable_evidence_gate": publishable_evidence_gate,
             "evidence_preflight_summary": evidence_preflight_summary,
             "delivery_gate": delivery_gate,

@@ -133,6 +133,13 @@ def _compact(value: Any, max_chars: int = 260) -> str:
     return text[: max(0, max_chars - 1)].rstrip() + "..."
 
 
+def _truncate_without_ellipsis(value: Any, max_chars: int) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip(" ,，;；。")
+
+
 def _dedupe(values: Iterable[Any], *, limit: int = 8) -> List[str]:
     result: List[str] = []
     seen = set()
@@ -195,12 +202,41 @@ def _is_snippet_like_public_text(value: Any) -> bool:
 
 
 def _clean_public_text(value: Any, max_chars: int = 900) -> str:
-    text = _compact(value, max_chars)
+    raw_text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not raw_text:
+        return ""
+    text = raw_text
     for pattern in TEMPLATE_SENTENCE_PATTERNS:
         text = re.sub(pattern, "", text, flags=re.I)
-    if _is_snippet_like_public_text(text) or any(re.search(pattern, text, flags=re.I) for pattern in BAD_FACT_PATTERNS):
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
         return ""
-    return re.sub(r"\s{2,}", " ", text).strip()
+
+    sentences = [
+        item.strip()
+        for item in re.split(r"(?<=[\u3002\uff1b\uff01\uff1f.!?;])\s*", text)
+        if item.strip()
+    ]
+    if not sentences:
+        sentences = [text]
+
+    kept: List[str] = []
+    for sentence in sentences:
+        candidate = sentence.strip()
+        if not candidate:
+            continue
+        if re.search(r"https?://|URL[:\uff1a]", candidate, flags=re.I):
+            continue
+        if _is_snippet_like_public_text(candidate):
+            continue
+        if any(re.search(pattern, candidate, flags=re.I) for pattern in BAD_FACT_PATTERNS):
+            continue
+        kept.append(candidate)
+
+    cleaned = re.sub(r"\s{2,}", " ", " ".join(kept)).strip()
+    if not cleaned:
+        return ""
+    return _truncate_without_ellipsis(cleaned, max_chars)
 
 
 def _has_template_risk(value: Any) -> bool:
@@ -1144,6 +1180,11 @@ def _section_from_unit(
         "required_evidence_refs": _as_list(layout_section.get("required_evidence_refs")),
         "claim": claim,
         "composed_paragraph": str(composition.get("paragraph") or "").strip(),
+        "hypothesis_id": unit.get("hypothesis_id") or "",
+        "requirement_id": unit.get("requirement_id") or "",
+        "requirement_ids": _as_list(unit.get("requirement_ids")),
+        "claim_strength_ceiling": unit.get("claim_strength_ceiling") or "",
+        "lineage": _as_dict(unit.get("lineage")),
         "analysis_role": unit.get("analysis_role") or "",
         "source_support_map": _as_dict(unit.get("source_support_map")),
         "paragraph_seed": unit.get("paragraph_seed") or "",

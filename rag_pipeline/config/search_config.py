@@ -88,6 +88,8 @@ def _env_int_optional(name: str) -> int | None:
 
 
 def _config_is_ready(config: dict[str, object]) -> bool:
+    if _config_is_removed_openai_gpt(config):
+        return False
     return bool(
         str(config.get("url") or "").strip()
         and str(config.get("api_key") or "").strip()
@@ -95,17 +97,11 @@ def _config_is_ready(config: dict[str, object]) -> bool:
     )
 
 
-GPT55_QUALITY_TASKS = {
-    "planning",
-    "coverage_eval",
-    "qa",
-    "review_stage2",
-    "reflection",
-    "reformatter",
-    "final_audit",
-}
-GPT55_QUALITY_PROFILE = "gpt-5.5"
-GPT55_FALLBACK_PROFILE = os.getenv("RAG_LLM_GPT55_FALLBACK_PROFILE", "deepseek-v4-pro").strip()
+def _config_is_removed_openai_gpt(config: dict[str, object]) -> bool:
+    model = str(config.get("model") or "").strip().lower()
+    profile = str(config.get("profile") or "").strip().lower()
+    url = str(config.get("url") or "").strip().lower()
+    return model.startswith("gpt-") or profile.startswith("gpt-") or "api.openai.com" in url
 
 
 def build_llm_config_from_profile(profile: str, *, default_timeout: float = 180.0) -> dict[str, object]:
@@ -133,35 +129,6 @@ def build_llm_config_from_profile(profile: str, *, default_timeout: float = 180.
         config["reasoning_effort"] = reasoning_effort
     if max_output_tokens:
         config["max_output_tokens"] = max_output_tokens
-    return config
-
-
-def _config_uses_gpt55(config: dict[str, object]) -> bool:
-    model = str(config.get("model") or "").strip().lower()
-    profile = str(config.get("profile") or "").strip().lower()
-    return model.startswith("gpt-5.5") or profile == GPT55_QUALITY_PROFILE
-
-
-def _attach_gpt55_fallback(config: dict[str, object], *, task_name: str = "") -> dict[str, object]:
-    """Attach a DeepSeek fallback to GPT-5.5 configs without changing callers."""
-
-    config = dict(config or {})
-    if not _config_uses_gpt55(config):
-        return config
-    fallback_profile = os.getenv("RAG_LLM_GPT55_FALLBACK_PROFILE", GPT55_FALLBACK_PROFILE).strip()
-    if not fallback_profile or fallback_profile.lower() == str(config.get("profile") or "").strip().lower():
-        return config
-    fallback_config = build_llm_config_from_profile(
-        fallback_profile,
-        default_timeout=float(config.get("timeout") or DEFAULT_LLM_SYNTHESIS_TIMEOUT),
-    )
-    if not _config_is_ready(fallback_config):
-        return config
-    fallback_config["task_name"] = task_name or str(config.get("task_name") or "")
-    fallback_config["fallback_for_profile"] = str(config.get("profile") or "")
-    fallback_config.pop("forced_quality_profile", None)
-    config["fallback_profile"] = fallback_profile
-    config["fallback_config"] = fallback_config
     return config
 
 
@@ -419,25 +386,18 @@ def build_llm_config_for_task(task_name: str) -> dict[str, object]:
     """
 
     task = str(task_name or "").strip()
-    if env_flag("RAG_FORCE_GPT55_QUALITY_TASKS", True) and normalize_llm_profile(task).lower() in {
-        normalize_llm_profile(item).lower() for item in GPT55_QUALITY_TASKS
-    }:
-        config = build_llm_config_from_profile(GPT55_QUALITY_PROFILE, default_timeout=DEFAULT_LLM_SYNTHESIS_TIMEOUT)
-        if _config_is_ready(config):
-            config["task_name"] = task
-            config["forced_quality_profile"] = True
-            return _attach_gpt55_fallback(config, task_name=task)
-
     task_env_name = llm_task_profile_env_name(task)
     profile = os.getenv(task_env_name, "").strip() if task_env_name else ""
     if profile:
         config = build_llm_config_from_profile(profile, default_timeout=DEFAULT_LLM_SYNTHESIS_TIMEOUT)
         if _config_is_ready(config):
             config["task_name"] = task
-            return _attach_gpt55_fallback(config, task_name=task)
+            return config
     config = build_legacy_synthesis_llm_config()
     config["task_name"] = task
-    return _attach_gpt55_fallback(config, task_name=task)
+    if _config_is_removed_openai_gpt(config):
+        config.update({"url": "", "api_key": "", "model": "", "disabled_reason": "removed_openai_gpt_profile"})
+    return config
 
 
 DEFAULT_ENABLE_MEMORY = env_flag("RAG_ENABLE_MEMORY", True)

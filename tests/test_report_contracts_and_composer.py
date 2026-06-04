@@ -9,6 +9,7 @@ from rag_pipeline.agents.report_contracts import (
 from rag_pipeline.agents.chapter_argument_agent import run_chapter_argument_agent
 from rag_pipeline.agents.section_composer import compose_section_paragraph
 from rag_pipeline.agents.writer_agent_clean import _expand_chapter_packages_for_body_target
+from rag_pipeline.contracts.report_contract import build_report_contract_from_package
 
 
 def test_evidence_fact_card_normalizes_legacy_shapes_and_preserves_zero_source_ref():
@@ -56,6 +57,159 @@ def test_claim_unit_collects_legacy_reference_aliases():
     assert unit.claim.startswith("Enterprise agents")
     assert unit.evidence_refs == ["EV-1", "EV-2", "EV-3"]
     assert unit.to_legacy_dict()["used_fact_refs"] == ["EV-1", "EV-2", "EV-3"]
+
+
+def test_fact_card_preserves_requirement_and_lineage_contract_fields():
+    card = EvidenceFactCard.from_legacy_dict(
+        {
+            "evidence_id": "EV-REQ",
+            "chapter_id": "ch_01",
+            "hypothesis_id": "H1",
+            "requirement_id": "H1_case",
+            "search_task_id": "task_case_1",
+            "source_id": "SRC-1",
+            "analysis_role": "case",
+            "analysis_eligible": True,
+            "allowed_use": "directional_signal",
+            "source_ref": "[3]",
+            "public_fact_card": {
+                "subject": "Salesforce Agentforce",
+                "distilled_fact": "Salesforce disclosed workflow deployment cases.",
+                "fact_type": "case",
+                "block_affinity": ["case_comparison"],
+            },
+        }
+    )
+
+    legacy = card.to_legacy_dict()
+
+    assert card.requirement_id == "H1_case"
+    assert card.hypothesis_id == "H1"
+    assert card.analysis_role == "case"
+    assert card.analysis_eligible is True
+    assert card.allowed_use == "directional_signal"
+    assert card.lineage == {
+        "chapter_id": "ch_01",
+        "hypothesis_id": "H1",
+        "requirement_id": "H1_case",
+        "fact_id": "EV-REQ",
+        "source_id": "SRC-1",
+        "search_task_id": "task_case_1",
+    }
+    assert legacy["requirement_id"] == "H1_case"
+    assert legacy["lineage"]["requirement_id"] == "H1_case"
+
+
+def test_claim_unit_preserves_requirement_ids_strength_ceiling_and_lineage():
+    unit = ClaimUnit.from_legacy_dict(
+        {
+            "claim_id": "CL-H1",
+            "chapter_id": "ch_01",
+            "hypothesis_id": "H1",
+            "requirement_ids": ["H1_metric", "H1_case"],
+            "claim": "Agent demand is moving toward workflow deployment.",
+            "claim_strength": "moderate",
+            "claim_strength_ceiling": "moderate",
+            "used_evidence_ids": ["EV-1"],
+            "source_support_map": {"claim": ["EV-1"]},
+            "lineage": {
+                "requirement_ids": ["H1_metric", "H1_case"],
+                "fact_ids": ["EV-1"],
+                "source_ids": ["SRC-1"],
+                "search_task_ids": ["task_metric_1"],
+            },
+        }
+    )
+
+    legacy = unit.to_legacy_dict()
+
+    assert unit.hypothesis_id == "H1"
+    assert unit.requirement_ids == ["H1_metric", "H1_case"]
+    assert unit.claim_strength_ceiling == "moderate"
+    assert unit.lineage["source_ids"] == ["SRC-1"]
+    assert legacy["requirement_ids"] == ["H1_metric", "H1_case"]
+    assert legacy["claim_strength_ceiling"] == "moderate"
+    assert legacy["lineage"]["fact_ids"] == ["EV-1"]
+
+
+def test_report_contract_emits_requirement_slots_with_stable_ids():
+    package = {
+        "query": "AI Agent workflow adoption",
+        "evidence_package": {
+            "metadata": {
+                "research_plan": {
+                    "query": "AI Agent workflow adoption",
+                    "chapters": [
+                        {
+                            "chapter_id": "ch_01",
+                            "chapter_title": "Workflow demand",
+                            "core_question": "Is workflow demand real?",
+                            "required_evidence_roles": ["metric", "case", "counter"],
+                            "min_ab_sources": 1,
+                        }
+                    ],
+                }
+            }
+        },
+    }
+
+    contract = build_report_contract_from_package(package)
+    requirements = contract["evidence_requirements"]["requirements"]
+
+    assert [item["requirement_id"] for item in requirements] == [
+        "ch_01_metric",
+        "ch_01_case",
+        "ch_01_counter",
+        "ch_01_source_check",
+    ]
+    assert requirements[0]["chapter_id"] == "ch_01"
+    assert requirements[0]["proof_role"] == "metric"
+    assert "value" in requirements[0]["required_fields"]
+    assert requirements[1]["claim_strength_ceiling"] == "directional"
+
+
+def test_report_contract_evaluates_requirement_status_from_fact_cards():
+    package = {
+        "query": "AI Agent workflow adoption",
+        "evidence_package": {
+            "metadata": {
+                "research_plan": {
+                    "query": "AI Agent workflow adoption",
+                    "chapters": [
+                        {
+                            "chapter_id": "ch_01",
+                            "chapter_title": "Workflow demand",
+                            "core_question": "Is workflow demand real?",
+                            "required_evidence_roles": ["metric", "case"],
+                        }
+                    ],
+                }
+            },
+            "analysis_ready_evidence": [
+                {
+                    "evidence_id": "EV-CASE",
+                    "chapter_id": "ch_01",
+                    "requirement_id": "ch_01_case",
+                    "source_level": "C",
+                    "analysis_eligible": True,
+                    "analysis_role": "case",
+                    "source_ref": "[2]",
+                    "fact": "A customer case disclosed workflow deployment.",
+                }
+            ],
+        },
+    }
+
+    contract = build_report_contract_from_package(package)
+    status_by_id = {
+        item["requirement_id"]: item
+        for item in contract["evidence_requirements"]["requirement_status"]
+    }
+
+    assert status_by_id["ch_01_case"]["status"] == "directional_ready"
+    assert status_by_id["ch_01_case"]["matched_fact_refs"] == ["EV-CASE"]
+    assert status_by_id["ch_01_metric"]["status"] == "needs_repair"
+    assert "metric" in status_by_id["ch_01_metric"]["missing"]
 
 
 def test_chapter_insight_and_report_section_round_trip_legacy_dicts():
@@ -303,6 +457,45 @@ def test_composer_expands_valid_claim_to_research_paragraph(monkeypatch):
     assert "tool trials" in paragraph
     assert "workflow deployment" in paragraph
     assert "repeatable paid usage" in paragraph
+
+
+def test_composer_longform_does_not_repeat_same_fact_sentence(monkeypatch):
+    monkeypatch.setenv("REPORT_COMPOSER_TARGET_SECTION_CHARS", "850")
+    fact = "AI Agent commercialization landed, and the 3.3 trillion yuan track is accelerating."
+    card = EvidenceFactCard(
+        evidence_id="EV-REPEAT",
+        chapter_id="ch_01",
+        subject="AI Agent commercialization",
+        variable="deployment depth",
+        action_or_signal="landed",
+        distilled_fact=fact,
+        fact_type="case",
+        block_affinity=["case_comparison"],
+        source_ref="[2]",
+        source_level="B",
+    )
+    claim = ClaimUnit(
+        claim_id="CL-REPEAT",
+        chapter_id="ch_01",
+        claim="AI Agent commercialization is moving from concept discussion into observable deployment signals.",
+        evidence_refs=["EV-REPEAT"],
+        evidence_basis=[fact],
+        reasoning_chain="Deployment depth matters because it determines whether a signal can move from attention into workflow adoption.",
+        limitation_boundary="The judgment remains bounded by whether deployment depth appears across more customers and paid workflows.",
+        paragraph_seed="The section should explain why deployment depth is a stronger signal than attention alone.",
+        claim_strength="directional",
+    )
+
+    result = compose_section_paragraph(
+        fact_cards=[card],
+        claim_unit=claim,
+        block_type="case_comparison",
+        chapter_question="Can commercialization move into durable workflow demand?",
+    )
+
+    assert result["composition_status"] in {"composed", "composed_directional"}
+    assert result["composer_expansion_status"] == "expanded"
+    assert result["paragraph"].count(fact.rstrip(".")) <= 1
 
 
 def test_composer_does_not_promote_raw_evidence_basis_snippets():
@@ -558,6 +751,38 @@ def test_chapter_argument_does_not_render_boundary_as_standalone_public_paragrap
     assert len(public_blocks) == 1
     assert "should not represent the whole market" not in public_blocks[0]["text"]
     assert section["counter_evidence"]
+
+
+def test_chapter_argument_clean_public_text_preserves_long_analysis_after_clipping():
+    from rag_pipeline.agents.chapter_argument_agent import _clean_public_text
+
+    sentence = (
+        "企业级智能体已经从演示能力进入流程部署，关键在于客户是否把权限、集成、责任边界和持续运维放进同一个业务闭环。"
+        "这类事实说明需求判断不能只看概念热度，而要看部署动作是否进入真实岗位、真实流程和真实预算。"
+    )
+    paragraph = sentence * 6
+
+    cleaned = _clean_public_text(paragraph, max_chars=900)
+
+    assert len(cleaned.replace(" ", "")) > 500
+    assert "企业级智能体" in cleaned
+
+
+def test_chapter_argument_clean_public_text_removes_bad_sentence_not_whole_paragraph():
+    from rag_pipeline.agents.chapter_argument_agent import _clean_public_text
+
+    paragraph = (
+        "企业级智能体的部署信号已经进入客服和运营流程，这说明需求正在从试用工具转向可复用工作流。"
+        "Official statistics show AI agent adoption URL: https://example.invalid/report. "
+        "后续判断应关注客户是否继续扩大使用范围、是否形成付费链路，以及权限治理是否能支撑规模化部署。"
+    )
+
+    cleaned = _clean_public_text(paragraph, max_chars=900)
+
+    assert "Official statistics" not in cleaned
+    assert "https://example.invalid" not in cleaned
+    assert "企业级智能体" in cleaned
+    assert "付费链路" in cleaned
 
 
 def test_chapter_argument_composes_llm_claim_from_evidence_basis_when_cards_missing():

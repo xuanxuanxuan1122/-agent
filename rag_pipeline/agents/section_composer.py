@@ -36,6 +36,39 @@ def _dedupe(values: Iterable[str], *, limit: int = 4) -> List[str]:
     return result
 
 
+def _fact_norm(value: Any) -> str:
+    return re.sub(r"\W+", "", _text(value).lower())
+
+
+def _duplicates_known_fact(text: str, known_facts: Sequence[str]) -> bool:
+    normalized = _fact_norm(text)
+    if len(normalized) < 24:
+        return False
+    for fact in known_facts:
+        fact_norm = _fact_norm(fact)
+        if len(fact_norm) < 24:
+            continue
+        if normalized == fact_norm or fact_norm in normalized:
+            return True
+    return False
+
+
+def _would_repeat_known_fact(parts: Sequence[str], sentence: str, known_facts: Sequence[str]) -> bool:
+    existing = _fact_norm(" ".join(parts))
+    if not existing:
+        return False
+    candidate = _fact_norm(sentence)
+    if not candidate:
+        return False
+    for fact in known_facts:
+        fact_norm = _fact_norm(fact)
+        if len(fact_norm) < 24:
+            continue
+        if fact_norm in existing and fact_norm in candidate:
+            return True
+    return False
+
+
 def _lens(block_type: str) -> str:
     block = str(block_type or "").strip()
     if block == "metric_reconciliation":
@@ -256,7 +289,7 @@ def _general_sentence(card: EvidenceFactCard, lens: str) -> str:
     return f"{fact}。这一事实用于判断{variable}是否具备持续性。"
 
 
-def _claim_analysis_parts(claim_unit: ClaimUnit) -> List[str]:
+def _claim_analysis_parts(claim_unit: ClaimUnit, *, known_facts: Sequence[str] = ()) -> List[str]:
     parts: List[str] = []
     values: List[Any] = [
         claim_unit.claim,
@@ -268,6 +301,8 @@ def _claim_analysis_parts(claim_unit: ClaimUnit) -> List[str]:
     for value in values:
         text = _text(value)
         if not text or _is_snippet_like(text):
+            continue
+        if _duplicates_known_fact(text, known_facts):
             continue
         parts.append(text)
     return _dedupe(parts, limit=6)
@@ -342,7 +377,8 @@ def _expansion_sentences(
             boundary = f"由于该判断属于方向性分析，结论应限定在已引用事实能够覆盖的场景内，重点看{variable}后续是否重复出现并形成更稳定的证据链。"
     question_sentence = f"放回章节问题看，{chapter_question} 的回答不能只依赖单点事实，而要看上述机制能否连续支撑需求、商业化或风险判断。" if chapter_question else ""
     fact_sentence = f"已有事实链显示：{facts_text}。" if facts_text else ""
-    return [fact_sentence, mechanism, implication, boundary, question_sentence]
+    depth_sentence = f"进一步看，{variable}需要同时接受场景深度、组织采纳、交付成本和持续使用的检验；这些条件越完整，相关事实越能从单点样本转化为可解释的行业信号。"
+    return [fact_sentence, mechanism, implication, boundary, question_sentence, depth_sentence]
 
 
 def _expand_to_target(
@@ -356,6 +392,7 @@ def _expand_to_target(
 ) -> tuple[str, str]:
     target = _section_target_chars()
     parts = [part for part in base_parts if _text(part)]
+    known_facts = [card.distilled_fact for card in selected if _text(card.distilled_fact)]
     status = "base"
     if _compact_len(_join_public_sentences(parts)) < target:
         for sentence in _expansion_sentences(
@@ -366,6 +403,8 @@ def _expand_to_target(
             strength=strength,
         ):
             if sentence:
+                if _would_repeat_known_fact(parts, sentence, known_facts):
+                    continue
                 parts.append(sentence)
             if _compact_len(_join_public_sentences(parts)) >= target:
                 status = "expanded"
@@ -417,7 +456,14 @@ def compose_section_paragraph(
     else:
         status = "composed_directional"
     paragraph, expansion_status = _expand_to_target(
-        base_parts=[*_claim_analysis_parts(claim_unit), *sentences[:2], variable_explanation],
+        base_parts=[
+            *_claim_analysis_parts(
+                claim_unit,
+                known_facts=[card.distilled_fact for card in selected if card.distilled_fact],
+            ),
+            *sentences[:2],
+            variable_explanation,
+        ],
         lens=lens,
         claim_unit=claim_unit,
         selected=selected,

@@ -44,3 +44,43 @@ def test_iqs_filter_expands_legacy_sentence_must_terms():
     assert result["accepted"] is True
     assert "新能源汽车" in result["matched_terms"]
     assert "新型材料" in result["matched_terms"]
+def test_search_task_carries_requirement_contract_fields():
+    chapter = {
+        "chapter_id": "ch_01",
+        "chapter_title": "AI Agent workflow demand",
+        "core_question": "Is workflow deployment demand real?",
+        "required_evidence_mix": ["customer_case"],
+    }
+    goal = {
+        "goal_id": "H1_case",
+        "requirement_id": "H1_case",
+        "hypothesis_id": "H1",
+        "question": "Find enterprise AI Agent customer deployment cases.",
+        "proof_role": "case",
+        "required_fields": ["company", "use_case", "deployment_scope", "source_ref"],
+        "claim_strength_ceiling": "directional",
+    }
+    research_plan = {"query": "AI Agent workflow adoption"}
+
+    task = build_search_tasks_for_goal(chapter=chapter, goal=goal, research_plan=research_plan)[0]
+
+    assert task["requirement_id"] == "H1_case"
+    assert task["hypothesis_id"] == "H1"
+    assert task["required_fields"] == ["company", "use_case", "deployment_scope", "source_ref"]
+    assert task["claim_strength_ceiling"] == "directional"
+
+
+def test_generated_evidence_goals_default_requirement_id_to_goal_id():
+    from rag_pipeline.agents.brain_agent import build_evidence_goals_for_chapter
+
+    chapter = {
+        "chapter_id": "ch_01",
+        "chapter_title": "AI Agent workflow demand",
+        "core_question": "Is workflow deployment demand real?",
+        "required_evidence_roles": ["metric", "case"],
+    }
+
+    goals = build_evidence_goals_for_chapter(chapter, {"query": "AI Agent workflow adoption"})
+
+    assert goals
+    assert all(goal.get("requirement_id") == goal.get("goal_id") for goal in goals)

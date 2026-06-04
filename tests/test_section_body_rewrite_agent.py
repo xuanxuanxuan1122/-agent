@@ -107,6 +107,43 @@ def test_rewrite_section_body_rejects_missing_refs(monkeypatch, tmp_path):
     assert result["failure_reason"] == "missing_required_refs"
 
 
+def test_rewrite_section_body_accepts_shorter_safe_polished_paragraph(monkeypatch, tmp_path):
+    monkeypatch.setenv("REPORT_ENABLE_LLM_BODY_REWRITE", "true")
+    monkeypatch.setenv("REPORT_BODY_REWRITE_CACHE_ENABLED", "false")
+    monkeypatch.setenv("REPORT_BODY_REWRITE_CACHE_PATH", str(tmp_path))
+    monkeypatch.setattr(
+        "rag_pipeline.agents.section_body_rewrite_agent.llm_config_is_ready",
+        lambda config: True,
+    )
+    long_section = _section()
+    long_section["paragraph"] = (
+        "Salesforce disclosed customer-service workflow deployment [1]. "
+        "This supports workflow demand because customer-service deployment requires permission controls, integration, role ownership, operating responsibility, and repeatable service processes. "
+        "The same point is repeated in the composer paragraph because the deterministic path tries to preserve mechanism and boundary language before the public rewrite layer. "
+        "The same point is repeated in the composer paragraph because the deterministic path tries to preserve mechanism and boundary language before the public rewrite layer."
+    )
+    monkeypatch.setattr(
+        "rag_pipeline.agents.section_body_rewrite_agent.call_openai_compatible_json",
+        lambda **kwargs: {
+            "payload": {
+                "paragraph": "Salesforce disclosed customer-service workflow deployment, showing that enterprise agents are moving from trial tools into repeatable operating workflows [1].",
+                "used_fact_refs": ["EV-1"],
+                "citation_refs": ["[1]"],
+            }
+        },
+    )
+
+    result = rewrite_section_body(
+        section=long_section,
+        facts=_facts(),
+        chapter_question="Can AI agents convert into workflow deployment?",
+        llm_config={"url": "https://llm.test", "api_key": "key", "model": "mock-model"},
+    )
+
+    assert result["status"] == "rewritten"
+    assert "repeatable operating workflows" in result["paragraph"]
+
+
 def test_rewrite_section_body_rejects_new_numbers(monkeypatch, tmp_path):
     monkeypatch.setenv("REPORT_ENABLE_LLM_BODY_REWRITE", "true")
     monkeypatch.setenv("REPORT_BODY_REWRITE_CACHE_ENABLED", "false")
@@ -682,4 +719,5 @@ def test_rewrite_sections_for_report_marks_budget_exhausted(monkeypatch, tmp_pat
 
     assert [section["body_rewrite_status"] for section in rewritten[0]["sections"]] == ["rewritten", "skipped"]
     assert rewritten[0]["sections"][1]["body_rewrite"]["failure_reason"] == "budget_exhausted"
+    assert rewritten[0]["sections"][1]["render_blocks"][0]["text"] == _section_with_ref("EV-B", "[2]", section_id="s-b")["paragraph"]
     assert diagnostics["budget_exhausted_count"] == 1

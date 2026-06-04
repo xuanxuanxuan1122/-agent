@@ -69,6 +69,39 @@ def normalize_evidence_refs(payload: Dict[str, Any]) -> List[str]:
     return _refs_from_values(values)
 
 
+def normalize_requirement_ids(payload: Dict[str, Any]) -> List[str]:
+    values: List[Any] = []
+    for key in (
+        "requirement_ids",
+        "requirement_id",
+        "evidence_requirement_ids",
+        "evidence_requirement_id",
+        "required_slot_ids",
+        "slot_id",
+    ):
+        value = as_dict(payload.get("lineage")).get(key) if key in as_dict(payload.get("lineage")) else payload.get(key)
+        if isinstance(value, list):
+            values.extend(value)
+        elif value not in (None, ""):
+            values.append(value)
+    return _refs_from_values(values)
+
+
+def _first_requirement_id(payload: Dict[str, Any]) -> str:
+    ids = normalize_requirement_ids(payload)
+    return ids[0] if ids else ""
+
+
+def _lineage_list(payload: Dict[str, Any], key: str) -> List[str]:
+    lineage = as_dict(payload.get("lineage"))
+    value = lineage.get(key)
+    if isinstance(value, list):
+        return _refs_from_values(value)
+    if value not in (None, ""):
+        return _refs_from_values([value])
+    return []
+
+
 def _source_identity_refs(source: Dict[str, Any]) -> List[str]:
     refs: List[Any] = [
         source.get("ref"),
@@ -292,6 +325,8 @@ def normalize_chapter_id(payload: Dict[str, Any]) -> str:
 class EvidenceFactCard:
     evidence_id: str = ""
     chapter_id: str = ""
+    hypothesis_id: str = ""
+    requirement_id: str = ""
     subject: str = ""
     action_or_signal: str = ""
     variable: str = ""
@@ -304,8 +339,14 @@ class EvidenceFactCard:
     source_level: str = ""
     verification_status: str = ""
     proof_role: str = ""
+    analysis_role: str = ""
+    analysis_eligible: bool = False
+    allowed_use: str = ""
     block_affinity: List[str] = field(default_factory=list)
     claim_strength_hint: str = ""
+    source_id: str = ""
+    search_task_id: str = ""
+    lineage: Dict[str, Any] = field(default_factory=dict)
     raw: Dict[str, Any] = field(default_factory=dict)
     diagnostics: Dict[str, Any] = field(default_factory=dict)
 
@@ -326,14 +367,33 @@ class EvidenceFactCard:
         )
         if not source_ref and "source_id" in merged:
             source_ref = _text(merged.get("source_id"))
+        search_task = as_dict(merged.get("search_task"))
+        requirement_id = _first_requirement_id(merged)
+        hypothesis_id = _first_text(merged.get("hypothesis_id"), search_task.get("hypothesis_id"))
+        evidence_id = _first_text(merged.get("evidence_id"), merged.get("id"), merged.get("ref"))
+        chapter_id = normalize_chapter_id(merged)
+        source_id = _first_text(merged.get("source_id"), merged.get("source_ref"), merged.get("citation_ref"), source_ref)
+        search_task_id = _first_text(merged.get("search_task_id"), search_task.get("task_id"), search_task.get("id"))
+        lineage = {
+            **as_dict(merged.get("lineage")),
+            "chapter_id": chapter_id,
+            "hypothesis_id": hypothesis_id,
+            "requirement_id": requirement_id,
+            "fact_id": evidence_id,
+            "source_id": source_id,
+            "search_task_id": search_task_id,
+        }
+        lineage = {key: value for key, value in lineage.items() if value not in (None, "", [])}
         affinity_raw = merged.get("block_affinity")
         if isinstance(affinity_raw, str):
             affinity = [affinity_raw] if affinity_raw.strip() else []
         else:
             affinity = [_text(item) for item in as_list(affinity_raw) if _text(item)]
         return cls(
-            evidence_id=_first_text(merged.get("evidence_id"), merged.get("id"), merged.get("ref")),
-            chapter_id=normalize_chapter_id(merged),
+            evidence_id=evidence_id,
+            chapter_id=chapter_id,
+            hypothesis_id=hypothesis_id,
+            requirement_id=requirement_id,
             subject=_first_text(merged.get("subject"), merged.get("company"), merged.get("entity")),
             action_or_signal=_first_text(merged.get("action_or_signal"), merged.get("action"), merged.get("signal")),
             variable=_first_text(merged.get("variable"), merged.get("analysis_variable"), merged.get("metric"), merged.get("indicator")),
@@ -353,8 +413,14 @@ class EvidenceFactCard:
             source_level=_first_text(merged.get("source_level"), merged.get("credibility")),
             verification_status=_first_text(merged.get("source_verification_status"), merged.get("verification_status")),
             proof_role=_first_text(merged.get("proof_role"), merged.get("evidence_goal"), merged.get("role")),
+            analysis_role=_first_text(merged.get("analysis_role"), quality.get("analysis_role")),
+            analysis_eligible=bool(merged.get("analysis_eligible") if "analysis_eligible" in merged else quality.get("analysis_eligible")),
+            allowed_use=_first_text(merged.get("allowed_use"), quality.get("allowed_use")),
             block_affinity=affinity,
             claim_strength_hint=_first_text(merged.get("claim_strength_hint"), merged.get("claim_strength")),
+            source_id=source_id,
+            search_task_id=search_task_id,
+            lineage=lineage,
             raw=payload,
             diagnostics={"eligible_for_report": quality.get("eligible_for_report")},
         )
@@ -384,6 +450,14 @@ class EvidenceFactCard:
             **self.raw,
             "evidence_id": self.evidence_id,
             "chapter_id": self.chapter_id,
+            "hypothesis_id": self.hypothesis_id,
+            "requirement_id": self.requirement_id,
+            "analysis_role": self.analysis_role,
+            "analysis_eligible": self.analysis_eligible,
+            "allowed_use": self.allowed_use,
+            "source_id": self.source_id,
+            "search_task_id": self.search_task_id,
+            "lineage": dict(self.lineage),
             "public_fact_card": card,
             "public_fact_quality": {"eligible_for_report": self.is_valid_for_report, "public_fact_card": card},
         }
@@ -393,32 +467,51 @@ class EvidenceFactCard:
 class ClaimUnit:
     claim_id: str = ""
     chapter_id: str = ""
+    hypothesis_id: str = ""
+    requirement_ids: List[str] = field(default_factory=list)
     claim: str = ""
     evidence_refs: List[str] = field(default_factory=list)
     evidence_basis: List[str] = field(default_factory=list)
     reasoning_chain: str = ""
     limitation_boundary: str = ""
     claim_strength: str = "directional"
+    claim_strength_ceiling: str = ""
     analysis_role: str = ""
     source_support_map: Dict[str, List[str]] = field(default_factory=dict)
     paragraph_seed: str = ""
     block_type: str = ""
     section_id: str = ""
+    lineage: Dict[str, Any] = field(default_factory=dict)
     raw: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_legacy_dict(cls, payload: Dict[str, Any]) -> "ClaimUnit":
         payload = as_dict(payload)
         basis = payload.get("evidence_basis") or payload.get("supporting_facts") or payload.get("fact_chain") or []
+        evidence_refs = normalize_evidence_refs(payload)
+        requirement_ids = normalize_requirement_ids(payload)
+        lineage = {
+            **as_dict(payload.get("lineage")),
+            "chapter_id": normalize_chapter_id(payload),
+            "hypothesis_id": _first_text(payload.get("hypothesis_id"), as_dict(payload.get("lineage")).get("hypothesis_id")),
+            "requirement_ids": requirement_ids or _lineage_list(payload, "requirement_ids"),
+            "fact_ids": _lineage_list(payload, "fact_ids") or evidence_refs,
+            "source_ids": _lineage_list(payload, "source_ids"),
+            "search_task_ids": _lineage_list(payload, "search_task_ids"),
+        }
+        lineage = {key: value for key, value in lineage.items() if value not in (None, "", [])}
         return cls(
             claim_id=_first_text(payload.get("claim_id"), payload.get("id")),
             chapter_id=normalize_chapter_id(payload),
+            hypothesis_id=_first_text(payload.get("hypothesis_id"), as_dict(payload.get("lineage")).get("hypothesis_id")),
+            requirement_ids=requirement_ids,
             claim=_first_text(payload.get("claim"), payload.get("judgment"), payload.get("takeaway"), payload.get("core_answer")),
-            evidence_refs=normalize_evidence_refs(payload),
+            evidence_refs=evidence_refs,
             evidence_basis=[_text(item) for item in as_list(basis) if _text(item)],
             reasoning_chain=_first_text(payload.get("reasoning_chain"), payload.get("reasoning"), payload.get("mechanism")),
             limitation_boundary=_first_text(payload.get("limitation_boundary"), payload.get("counter_evidence"), payload.get("boundary")),
             claim_strength=_first_text(payload.get("claim_strength"), payload.get("strength"), payload.get("claim_status")) or "directional",
+            claim_strength_ceiling=_first_text(payload.get("claim_strength_ceiling"), as_dict(payload.get("lineage")).get("claim_strength_ceiling")),
             analysis_role=_first_text(payload.get("analysis_role"), payload.get("allowed_use"), payload.get("proof_role")),
             source_support_map={
                 key: [ref for ref in normalize_evidence_refs({"evidence_refs": value}) if ref]
@@ -427,6 +520,7 @@ class ClaimUnit:
             paragraph_seed=_first_text(payload.get("paragraph_seed")),
             block_type=_first_text(payload.get("block_type"), payload.get("layout_section_role"), payload.get("output_type")),
             section_id=_first_text(payload.get("section_id"), payload.get("id")),
+            lineage=lineage,
             raw=payload,
         )
 
@@ -435,6 +529,8 @@ class ClaimUnit:
             **self.raw,
             "claim_id": self.claim_id,
             "chapter_id": self.chapter_id,
+            "hypothesis_id": self.hypothesis_id,
+            "requirement_ids": list(self.requirement_ids),
             "claim": self.claim,
             "evidence_refs": list(self.evidence_refs),
             "used_fact_refs": list(self.evidence_refs),
@@ -444,11 +540,13 @@ class ClaimUnit:
             "mechanism": self.reasoning_chain,
             "counter_evidence": self.limitation_boundary,
             "claim_strength": self.claim_strength,
+            "claim_strength_ceiling": self.claim_strength_ceiling,
             "analysis_role": self.analysis_role,
             "source_support_map": {key: list(value) for key, value in self.source_support_map.items()},
             "paragraph_seed": self.paragraph_seed,
             "block_type": self.block_type,
             "section_id": self.section_id,
+            "lineage": dict(self.lineage),
         }
 
 

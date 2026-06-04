@@ -117,6 +117,17 @@ def _enabled() -> bool:
     return _env_flag("TRUSTED_SOURCE_CACHE_ENABLED", True)
 
 
+def trusted_source_stats() -> Dict[str, Any]:
+    """只读统计，供 cache_report 聚合（fail-open）。"""
+    try:
+        path = _path()
+        if not path.exists():
+            return {"enabled": _enabled(), "entry_count": 0, "path": str(path)}
+        return {"enabled": _enabled(), "entry_count": len(_load_entries(path)), "path": str(path)}
+    except Exception as exc:
+        return {"enabled": _enabled(), "error": str(exc)}
+
+
 def _compact_text(value: Any, *, max_chars: int = 1200) -> str:
     text = re.sub(r"\s+", " ", str(value or "")).strip()
     if len(text) <= max_chars:

@@ -107,6 +107,8 @@ def test_quality_mode_replay_reruns_analysis_with_llm_and_enables_rewrite(tmp_pa
     monkeypatch.setenv("REPORT_ENABLE_FINAL_AUDIT", "false")
     monkeypatch.setenv("REPORT_ENABLE_LLM_BODY_REWRITE", "false")
     monkeypatch.setenv("BRAIN_ENABLE_LLM_EVIDENCE_ANALYSIS", "false")
+    monkeypatch.setenv("RAG_MODEL_QA_PROFILE", "qwen")
+    monkeypatch.setenv("RAG_MODEL_QUERY_REWRITE_PROFILE", "deepseek-v4-pro")
     run_id = "20260101_000001_quality_topic"
     source_registry = _quality_test_source_registry()
     report_blueprint = {
@@ -200,9 +202,12 @@ def test_quality_mode_replay_reruns_analysis_with_llm_and_enables_rewrite(tmp_pa
                 "rewrite_max_expansion_ratio": os.environ.get("REPORT_BODY_REWRITE_MAX_EXPANSION_RATIO"),
                 "rewrite_target_chars": os.environ.get("REPORT_BODY_REWRITE_TARGET_SECTION_CHARS"),
                 "chapter_narrative_enabled": os.environ.get("REPORT_ENABLE_LLM_CHAPTER_NARRATIVE"),
+                "chapter_narrative_max_chapters": os.environ.get("REPORT_CHAPTER_NARRATIVE_MAX_CHAPTERS"),
                 "target_body_chars": os.environ.get("REPORT_TARGET_BODY_CHARS"),
                 "composer_target_chars": os.environ.get("REPORT_COMPOSER_TARGET_SECTION_CHARS"),
                 "render_min_section_chars": os.environ.get("REPORT_RENDER_MIN_SECTION_CHARS"),
+                "qa_profile": os.environ.get("RAG_MODEL_QA_PROFILE"),
+                "query_rewrite_profile": os.environ.get("RAG_MODEL_QUERY_REWRITE_PROFILE"),
             }
         )
         structured = {
@@ -254,13 +259,16 @@ def test_quality_mode_replay_reruns_analysis_with_llm_and_enables_rewrite(tmp_pa
     assert calls[0]["llm_enabled"] == "true"
     assert calls[0]["rewrite_enabled"] == "true"
     assert calls[0]["rewrite_max_sections"] == "24"
-    assert calls[0]["rewrite_max_elapsed"] == "300"
+    assert calls[0]["rewrite_max_elapsed"] == "900"
     assert calls[0]["rewrite_max_expansion_ratio"] == "5.0"
-    assert calls[0]["rewrite_target_chars"] == "850"
+    assert calls[0]["rewrite_target_chars"] == "650"
     assert calls[0]["chapter_narrative_enabled"] == "true"
-    assert calls[0]["target_body_chars"] == "20000"
-    assert calls[0]["composer_target_chars"] == "850"
-    assert calls[0]["render_min_section_chars"] == "850"
+    assert calls[0]["chapter_narrative_max_chapters"] == "12"
+    assert calls[0]["target_body_chars"] == "0"
+    assert calls[0]["composer_target_chars"] == "550"
+    assert calls[0]["render_min_section_chars"] == "0"
+    assert calls[0]["qa_profile"] == "deepseek-v4-pro"
+    assert calls[0]["query_rewrite_profile"] == "qwen"
     assert calls[0]["llm_config"]
     score_text = Path(result["score_path"]).read_text(encoding="utf-8")
     assert "report_execution_mode: quality_llm_replay" in score_text

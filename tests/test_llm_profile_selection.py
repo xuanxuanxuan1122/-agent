@@ -84,34 +84,23 @@ def test_build_llm_config_for_task_routes_to_function_profile(monkeypatch):
         url="https://api.deepseek.example/chat/completions",
         disable_thinking="false",
     )
-    _profile(
-        monkeypatch,
-        "gpt-5.5",
-        model="gpt-5.5",
-        url="https://api.openai.example/v1",
-        disable_thinking="false",
-    )
-    monkeypatch.setenv("RAG_LLM_PROFILE_GPT_5_5_REASONING_EFFORT", "high")
-    monkeypatch.setenv("RAG_LLM_PROFILE_GPT_5_5_MAX_OUTPUT_TOKENS", "32000")
-    monkeypatch.setenv("RAG_MODEL_PLANNING_PROFILE", "gpt-5.5")
-    monkeypatch.setenv("RAG_MODEL_QA_PROFILE", "gpt-5.5")
-    monkeypatch.setenv("RAG_MODEL_FINAL_AUDIT_PROFILE", "gpt-5.5")
+    monkeypatch.setenv("RAG_MODEL_PLANNING_PROFILE", "deepseek-v4-pro")
+    monkeypatch.setenv("RAG_MODEL_QA_PROFILE", "deepseek-v4-pro")
+    monkeypatch.setenv("RAG_MODEL_FINAL_AUDIT_PROFILE", "deepseek-v4-pro")
 
     planning = search_config.build_llm_config_for_task("planning")
     qa = search_config.build_llm_config_for_task("qa")
     final_audit = search_config.build_llm_config_for_task("final_audit")
 
-    assert planning["model"] == "gpt-5.5"
-    assert qa["model"] == "gpt-5.5"
-    assert final_audit["model"] == "gpt-5.5"
-    assert planning["fallback_config"]["model"] == "deepseek-v4-pro"
-    assert qa["fallback_config"]["model"] == "deepseek-v4-pro"
-    assert final_audit["fallback_config"]["model"] == "deepseek-v4-pro"
-    assert final_audit["reasoning_effort"] == "high"
-    assert final_audit["max_output_tokens"] == 32000
+    assert planning["model"] == "deepseek-v4-pro"
+    assert qa["model"] == "deepseek-v4-pro"
+    assert final_audit["model"] == "deepseek-v4-pro"
+    assert "fallback_config" not in planning
+    assert "fallback_config" not in qa
+    assert "fallback_config" not in final_audit
 
 
-def test_quality_tasks_force_gpt55_profile_when_available(monkeypatch):
+def test_quality_tasks_respect_explicit_function_profile(monkeypatch):
     _profile(
         monkeypatch,
         "qwen",
@@ -126,24 +115,17 @@ def test_quality_tasks_force_gpt55_profile_when_available(monkeypatch):
         url="https://api.deepseek.example/chat/completions",
         disable_thinking="false",
     )
-    _profile(
-        monkeypatch,
-        "gpt-5.5",
-        model="gpt-5.5",
-        url="https://api.openai.example/v1",
-        disable_thinking="false",
-    )
     monkeypatch.setenv("RAG_MODEL_REFORMATTER_PROFILE", "qwen")
     monkeypatch.setenv("RAG_MODEL_REVIEW_STAGE2_PROFILE", "qwen")
 
     reformatter = search_config.build_llm_config_for_task("reformatter")
     review = search_config.build_llm_config_for_task("review_stage2")
 
-    assert reformatter["model"] == "gpt-5.5"
-    assert review["model"] == "gpt-5.5"
-    assert reformatter["fallback_config"]["model"] == "deepseek-v4-pro"
-    assert review["fallback_config"]["model"] == "deepseek-v4-pro"
-    assert reformatter["forced_quality_profile"] is True
+    assert reformatter["model"] == "qwen3.6-plus"
+    assert review["model"] == "qwen3.6-plus"
+    assert "fallback_config" not in reformatter
+    assert "fallback_config" not in review
+    assert not reformatter.get("forced_quality_profile")
 
 
 def test_industry_ecosystem_report_routes_to_industry_deep_report():
@@ -157,7 +139,6 @@ def test_build_llm_config_from_profile_handles_model_pool_names(monkeypatch):
         "qwen": "qwen3.6-plus",
         "deepseek-v4-pro": "deepseek-v4-pro",
         "deepseek-v4-flash": "deepseek-v4-flash",
-        "gpt-5.5": "gpt-5.5",
         "gemini-3.5-flash": "gemini-3.5-flash",
     }
     for profile, model in profiles.items():
@@ -180,7 +161,6 @@ def test_build_llm_config_for_task_falls_back_to_legacy_synthesis(monkeypatch):
     for name in list(os.environ):
         if name.startswith("RAG_MODEL_"):
             monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("RAG_FORCE_GPT55_QUALITY_TASKS", "false")
     monkeypatch.setenv("RAG_MODEL_QA_PROFILE", "deepseek-v4-pro")
     monkeypatch.setenv("RAG_LLM_PROFILE_DEEPSEEK_V4_PRO_URL", "")
     monkeypatch.setenv("RAG_LLM_PROFILE_DEEPSEEK_V4_PRO_API_KEY", "")

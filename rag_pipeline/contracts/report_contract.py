@@ -354,6 +354,174 @@ def _quality_thresholds(
     }
 
 
+ROLE_REQUIRED_FIELDS = {
+    "metric": ["metric", "value", "unit", "period", "scope", "source_ref"],
+    "source_check": ["source_ref", "source_title", "source_url"],
+    "counter": ["counter_signal", "source_ref"],
+    "case": ["company", "use_case", "deployment_scope", "source_ref"],
+    "customer_case": ["company", "use_case", "deployment_scope", "source_ref"],
+    "technology": ["capability", "constraint", "source_ref"],
+    "technology_product": ["capability", "constraint", "source_ref"],
+    "competitive_positioning": ["player", "positioning_signal", "source_ref"],
+    "support": ["fact", "source_ref"],
+}
+
+
+def _role_source_level(role: str, chapter: Dict[str, Any]) -> str:
+    role = str(role or "").strip().lower()
+    minimum = str(chapter.get("minimum_source_level") or "B").strip().upper() or "B"
+    if role in {"metric", "source_check"}:
+        return "A" if minimum == "A" else "B"
+    if role in {"case", "customer_case", "counter", "technology", "technology_product"}:
+        return "C"
+    return minimum if minimum in {"A", "B", "C", "D"} else "B"
+
+
+def _role_strength_ceiling(role: str, min_source_level: str) -> str:
+    role = str(role or "").strip().lower()
+    min_source_level = str(min_source_level or "").strip().upper()
+    if role in {"metric", "source_check"} and min_source_level in {"A", "B"}:
+        return "moderate"
+    if min_source_level == "A":
+        return "moderate"
+    return "directional"
+
+
+def _requirement_slots_for_chapters(chapters: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    requirements: List[Dict[str, Any]] = []
+    seen = set()
+    for chapter in chapters or []:
+        chapter_id = str(chapter.get("chapter_id") or "").strip()
+        if not chapter_id:
+            continue
+        for role in _as_list(chapter.get("required_evidence_roles")):
+            proof_role = re.sub(r"[^A-Za-z0-9_\-\u4e00-\u9fff]+", "_", str(role or "").strip().lower()).strip("_")
+            if not proof_role:
+                continue
+            requirement_id = f"{chapter_id}_{proof_role}"
+            if requirement_id in seen:
+                continue
+            seen.add(requirement_id)
+            min_source_level = _role_source_level(proof_role, chapter)
+            requirements.append(
+                {
+                    "requirement_id": requirement_id,
+                    "chapter_id": chapter_id,
+                    "hypothesis_id": f"{chapter_id}_H1",
+                    "proof_role": proof_role,
+                    "required_fields": ROLE_REQUIRED_FIELDS.get(proof_role, ROLE_REQUIRED_FIELDS["support"]),
+                    "min_source_level": min_source_level,
+                    "source_family_preference": _as_list(chapter.get("required_evidence_mix")),
+                    "claim_strength_ceiling": _role_strength_ceiling(proof_role, min_source_level),
+                    "repair_policy": {
+                        "route": "targeted_repair",
+                        "max_tasks_per_chapter": 1,
+                    },
+                }
+            )
+    return requirements
+
+
+def _package_evidence_items(package: Dict[str, Any]) -> List[Dict[str, Any]]:
+    evidence_package = _as_dict(package.get("evidence_package"))
+    items: List[Dict[str, Any]] = []
+    for key in (
+        "analysis_ready_evidence",
+        "clean_evidence_list",
+        "evidence_analyses",
+        "fact_cards",
+    ):
+        items.extend(item for item in _as_list(evidence_package.get(key)) if isinstance(item, dict))
+    for chapter_package in _as_list(evidence_package.get("chapter_evidence_packages")):
+        chapter = _as_dict(chapter_package)
+        for key, value in chapter.items():
+            if key.endswith("_evidence") or key in {"core_evidence", "supporting_evidence", "directional_evidence"}:
+                items.extend(item for item in _as_list(value) if isinstance(item, dict))
+    return items
+
+
+def _item_requirement_ids(item: Dict[str, Any]) -> List[str]:
+    values: List[Any] = []
+    lineage = _as_dict(item.get("lineage"))
+    for key in ("requirement_ids", "requirement_id", "evidence_requirement_ids", "evidence_requirement_id", "slot_id"):
+        value = lineage.get(key) if key in lineage else item.get(key)
+        if isinstance(value, list):
+            values.extend(value)
+        elif value not in (None, ""):
+            values.append(value)
+    return _dedupe(values, limit=12, max_chars=100)
+
+
+def _item_ref(item: Dict[str, Any]) -> str:
+    return _compact(item.get("evidence_id") or item.get("id") or item.get("ref") or item.get("source_ref"), 100)
+
+
+def _item_source_level(item: Dict[str, Any]) -> str:
+    return str(item.get("source_level") or _as_dict(item.get("evidence_card")).get("source_level") or "C").strip().upper()
+
+
+def _item_analysis_eligible(item: Dict[str, Any]) -> bool:
+    if "analysis_eligible" in item:
+        return bool(item.get("analysis_eligible"))
+    card = _as_dict(item.get("evidence_card"))
+    if "analysis_eligible" in card:
+        return bool(card.get("analysis_eligible"))
+    return True
+
+
+def _requirement_status_matrix(requirements: Sequence[Dict[str, Any]], evidence_items: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for item in evidence_items or []:
+        payload = _as_dict(item)
+        if not payload or not _item_analysis_eligible(payload):
+            continue
+        for requirement_id in _item_requirement_ids(payload):
+            grouped.setdefault(requirement_id, []).append(payload)
+    matrix: List[Dict[str, Any]] = []
+    for requirement in requirements or []:
+        requirement_id = str(requirement.get("requirement_id") or "").strip()
+        proof_role = str(requirement.get("proof_role") or "").strip()
+        matched = grouped.get(requirement_id, [])
+        matched_refs = _dedupe([_item_ref(item) for item in matched if _item_ref(item)], limit=20, max_chars=100)
+        if not matched_refs:
+            matrix.append(
+                {
+                    "requirement_id": requirement_id,
+                    "chapter_id": requirement.get("chapter_id"),
+                    "proof_role": proof_role,
+                    "status": "needs_repair",
+                    "matched_fact_refs": [],
+                    "missing": [proof_role or "evidence"],
+                    "can_generate_claim": False,
+                    "claim_strength_ceiling": "none",
+                    "repair_tasks": [
+                        {
+                            "proof_role": proof_role,
+                            "required_fields": _as_list(requirement.get("required_fields")),
+                            "reason": "no_matching_fact_card",
+                        }
+                    ],
+                }
+            )
+            continue
+        levels = {_item_source_level(item) for item in matched}
+        directional = bool(levels - {"A", "B"}) or proof_role in {"case", "customer_case", "counter", "technology", "technology_product"}
+        matrix.append(
+            {
+                "requirement_id": requirement_id,
+                "chapter_id": requirement.get("chapter_id"),
+                "proof_role": proof_role,
+                "status": "directional_ready" if directional else "ready",
+                "matched_fact_refs": matched_refs,
+                "missing": [],
+                "can_generate_claim": True,
+                "claim_strength_ceiling": "directional" if directional else str(requirement.get("claim_strength_ceiling") or "moderate"),
+                "repair_tasks": [],
+            }
+        )
+    return matrix
+
+
 def build_report_contract(
     *,
     query: str,
@@ -405,6 +573,7 @@ def build_report_contract(
             "global_forbidden_terms": _dedupe(research_plan.get("global_forbidden_terms"), limit=20, max_chars=80),
             "source_requirements": source_requirements,
             "coverage_requirements": coverage_requirements,
+            "requirements": _requirement_slots_for_chapters(chapters),
             "per_chapter": [
                 {
                     "chapter_id": chapter.get("chapter_id"),
@@ -447,9 +616,16 @@ def build_report_contract_from_package(package: Dict[str, Any]) -> Dict[str, Any
     research_plan = _research_plan_from_package(package)
     report_blueprint = _as_dict(package.get("report_blueprint"))
     template = _as_dict(package.get("report_template")) or _as_dict(package.get("template"))
-    return build_report_contract(
+    contract = build_report_contract(
         query=str(package.get("query") or research_plan.get("query") or ""),
         research_plan=research_plan,
         report_blueprint=report_blueprint,
         template=template,
     )
+    requirements = _as_list(_as_dict(contract.get("evidence_requirements")).get("requirements"))
+    if requirements:
+        contract["evidence_requirements"] = {
+            **_as_dict(contract.get("evidence_requirements")),
+            "requirement_status": _requirement_status_matrix(requirements, _package_evidence_items(package)),
+        }
+    return contract

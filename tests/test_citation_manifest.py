@@ -937,6 +937,54 @@ def test_final_writer_drops_evidence_backed_section_without_manifest_citation(mo
     assert output["final_citation_audit"]["factual_body_without_citations_count"] == 0
 
 
+def test_final_writer_recomputes_citation_audit_after_public_gate(monkeypatch):
+    from rag_pipeline.agents import final_writer_agent
+
+    monkeypatch.setenv("REPORT_FINAL_WRITER_SOURCE_APPENDIX", "true")
+
+    def fake_public_gate(markdown: str):
+        cleaned = str(markdown or "").replace("2026 market size reached 10 billion.", "")
+        return cleaned, {
+            "public_narrative_leak_input_count": 1,
+            "public_narrative_leak_remaining_count": 0,
+            "public_narrative_leak_removed_count": 1,
+            "public_narrative_leak_reason_counts": {"test": 1},
+            "public_narrative_leak_examples": ["2026 market size reached 10 billion."],
+            "public_narrative_leak_remaining_examples": [],
+        }
+
+    monkeypatch.setattr(final_writer_agent, "apply_public_narrative_gate", fake_public_gate)
+
+    output = run_final_writer_agent(
+        query="AI Agent",
+        report_blueprint={
+            "report_shell": {"front_blocks": [], "back_blocks": []},
+            "chapters": [{"chapter_id": "ch_01", "chapter_title": "Market"}],
+        },
+        chapter_packages=[
+            {
+                "chapter_id": "ch_01",
+                "chapter_title": "Market",
+                "sections": [
+                    {
+                        "section_id": "s1",
+                        "section_title": "Market signal",
+                        "claim": "2026 market size reached 10 billion.",
+                        "reasoning": "2026 market size reached 10 billion.",
+                        "render_blocks": [{"type": "paragraph", "text": "2026 market size reached 10 billion."}],
+                        "evidence_backed": False,
+                    }
+                ],
+            }
+        ],
+        source_registry=[],
+    )
+
+    assert "2026 market size reached 10 billion" not in output["report_markdown"]
+    assert output["final_citation_audit"]["final_citation_reconciliation_status"] == "ok"
+    assert output["final_citation_audit"]["factual_body_without_citations_count"] == 0
+
+
 def test_final_writer_preserves_analysis_claim_from_single_company_source(monkeypatch):
     monkeypatch.setenv("REPORT_FINAL_WRITER_SOURCE_APPENDIX", "true")
 

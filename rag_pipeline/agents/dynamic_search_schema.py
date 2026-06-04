@@ -386,10 +386,10 @@ def normalize_search_task(raw: Dict[str, Any], *, fallback_index: int = 1) -> Di
     evidence_goal = str(task.get("evidence_goal") or task.get("goal") or task.get("targets_gap") or "").strip()
     intent = str(task.get("intent") or "analysis").strip().lower()
     agent = str(task.get("agent") or "iqs").strip().lower()
-    if agent not in {"iqs", "rag", "both", "all", "openai_web"} and not agent.startswith("iqs_"):
+    if agent not in {"iqs", "rag", "both", "all"} and not agent.startswith("iqs_"):
         agent = "iqs"
     retrieval_mode = str(task.get("retrieval_mode") or "").strip().lower()
-    if retrieval_mode not in {"deep", "normal", "hybrid", "openai_repair"}:
+    if retrieval_mode not in {"deep", "normal", "hybrid"}:
         retrieval_mode = ""
     return {
         "task_id": task_id,
@@ -403,6 +403,14 @@ def normalize_search_task(raw: Dict[str, Any], *, fallback_index: int = 1) -> Di
         "evidence_goal": evidence_goal,
         "targets_gap": str(task.get("targets_gap") or evidence_goal).strip(),
         "evidence_goal_id": str(task.get("evidence_goal_id") or task.get("goal_id") or "").strip(),
+        "requirement_id": str(
+            task.get("requirement_id")
+            or task.get("evidence_requirement_id")
+            or task.get("slot_id")
+            or task.get("evidence_goal_id")
+            or task.get("goal_id")
+            or ""
+        ).strip(),
         "gap_id": str(task.get("gap_id") or task.get("mandatory_proof_id") or task.get("proof_id") or task.get("targets_gap") or "").strip(),
         "gap_type": str(task.get("gap_type") or task.get("type") or "").strip(),
         "type": str(task.get("type") or "").strip(),
@@ -419,6 +427,7 @@ def normalize_search_task(raw: Dict[str, Any], *, fallback_index: int = 1) -> Di
         "retriever": str(task.get("retriever") or task.get("source_type") or "").strip(),
         "hypothesis_id": str(task.get("hypothesis_id") or "").strip(),
         "hypothesis_statement": str(task.get("hypothesis_statement") or task.get("hypothesis") or "").strip(),
+        "claim_strength_ceiling": str(task.get("claim_strength_ceiling") or task.get("claim_strength") or "").strip().lower(),
         "evidence_type": str(task.get("evidence_type") or task.get("intent") or "data").strip().lower(),
         "lane_targets": _string_list(task.get("lane_targets") or task.get("lanes")),
         "counter_evidence": bool(task.get("counter_evidence") or str(task.get("proof_role") or "").strip().lower() == "counter"),

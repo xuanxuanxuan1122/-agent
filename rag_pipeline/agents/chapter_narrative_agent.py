@@ -354,7 +354,6 @@ def _fallback_llm_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
     profile_values = [
         os.getenv("REPORT_CHAPTER_NARRATIVE_FALLBACK_PROFILES", ""),
         os.getenv("REPORT_BODY_REWRITE_FALLBACK_PROFILES", ""),
-        os.getenv("RAG_LLM_GPT55_FALLBACK_PROFILE", ""),
     ]
     seen = {
         (

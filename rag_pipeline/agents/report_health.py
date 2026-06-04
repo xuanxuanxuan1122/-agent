@@ -75,7 +75,7 @@ def build_report_health_card(payload: Dict[str, Any]) -> Dict[str, Any]:
     quality_mode = str(payload.get("quality_mode") or quality_posture.get("mode") or payload.get("execution_mode") or "").strip().lower()
     high_quality_mode = quality_mode in {"true", "1", "yes", "high", "strict", "due_diligence", "live_quality_full", "quality_llm_replay"}
     body_chars = _int(payload.get("body_char_count") or payload.get("body_chars"))
-    target_body_chars = _int(payload.get("target_body_chars")) or 20000
+    target_body_chars = _int(payload.get("target_body_chars"))
     min_body_chars = int(target_body_chars * 0.9) if target_body_chars else 0
     h3_count = _int(payload.get("h3_count"))
     llm_usable_claim_count = _int(analysis.get("llm_usable_claim_count") or payload.get("llm_usable_claim_count"))

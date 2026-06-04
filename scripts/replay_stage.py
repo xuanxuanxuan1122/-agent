@@ -21,7 +21,14 @@ from rag_pipeline.agents.micro_layout_agent import run_micro_layout_agent
 from rag_pipeline.cache.stage_snapshot_cache import list_stage_snapshots, load_stage_snapshot, stage_snapshot_cache_root
 from rag_pipeline.config.search_config import build_llm_config_for_task
 from rag_pipeline.flows.report.final_audit_agent import run_final_audit
-from rag_pipeline.flows.report.full_report import render_score_markdown, write_formal_markdown, write_score_markdown
+from rag_pipeline.flows.report.full_report import (
+    HIGH_WRITING_QUALITY_DEFAULTS,
+    apply_report_quality_posture,
+    finalize_formal_report_and_refresh_audit,
+    render_score_markdown,
+    write_formal_markdown,
+    write_score_markdown,
+)
 from rag_pipeline.observability.run_trace import write_run_trace_from_package
 from regenerate_report_from_package import _augment_chapter_evidence_packages, _as_dict, _as_list, _normalize_structured_analysis
 
@@ -178,19 +185,24 @@ def replay_stage(
         "REPORT_COMPOSER_TARGET_SECTION_CHARS": os.environ.get("REPORT_COMPOSER_TARGET_SECTION_CHARS"),
         "REPORT_RENDER_MIN_SECTION_CHARS": os.environ.get("REPORT_RENDER_MIN_SECTION_CHARS"),
         "REPORT_REPLAY_EXECUTION_MODE": os.environ.get("REPORT_REPLAY_EXECUTION_MODE"),
+        "RAG_MODEL_PLANNING_PROFILE": os.environ.get("RAG_MODEL_PLANNING_PROFILE"),
+        "RAG_MODEL_QUERY_REWRITE_PROFILE": os.environ.get("RAG_MODEL_QUERY_REWRITE_PROFILE"),
+        "RAG_MODEL_WEB_SUMMARY_PROFILE": os.environ.get("RAG_MODEL_WEB_SUMMARY_PROFILE"),
+        "RAG_MODEL_EVIDENCE_MERGE_PROFILE": os.environ.get("RAG_MODEL_EVIDENCE_MERGE_PROFILE"),
+        "RAG_MODEL_COVERAGE_EVAL_PROFILE": os.environ.get("RAG_MODEL_COVERAGE_EVAL_PROFILE"),
+        "RAG_MODEL_RISK_PROFILE": os.environ.get("RAG_MODEL_RISK_PROFILE"),
+        "RAG_MODEL_DECISION_PROFILE": os.environ.get("RAG_MODEL_DECISION_PROFILE"),
+        "RAG_MODEL_REFORMATTER_PROFILE": os.environ.get("RAG_MODEL_REFORMATTER_PROFILE"),
+        "RAG_MODEL_BODY_REWRITE_PROFILE": os.environ.get("RAG_MODEL_BODY_REWRITE_PROFILE"),
+        "RAG_MODEL_QA_PROFILE": os.environ.get("RAG_MODEL_QA_PROFILE"),
+        "RAG_MODEL_REFLECTION_PROFILE": os.environ.get("RAG_MODEL_REFLECTION_PROFILE"),
+        "RAG_MODEL_FINAL_AUDIT_PROFILE": os.environ.get("RAG_MODEL_FINAL_AUDIT_PROFILE"),
+        "READPAGE_FACT_EXTRACTOR_MODEL_PROFILE": os.environ.get("READPAGE_FACT_EXTRACTOR_MODEL_PROFILE"),
     }
     if quality_mode:
-        os.environ["BRAIN_ENABLE_LLM_EVIDENCE_ANALYSIS"] = "true"
-        os.environ["REPORT_ENABLE_LLM_BODY_REWRITE"] = "true"
-        os.environ["REPORT_BODY_REWRITE_MAX_SECTIONS"] = "24"
-        os.environ["REPORT_BODY_REWRITE_MAX_ELAPSED_SECONDS"] = "300"
-        os.environ["REPORT_BODY_REWRITE_CONCURRENCY"] = "3"
-        os.environ["REPORT_BODY_REWRITE_MAX_EXPANSION_RATIO"] = "5.0"
-        os.environ["REPORT_BODY_REWRITE_TARGET_SECTION_CHARS"] = "850"
-        os.environ["REPORT_ENABLE_LLM_CHAPTER_NARRATIVE"] = "true"
-        os.environ["REPORT_TARGET_BODY_CHARS"] = "20000"
-        os.environ["REPORT_COMPOSER_TARGET_SECTION_CHARS"] = "850"
-        os.environ["REPORT_RENDER_MIN_SECTION_CHARS"] = "850"
+        apply_report_quality_posture(os.environ.get("REPORT_QUALITY_MODE") or "high")
+        for key, value in HIGH_WRITING_QUALITY_DEFAULTS.items():
+            os.environ[key] = value
         os.environ["REPORT_REPLAY_EXECUTION_MODE"] = execution_mode
     elif not allow_llm:
         os.environ["BRAIN_ENABLE_LLM_EVIDENCE_ANALYSIS"] = "false"
@@ -300,6 +312,7 @@ def _replay_stage_impl(
         chapter_evidence_packages=_as_list(package.get("chapter_evidence_packages")),
         claim_units=_as_list(package.get("argument_units")),
         analysis_claim_units=_as_list(_as_dict(package.get("structured_analysis")).get("claim_units")),
+        analysis_stage_diagnostics=_as_dict(_as_dict(package.get("structured_analysis")).get("analysis_stage_diagnostics")),
     )
     writer_report = {
         **writer_report,
@@ -311,6 +324,7 @@ def _replay_stage_impl(
         "citation_manifest": writer_output.get("citation_manifest") or {},
         "final_citation_audit": writer_output.get("final_citation_audit") or {},
         "source_claim_support": writer_output.get("source_claim_support") or {},
+        "chapter_narrative": writer_output.get("chapter_narrative") or {},
         "analysis_transfer": writer_output.get("analysis_transfer") or {},
         "ref_lineage_diagnostics": writer_output.get("ref_lineage_diagnostics") or {},
         "naturalness_cleanup": writer_output.get("naturalness_cleanup") or {},
@@ -328,6 +342,7 @@ def _replay_stage_impl(
             "citation_manifest": writer_output.get("citation_manifest") or {},
             "final_citation_audit": writer_output.get("final_citation_audit") or {},
             "source_claim_support": writer_output.get("source_claim_support") or {},
+            "chapter_narrative": writer_output.get("chapter_narrative") or {},
             "analysis_transfer": writer_output.get("analysis_transfer") or {},
             "ref_lineage_diagnostics": writer_output.get("ref_lineage_diagnostics") or {},
             "public_narrative_leak_audit": writer_output.get("public_narrative_leak_audit") or {},
@@ -341,6 +356,7 @@ def _replay_stage_impl(
     markdown = str(writer_report.get("report_markdown") or "").strip()
     if not markdown:
         raise RuntimeError("Replay writer output is empty.")
+    markdown, writer_report = finalize_formal_report_and_refresh_audit(markdown, writer_report)
 
     audit_package = {
         **package,

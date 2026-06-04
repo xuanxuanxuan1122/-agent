@@ -1,7 +1,9 @@
 import json
+import os
 
 import rag_pipeline.agents.analysis_agent as analysis_agent
 import rag_pipeline.agents.analysis_agent as analysis_agent
+from rag_pipeline.flows.report import full_report
 
 from rag_pipeline.agents.analysis_agent import (
     _chapter_evidence_diagnostics,
@@ -331,6 +333,91 @@ def test_llm_validator_normalizes_analysis_first_claim_contract():
     assert unit["analysis_role"] == "directional"
 
 
+def test_llm_input_v2_carries_requirement_contract_fields():
+    evidence = _evidence("EV-REQ")
+    evidence.update(
+        {
+            "hypothesis_id": "H1",
+            "requirement_id": "H1_case",
+            "analysis_role": "case",
+            "analysis_eligible": True,
+            "allowed_use": "directional_signal",
+            "search_task_id": "task_case_1",
+            "source_id": "SRC-1",
+        }
+    )
+    evidence_package = {
+        "query": "AI Agent report",
+        "report_contract": {
+            "evidence_requirements": {
+                "requirements": [
+                    {
+                        "requirement_id": "H1_case",
+                        "chapter_id": "ch_01",
+                        "proof_role": "case",
+                        "required_fields": ["company", "use_case", "source_ref"],
+                        "claim_strength_ceiling": "directional",
+                    }
+                ]
+            }
+        },
+        "chapter_evidence_packages": [
+            {
+                "chapter_id": "ch_01",
+                "chapter_title": "Demand validation",
+            }
+        ],
+        "analysis_ready_evidence": [evidence],
+    }
+
+    payload = build_llm_analysis_input_v2(evidence_package, {})
+    card = payload["chapters"][0]["fact_cards"][0]
+
+    assert card["requirement_id"] == "H1_case"
+    assert card["hypothesis_id"] == "H1"
+    assert card["analysis_role"] == "case"
+    assert card["allowed_use"] == "directional_signal"
+    assert card["lineage"]["search_task_id"] == "task_case_1"
+    assert payload["chapters"][0]["evidence_requirements"][0]["requirement_id"] == "H1_case"
+
+
+def test_llm_validator_preserves_requirement_ids_and_lineage():
+    evidence = _evidence("EV-REQ")
+    evidence.update({"requirement_id": "H1_case", "hypothesis_id": "H1", "source_id": "SRC-1"})
+    evidence_package = {"analysis_ready_evidence": [evidence]}
+    payload = {
+        "chapter_synthesis": [
+            {
+                "chapter_id": "ch_01",
+                "chapter_title": "Demand validation",
+                "claim_units": [
+                    {
+                        "claim": "Enterprise agents are moving into workflow automation.",
+                        "claim_strength": "directional",
+                        "claim_strength_ceiling": "directional",
+                        "hypothesis_id": "H1",
+                        "requirement_ids": ["H1_case"],
+                        "used_evidence_ids": ["EV-REQ"],
+                        "evidence_basis": ["Workflow deployment evidence is present."],
+                        "reasoning_chain": ["Workflow deployment indicates operational adoption."],
+                        "limitation_boundary": ["The claim is limited to disclosed samples."],
+                        "source_support_map": {"claim": ["EV-REQ"], "mechanism": ["EV-REQ"], "boundary": ["EV-REQ"]},
+                    }
+                ],
+            }
+        ]
+    }
+
+    validation = validate_llm_analysis_output(payload, evidence_package)
+    unit = validation["chapter_synthesis"][0]["claim_units"][0]
+
+    assert unit["requirement_ids"] == ["H1_case"]
+    assert unit["hypothesis_id"] == "H1"
+    assert unit["claim_strength_ceiling"] == "directional"
+    assert unit["lineage"]["requirement_ids"] == ["H1_case"]
+    assert unit["lineage"]["fact_ids"] == ["EV-REQ"]
+
+
 def test_llm_input_filters_dirty_cards_and_internal_diagnostics():
     dirty = _evidence("EV-DIRTY")
     dirty["fact"] = "Skip to content login menu picture intentionally omitted"
@@ -478,6 +565,47 @@ def test_build_llm_analysis_input_v2_is_compact_and_excludes_diagnostics(monkeyp
         ]
     ).issubset(card)
     assert len(card["distilled_fact"]) <= 45
+
+
+def test_high_quality_posture_feeds_more_fact_cards_to_llm_analysis(monkeypatch):
+    posture_keys = (
+        *full_report.HIGH_EVIDENCE_DEPTH_DEFAULTS.keys(),
+        *full_report.HIGH_WRITING_QUALITY_DEFAULTS.keys(),
+    )
+    previous_env = {key: os.environ.get(key) for key in posture_keys}
+    for key in posture_keys:
+        monkeypatch.delenv(key, raising=False)
+    full_report.apply_report_quality_posture("high")
+    evidence_package = {
+        "query": "AI Agent industry report",
+        "chapter_evidence_diagnostics": {
+            "ch_01": {
+                "chapter_title": "Demand validation",
+                "chapter_question": "Does AI Agent demand move into workflow deployment?",
+            }
+        },
+        "analysis_ready_evidence": [
+            {
+                **_evidence(f"EV-{index:02d}", proof_role="case"),
+                "fact": f"Enterprise AI agent deployment case {index} entered repeatable workflow operations.",
+                "public_fact_card": {
+                    "distilled_fact": f"Enterprise AI agent deployment case {index} entered repeatable workflow operations.",
+                    "fact_type": "case",
+                    "block_affinity": ["case_comparison"],
+                },
+            }
+            for index in range(1, 21)
+        ],
+    }
+
+    payload = build_llm_analysis_input_v2(evidence_package, {})
+
+    assert len(payload["chapters"][0]["fact_cards"]) >= 16
+    for key, value in previous_env.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
 
 
 def test_llm_validator_exposes_issue_counts_and_examples():

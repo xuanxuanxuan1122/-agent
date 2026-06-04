@@ -94,6 +94,11 @@ def normalize_llm_config(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
 def llm_config_is_ready(config: Optional[Dict[str, Any]]) -> bool:
     normalized = normalize_llm_config(config)
+    model = str(normalized.get("model") or "").strip().lower()
+    profile = str(normalized.get("profile") or "").strip().lower()
+    url = str(normalized.get("url") or "").strip().lower()
+    if model.startswith("gpt-") or profile.startswith("gpt-") or "api.openai.com" in url:
+        return False
     return bool(normalized["url"] and normalized["api_key"] and normalized["model"])
 
 
@@ -108,33 +113,13 @@ def normalize_openai_compatible_chat_url(url: str) -> str:
     return cleaned
 
 
-def normalize_openai_responses_url(url: str) -> str:
-    cleaned = str(url or "").strip().rstrip("/")
-    if not cleaned:
-        return ""
-    if cleaned.endswith("/responses"):
-        return cleaned
-    if cleaned.endswith("/chat/completions"):
-        return f"{cleaned[: -len('/chat/completions')]}/responses"
-    if cleaned.endswith("/v1"):
-        return f"{cleaned}/responses"
-    return cleaned
-
-
 def model_uses_default_temperature_only(model: str) -> bool:
-    return str(model or "").strip().lower().startswith("gpt-5")
+    del model
+    return False
 
 
 def _model_uses_default_temperature_only(model: str) -> bool:
     return model_uses_default_temperature_only(model)
-
-
-def should_use_openai_responses_api(normalized: Dict[str, Any]) -> bool:
-    mode = str(normalized.get("api_mode") or "").strip().lower()
-    if mode in {"responses", "openai_responses"}:
-        return True
-    model = str(normalized.get("model") or "").strip().lower()
-    return model.startswith("gpt-5.5")
 
 
 def _llm_circuit_key(normalized: Dict[str, Any]) -> str:
@@ -148,15 +133,7 @@ def _llm_circuit_key(normalized: Dict[str, Any]) -> str:
     )
 
 
-def _is_gpt55_config(normalized: Dict[str, Any]) -> bool:
-    model = str(normalized.get("model") or "").strip().lower()
-    profile = str(normalized.get("profile") or "").strip().lower()
-    return model.startswith("gpt-5.5") or profile == "gpt-5.5"
-
-
 def _fallback_config_for(config: Dict[str, Any], normalized: Dict[str, Any]) -> Dict[str, Any]:
-    if not _is_gpt55_config(normalized):
-        return {}
     fallback = config.get("fallback_config") if isinstance(config, dict) else None
     if not isinstance(fallback, dict):
         return {}
@@ -177,8 +154,7 @@ def _llm_error_summary(exc: Exception) -> str:
 
 def _mark_primary_unavailable(normalized: Dict[str, Any], exc: Exception) -> None:
     del exc
-    if _is_gpt55_config(normalized):
-        _UNAVAILABLE_LLM_KEYS.add(_llm_circuit_key(normalized))
+    _UNAVAILABLE_LLM_KEYS.add(_llm_circuit_key(normalized))
 
 
 def _annotate_fallback_result(
@@ -240,12 +216,6 @@ def apply_openai_compatible_reasoning_flags(payload: Dict[str, Any], normalized:
 
 def _apply_openai_compatible_reasoning_flags(payload: Dict[str, Any], normalized: Dict[str, Any]) -> None:
     apply_openai_compatible_reasoning_flags(payload, normalized)
-
-
-def _apply_openai_responses_reasoning(payload: Dict[str, Any], normalized: Dict[str, Any]) -> None:
-    effort = str(normalized.get("reasoning_effort") or "").strip().lower()
-    if effort:
-        payload["reasoning"] = {"effort": effort}
 
 
 def _record_llm_usage_event(
@@ -337,23 +307,6 @@ def _post_llm_json(
     return json.loads(raw)
 
 
-def collect_openai_response_text(response: Dict[str, Any]) -> str:
-    if str(response.get("output_text") or "").strip():
-        return str(response.get("output_text") or "").strip()
-    parts: List[str] = []
-    for output in response.get("output") or []:
-        if not isinstance(output, dict):
-            continue
-        for content in output.get("content") or []:
-            if isinstance(content, dict):
-                text = content.get("text") or content.get("output_text")
-                if text:
-                    parts.append(str(text))
-        if output.get("type") == "message" and isinstance(output.get("text"), str):
-            parts.append(str(output.get("text")))
-    return "\n".join(part.strip() for part in parts if str(part or "").strip()).strip()
-
-
 def _chat_message_text(message: Dict[str, Any]) -> str:
     content = message.get("content", "")
     if isinstance(content, list):
@@ -434,80 +387,6 @@ def _retry_deepseek_with_disabled_thinking(
     return data, retry_normalized, llm_call
 
 
-def call_openai_responses_json(
-    *,
-    normalized: Dict[str, Any],
-    system_prompt: str,
-    user_payload: Dict[str, Any],
-) -> Dict[str, Any]:
-    api = "openai_responses_json"
-    input_payload = {
-        "response_format_instruction": "Return a valid JSON object. The response must be json.",
-        "payload": user_payload,
-    }
-    user_content = compact_json(input_payload)
-    max_output_tokens = int(normalized.get("max_output_tokens") or 0)
-    context_budget = assert_llm_input_budget(
-        normalized_config=normalized,
-        system_prompt=system_prompt,
-        user_content=user_content,
-        api=api,
-        max_output_tokens=max_output_tokens,
-    )
-    payload: Dict[str, Any] = {
-        "model": normalized["model"],
-        "instructions": system_prompt,
-        "input": user_content,
-        "text": {"format": {"type": "json_object"}},
-    }
-    if max_output_tokens > 0:
-        payload["max_output_tokens"] = max_output_tokens
-    _apply_openai_responses_reasoning(payload, normalized)
-    started_at = time.perf_counter()
-    try:
-        data = _post_llm_json(
-            normalized=normalized,
-            url=normalize_openai_responses_url(normalized["url"]),
-            payload=payload,
-            error_prefix="OpenAI Responses request",
-        )
-    except Exception as exc:
-        _raise_llm_call_error(exc, normalized=normalized, api=api, started_at=started_at)
-    _record_llm_usage_event(
-        normalized=normalized,
-        usage=data.get("usage", {}),
-        api=api,
-        started_at=started_at,
-    )
-    llm_call = _llm_call_diagnostic(
-        normalized=normalized,
-        api=api,
-        started_at=started_at,
-        status="success",
-        usage=data.get("usage", {}),
-    )
-    llm_call["context_budget"] = context_budget
-    content = collect_openai_response_text(data)
-    if not content:
-        diagnostic = {**llm_call, "status": "failed", "error": "OpenAI Responses content is empty."}
-        raise LLMCallError("OpenAI Responses content is empty.", diagnostic=diagnostic)
-    try:
-        parsed = json.loads(content)
-    except json.JSONDecodeError as exc:
-        diagnostic = {**llm_call, "status": "failed", "error": f"OpenAI Responses output is not valid JSON: {content[:400]}"}
-        raise LLMCallError(diagnostic["error"], diagnostic=diagnostic) from exc
-    if not isinstance(parsed, dict):
-        diagnostic = {**llm_call, "status": "failed", "error": "OpenAI Responses JSON root must be an object."}
-        raise LLMCallError("OpenAI Responses JSON root must be an object.", diagnostic=diagnostic)
-    return {
-        "payload": parsed,
-        "usage": data.get("usage", {}),
-        "raw_response": data,
-        "request_payload": user_payload,
-        "llm_call": llm_call,
-    }
-
-
 def _call_openai_compatible_text_once(
     *,
     config: Dict[str, Any],
@@ -523,53 +402,6 @@ def _call_openai_compatible_text_once(
         raise RuntimeError("LLM config is incomplete.")
 
     max_output_tokens = int(normalized.get("max_output_tokens") or 0) or int(max_tokens or 0)
-    if should_use_openai_responses_api(normalized):
-        api = "openai_responses_text"
-        context_budget = assert_llm_input_budget(
-            normalized_config=normalized,
-            system_prompt=system_prompt,
-            user_content=user_content,
-            api=api,
-            max_output_tokens=max_output_tokens,
-        )
-        payload: Dict[str, Any] = {
-            "model": normalized["model"],
-            "instructions": system_prompt,
-            "input": user_content,
-        }
-        if max_output_tokens > 0:
-            payload["max_output_tokens"] = max_output_tokens
-        _apply_openai_responses_reasoning(payload, normalized)
-        started_at = time.perf_counter()
-        try:
-            data = _post_llm_json(
-                normalized=normalized,
-                url=normalize_openai_responses_url(normalized["url"]),
-                payload=payload,
-                error_prefix="OpenAI Responses request",
-            )
-        except Exception as exc:
-            _raise_llm_call_error(exc, normalized=normalized, api=api, started_at=started_at)
-        _record_llm_usage_event(
-            normalized=normalized,
-            usage=data.get("usage", {}),
-            api=api,
-            started_at=started_at,
-        )
-        llm_call = _llm_call_diagnostic(
-            normalized=normalized,
-            api=api,
-            started_at=started_at,
-            status="success",
-            usage=data.get("usage", {}),
-        )
-        llm_call["context_budget"] = context_budget
-        text = collect_openai_response_text(data)
-        if not text:
-            diagnostic = {**llm_call, "status": "failed", "error": "OpenAI Responses content is empty."}
-            raise LLMCallError("OpenAI Responses content is empty.", diagnostic=diagnostic)
-        return {"text": text, "usage": data.get("usage", {}), "raw_response": data, "llm_call": llm_call}
-
     api = "openai_compatible_chat_text"
     context_budget = assert_llm_input_budget(
         normalized_config=normalized,
@@ -715,12 +547,6 @@ def _call_openai_compatible_json_once(
         raise RuntimeError(f"Unsupported LLM provider: {normalized['provider']}")
     if not llm_config_is_ready(normalized):
         raise RuntimeError("LLM config is incomplete.")
-    if should_use_openai_responses_api(normalized):
-        return call_openai_responses_json(
-            normalized=normalized,
-            system_prompt=system_prompt,
-            user_payload=user_payload,
-        )
 
     api = "openai_compatible_chat_json"
     user_content = compact_json(user_payload)

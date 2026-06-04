@@ -3,15 +3,14 @@
 from rag_pipeline.flows.report import final_audit_agent
 
 
-def _configure_gpt55_final_audit(monkeypatch):
-    monkeypatch.setenv("RAG_MODEL_FINAL_AUDIT_PROFILE", "gpt-5.5")
-    monkeypatch.setenv("RAG_LLM_PROFILE_GPT_5_5_PROVIDER", "openai_compatible")
-    monkeypatch.setenv("RAG_LLM_PROFILE_GPT_5_5_URL", "https://api.openai.com/v1/responses")
-    monkeypatch.setenv("RAG_LLM_PROFILE_GPT_5_5_API_KEY", "sk-test")
-    monkeypatch.setenv("RAG_LLM_PROFILE_GPT_5_5_MODEL", "gpt-5.5")
-    monkeypatch.setenv("RAG_LLM_PROFILE_GPT_5_5_TIMEOUT", "240")
-    monkeypatch.setenv("RAG_LLM_PROFILE_GPT_5_5_REASONING_EFFORT", "high")
-    monkeypatch.setenv("RAG_LLM_PROFILE_GPT_5_5_MAX_OUTPUT_TOKENS", "32000")
+def _configure_deepseek_final_audit(monkeypatch):
+    monkeypatch.setenv("RAG_MODEL_FINAL_AUDIT_PROFILE", "deepseek-v4-pro")
+    monkeypatch.setenv("RAG_LLM_PROFILE_DEEPSEEK_V4_PRO_PROVIDER", "openai_compatible")
+    monkeypatch.setenv("RAG_LLM_PROFILE_DEEPSEEK_V4_PRO_URL", "https://api.deepseek.example/chat/completions")
+    monkeypatch.setenv("RAG_LLM_PROFILE_DEEPSEEK_V4_PRO_API_KEY", "deepseek-test")
+    monkeypatch.setenv("RAG_LLM_PROFILE_DEEPSEEK_V4_PRO_MODEL", "deepseek-v4-pro")
+    monkeypatch.setenv("RAG_LLM_PROFILE_DEEPSEEK_V4_PRO_TIMEOUT", "240")
+    monkeypatch.setenv("RAG_LLM_PROFILE_DEEPSEEK_V4_PRO_MAX_OUTPUT_TOKENS", "32000")
 
 
 def test_final_audit_disabled_skips_without_calling_model(monkeypatch):
@@ -24,7 +23,7 @@ def test_final_audit_disabled_skips_without_calling_model(monkeypatch):
 
 
 def test_final_audit_fatal_blocks_when_blocking_enabled(monkeypatch):
-    _configure_gpt55_final_audit(monkeypatch)
+    _configure_deepseek_final_audit(monkeypatch)
     monkeypatch.setenv("REPORT_ENABLE_FINAL_AUDIT", "true")
     monkeypatch.setenv("REPORT_FINAL_AUDIT_BLOCKING", "true")
     captured = {}
@@ -43,9 +42,9 @@ def test_final_audit_fatal_blocks_when_blocking_enabled(monkeypatch):
             "usage": {"total_tokens": 10},
             "llm_call": {
                 "task": "final_audit",
-                "profile": "gpt-5.5",
-                "model": "gpt-5.5",
-                "api": "openai_responses_json",
+                "profile": "deepseek-v4-pro",
+                "model": "deepseek-v4-pro",
+                "api": "openai_compatible_chat_json",
                 "status": "success",
             },
         }
@@ -60,17 +59,16 @@ def test_final_audit_fatal_blocks_when_blocking_enabled(monkeypatch):
         query="industry report",
     )
 
-    assert captured["config"]["model"] == "gpt-5.5"
-    assert captured["config"]["reasoning_effort"] == "high"
+    assert captured["config"]["model"] == "deepseek-v4-pro"
     assert captured["user_payload"]["reformatter_validation"]["passed"] is True
     assert result["status"] == "fatal"
     assert result["blocked"] is True
     assert result["audit"]["publish_recommendation"] == "hold"
-    assert result["llm_call"]["model"] == "gpt-5.5"
+    assert result["llm_call"]["model"] == "deepseek-v4-pro"
 
 
 def test_final_audit_drops_false_future_date_fatal_when_date_is_not_future(monkeypatch):
-    _configure_gpt55_final_audit(monkeypatch)
+    _configure_deepseek_final_audit(monkeypatch)
     monkeypatch.setenv("REPORT_ENABLE_FINAL_AUDIT", "true")
     monkeypatch.setenv("REPORT_FINAL_AUDIT_BLOCKING", "true")
     monkeypatch.setenv("REPORT_FINAL_AUDIT_CURRENT_DATE", "2026-06-02")
@@ -102,7 +100,7 @@ def test_final_audit_drops_false_future_date_fatal_when_date_is_not_future(monke
                 "summary": "Future dated citation.",
             },
             "usage": {"total_tokens": 10},
-            "llm_call": {"task": "final_audit", "model": "gpt-5.5", "status": "success"},
+            "llm_call": {"task": "final_audit", "model": "deepseek-v4-pro", "status": "success"},
         }
 
     monkeypatch.setattr(final_audit_agent, "call_openai_compatible_json", fake_call_openai_compatible_json)

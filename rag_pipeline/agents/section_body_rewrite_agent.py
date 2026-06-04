@@ -252,6 +252,26 @@ def _fallback(
     }
 
 
+def ensure_public_render_blocks(section: Dict[str, Any]) -> Dict[str, Any]:
+    payload = dict(section or {})
+    blocks = [dict(block) for block in _as_list(payload.get("render_blocks")) if isinstance(block, dict)]
+    if any(str(block.get("type") or "") == "paragraph" and _text(block.get("text")) for block in blocks):
+        return payload
+
+    paragraph = ""
+    for key in ("composed_paragraph", "paragraph", "mechanism", "reasoning", "claim"):
+        paragraph = _text(payload.get(key))
+        if paragraph:
+            break
+    if not paragraph:
+        return payload
+
+    non_paragraph_blocks = [block for block in blocks if str(block.get("type") or "") != "paragraph"]
+    payload["render_blocks"] = [{"type": "paragraph", "label": "", "text": paragraph}, *non_paragraph_blocks]
+    payload["render_blocks_recovered"] = True
+    return payload
+
+
 def _validate_candidate(
     *,
     paragraph: str,
@@ -279,7 +299,12 @@ def _validate_candidate(
         return False, "new_numeric_claim"
     original_len = len(re.sub(r"\s+", "", original))
     candidate_len = len(re.sub(r"\s+", "", paragraph))
-    if original_len >= 30 and candidate_len < int(original_len * 0.7):
+    min_safe_chars = _env_int("REPORT_BODY_REWRITE_MIN_ACCEPT_CHARS", 80, min_value=20, max_value=2000)
+    try:
+        min_ratio = float(os.getenv("REPORT_BODY_REWRITE_MIN_COMPRESSION_RATIO", "0.35") or "0.35")
+    except ValueError:
+        min_ratio = 0.35
+    if original_len >= 30 and candidate_len < min_safe_chars and candidate_len < int(original_len * min_ratio):
         return False, "output_too_short"
     max_ratio = body_rewrite_max_expansion_ratio()
     if original_len >= 30 and candidate_len > int(original_len * max_ratio):
@@ -302,7 +327,6 @@ def _fallback_llm_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
         configs.append(dict(embedded))
     profile_values = [
         os.getenv("REPORT_BODY_REWRITE_FALLBACK_PROFILES", ""),
-        os.getenv("RAG_LLM_GPT55_FALLBACK_PROFILE", ""),
     ]
     seen = {
         (
@@ -487,7 +511,7 @@ def rewrite_sections_for_chapter(
     started_at = time.monotonic()
     max_elapsed = body_rewrite_max_elapsed_seconds()
     for section in sections:
-        payload = dict(section)
+        payload = ensure_public_render_blocks(dict(section))
         facts = [
             {
                 "evidence_id": ref,
@@ -528,6 +552,8 @@ def rewrite_sections_for_chapter(
             diagnostics["failure_reasons"][reason] = diagnostics["failure_reasons"].get(reason, 0) + 1
         payload["body_rewrite_status"] = status
         payload["body_rewrite"] = result
+        if status not in {"rewritten", "cached"}:
+            payload = ensure_public_render_blocks(payload)
         rewritten_sections.append(payload)
     return rewritten_sections, diagnostics
 
@@ -612,7 +638,7 @@ def _merge_diagnostics(target: Dict[str, Any], source: Dict[str, Any]) -> None:
 
 
 def _apply_rewrite_result(section: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, Any]:
-    payload = dict(section)
+    payload = ensure_public_render_blocks(dict(section))
     status = str(result.get("status") or "")
     if status in {"rewritten", "cached"}:
         paragraph = _text(result.get("paragraph"))
@@ -620,6 +646,8 @@ def _apply_rewrite_result(section: Dict[str, Any], result: Dict[str, Any]) -> Di
         payload["reasoning"] = paragraph
         payload["mechanism"] = paragraph
         payload["render_blocks"] = [{"type": "paragraph", "label": "", "text": paragraph}]
+    else:
+        payload = ensure_public_render_blocks(payload)
     payload["body_rewrite_status"] = status
     payload["body_rewrite"] = result
     return payload

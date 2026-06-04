@@ -244,6 +244,94 @@ def write_stage_snapshot_safe(
         }
 
 
+def init_artifact_ledger_run_safe(
+    *,
+    run_id: str,
+    query: str,
+    report_type: str = "full_report",
+    freshness_policy: Optional[Dict[str, Any]] = None,
+) -> tuple[Any, Dict[str, Any]]:
+    try:
+        from rag_pipeline.cache.artifact_store import default_artifact_store
+
+        store = default_artifact_store()
+        if not store.enabled():
+            return None, {"enabled": False, "status": "disabled"}
+        store.upsert_run(
+            run_id=run_id,
+            query=query,
+            report_type=report_type,
+            status="running",
+            freshness_policy=freshness_policy or {},
+        )
+        return store, {
+            "enabled": True,
+            "status": "running",
+            "ledger_path": str(store.path),
+            "object_root": str(store.object_root),
+        }
+    except Exception as exc:  # pragma: no cover - artifact ledger must never block report delivery.
+        return None, {"enabled": True, "status": "init_failed", "error": str(exc)}
+
+
+def record_stage_snapshot_artifact_safe(
+    store: Any,
+    *,
+    run_id: str,
+    stage_name: str,
+    payload: Any,
+    snapshot_result: Dict[str, Any],
+) -> Dict[str, Any]:
+    if store is None:
+        return {}
+    try:
+        from rag_pipeline.cache.artifact_pipeline_bridge import record_stage_snapshot_artifact
+
+        return record_stage_snapshot_artifact(
+            store,
+            run_id=run_id,
+            stage_name=stage_name,
+            payload=payload,
+            snapshot_result=snapshot_result,
+        )
+    except Exception as exc:  # pragma: no cover - artifact ledger must stay fail-open.
+        return {"status": "record_failed", "error": str(exc)}
+
+
+def sync_artifact_ledger_package_safe(
+    store: Any,
+    *,
+    run_id: str,
+    writer_package: Dict[str, Any],
+    writer_report: Dict[str, Any],
+    final_audit_result: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if store is None:
+        return {}
+    try:
+        from rag_pipeline.cache.artifact_pipeline_bridge import ingest_writer_package_artifacts
+
+        return ingest_writer_package_artifacts(
+            store,
+            run_id=run_id,
+            writer_package=writer_package,
+            writer_report=writer_report,
+            final_audit_result=final_audit_result,
+        )
+    except Exception as exc:  # pragma: no cover - artifact ledger must stay fail-open.
+        return {"enabled": True, "status": "sync_failed", "error": str(exc)}
+
+
+def finish_artifact_ledger_run_safe(store: Any, *, run_id: str, query: str, status: str) -> Dict[str, Any]:
+    if store is None:
+        return {}
+    try:
+        store.upsert_run(run_id=run_id, query=query, report_type="full_report", status=status)
+        return {"enabled": True, "status": status}
+    except Exception as exc:  # pragma: no cover - artifact ledger must stay fail-open.
+        return {"enabled": True, "status": "finish_failed", "error": str(exc)}
+
+
 def attach_token_usage_snapshot(payload: Dict[str, Any]) -> Dict[str, Any]:
     try:
         from rag_pipeline.telemetry.token_usage import token_usage_payload
@@ -264,6 +352,9 @@ def write_markdown(path: Path, text: str) -> None:
 
 
 FORMAL_REPORT_PRIVATE_SENTENCE_PATTERNS = [
+    "(?m)^\\s*[-*]?\\s*\\u62a5\\u544a\\u7ea7\\u68c0\\u7d22\\u7f3a\\u53e3[^\\n]*$",
+    "(?m)^\\s*[-*]?\\s*[^\\n]{0,24}\\u68c0\\u7d22\\u7f3a\\u53e3[^\\n]*$",
+    "(?m)^\\s*[-*]?\\s*[^\\n]{0,24}\\u8bc1\\u636e\\u7f3a\\u53e3[^\\n]*$",
     r"[^。\n]*正文应把[^。\n]*(?:。|$)",
     r"[^。\n]*正文应当[^。\n]*(?:。|$)",
     r"[^。\n]*本章应写成[^。\n]*(?:。|$)",
@@ -384,6 +475,54 @@ def _public_body_char_count(markdown: str) -> int:
 def write_formal_markdown(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(finalize_formal_report(str(text or "")).strip() + "\n", encoding="utf-8")
+
+
+def finalize_formal_report_and_refresh_audit(
+    markdown: str,
+    writer_report: Dict[str, Any],
+) -> tuple[str, Dict[str, Any]]:
+    """Finalize public markdown and keep writer diagnostics in the same state.
+
+    ``write_formal_markdown`` applies a last public-report sanitizer.  If score
+    rendering or FinalAudit inspect the pre-sanitized string, they can report
+    citationless diagnostic lines that are no longer present in the actual
+    ``*_report.md``.  This helper moves that finalization before audit/score and
+    refreshes the final citation audit against the exact markdown that will be
+    written.
+    """
+
+    finalized = finalize_formal_report(str(markdown or ""))
+    report = dict(writer_report or {})
+    render_artifacts = dict(as_dict(report.get("render_artifacts")))
+    report["report_markdown"] = finalized
+    try:
+        from rag_pipeline.agents.final_writer_agent import _rewrite_final_markdown_with_reconciled_appendix
+
+        citation_manifest = as_dict(report.get("citation_manifest")) or as_dict(render_artifacts.get("citation_manifest"))
+        source_registry = (
+            as_list(report.get("source_registry"))
+            or as_list(render_artifacts.get("source_registry"))
+            or as_list(report.get("sources"))
+        )
+        appendix_package = as_dict(report.get("appendix_package")) or as_dict(render_artifacts.get("appendix_package"))
+        if citation_manifest or source_registry:
+            finalized, refreshed_sources, refreshed_audit = _rewrite_final_markdown_with_reconciled_appendix(
+                finalized,
+                citation_manifest=citation_manifest,
+                source_registry=source_registry,
+                appendix_package=appendix_package,
+            )
+            report["report_markdown"] = finalized
+            report["source_registry"] = refreshed_sources
+            report["final_citation_audit"] = refreshed_audit
+            render_artifacts["source_registry"] = refreshed_sources
+            render_artifacts["final_citation_audit"] = refreshed_audit
+            if citation_manifest:
+                render_artifacts["citation_manifest"] = citation_manifest
+            report["render_artifacts"] = render_artifacts
+    except Exception as exc:  # pragma: no cover - diagnostics must not block report output.
+        report.setdefault("finalization_warnings", []).append(f"final_citation_refresh_failed:{type(exc).__name__}")
+    return str(report.get("report_markdown") or finalized).strip(), report
 
 
 def write_score_markdown(path: Path, text: str) -> None:
@@ -1739,13 +1878,7 @@ def _directed_repair_diagnostics(writer_package: Dict[str, Any], writer_report: 
         writer_package.get("repair_task_selection_summary"),
         render_artifacts.get("repair_task_selection_summary"),
     )
-    planned = _first_score_dict(
-        raw_metadata.get("openai_web_search_summary"),
-        raw_output.get("openai_web_search_summary"),
-        metadata.get("openai_web_search_summary"),
-        writer_package.get("openai_web_search_summary"),
-        render_artifacts.get("openai_web_search_summary"),
-    )
+    planned: Dict[str, Any] = {}
     if not selected and not planned:
         return {}
     selected_by_reason = as_dict(selected.get("by_proof_role")) or as_dict(selected.get("by_reason"))
@@ -2291,7 +2424,7 @@ def render_score_markdown(
         or writer_package.get("report_markdown")
         or ""
     )
-    target_body_chars_for_health = _coerce_int(writer_report.get("target_body_chars")) or _coerce_int(os.getenv("REPORT_TARGET_BODY_CHARS")) or 20000
+    target_body_chars_for_health = _coerce_int(writer_report.get("target_body_chars")) or _coerce_int(os.getenv("REPORT_TARGET_BODY_CHARS"))
     body_markdown_for_health = _public_body_markdown_for_health(report_markdown_for_health)
     h3_count_for_health = len(re.findall(r"(?m)^###\s+", body_markdown_for_health))
     body_char_count_for_health = _public_body_char_count(report_markdown_for_health)
@@ -3192,6 +3325,142 @@ HIGH_COST_SEARCH_FLAGS = (
 )
 
 
+HIGH_EVIDENCE_DEPTH_DEFAULTS = {
+    "FULL_REPORT_IQS_MAX_QUERIES": "4",
+    "FULL_REPORT_IQS_MAX_SEARCH_TASKS": "32",
+    "FULL_REPORT_IQS_RESULTS_PER_QUERY": "80",
+    "FULL_REPORT_IQS_RERANK_TOP_K": "36",
+    "FULL_REPORT_IQS_RERANK_MAX_DOCS": "100",
+    "FULL_REPORT_IQS_RERANK_PREFILTER_MAX_DOCS": "100",
+    "BRAIN_INITIAL_LANE_ADAPTIVE_SEARCH_BUDGET": "false",
+    "BRAIN_FOLLOWUP_ADAPTIVE_SEARCH_BUDGET": "false",
+    "IQS_AUTO_READPAGE_TOP_N": "5",
+    "IQS_AUTO_READPAGE_REQUIRED_TOP_N": "8",
+    "IQS_AUTO_READPAGE_MIN_SCORE": "0.55",
+    "IQS_AUTO_READPAGE_REQUIRED_MIN_SCORE": "0.35",
+    "IQS_READPAGE_PARALLEL_WORKERS": "4",
+    "READPAGE_FACT_EXTRACTOR_MAX_CALLS_PER_REPORT": "80",
+    "READPAGE_FACT_EXTRACTOR_MAX_PAGES_PER_TASK": "6",
+    "READPAGE_FACT_EXTRACTOR_MAX_CHARS_PER_PAGE": "9000",
+    "BRAIN_LLM_ANALYSIS_MAX_CHAPTERS": "12",
+    "BRAIN_LLM_ANALYSIS_MAX_FACTS_PER_CHAPTER": "16",
+    "BRAIN_LLM_ANALYSIS_MAX_FACT_CHARS": "420",
+    "BRAIN_LLM_ANALYSIS_CONCURRENCY": "4",
+    "REPORT_FACTS_PER_CHAPTER_ARGUMENTS": "24",
+    "REPORT_CHAPTER_FACT_DIGEST_LIMIT": "16",
+}
+
+
+HIGH_WRITING_QUALITY_DEFAULTS = {
+    "BRAIN_ENABLE_LLM_EVIDENCE_ANALYSIS": "true",
+    "REPORT_ENABLE_LLM_BODY_REWRITE": "true",
+    "REPORT_BODY_REWRITE_MAX_SECTIONS": "24",
+    "REPORT_BODY_REWRITE_MAX_ELAPSED_SECONDS": "900",
+    "REPORT_BODY_REWRITE_CONCURRENCY": "3",
+    "REPORT_BODY_REWRITE_MAX_EXPANSION_RATIO": "5.0",
+    "REPORT_BODY_REWRITE_TARGET_SECTION_CHARS": "650",
+    "REPORT_ENABLE_LLM_CHAPTER_NARRATIVE": "true",
+    "REPORT_CHAPTER_NARRATIVE_MAX_CHAPTERS": "12",
+    "REPORT_TARGET_BODY_CHARS": "0",
+    "REPORT_TARGET_BODY_CHARS_BLOCKING": "false",
+    "REPORT_COMPOSER_TARGET_SECTION_CHARS": "550",
+    "REPORT_RENDER_MIN_SECTION_CHARS": "0",
+}
+
+
+DEEPSEEK_QUALITY_MODEL_DEFAULTS = {
+    "RAG_MODEL_PLANNING_PROFILE": "deepseek-v4-pro",
+    "RAG_MODEL_EVIDENCE_MERGE_PROFILE": "deepseek-v4-pro",
+    "RAG_MODEL_COVERAGE_EVAL_PROFILE": "deepseek-v4-pro",
+    "RAG_MODEL_RISK_PROFILE": "deepseek-v4-pro",
+    "RAG_MODEL_DECISION_PROFILE": "deepseek-v4-pro",
+    "RAG_MODEL_REFORMATTER_PROFILE": "deepseek-v4-pro",
+    "RAG_MODEL_BODY_REWRITE_PROFILE": "deepseek-v4-pro",
+    "RAG_MODEL_QA_PROFILE": "deepseek-v4-pro",
+    "RAG_MODEL_REFLECTION_PROFILE": "deepseek-v4-pro",
+    "RAG_MODEL_FINAL_AUDIT_PROFILE": "deepseek-v4-pro",
+    "READPAGE_FACT_EXTRACTOR_MODEL_PROFILE": "deepseek-v4-pro",
+}
+
+
+QWEN_WEB_SEARCH_MODEL_DEFAULTS = {
+    "RAG_MODEL_QUERY_REWRITE_PROFILE": "qwen",
+    "RAG_MODEL_WEB_SUMMARY_PROFILE": "qwen",
+}
+
+
+REPORT_MODEL_ROUTING_DEFAULTS = {
+    **DEEPSEEK_QUALITY_MODEL_DEFAULTS,
+    **QWEN_WEB_SEARCH_MODEL_DEFAULTS,
+}
+
+
+STRICT_RESEARCH_EVIDENCE_DEPTH_DEFAULTS = {
+    **HIGH_EVIDENCE_DEPTH_DEFAULTS,
+    "FULL_REPORT_IQS_MAX_QUERIES": "6",
+    "FULL_REPORT_IQS_MAX_SEARCH_TASKS": "40",
+    "FULL_REPORT_IQS_RERANK_TOP_K": "48",
+    "FULL_REPORT_IQS_RERANK_MAX_DOCS": "100",
+    "FULL_REPORT_IQS_RERANK_PREFILTER_MAX_DOCS": "100",
+    "READPAGE_FACT_EXTRACTOR_MAX_CALLS_PER_REPORT": "120",
+    "BRAIN_LLM_ANALYSIS_MAX_FACTS_PER_CHAPTER": "20",
+}
+
+
+def _looks_like_removed_openai_gpt_profile(value: Any) -> bool:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return False
+    normalized = raw.replace("_", "-")
+    return (
+        normalized.startswith("gpt-")
+        or normalized.startswith("gpt.")
+        or "gpt55" in normalized
+        or "api.openai.com" in normalized
+    )
+
+
+def _apply_env_defaults(defaults: Dict[str, str]) -> tuple[Dict[str, str], Dict[str, str]]:
+    applied: Dict[str, str] = {}
+    preserved: Dict[str, str] = {}
+    for key, value in defaults.items():
+        if key in os.environ:
+            preserved[key] = os.environ[key]
+            continue
+        os.environ[key] = value
+        applied[key] = value
+    return applied, preserved
+
+
+def _apply_model_routing_defaults(defaults: Dict[str, str]) -> tuple[Dict[str, str], Dict[str, str], Dict[str, str], Dict[str, str]]:
+    applied: Dict[str, str] = {}
+    preserved: Dict[str, str] = {}
+    replaced_removed: Dict[str, str] = {}
+    overridden: Dict[str, str] = {}
+    allow_custom = str(os.environ.get("REPORT_ALLOW_CUSTOM_MODEL_ROUTING") or "").strip().lower() in {"1", "true", "yes", "on"}
+    for key, value in defaults.items():
+        if key not in os.environ:
+            os.environ[key] = value
+            applied[key] = value
+            continue
+        existing = os.environ.get(key, "")
+        if str(existing).strip() == value:
+            preserved[key] = existing
+            continue
+        if _looks_like_removed_openai_gpt_profile(existing):
+            replaced_removed[key] = existing
+            os.environ[key] = value
+            applied[key] = value
+            continue
+        if not allow_custom:
+            overridden[key] = existing
+            os.environ[key] = value
+            applied[key] = value
+            continue
+        preserved[key] = existing
+    return applied, preserved, replaced_removed, overridden
+
+
 def apply_report_quality_posture(mode: str = "") -> Dict[str, Any]:
     normalized = str(mode or os.environ.get("REPORT_QUALITY_MODE") or "high").strip().lower() or "high"
     if normalized in {"strict", "deep_strict", "due_diligence", "investment_due_diligence"}:
@@ -3207,17 +3476,16 @@ def apply_report_quality_posture(mode: str = "") -> Dict[str, Any]:
             "BRAIN_AGENT_TEXT_SELF_REFINE": "false",
             "REPORT_CONTINUOUS_EVIDENCE_LOOP": "false",
         }
+        evidence_defaults = STRICT_RESEARCH_EVIDENCE_DEPTH_DEFAULTS
     else:
         defaults = {key: "false" for key in HIGH_COST_SEARCH_FLAGS}
+        evidence_defaults = HIGH_EVIDENCE_DEPTH_DEFAULTS if normalized == "high" else {}
 
-    applied: Dict[str, str] = {}
-    preserved: Dict[str, str] = {}
-    for key, value in defaults.items():
-        if key in os.environ:
-            preserved[key] = os.environ[key]
-            continue
-        os.environ[key] = value
-        applied[key] = value
+    writing_defaults = HIGH_WRITING_QUALITY_DEFAULTS if normalized in {"high", "strict_research"} else {}
+    applied, preserved = _apply_env_defaults({**defaults, **evidence_defaults, **writing_defaults})
+    model_applied, model_preserved, replaced_removed_models, overridden_models = _apply_model_routing_defaults(REPORT_MODEL_ROUTING_DEFAULTS)
+    applied.update(model_applied)
+    preserved.update(model_preserved)
 
     disabled = {
         "query_rewrite": str(os.environ.get("IQS_ENABLE_LLM_QUERY_REWRITE") or "").strip().lower()
@@ -3238,6 +3506,29 @@ def apply_report_quality_posture(mode: str = "") -> Dict[str, Any]:
         "disabled": disabled,
         "query_rewrite_max_calls": os.environ.get("QUERY_REWRITE_MAX_CALLS_PER_REPORT", "4"),
         "query_rewrite_max_input_chars": os.environ.get("QUERY_REWRITE_MAX_INPUT_CHARS", "6000"),
+        "evidence_depth": {
+            "iqs_max_queries": os.environ.get("FULL_REPORT_IQS_MAX_QUERIES", ""),
+            "iqs_max_search_tasks": os.environ.get("FULL_REPORT_IQS_MAX_SEARCH_TASKS", ""),
+            "readpage_top_n": os.environ.get("IQS_AUTO_READPAGE_TOP_N", ""),
+            "readpage_required_top_n": os.environ.get("IQS_AUTO_READPAGE_REQUIRED_TOP_N", ""),
+            "fact_extractor_max_calls": os.environ.get("READPAGE_FACT_EXTRACTOR_MAX_CALLS_PER_REPORT", ""),
+            "llm_analysis_max_chapters": os.environ.get("BRAIN_LLM_ANALYSIS_MAX_CHAPTERS", ""),
+            "llm_analysis_max_facts_per_chapter": os.environ.get("BRAIN_LLM_ANALYSIS_MAX_FACTS_PER_CHAPTER", ""),
+            "claim_builder_facts_per_chapter": os.environ.get("REPORT_FACTS_PER_CHAPTER_ARGUMENTS", ""),
+        },
+        "writing_depth": {
+            "body_rewrite_max_sections": os.environ.get("REPORT_BODY_REWRITE_MAX_SECTIONS", ""),
+            "body_rewrite_max_elapsed_seconds": os.environ.get("REPORT_BODY_REWRITE_MAX_ELAPSED_SECONDS", ""),
+            "chapter_narrative_max_chapters": os.environ.get("REPORT_CHAPTER_NARRATIVE_MAX_CHAPTERS", ""),
+            "target_body_chars": os.environ.get("REPORT_TARGET_BODY_CHARS", ""),
+            "composer_target_section_chars": os.environ.get("REPORT_COMPOSER_TARGET_SECTION_CHARS", ""),
+        },
+        "model_routing": {
+            key: os.environ.get(key, "")
+            for key in REPORT_MODEL_ROUTING_DEFAULTS
+        },
+        "replaced_removed_model_profiles": replaced_removed_models,
+        "overridden_model_profiles": overridden_models,
     }
 
 
@@ -3569,6 +3860,7 @@ def _run_topic_bundle_cached_flow(query: str, cache_context: Dict[str, Any]) -> 
         chapter_evidence_packages=chapter_evidence_packages,
         claim_units=argument_units,
         analysis_claim_units=as_list(as_dict(structured_analysis).get("claim_units")),
+        analysis_stage_diagnostics=as_dict(as_dict(structured_analysis).get("analysis_stage_diagnostics")),
     )
     report_markdown = str(writer_output.get("report_markdown") or "").strip()
     writer_report = {
@@ -3785,6 +4077,7 @@ def _run_fail_open_rebuild_from_package(
         chapter_evidence_packages=chapter_evidence_packages,
         claim_units=argument_units,
         analysis_claim_units=as_list(as_dict(structured_analysis).get("claim_units")),
+        analysis_stage_diagnostics=as_dict(as_dict(structured_analysis).get("analysis_stage_diagnostics")),
     )
     live_timeout = {
         **_timeout_metadata(timeout_context, stage=str(as_dict(timeout_context).get("timeout_stage") or "brain"), partial_artifact="evidence_package"),
@@ -4025,17 +4318,7 @@ def main() -> int:
     report_quality_mode = resolved_quality_mode
     high_quality_mode = report_quality_mode in {"high", "strict_research"}
     if high_quality_mode:
-        os.environ["BRAIN_ENABLE_LLM_EVIDENCE_ANALYSIS"] = "true"
-        os.environ["REPORT_ENABLE_LLM_BODY_REWRITE"] = "true"
-        os.environ["REPORT_BODY_REWRITE_MAX_SECTIONS"] = "24"
-        os.environ["REPORT_BODY_REWRITE_MAX_ELAPSED_SECONDS"] = "300"
-        os.environ["REPORT_BODY_REWRITE_CONCURRENCY"] = "3"
-        os.environ["REPORT_BODY_REWRITE_MAX_EXPANSION_RATIO"] = "5.0"
-        os.environ["REPORT_BODY_REWRITE_TARGET_SECTION_CHARS"] = "850"
-        os.environ["REPORT_ENABLE_LLM_CHAPTER_NARRATIVE"] = "true"
-        os.environ["REPORT_TARGET_BODY_CHARS"] = "20000"
-        os.environ["REPORT_COMPOSER_TARGET_SECTION_CHARS"] = "850"
-        os.environ["REPORT_RENDER_MIN_SECTION_CHARS"] = "850"
+        _apply_env_defaults(HIGH_WRITING_QUALITY_DEFAULTS)
     selected_llm_profile = select_llm_profile(args)
     progress_enabled = (not args.no_progress_bar) and env_flag("REPORT_PROGRESS_BAR", True)
     global QUIET_STAGE_LOGS
@@ -4066,6 +4349,15 @@ def main() -> int:
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_id = f"{run_timestamp}_{safe_filename(query)}"
     stage_snapshot_index: List[Dict[str, Any]] = []
+    artifact_ledger_store, artifact_ledger_status = init_artifact_ledger_run_safe(
+        run_id=run_id,
+        query=query,
+        report_type="full_report",
+        freshness_policy={
+            "default_mode": "run_scoped",
+            "current_query_terms": ["news", "policy", "finance", "funding", "current", "latest"],
+        },
+    )
 
     def record_stage_snapshot(stage_name: str, payload: Any, *, summary: Optional[Dict[str, Any]] = None, diagnostics: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         result = write_stage_snapshot_safe(
@@ -4075,17 +4367,27 @@ def main() -> int:
             summary=summary,
             diagnostics=diagnostics,
         )
+        artifact_ledger_artifact = record_stage_snapshot_artifact_safe(
+            artifact_ledger_store,
+            run_id=run_id,
+            stage_name=stage_name,
+            payload=payload,
+            snapshot_result=result,
+        )
         if result.get("enabled") is not False:
+            snapshot_entry = {
+                "stage_name": stage_name,
+                "stored": bool(result.get("stored")),
+                "replayable": bool(result.get("replayable")),
+                "manifest_path": str(Path(str(result.get("full_payload_path") or "")).with_name("manifest.json")) if result.get("full_payload_path") else "",
+                "full_payload_path": result.get("full_payload_path") or "",
+                "reason": result.get("reason") or "",
+                "error": result.get("error") or "",
+            }
+            if artifact_ledger_artifact:
+                snapshot_entry["artifact_ledger"] = artifact_ledger_artifact
             stage_snapshot_index.append(
-                {
-                    "stage_name": stage_name,
-                    "stored": bool(result.get("stored")),
-                    "replayable": bool(result.get("replayable")),
-                    "manifest_path": str(Path(str(result.get("full_payload_path") or "")).with_name("manifest.json")) if result.get("full_payload_path") else "",
-                    "full_payload_path": result.get("full_payload_path") or "",
-                    "reason": result.get("reason") or "",
-                    "error": result.get("error") or "",
-                }
+                snapshot_entry
             )
         return result
 
@@ -4117,7 +4419,7 @@ def main() -> int:
     progress.pulse_to(72, "检索 / 证据 / 正文生成")
     state: Dict[str, Any] = {}
     if topic_cache_skip_search:
-        log("[cache] usable topic bundle found; skipping live IQS/OpenAI retrieval and rebuilding from cached evidence")
+        log("[cache] usable topic bundle found; skipping live IQS/Qwen-assisted retrieval and rebuilding from cached evidence")
         try:
             state = _run_topic_bundle_cached_flow(query, topic_cache_context)
         except Exception as cache_rebuild_exc:
@@ -4297,8 +4599,7 @@ def main() -> int:
 
     state_dict["writer_package_path"] = str(package_path)
     if formal_report_available:
-        report_markdown = finalize_formal_report(report_markdown)
-        writer_report["report_markdown"] = report_markdown
+        report_markdown, writer_report = finalize_formal_report_and_refresh_audit(report_markdown, writer_report)
         state_dict["answer_text"] = report_markdown
         write_formal_markdown(formal_report_md_path, report_markdown)
         writer_report["formal_report_path"] = str(formal_report_md_path)
@@ -4396,6 +4697,36 @@ def main() -> int:
     writer_report["stage_snapshot_run_id"] = run_id
     writer_report["stage_snapshot_index"] = list(stage_snapshot_index)
     state_dict["stage_snapshot_run_id"] = run_id
+    artifact_ledger_sync = sync_artifact_ledger_package_safe(
+        artifact_ledger_store,
+        run_id=run_id,
+        writer_package=writer_package_payload,
+        writer_report=writer_report,
+    )
+    if artifact_ledger_sync:
+        artifact_ledger_status.update(artifact_ledger_sync)
+    if artifact_ledger_status:
+        writer_package_payload["artifact_ledger"] = dict(artifact_ledger_status)
+        writer_report["artifact_ledger"] = dict(artifact_ledger_status)
+        state_dict["artifact_ledger"] = dict(artifact_ledger_status)
+
+    # [cache_report] Phase 0 观测：写一个只读 sidecar，聚合各缓存命中/规模，便于阶段间 diff。
+    # 完全 fail-open，不修改任何既有 payload；关闭用 CACHE_REPORT_SIDECAR_ENABLED=0。
+    if env_flag("CACHE_REPORT_SIDECAR_ENABLED", True):
+        try:
+            from rag_pipeline.cache.cache_report import write_cache_report
+
+            _cache_report = write_cache_report(
+                run_id,
+                output_dir,
+                base_name=base_name,
+                query=query,
+                stage_snapshot_index=stage_snapshot_index,
+                topic_bundle=writer_package_payload.get("topic_bundle_cache"),
+            )
+            log(f"[cache] cache_report -> {_cache_report.get('_path') or '(write skipped)'}")
+        except Exception as _cache_report_exc:
+            log(f"[WARN] cache_report 生成失败（不影响报告交付）: {_cache_report_exc}")
 
     def refresh_llm_call_trace() -> None:
         calls: List[Dict[str, Any]] = []
@@ -4909,6 +5240,15 @@ def main() -> int:
         "topic_bundle_cache_used_for_skip_search": bool(topic_cache_skip_search),
         "topic_bundle_cache_store": topic_bundle_store_summary,
     }
+    artifact_ledger_final_status = (
+        "not_ready"
+        if writer_not_ready
+        else (
+            "clean_blocked"
+            if final_audit_blocked or reformatter_blocked_clean
+            else ("review_required" if not writer_publishable else "completed")
+        )
+    )
     run_trace_result: Dict[str, Any] = {}
     try:
         trace_final_status = (
@@ -4938,6 +5278,18 @@ def main() -> int:
     except Exception as trace_exc:  # pragma: no cover - trace must never block report delivery.
         run_trace_result = {"enabled": True, "status": "failed", "error": str(trace_exc)}
         writer_package_payload["run_trace"] = run_trace_result
+    artifact_ledger_finish = finish_artifact_ledger_run_safe(
+        artifact_ledger_store,
+        run_id=run_id,
+        query=query,
+        status=str(locals().get("trace_final_status") or artifact_ledger_final_status),
+    )
+    if artifact_ledger_finish:
+        artifact_ledger_status.update(artifact_ledger_finish)
+        writer_package_payload["artifact_ledger"] = dict(artifact_ledger_status)
+        writer_report["artifact_ledger"] = dict(artifact_ledger_status)
+        state_dict["artifact_ledger"] = dict(artifact_ledger_status)
+        writer_package_payload["writer_report"] = writer_report
     write_writer_package()
 
     if writer_not_ready:

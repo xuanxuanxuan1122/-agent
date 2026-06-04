@@ -36,22 +36,12 @@ from .evidence_merger import merge_evidence_package
 from .pre_layout_agent import run_pre_layout_agent
 from .rag_agent import namespace_to_overrides, run_rag_agent
 from .research_planner import run_research_planner_agent
-from .openai_web_search_provider import (
-    CHILD_AGENT_NAME as OPENAI_WEB_CHILD_AGENT_NAME,
-    PROVIDER_NAME as OPENAI_WEB_PROVIDER_NAME,
-    allowed_domains_for_task,
-    openai_web_search_config,
-    openai_web_search_enabled,
-    run_openai_web_search_child,
-)
 from .web_analysis_agent import run_web_analysis_agent
 from .writer_agent import run_writer_agent
 
 
 AGENT_NAME = "brain_agent"
 logger = logging.getLogger(__name__)
-_OPENAI_WEB_SEMAPHORES: Dict[int, threading.BoundedSemaphore] = {}
-_OPENAI_WEB_SEMAPHORES_LOCK = threading.Lock()
 AGENT_DESCRIPTION = (
     "企业研究多智能体系统的大脑 Agent。负责理解用户问题，调用 Research Planner 生成动态研究维度和搜索任务，"
     "并调度 IQS 联网检索 Worker 获取对应证据。本地 RAG 默认不进入主流程，可通过环境变量重新启用。"
@@ -613,7 +603,7 @@ def _role_for_lane_type_safe(lane_type: str) -> str:
     return IQS_LANE_TO_ROLE.get(str(lane_type or "").strip().lower(), "")
 
 
-RETRIEVAL_MODES = {"deep", "normal", "hybrid", "openai_repair"}
+RETRIEVAL_MODES = {"deep", "normal", "hybrid"}
 DEEP_DEFAULT_LANE_TYPES = {"official_data", "filing_company", "market_research", "technology_product"}
 HYBRID_DEFAULT_LANE_TYPES = {"customer_case"}
 DEEP_PROOF_ROLES = {"metric", "source_check", "filing", "official_data", "technology_product", "counter"}
@@ -657,13 +647,6 @@ def _retrieval_task_text(task: Dict[str, Any]) -> str:
 
 def _retrieval_route_for_task(task: Dict[str, Any], lane_type: str = "") -> Dict[str, Any]:
     explicit_mode = _normalize_retrieval_mode(task.get("retrieval_mode"))
-    if explicit_mode == "openai_repair":
-        return {
-            "retrieval_mode": "openai_repair",
-            "retrieval_reason": task.get("retrieval_reason") or "openai_web_gap_repair",
-            "primary_provider": OPENAI_WEB_PROVIDER_NAME,
-            "fallback_providers": _as_list(task.get("fallback_providers")),
-        }
     if explicit_mode and not _retrieval_routing_enabled():
         return {
             "retrieval_mode": explicit_mode,
@@ -1065,6 +1048,45 @@ def _terms_for_chapter(chapter: Dict[str, Any], goal: Dict[str, Any]) -> List[st
     return terms[:8]
 
 
+_SEARCH_REQUIRED_FIELDS_BY_ROLE: Dict[str, List[str]] = {
+    "metric": ["metric", "value", "unit", "period", "scope", "source_ref"],
+    "source_check": ["source_ref", "source_title", "source_url"],
+    "counter": ["counter_signal", "source_ref"],
+    "case": ["company", "use_case", "deployment_scope", "source_ref"],
+    "customer_case": ["company", "use_case", "deployment_scope", "source_ref"],
+    "technology_product": ["capability", "constraint", "source_ref"],
+    "filing": ["company", "filing_type", "period", "source_ref"],
+    "support": ["fact", "source_ref"],
+}
+
+
+def _required_fields_for_proof_role(proof_role: Any) -> List[str]:
+    role = str(proof_role or "").strip().lower()
+    return list(_SEARCH_REQUIRED_FIELDS_BY_ROLE.get(role) or _SEARCH_REQUIRED_FIELDS_BY_ROLE["support"])
+
+
+def _claim_strength_ceiling_for_goal(goal: Dict[str, Any], proof_role: str) -> str:
+    explicit = str(goal.get("claim_strength_ceiling") or goal.get("claim_strength") or "").strip().lower()
+    if explicit:
+        return explicit
+    min_levels = [str(item or "").strip().upper() for item in _as_list(goal.get("required_source_levels") or goal.get("min_source_level"))]
+    if proof_role in {"metric", "source_check"} and any(level in {"A", "B"} for level in min_levels or ["B"]):
+        return "moderate"
+    if "A" in min_levels:
+        return "moderate"
+    return "directional"
+
+
+def _requirement_id_for_goal(goal: Dict[str, Any]) -> str:
+    return str(
+        goal.get("requirement_id")
+        or goal.get("evidence_requirement_id")
+        or goal.get("slot_id")
+        or goal.get("goal_id")
+        or ""
+    ).strip()
+
+
 def build_evidence_goals_for_chapter(chapter: Dict[str, Any], research_plan: Dict[str, Any]) -> List[Dict[str, Any]]:
     chapter_id = str(chapter.get("chapter_id") or "").strip()
     title = str(chapter.get("chapter_title") or "").strip()
@@ -1128,6 +1150,9 @@ def build_evidence_goals_for_chapter(chapter: Dict[str, Any], research_plan: Dic
         copied["required_evidence_mix"] = _as_list(copied.get("required_evidence_mix")) or _as_list(chapter.get("required_evidence_mix"))
         copied["lane_targets"] = _as_list(copied.get("lane_targets") or copied.get("lanes")) or _mix_to_lane_targets(copied["required_evidence_mix"], proof_role)
         copied["required_source_levels"] = _as_list(copied.get("required_source_levels")) or ["A", "B"]
+        copied["requirement_id"] = _requirement_id_for_goal(copied) or copied["goal_id"]
+        copied["required_fields"] = _as_list(copied.get("required_fields")) or _required_fields_for_proof_role(proof_role)
+        copied["claim_strength_ceiling"] = _claim_strength_ceiling_for_goal(copied, proof_role)
         copied["min_sources"] = int(copied.get("min_sources") or (chapter.get("min_ab_sources") if proof_role in {"metric", "source_check"} else 1) or 1)
         goals.append(copied)
     roles_present = {str(goal.get("proof_role") or "").strip().lower() for goal in goals}
@@ -1145,6 +1170,7 @@ def build_evidence_goals_for_chapter(chapter: Dict[str, Any], research_plan: Dic
         goals.append(
             {
                 "goal_id": f"{chapter_id}_{role}",
+                "requirement_id": f"{chapter_id}_{role}",
                 "chapter_id": chapter_id,
                 "chapter_title": title,
                 "chapter_question": core_question,
@@ -1155,6 +1181,8 @@ def build_evidence_goals_for_chapter(chapter: Dict[str, Any], research_plan: Dic
                 "required_evidence_mix": _as_list(chapter.get("required_evidence_mix")),
                 "lane_targets": _mix_to_lane_targets(_as_list(chapter.get("required_evidence_mix")), role),
                 "required_source_levels": ["A", "B"],
+                "required_fields": _required_fields_for_proof_role(role),
+                "claim_strength_ceiling": _claim_strength_ceiling_for_goal({"required_source_levels": ["A", "B"]}, role),
                 "min_sources": max(1, int(chapter.get("min_ab_sources") or 2)) if role in {"metric", "source_check"} else 1,
             }
         )
@@ -1213,6 +1241,9 @@ def build_search_tasks_for_goal(
         "min_source_level": _as_list(goal.get("required_source_levels")) or ["A", "B"],
         "required_evidence_mix": required_mix,
         "proof_role": proof_role,
+        "requirement_id": _requirement_id_for_goal(goal),
+        "required_fields": _as_list(goal.get("required_fields")) or _required_fields_for_proof_role(proof_role),
+        "claim_strength_ceiling": goal.get("claim_strength_ceiling") or _claim_strength_ceiling_for_goal(goal, proof_role),
         "counter_evidence": proof_role == "counter",
         "research_object": research_object,
         "global_required_terms": global_required_terms,
@@ -5314,8 +5345,6 @@ def _child_output_to_pool_item(
 ) -> Dict[str, Any]:
     if agent == "rag":
         child_agent = "industry_rag_agent"
-    elif agent == OPENAI_WEB_PROVIDER_NAME:
-        child_agent = OPENAI_WEB_CHILD_AGENT_NAME
     elif agent in IQS_ROLE_CONFIGS:
         child_agent = IQS_ROLE_CONFIGS[agent]["child"]
     else:
@@ -5447,492 +5476,9 @@ def _state_metadata(state: BrainAgentState) -> Dict[str, Any]:
     return metadata
 
 
-OPENAI_WEB_GAP_REPAIR_MARKERS = {
-    "iqs_lane_timeout_without_signal",
-    "iqs_lane_no_success",
-    "lane_timeout",
-    "timeout",
-    "page_results_zero",
-    "search_tasks_dropped",
-    "insufficient_ab_sources",
-    "insufficient_ab_core_sources",
-    "low_ab_sources",
-    "core_claim_without_ab_source",
-    "source_check",
-    "missing_source_ref",
-    "citation_source_missing",
-    "missing_sources_appendix",
-    "title_only_source",
-    "counter_evidence_missing",
-    "missing_counter_evidence",
-}
-
-
-def _openai_web_gap_repair_reason(task: Dict[str, Any]) -> str:
-    search_task = _as_dict(task.get("search_task")) or _as_dict(task)
-    markers = _followup_marker_values(search_task)
-    text = " ".join(
-        str(value or "")
-        for value in [
-            task.get("targets_gap"),
-            search_task.get("targets_gap"),
-            search_task.get("evidence_goal"),
-            search_task.get("proof_role"),
-            search_task.get("evidence_type"),
-            " ".join(str(item) for item in _as_list(search_task.get("blocking_gaps"))),
-            " ".join(str(item) for item in _as_list(search_task.get("source_priority"))),
-            " ".join(str(item) for item in _as_list(search_task.get("min_source_level"))),
-            " ".join(sorted(markers)),
-        ]
-    ).lower()
-    marker_hits = sorted(markers.intersection(OPENAI_WEB_GAP_REPAIR_MARKERS))
-    if marker_hits:
-        return "blocking_gap:" + ",".join(marker_hits[:3])
-    if re.search(r"lane_timeout|timeout|timed_out|page_results_zero|no_success|search_tasks_dropped", text):
-        return "lane_timeout_or_zero_results"
-    if re.search(r"insufficient_ab|low_ab|core_claim_without_ab|a/b|source_check|missing_source_ref|title_only|source_appendix", text):
-        return "ab_source_or_traceability_gap"
-    if re.search(r"counter|risk|反证|风险|失败案例", text):
-        return "counter_evidence_gap"
-    if re.search(
-        r"filing|official|gov|research|market|policy|customer|case|technology|product|"
-        r"监管|官方|公告|财报|年报|研报|报告|客户|案例|订单|中标|技术|产品",
-        text,
-    ) and _followup_priority(search_task) <= 15:
-        return "high_priority_evidence_gap"
-    return ""
-
-
-def _openai_web_gap_repair_needed(task: Dict[str, Any]) -> bool:
-    return bool(_openai_web_gap_repair_reason(task))
-
-
-def _openai_web_followup_semaphore() -> threading.BoundedSemaphore:
-    limit = _env_int("OPENAI_WEB_SEARCH_CONCURRENCY", 2, min_value=1, max_value=10)
-    with _OPENAI_WEB_SEMAPHORES_LOCK:
-        semaphore = _OPENAI_WEB_SEMAPHORES.get(limit)
-        if semaphore is None:
-            semaphore = threading.BoundedSemaphore(limit)
-            _OPENAI_WEB_SEMAPHORES[limit] = semaphore
-        return semaphore
-
-
-def _openai_web_candidate_chapter_key(task: Dict[str, Any], index: int = 0) -> str:
-    payload = _as_dict(task.get("search_task")) or _as_dict(_as_dict(task.get("limitations")).get("search_task")) or _as_dict(task)
-    chapter = str(
-        payload.get("chapter_id")
-        or payload.get("hypothesis_id")
-        or payload.get("dimension_id")
-        or payload.get("evidence_goal_id")
-        or payload.get("gap_id")
-        or ""
-    ).strip().lower()
-    role = str(payload.get("proof_role") or payload.get("evidence_type") or "source_check").strip().lower()
-    if not chapter or chapter == "unknown":
-        chapter = "report" if role == "counter" else f"openai_task_{index}"
-    return f"{chapter}:{role or 'source_check'}"
-
-
-def _openai_web_candidate_rank(task: Dict[str, Any], index: int = 0) -> tuple:
-    payload = _as_dict(task.get("search_task")) or _as_dict(task)
-    reason = _openai_web_gap_repair_reason(task)
-    role = str(payload.get("proof_role") or payload.get("evidence_type") or "").strip().lower()
-    role_rank = {
-        "source_check": 0,
-        "metric": 1,
-        "filing": 2,
-        "company_filing": 2,
-        "case": 3,
-        "customer_case": 3,
-        "counter": 4,
-        "technology_product": 5,
-        "support": 6,
-    }.get(role, 9)
-    reason_rank = {
-        "ab_source_or_traceability_gap": 0,
-        "lane_timeout_or_zero_results": 1,
-        "counter_evidence_gap": 2,
-        "high_priority_evidence_gap": 3,
-    }.get(reason.split(":", 1)[0], 4)
-    return (
-        _followup_priority(payload),
-        reason_rank,
-        role_rank,
-        _followup_target_key(payload),
-        index,
-    )
-
-
-def _diversify_openai_web_candidates(candidates: Sequence[Dict[str, Any]], *, limit: int) -> List[Dict[str, Any]]:
-    ranked = sorted(
-        [(index, dict(task)) for index, task in enumerate(candidates) if isinstance(task, dict)],
-        key=lambda item: _openai_web_candidate_rank(item[1], item[0]),
-    )
-    selected: List[Dict[str, Any]] = []
-    selected_indices: set[int] = set()
-    seen_chapters: set[str] = set()
-    for index, task in ranked:
-        if len(selected) >= limit:
-            break
-        chapter_key = _openai_web_candidate_chapter_key(task, index)
-        if chapter_key in seen_chapters:
-            continue
-        selected.append(task)
-        selected_indices.add(index)
-        seen_chapters.add(chapter_key)
-    for index, task in ranked:
-        if len(selected) >= limit:
-            break
-        if index in selected_indices:
-            continue
-        selected.append(task)
-        selected_indices.add(index)
-    return selected
-
-
-def _openai_web_preflight_candidates_from_state(state: BrainAgentState) -> List[Dict[str, Any]]:
-    package = _as_dict(state.get("evidence_package"))
-    summary = (
-        _as_dict(package.get("evidence_preflight_summary"))
-        or _as_dict(_as_dict(package.get("summary")).get("evidence_preflight_summary"))
-        or _as_dict(_as_dict(package.get("metadata")).get("evidence_preflight_summary"))
-    )
-    candidates: List[Dict[str, Any]] = []
-    if summary and bool(summary.get("needs_gap_repair")):
-        for reason in _as_list(summary.get("clean_blocking_reasons")):
-            payload = _as_dict(reason)
-            if not payload or not bool(payload.get("repairable_by_openai")):
-                continue
-            missing_roles = [str(item or "").strip().lower() for item in _as_list(payload.get("missing_proof_roles")) if str(item or "").strip()]
-            if not missing_roles:
-                role = str(payload.get("proof_role") or payload.get("required_proof_role") or "").strip().lower()
-                if not role:
-                    reason_type = str(payload.get("type") or payload.get("root_cause") or "").strip()
-                    role = "counter" if "counter" in reason_type else ("metric" if "metric" in reason_type else "source_check")
-                missing_roles = [role]
-            for role in missing_roles[:3]:
-                gap = {
-                    "gap_id": payload.get("gap_id") or _stable_short_hash("preflight_gap", payload.get("chapter_id"), role, payload.get("type")),
-                    "gap_type": payload.get("type") or "evidence_preflight_gap",
-                    "type": payload.get("type") or "evidence_preflight_gap",
-                    "chapter_id": payload.get("chapter_id") or ("report" if role == "counter" else ""),
-                    "chapter_title": payload.get("chapter_title"),
-                    "chapter_question": payload.get("chapter_question") or payload.get("chapter_title"),
-                    "required_proof_role": role,
-                    "proof_role": role,
-                    "required_source_level": payload.get("required_source_level") or ["A", "B"],
-                    "required_fields": payload.get("required_fields") or ["source"],
-                    "lane_targets": payload.get("lane_targets") or (["news_event", "market_research"] if role == "counter" else ["official_data", "market_research", "filing_company"]),
-                    "targets_gap": payload.get("targets_gap") or payload.get("type") or "evidence_preflight_gap",
-                    "why_current_evidence_insufficient": payload.get("why_current_evidence_insufficient") or payload.get("type") or "Evidence preflight gap",
-                    "root_cause": payload.get("root_cause") or payload.get("type") or "evidence_preflight_gap",
-                    "repair_priority": payload.get("repair_priority") or "high",
-                    "can_openai_repair": True,
-                    "source": "evidence_preflight_summary",
-                    "agent": "iqs",
-                }
-                task = _repair_task_from_item(gap, origin_node="evidence_preflight", loop_name="openai_gap_repair")
-                if task:
-                    task["origin_node"] = "evidence_preflight"
-                    task["loop_name"] = "openai_gap_repair"
-                    task["root_cause"] = gap["root_cause"]
-                    task["chapter_id"] = gap["chapter_id"] or task.get("chapter_id") or task.get("hypothesis_id") or "report"
-                    task["chapter_title"] = gap["chapter_title"] or task.get("chapter_title")
-                    candidates.append(task)
-    lane_coverage = _lane_coverage_from_state(state)
-    for lane_key, raw_lane in _as_dict(lane_coverage).items():
-        lane = _as_dict(raw_lane)
-        scheduled = int(_safe_float(lane.get("scheduled"), 0.0))
-        succeeded = int(_safe_float(lane.get("succeeded") or lane.get("success_count"), 0.0))
-        timed_out = int(_safe_float(lane.get("timed_out_task_count") or lane.get("timed_out"), 0.0))
-        dropped_blocking = int(_safe_float(lane.get("dropped_blocking_count"), 0.0))
-        page_results = int(_safe_float(lane.get("page_results"), 0.0))
-        if scheduled <= 0 or (succeeded > 0 and timed_out <= 0 and dropped_blocking <= 0 and page_results > 0):
-            continue
-        lane_type = str(lane.get("scheduled_lane_type") or _lane_type_for_role(str(lane_key)) or lane_key or "unknown").strip().lower()
-        role = "case" if lane_type == "customer_case" else ("counter" if "counter" in str(lane_key).lower() else "source_check")
-        root_cause = "iqs_lane_timeout_or_zero_result" if succeeded <= 0 or page_results <= 0 or timed_out > 0 else "search_tasks_dropped"
-        gap = {
-            "gap_id": _stable_short_hash("lane_openai_repair", lane_key, role, root_cause),
-            "gap_type": root_cause,
-            "type": root_cause,
-            "chapter_id": "report",
-            "chapter_title": "报告级检索缺口",
-            "query": f"{state.get('query') or ''} {lane_type} {role} evidence",
-            "targets_gap": f"{lane_type} {root_cause}",
-            "proof_role": role,
-            "required_proof_role": role,
-            "required_source_level": ["A", "B", "C"],
-            "lane_targets": [lane_type],
-            "root_cause": root_cause,
-            "repair_priority": "high",
-            "can_openai_repair": True,
-            "agent": "iqs",
-        }
-        task = _repair_task_from_item(gap, origin_node="lane_coverage", loop_name="openai_gap_repair")
-        if task:
-            task["chapter_id"] = "report"
-            task["chapter_title"] = gap["chapter_title"]
-            task["root_cause"] = root_cause
-            candidates.append(task)
-    schedule = _as_dict(state.get("search_task_schedule")) or _as_dict(_as_dict(state.get("query_analysis")).get("search_task_schedule"))
-    for dropped in _as_list(schedule.get("dropped_tasks"))[:24]:
-        task_payload = _as_dict(dropped)
-        if not task_payload or not _is_blocking_dropped_task(task_payload):
-            continue
-        role = str(task_payload.get("proof_role") or task_payload.get("evidence_type") or "source_check").strip().lower()
-        gap = {
-            **task_payload,
-            "gap_id": task_payload.get("gap_id") or _stable_short_hash("dropped_openai_repair", task_payload.get("query"), role),
-            "type": "search_tasks_dropped",
-            "gap_type": "search_tasks_dropped",
-            "chapter_id": task_payload.get("chapter_id") or task_payload.get("hypothesis_id") or "report",
-            "proof_role": role,
-            "required_proof_role": role,
-            "root_cause": "search_tasks_dropped",
-            "repair_priority": "high",
-            "can_openai_repair": True,
-            "agent": "iqs",
-        }
-        task = _repair_task_from_item(gap, origin_node="search_task_schedule", loop_name="openai_gap_repair")
-        if task:
-            task["chapter_id"] = gap["chapter_id"]
-            task["root_cause"] = "search_tasks_dropped"
-            candidates.append(task)
-    return candidates
-
-
-def _openai_web_repair_contract_valid(search_task: Dict[str, Any]) -> bool:
-    task = _as_dict(search_task)
-    return (
-        str(task.get("retrieval_mode") or "").strip().lower() == "openai_repair"
-        and str(task.get("repair_source") or "").strip().lower() == "openai_web_gap_repair"
-        and str(task.get("primary_provider") or task.get("provider") or "").strip().lower() == OPENAI_WEB_PROVIDER_NAME
-    )
-
-
-def _record_openai_web_invalid_direct_invocation(
-    state: BrainAgentState,
-    *,
-    search_task: Optional[Dict[str, Any]] = None,
-    query: str = "",
-    targets_gap: str = "",
-    round_number: int = 0,
-    action: str = "blocked",
-) -> None:
-    metadata = _state_metadata(state)
-    summary = dict(metadata.get("openai_web_search_summary") or {})
-    summary["invalid_direct_invocation_count"] = int(_safe_float(summary.get("invalid_direct_invocation_count"), 0.0)) + 1
-    summary["last_invalid_direct_invocation_action"] = action
-    examples = _as_list(summary.get("invalid_direct_invocation_examples"))
-    task = _as_dict(search_task)
-    examples.append(
-        {
-            "query": _compact_text(query or task.get("query"), max_chars=160),
-            "targets_gap": _compact_text(targets_gap or task.get("targets_gap") or task.get("evidence_goal"), max_chars=160),
-            "round": round_number,
-            "action": action,
-            "retrieval_mode": task.get("retrieval_mode"),
-            "repair_source": task.get("repair_source"),
-            "primary_provider": task.get("primary_provider"),
-        }
-    )
-    summary["invalid_direct_invocation_examples"] = examples[-5:]
-    metadata["openai_web_search_summary"] = summary
-
-
-def _build_openai_web_gap_repair_tasks(
-    tasks: Sequence[Dict[str, Any]],
-    *,
-    state: BrainAgentState,
-    round_number: int,
-) -> List[Dict[str, Any]]:
-    if not openai_web_search_enabled():
-        return []
-    default_max_per_report = 30
-    max_per_report = _env_int("OPENAI_WEB_SEARCH_MAX_TASKS_PER_REPORT", default_max_per_report, min_value=1, max_value=100)
-    hard_max_per_report = _env_int("OPENAI_WEB_SEARCH_HARD_MAX_TASKS_PER_REPORT", 36, min_value=max_per_report, max_value=120)
-    max_per_round = _env_int("OPENAI_WEB_SEARCH_MAX_GAP_REPAIR_TASKS_PER_ROUND", 6, min_value=0, max_value=20)
-    metadata = _state_metadata(state)
-    summary = dict(metadata.get("openai_web_search_summary") or {})
-    if bool(summary.get("quota_blocked")):
-        summary["last_skip_reason"] = "openai_web_quota_blocked"
-        metadata["openai_web_search_summary"] = summary
-        return []
-    if int(_safe_float(summary.get("consecutive_failed_tasks"), 0.0)) >= _env_int("OPENAI_WEB_SEARCH_MAX_CONSECUTIVE_FAILURES_PER_REPORT", 6, min_value=2, max_value=20):
-        summary["global_consecutive_failure_warning"] = True
-        summary["last_skip_reason"] = "openai_web_consecutive_failures_warning"
-        metadata["openai_web_search_summary"] = summary
-    used = int(_safe_float(metadata.get("openai_web_search_task_count"), 0.0))
-    remaining = min(max_per_round, max(0, max_per_report - used), max(0, hard_max_per_report - used))
-    if remaining <= 0:
-        summary["last_skip_reason"] = "openai_web_budget_exhausted"
-        summary["max_per_report"] = max_per_report
-        summary["hard_max_per_report"] = hard_max_per_report
-        metadata["openai_web_search_summary"] = summary
-        return []
-    preflight_candidates = _openai_web_preflight_candidates_from_state(state)
-    candidates = [
-        task
-        for task in [*preflight_candidates, *list(tasks or [])]
-        if isinstance(task, dict)
-        and str(task.get("agent") or "").strip().lower() != OPENAI_WEB_PROVIDER_NAME
-        and _openai_web_gap_repair_needed(task)
-    ]
-    failures_by_chapter = _as_dict(summary.get("failures_by_chapter"))
-    candidates = [
-        task
-        for task in candidates
-        if int(_safe_float(failures_by_chapter.get(_openai_web_candidate_chapter_key(task)), 0.0)) < 2
-    ]
-    if not candidates:
-        return []
-    candidates = _diversify_openai_web_candidates(candidates, limit=remaining)
-    openai_tasks: List[Dict[str, Any]] = []
-    for index, task in enumerate(candidates, start=1):
-        cloned = copy.deepcopy(task)
-        cloned["agent"] = OPENAI_WEB_PROVIDER_NAME
-        search_task = copy.deepcopy(_as_dict(cloned.get("search_task")) or {"query": cloned.get("query")})
-        reason = _openai_web_gap_repair_reason(cloned) or "openai_web_gap_repair"
-        search_task["agent"] = OPENAI_WEB_PROVIDER_NAME
-        search_task["provider"] = OPENAI_WEB_PROVIDER_NAME
-        search_task["retrieval_mode"] = "openai_repair"
-        search_task["retrieval_reason"] = f"openai_web_gap_repair:{reason}"
-        search_task["primary_provider"] = OPENAI_WEB_PROVIDER_NAME
-        search_task["fallback_providers"] = []
-        search_task["repair_source"] = "openai_web_gap_repair"
-        search_task.setdefault("gap_repair_round", round_number)
-        for key in (
-            "chapter_id",
-            "chapter_title",
-            "hypothesis_id",
-            "dimension_id",
-            "proof_role",
-            "required_proof_role",
-            "root_cause",
-            "gap_id",
-            "gap_type",
-            "targets_gap",
-            "evidence_goal",
-            "required_source_level",
-            "source_priority",
-            "must_have_terms",
-        ):
-            value = cloned.get(key)
-            if (value is None or value == "") and key == "proof_role":
-                value = cloned.get("evidence_type") or search_task.get("evidence_type")
-            if value is not None and value != "" and not search_task.get(key):
-                search_task[key] = copy.deepcopy(value)
-        if not search_task.get("chapter_id"):
-            search_task["chapter_id"] = "report" if str(search_task.get("proof_role") or "").strip().lower() == "counter" else (
-                search_task.get("hypothesis_id") or search_task.get("dimension_id") or search_task.get("gap_id") or "report"
-            )
-        if not search_task.get("proof_role"):
-            search_task["proof_role"] = "source_check"
-        domains = allowed_domains_for_task(search_task)
-        if domains:
-            search_task["allowed_domains"] = domains
-            search_task["allowed_domains_source"] = "explicit_or_specific_target_domain"
-        cloned["retrieval_mode"] = "openai_repair"
-        cloned["retrieval_reason"] = search_task["retrieval_reason"]
-        cloned["primary_provider"] = OPENAI_WEB_PROVIDER_NAME
-        cloned["fallback_providers"] = []
-        cloned["provider"] = OPENAI_WEB_PROVIDER_NAME
-        cloned["repair_source"] = "openai_web_gap_repair"
-        cloned["search_task"] = search_task
-        cloned["chapter_id"] = search_task.get("chapter_id")
-        cloned["chapter_title"] = search_task.get("chapter_title")
-        cloned["proof_role"] = search_task.get("proof_role")
-        cloned["root_cause"] = search_task.get("root_cause") or reason
-        cloned["openai_gap_repair_index"] = used + index
-        cloned["openai_gap_repair_reason"] = reason
-        openai_tasks.append(cloned)
-    metadata["openai_web_search_task_count"] = used + len(openai_tasks)
-    if openai_tasks:
-        summary["gap_repair_task_count"] = int(_safe_float(summary.get("gap_repair_task_count"), 0.0)) + len(openai_tasks)
-        summary["planned_count"] = int(_safe_float(summary.get("planned_count"), 0.0)) + len(openai_tasks)
-        summary["last_round_number"] = round_number
-        summary["max_per_round"] = max_per_round
-        summary["max_per_report"] = max_per_report
-        summary["hard_max_per_report"] = hard_max_per_report
-        summary["last_planned_by_chapter"] = _count_tasks_by_key(
-            [_as_dict(task.get("search_task")) for task in openai_tasks],
-            "chapter_id",
-            fallback_key="hypothesis_id",
-        )
-        summary["last_planned_by_proof_role"] = _count_tasks_by_key(
-            [_as_dict(task.get("search_task")) for task in openai_tasks],
-            "proof_role",
-            fallback_key="evidence_type",
-        )
-        metadata["openai_web_search_summary"] = summary
-    return openai_tasks
-
-
-def _record_openai_web_gap_repair_result(state: BrainAgentState, child: Dict[str, Any]) -> None:
-    metadata = _state_metadata(state)
-    summary = dict(metadata.get("openai_web_search_summary") or {})
-    status = str(child.get("status") or "failed").strip().lower()
-    has_signal = bool(_as_list(child.get("key_sources")) and _as_list(child.get("raw_data_points")))
-    source_candidates = _as_list(child.get("source_candidates"))
-    if source_candidates:
-        summary["source_candidate_count"] = int(_safe_float(summary.get("source_candidate_count"), 0.0)) + len(source_candidates)
-    search_task = _as_dict(child.get("search_task"))
-    chapter_key = _openai_web_candidate_chapter_key(search_task or child)
-    if status in {"success", "partial"} and has_signal:
-        sources = _as_list(child.get("key_sources"))
-        summary["success_count"] = int(_safe_float(summary.get("success_count"), 0.0)) + 1
-        summary["accepted_evidence_count"] = int(_safe_float(summary.get("accepted_evidence_count"), 0.0)) + len(_as_list(child.get("raw_data_points")))
-        summary["accepted_source_count"] = int(_safe_float(summary.get("accepted_source_count"), 0.0)) + len(sources)
-        summary["accepted_ab_source_count"] = int(_safe_float(summary.get("accepted_ab_source_count"), 0.0)) + len(
-            [
-                source
-                for source in sources
-                if str(_as_dict(source).get("source_level") or "").strip().upper() in {"A", "B"}
-            ]
-        )
-        summary["consecutive_failed_tasks"] = 0
-        failures_by_chapter = dict(_as_dict(summary.get("failures_by_chapter")))
-        if chapter_key:
-            failures_by_chapter[chapter_key] = 0
-        summary["failures_by_chapter"] = failures_by_chapter
-    else:
-        summary["failed_count"] = int(_safe_float(summary.get("failed_count"), 0.0)) + 1
-        summary["consecutive_failed_tasks"] = int(_safe_float(summary.get("consecutive_failed_tasks"), 0.0)) + 1
-        failures_by_chapter = dict(_as_dict(summary.get("failures_by_chapter")))
-        if chapter_key:
-            failures_by_chapter[chapter_key] = int(_safe_float(failures_by_chapter.get(chapter_key), 0.0)) + 1
-        summary["failures_by_chapter"] = failures_by_chapter
-        limitations = _as_dict(child.get("limitations"))
-        reason = str(limitations.get("failure_reason") or child.get("note") or status or "failed").strip()
-        if reason:
-            summary[reason + "_count"] = int(_safe_float(summary.get(reason + "_count"), 0.0)) + 1
-        lowered_reason = reason.lower()
-        if "insufficient_quota" in lowered_reason or "exceeded your current quota" in lowered_reason:
-            summary["quota_blocked"] = True
-            summary["openai_web_status"] = "quota_blocked"
-            summary["last_skip_reason"] = "openai_web_quota_blocked"
-            summary["quota_blocked_count"] = int(_safe_float(summary.get("quota_blocked_count"), 0.0)) + 1
-        summary["last_failure_reason"] = _compact_text(reason, max_chars=220)
-        examples = _as_list(summary.get("failure_examples"))
-        if reason:
-            examples.append({"reason": _compact_text(reason, max_chars=220)})
-        summary["failure_examples"] = examples[-5:]
-        if int(_safe_float(failures_by_chapter.get(chapter_key), 0.0)) >= 2:
-            exhausted = _as_list(summary.get("chapter_repair_exhausted"))
-            if chapter_key and chapter_key not in exhausted:
-                exhausted.append(chapter_key)
-            summary["chapter_repair_exhausted"] = exhausted
-        if int(_safe_float(summary.get("consecutive_failed_tasks"), 0.0)) >= _env_int("OPENAI_WEB_SEARCH_MAX_CONSECUTIVE_FAILURES_PER_REPORT", 6, min_value=2, max_value=20):
-            summary["global_consecutive_failure_warning"] = True
-    metadata["openai_web_search_summary"] = summary
-
-
 def _child_agent_for_followup_agent(agent: str) -> str:
     if agent == "rag":
         return "industry_rag_agent"
-    if agent == OPENAI_WEB_PROVIDER_NAME:
-        return OPENAI_WEB_CHILD_AGENT_NAME
     return IQS_ROLE_CONFIGS.get(agent, {}).get("child", "web_analysis_agent")
 
 
@@ -5976,65 +5522,6 @@ def _run_single_followup(
         except Exception as exc:
             logger.exception("RAG followup failed", extra={"query": query, "round": round_number})
             child = normalize_rag_child_output(None, route="local", errors=[f"本地 RAG 补充检索失败：{exc}"])
-    elif agent == OPENAI_WEB_PROVIDER_NAME:
-        task_payload = _as_dict(search_task) or {"query": query, "agent": agent, "dimension_name": targets_gap, "evidence_goal": targets_gap}
-        if not _openai_web_repair_contract_valid(task_payload):
-            _record_openai_web_invalid_direct_invocation(
-                state,
-                search_task=task_payload,
-                query=query,
-                targets_gap=targets_gap,
-                round_number=round_number,
-                action="blocked_before_provider_call",
-            )
-            child = {
-                "status": "failed",
-                "confidence": 0.0,
-                "answer": "",
-                "key_sources": [],
-                "search_task": task_payload,
-                "limitations": {
-                    "failure_reason": "openai_web_invalid_direct_invocation",
-                    "provider": OPENAI_WEB_PROVIDER_NAME,
-                    "query": query,
-                    "search_task": task_payload,
-                },
-                "note": "OpenAI Web Search 只能通过 gap repair 调度入口执行；本次直接调用已阻断。",
-                "raw_data_points": [],
-                "data_gap": ["openai_web_invalid_direct_invocation"],
-            }
-        else:
-            try:
-                with _openai_web_followup_semaphore():
-                    child = run_openai_web_search_child(
-                        query=query,
-                        search_task=task_payload,
-                        targets_gap=targets_gap,
-                        round_number=round_number,
-                    )
-            except Exception as exc:
-                logger.exception("OpenAI web followup failed", extra={"query": query, "round": round_number})
-                web_config = openai_web_search_config()
-                child = {
-                    "status": "failed",
-                    "confidence": 0.0,
-                    "answer": "",
-                    "key_sources": [],
-                    "search_task": task_payload,
-                    "limitations": {
-                        "failure_reason": str(exc),
-                        "provider": OPENAI_WEB_PROVIDER_NAME,
-                        "model": web_config.get("model"),
-                        "api": web_config.get("url"),
-                        "query": query,
-                        "allowed_domains": allowed_domains_for_task(task_payload),
-                        "search_task": task_payload,
-                    },
-                    "note": f"OpenAI Web Search 补证失败：{exc}",
-                    "raw_data_points": [],
-                    "data_gap": [],
-                }
-        _record_openai_web_gap_repair_result(state, child)
     elif agent in IQS_ROLE_CONFIGS:
         config = IQS_ROLE_CONFIGS[agent]
         try:
@@ -6091,16 +5578,6 @@ def run_followup_queries(
         query = str(item.get("query") or "").strip()
         agent = str(item.get("agent") or "").strip().lower()
         targets_gap = str(item.get("targets_gap") or "").strip()
-        if agent == OPENAI_WEB_PROVIDER_NAME:
-            _record_openai_web_invalid_direct_invocation(
-                state,
-                search_task=_as_dict(item),
-                query=query,
-                targets_gap=targets_gap,
-                round_number=round_number,
-                action="rerouted_to_iqs",
-            )
-            agent = "iqs"
         if agent == "rag" and not local_rag_enabled:
             agent = "iqs"
         if not query or agent not in valid_agents:
@@ -6164,12 +5641,6 @@ def run_followup_queries(
     _record_gap_attempts(tasks, state=state, round_number=round_number)
     cache_results, tasks, cache_only_skipped = _apply_evidence_cache_to_followup_tasks(tasks, state=state, round_number=round_number)
     tasks = _apply_deep_repair_policy_to_tasks(tasks, state=state, round_number=round_number)
-    openai_gap_repair_tasks = _build_openai_web_gap_repair_tasks(tasks, state=state, round_number=round_number)
-    if openai_gap_repair_tasks:
-        openai_gap_repair_tasks = _filter_exhausted_gap_tasks(openai_gap_repair_tasks, state=state)
-        _record_gap_attempts(openai_gap_repair_tasks, state=state, round_number=round_number)
-        tasks = [*tasks, *openai_gap_repair_tasks]
-        _progress("followup", "OpenAI Web Search 补证任务已追加", tasks=len(openai_gap_repair_tasks), round=round_number)
     live_refresh_attempted_count = len(
         [
             task
@@ -6190,8 +5661,7 @@ def run_followup_queries(
     started = time.perf_counter()
     max_workers = max(1, min(_env_int("BRAIN_FOLLOWUP_PARALLEL_WORKERS", 4), len(tasks)))
     deep_count = len([task for task in tasks if _as_dict(task.get("search_task")).get("prefer_deep")])
-    openai_count = len([task for task in tasks if str(task.get("agent") or "") == OPENAI_WEB_PROVIDER_NAME])
-    _progress("followup", "补证任务开始", tasks=len(tasks), deep=deep_count, openai_web=openai_count, workers=max_workers, round=round_number)
+    _progress("followup", "补证任务开始", tasks=len(tasks), deep=deep_count, workers=max_workers, round=round_number)
     results: List[Dict[str, Any]] = []
     task_timeout = max(0.0, _env_float("BRAIN_FOLLOWUP_TASK_TIMEOUT_SECONDS", 180.0))
     executor = ThreadPoolExecutor(max_workers=max_workers)
@@ -6537,8 +6007,6 @@ def _retrieval_mode_for_summary(task: Dict[str, Any]) -> str:
     mode = _normalize_retrieval_mode(task.get("retrieval_mode"))
     if mode:
         return mode
-    if str(task.get("provider") or "").strip().lower() == OPENAI_WEB_PROVIDER_NAME:
-        return "openai_repair"
     return "deep" if task.get("prefer_deep") else "normal"
 
 
@@ -6546,8 +6014,6 @@ def _provider_for_summary(task: Dict[str, Any]) -> str:
     provider = str(task.get("primary_provider") or task.get("provider") or "").strip().lower()
     if provider:
         return provider
-    if str(task.get("agent") or "").strip().lower() == OPENAI_WEB_PROVIDER_NAME:
-        return OPENAI_WEB_PROVIDER_NAME
     return "iqs_deep" if _retrieval_mode_for_summary(task) in {"deep", "hybrid"} else "iqs_normal"
 
 
@@ -6588,7 +6054,6 @@ def _retrieval_strategy_summary_from_state(
         "deep_task_count": 0,
         "normal_task_count": 0,
         "hybrid_task_count": 0,
-        "openai_repair_task_count": 0,
         "success_count": 0,
         "failed_task_count": 0,
         "timed_out_task_count": 0,
@@ -6607,7 +6072,6 @@ def _retrieval_strategy_summary_from_state(
                 "deep_task_count": 0,
                 "normal_task_count": 0,
                 "hybrid_task_count": 0,
-                "openai_repair_task_count": 0,
                 "success_count": 0,
                 "failed_task_count": 0,
                 "timed_out_task_count": 0,
@@ -6617,7 +6081,7 @@ def _retrieval_strategy_summary_from_state(
         )
         lane_summary["scheduled_task_count"] += 1
         totals["scheduled_task_count"] += 1
-        if mode in {"deep", "normal", "hybrid", "openai_repair"}:
+        if mode in {"deep", "normal", "hybrid"}:
             lane_summary[f"{mode}_task_count"] += 1
             totals[f"{mode}_task_count"] += 1
         _increment_count(by_mode, mode)
@@ -6636,7 +6100,6 @@ def _retrieval_strategy_summary_from_state(
                 "deep_task_count": 0,
                 "normal_task_count": 0,
                 "hybrid_task_count": 0,
-                "openai_repair_task_count": 0,
                 "success_count": 0,
                 "failed_task_count": 0,
                 "timed_out_task_count": 0,
@@ -6666,23 +6129,13 @@ def _retrieval_strategy_summary_from_state(
         totals["ab_source_count"] = max(totals["ab_source_count"], package_ab)
 
     metadata = _as_dict(state.get("metadata"))
-    openai_summary = _as_dict(metadata.get("openai_web_search_summary"))
-    if openai_summary:
-        openai_task_count = int(_safe_float(openai_summary.get("gap_repair_task_count"), 0.0))
-        totals["openai_repair_task_count"] = max(
-            totals["openai_repair_task_count"],
-            openai_task_count,
-        )
-        _increment_count(by_mode, "openai_repair", openai_task_count)
-        _increment_count(by_provider, OPENAI_WEB_PROVIDER_NAME, openai_task_count)
 
     return {
-        "policy": "iqs_deep_core_iqs_normal_breadth_openai_gap_repair",
+        "policy": "iqs_deep_core_iqs_normal_breadth",
         "scheduled_by_mode": by_mode,
         "scheduled_by_provider": by_provider,
         "totals": totals,
         "by_lane": by_lane,
-        "openai_web_repair_summary": openai_summary,
         "iqs_deep_repair_summary": _as_dict(metadata.get("iqs_deep_repair")),
     }
 
@@ -6709,7 +6162,6 @@ def _annotate_evidence_package_runtime(
         int(_safe_float(_as_dict(lane).get("true_a_source_count"), 0.0))
         for lane in _as_dict(lane_coverage).values()
     )
-    openai_summary = _as_dict(_as_dict(state.get("metadata")).get("openai_web_search_summary"))
     retrieval_strategy_summary = _retrieval_strategy_summary_from_state(
         state,
         lane_coverage=lane_coverage,
@@ -6777,7 +6229,7 @@ def _annotate_evidence_package_runtime(
                     "severity": "blocking",
                     "root_cause": issue.get("root_cause") or issue.get("type"),
                     "repair_priority": "high",
-                    "can_openai_repair": issue.get("root_cause") != "missing_lane_state",
+                    "can_iqs_repair": issue.get("root_cause") != "missing_lane_state",
                     "required_proof_role": "source_check",
                     "required_fields": ["source"],
                     "lane_targets": [issue.get("lane")] if issue.get("lane") else [],
@@ -6795,7 +6247,6 @@ def _annotate_evidence_package_runtime(
         "succeeded": readpage_succeeded,
     }
     summary["true_a_source_count"] = true_a_source_count
-    summary["openai_web_repair_summary"] = openai_summary
     summary["retrieval_strategy_summary"] = retrieval_strategy_summary
     health_summary.update(
         {
@@ -6884,14 +6335,14 @@ def _annotate_evidence_package_runtime(
                     "root_cause": issue.get("root_cause") or issue.get("type"),
                     "chapter_id": issue.get("chapter_id") or "runtime",
                     "proof_role": "source_check",
-                    "repairable_by_openai": issue.get("root_cause") != "missing_lane_state",
+                    "repairable_by_search": issue.get("root_cause") != "missing_lane_state",
                     **issue,
                 }
             )
         preflight.update(
             {
                 "ready_for_clean_writer": tier == "publishable_clean",
-                "needs_gap_repair": bool([item for item in blocking if bool(_as_dict(item).get("repairable_by_openai"))]) and tier != "publishable_clean",
+                "needs_gap_repair": bool([item for item in blocking if bool(_as_dict(item).get("repairable_by_search"))]) and tier != "publishable_clean",
                 "review_draft_allowed": tier in {"publishable_clean", "limited_review_draft"},
                 "diagnostic_only": tier == "diagnostic_only",
                 "clean_blocking_reasons": blocking,
@@ -6912,7 +6363,6 @@ def _annotate_evidence_package_runtime(
         evidence_package["evidence_preflight_summary"] = preflight
     evidence_package.setdefault("metadata", {})
     evidence_package["metadata"]["readpage_coverage"] = summary["readpage_coverage"]
-    evidence_package["metadata"]["openai_web_search_summary"] = openai_summary
     evidence_package["metadata"]["retrieval_strategy_summary"] = retrieval_strategy_summary
     evidence_package["metadata"]["delivery_gate"] = delivery_gate
     evidence_package["metadata"]["evidence_health_summary"] = health_summary
@@ -7002,8 +6452,6 @@ def _attach_lane_health_to_writer_report(
             copied["lane_circuit_breaker_summary"] = metadata.get("lane_circuit_breaker_summary")
         if metadata.get("repair_task_selection_summary"):
             copied["repair_task_selection_summary"] = metadata.get("repair_task_selection_summary")
-        if metadata.get("openai_web_search_summary"):
-            copied["openai_web_search_summary"] = metadata.get("openai_web_search_summary")
     return copied
 
 
@@ -10243,7 +9691,6 @@ def aggregate_children_from_evidence_pool(evidence_pool: Sequence[Dict[str, Any]
     agent_pairs: List[tuple[str, str, str]] = [("rag", "industry_rag_agent", "本地 RAG")]
     agent_pairs.extend((key, IQS_ROLE_CONFIGS[key]["child"], IQS_ROLE_CONFIGS[key]["label"]) for key in IQS_ROLE_ORDER)
     agent_pairs.append(("iqs", "web_analysis_agent", "联网 IQS"))
-    agent_pairs.append((OPENAI_WEB_PROVIDER_NAME, OPENAI_WEB_CHILD_AGENT_NAME, "OpenAI Web Search"))
     for agent, child_name, label in agent_pairs:
         items = [item for item in evidence_pool if item.get("agent") == agent]
         usable = [
@@ -10396,7 +9843,6 @@ def aggregate_best_children_from_evidence_pool(evidence_pool: Sequence[Dict[str,
     agent_pairs: List[tuple[str, str, str]] = [("rag", "industry_rag_agent", "本地 RAG")]
     agent_pairs.extend((key, IQS_ROLE_CONFIGS[key]["child"], IQS_ROLE_CONFIGS[key]["label"]) for key in IQS_ROLE_ORDER)
     agent_pairs.append(("iqs", "web_analysis_agent", "联网 IQS"))
-    agent_pairs.append((OPENAI_WEB_PROVIDER_NAME, OPENAI_WEB_CHILD_AGENT_NAME, "OpenAI Web Search"))
     for agent, child_name, label in agent_pairs:
         items = [item for item in evidence_pool if isinstance(item, dict) and item.get("agent") == agent]
         usable = [

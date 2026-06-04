@@ -3,7 +3,7 @@ import re
 from rag_pipeline.agents.final_writer_agent import run_final_writer_agent
 from rag_pipeline.agents.public_report_sanitizer import sanitize_public_markdown
 from rag_pipeline.agents.report_health import build_report_health_card
-from rag_pipeline.flows.report.full_report import render_score_markdown
+from rag_pipeline.flows.report.full_report import finalize_formal_report_and_refresh_audit, render_score_markdown
 
 
 def test_report_health_card_marks_fact_passthrough_as_red():
@@ -27,6 +27,36 @@ def test_report_health_card_marks_fact_passthrough_as_red():
     assert health["overall_status"] == "red"
     assert health["metrics"]["body_composition_status"]["status"] == "red"
     assert health["metrics"]["evidence_backed_section_ratio"]["status"] == "red"
+
+
+def test_report_health_card_does_not_invent_default_longform_target():
+    health = build_report_health_card(
+        {
+            "layout": {
+                "layout_block_rendered_count": 3,
+                "layout_block_evidence_backed_count": 3,
+                "must_render_block_count": 3,
+                "rendered_must_block_count": 3,
+            },
+            "chapter_evidence": {"total_valid_fact_card_count": 6},
+            "analysis": {
+                "final_analysis_source": "llm_partial_merged",
+                "llm_usable_claim_count": 12,
+                "llm_usable_chapter_count": 4,
+            },
+            "summary": {"executive_summary_valid_judgment_count": 1},
+            "body_char_count": 5000,
+            "h3_count": 6,
+            "quality_mode": "high",
+            "body_composition_status": "composed",
+            "citation_manifest": {"citation_manifest_status": "ok"},
+            "final_citation_audit": {"final_citation_reconciliation_status": "ok"},
+        }
+    )
+
+    assert health["target_body_chars"] == 0
+    assert health["body_char_gap"] == 0
+    assert "body_chars_below_minimum" not in health["quality_degraded_reasons"]
 
 
 def test_report_health_card_exposes_body_rewrite_status():
@@ -119,10 +149,11 @@ def test_report_health_card_marks_factual_body_without_citations_as_red():
     assert health["overall_status"] == "red"
 
 
-def test_high_quality_density_gate_marks_thin_report_degraded():
+def test_explicit_longform_target_marks_thin_report_degraded():
     health = build_report_health_card(
         {
             "quality_mode": "high",
+            "target_body_chars": 20000,
             "body_char_count": 2046,
             "h3_count": 2,
             "layout": {
@@ -292,12 +323,8 @@ def test_score_markdown_includes_report_health_card():
                     "repair_task_selection_summary": {
                         "task_count": 2,
                         "by_proof_role": {"metric": 1, "counter": 1},
-                        "deep_budget_exhausted_count": 0,
-                    },
-                    "openai_web_search_summary": {
-                        "gap_repair_task_count": 1,
-                        "last_planned_by_proof_role": {"metric": 1},
-                        "last_skip_reason": "budget_exhausted",
+                        "deep_budget_exhausted_count": 1,
+                        "budget_exhausted": True,
                     },
                 }
             },
@@ -353,7 +380,7 @@ def test_score_markdown_includes_report_health_card():
     assert "quality_posture_mode: high" in markdown
     assert "query_rewrite_disabled: True" in markdown
     assert "Directed Evidence Repair" in markdown
-    assert "repair_task_count_by_reason: {'metric': 1}" in markdown
+    assert "repair_task_count_by_reason: {'metric': 1, 'counter': 1}" in markdown
     assert "selected_repair_task_count_by_reason: {'metric': 1, 'counter': 1}" in markdown
     assert "repair_budget_exhausted: True" in markdown
     assert "Chapter Narrative Diagnostics" in markdown
@@ -389,6 +416,31 @@ def test_score_markdown_body_char_count_excludes_source_appendix():
 
     expected_body_chars = len(re.sub(r"\s+", "", body))
     assert f"- body_char_count: {expected_body_chars}" in markdown
+
+
+def test_final_formal_report_refreshes_citation_audit_after_last_sanitizer():
+    diagnostic_line = "\u62a5\u544a\u7ea7\u68c0\u7d22\u7f3a\u53e3\uff1bemployeeITrequestshandledandITcaseresolutionspeedimprovement\uff1bpress release published 2026-05"
+    markdown = (
+        "# AI Agent\u7814\u7a76\u62a5\u544a\n\n"
+        "## 1. \u9700\u6c42\u9a8c\u8bc1\n"
+        f"{diagnostic_line}\n\n"
+        "\u4f01\u4e1a\u7ea7 AI Agent \u5df2\u8fdb\u5165\u5ba2\u6237\u6d41\u7a0b\u3002[1]\n\n"
+        "## \u6765\u6e90\u9644\u5f55\n"
+        "- [1] \u6765\u6e90A | https://example.org/a\n"
+    )
+    writer_report = {
+        "report_markdown": markdown,
+        "source_registry": [{"ref": "[1]", "title": "\u6765\u6e90A", "url": "https://example.org/a"}],
+        "citation_manifest": {
+            "appendix_sources": [{"ref": "[1]", "title": "\u6765\u6e90A", "url": "https://example.org/a"}]
+        },
+    }
+
+    finalized, refreshed = finalize_formal_report_and_refresh_audit(markdown, writer_report)
+
+    assert diagnostic_line not in finalized
+    assert refreshed["final_citation_audit"]["final_citation_reconciliation_status"] == "ok"
+    assert refreshed["final_citation_audit"]["factual_body_without_citations_count"] == 0
 
 
 def test_score_markdown_counts_global_cached_body_rewrites_as_successes():

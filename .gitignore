@@ -34,6 +34,7 @@ sessions_test/
 
 # Local model/vector/cache data
 .hf_cache/
+.codegraph/
 qdrant_storage/
 rag_chunks_store/
 *.sqlite
@@ -48,4 +49,3 @@ sqlite_probe.db*
 *.zip
 *.tar
 *.tar.gz
-

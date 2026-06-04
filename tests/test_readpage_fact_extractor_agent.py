@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from rag_pipeline.agents import brain_agent, web_analysis_agent
 from rag_pipeline.agents.readpage_fact_extractor_agent import (
@@ -169,7 +169,7 @@ def test_readpage_extractor_rejects_incomplete_metric_and_internal_claim():
                 "action_or_signal": "needs repair",
                 "variable": "diagnostic",
                 "time_or_scope": "2025",
-                "distilled_fact": "证据不足，建议补证后本章应写成方向性观察。",
+                "distilled_fact": "Insufficient evidence; this chapter needs more evidence before drafting.",
                 "fact_type": "case",
                 "source_url": "https://www.salesforce.com/news/diagnostic",
                 "source_ref": "S2",
@@ -191,7 +191,7 @@ def test_readpage_extractor_rejects_incomplete_metric_and_internal_claim():
 
 def test_brain_normalize_prefers_extracted_fact_cards_over_regex_fallback():
     web_state = {
-        "answer_text": "【事实】AI Agent adoption: 50% [0]",
+        "answer_text": "銆愪簨瀹炪€慉I Agent adoption: 50% [0]",
         "raw_output": {
             "search_options": {"search_task": {"task_id": "t1", "proof_role": "case", "chapter_id": "ch_02"}},
             "search_results": [{"source_id": 0, "title": "Search result", "url": "https://example.org/search", "snippet": "AI Agent adoption: 50%"}],
@@ -244,7 +244,7 @@ def test_score_report_exposes_readpage_fact_extractor_diagnostics():
                 "regex_fallback_used": False,
                 "fallback_used": False,
                 "status": "success",
-                "model": "gpt-5.5",
+                "model": "deepseek-v4-pro",
             }
         },
         final_audit_result={},
@@ -326,7 +326,7 @@ def test_score_extractor_diagnostics_ignores_chapter_fact_card_counts():
 
 def test_brain_regex_fallback_flag_requires_actual_raw_points():
     web_state = {
-        "answer_text": "没有可抽取的结构化证据。",
+        "answer_text": "",
         "raw_output": {
             "search_options": {"search_task": {"task_id": "t1", "proof_role": "case", "chapter_id": "ch_02"}},
             "search_results": [{"source_id": 0, "title": "Search result", "url": "https://example.org/search", "snippet": "No structured fact"}],
@@ -498,7 +498,7 @@ def test_brain_fact_extractor_diagnostics_survive_to_score_paths():
                 "budget_used": 2,
                 "budget_limit": 40,
                 "status": "success",
-                "model": "gpt-5.5",
+                "model": "deepseek-v4-pro",
             },
         },
         "metadata": {"readpage_fact_extractor": {"attempted": 2, "success_count": 1, "fact_card_count": 3, "budget_used": 2}},

@@ -14,6 +14,7 @@ from .citation_manifest import (
     manifest_appendix_sources,
     merge_source_registries,
 )
+from .chapter_narrative_agent import run_chapter_narrative
 
 from .markdown_renderer import (
     collect_format_warnings,
@@ -2088,6 +2089,7 @@ def run_final_writer_agent(
     chapter_evidence_packages: Optional[Sequence[Dict[str, Any]]] = None,
     claim_units: Optional[Sequence[Dict[str, Any]]] = None,
     analysis_claim_units: Optional[Sequence[Dict[str, Any]]] = None,
+    analysis_stage_diagnostics: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     report_blueprint = _as_dict(report_blueprint)
     chapter_packages = [item for item in list(chapter_packages or []) if isinstance(item, dict)]
@@ -2162,6 +2164,39 @@ def run_final_writer_agent(
         query=query,
     )
     public_chapters = attach_manifest_citations(public_chapters, citation_manifest)
+    chapter_narrative_diagnostics: Dict[str, Any] = {
+        "enabled": False,
+        "status": "skipped",
+        "skipped_reason": "not_run",
+    }
+    quality_context = _as_dict(analysis_stage_diagnostics)
+    if not str(quality_context.get("final_analysis_source") or "").strip():
+        has_llm_claim = any(
+            "_llm_" in str(item.get("claim_id") or "")
+            for item in list(analysis_claim_units or [])
+            if isinstance(item, dict)
+        )
+        if has_llm_claim:
+            quality_context = {**quality_context, "final_analysis_source": "llm_evidence_analysis"}
+    try:
+        public_chapters, chapter_narrative_diagnostics = run_chapter_narrative(
+            chapter_packages=public_chapters,
+            report_blueprint=report_blueprint,
+            llm_config=None,
+            quality_context=quality_context,
+        )
+    except Exception as exc:
+        chapter_narrative_diagnostics = {
+            "enabled": True,
+            "status": "yellow",
+            "skipped_reason": "",
+            "attempted_count": 0,
+            "success_count": 0,
+            "fallback_count": len(public_chapters),
+            "rejected_count": 0,
+            "rejected_reasons": {},
+            "failure_reasons": {f"runtime_error:{type(exc).__name__}": 1},
+        }
     public_chapters, manifest_section_support = _drop_factual_sections_without_manifest_citations(public_chapters)
     source_claim_support = _merge_source_claim_support_diagnostics(source_claim_support, manifest_section_support)
     before_chapter_count = len(public_chapters)
@@ -2299,6 +2334,24 @@ def run_final_writer_agent(
             )
     markdown, final_public_narrative_gate = apply_public_narrative_gate(markdown)
     markdown = normalize_markdown_spacing(markdown)
+    audit_before_final_gate = dict(final_citation_audit)
+    markdown, source_registry, final_citation_audit = _rewrite_final_markdown_with_reconciled_appendix(
+        markdown,
+        citation_manifest=citation_manifest,
+        source_registry=source_registry,
+        appendix_package=appendix_package,
+    )
+    if audit_before_final_gate:
+        earlier_removed = _as_list(audit_before_final_gate.get("final_unresolved_citation_refs"))
+        if earlier_removed:
+            final_citation_audit["final_unresolved_citation_refs"] = _dedupe_strings(
+                [*earlier_removed, *_as_list(final_citation_audit.get("final_unresolved_citation_refs"))],
+                limit=50,
+            )
+            final_citation_audit["final_unresolved_citation_removed_count"] = len(
+                final_citation_audit["final_unresolved_citation_refs"]
+            )
+    markdown = normalize_markdown_spacing(markdown)
     public_narrative_after = public_narrative_leak_audit(markdown)
     public_narrative_gate = {
         "skipped_global_blocks": [item for item in skipped_public_global_blocks if item],
@@ -2332,6 +2385,7 @@ def run_final_writer_agent(
         "citation_manifest": citation_manifest,
         "final_citation_audit": final_citation_audit,
         "source_claim_support": source_claim_support,
+        "chapter_narrative": chapter_narrative_diagnostics,
         "analysis_transfer": analysis_transfer,
         "ref_lineage_diagnostics": ref_lineage_diagnostics,
         "public_narrative_leak_audit": public_narrative_gate,

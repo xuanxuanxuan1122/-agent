@@ -1270,7 +1270,21 @@ def _unit_from_structured(unit: Dict[str, Any], package: Dict[str, Any], section
     if original_status in {"decision_ready", "core_claim"} and int(source_quality.get("claim_ab_count") or source_quality.get("ab_count") or 0) <= 0:
         payload["claim_downgraded_reason"] = "decision_ready_without_ab_source"
     payload["block_type"] = _analysis_block_type_for_unit({**unit, **payload})
-    for key in ("block_affinity", "fact_type", "proof_role", "layout_section_role", "claim_strength", "analysis_role", "source_support_map", "paragraph_seed"):
+    for key in (
+        "block_affinity",
+        "fact_type",
+        "proof_role",
+        "layout_section_role",
+        "claim_strength",
+        "claim_strength_ceiling",
+        "analysis_role",
+        "source_support_map",
+        "paragraph_seed",
+        "hypothesis_id",
+        "requirement_id",
+        "requirement_ids",
+        "lineage",
+    ):
         value = unit.get(key)
         if value not in (None, "", []):
             payload[key] = value

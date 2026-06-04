@@ -408,6 +408,8 @@ def _is_internal_section_title(value: Any) -> bool:
     }
     if text in generic_titles:
         return True
+    if re.fullmatch(r"(?:H|h)\d{1,3}|ch[_-]?\d{1,3}", text.strip()):
+        return True
     if text in {"代表性案例对比", "反向信号与失效条件", "市场空间是否成立", "付费转化是否成立"}:
         return True
     lowered = text.lower()
@@ -780,6 +782,13 @@ def _public_table_shape(headers: Sequence[Any], rows: Sequence[Sequence[Any]]) -
 
 
 DIAGNOSTIC_TABLE_PATTERNS = [
+    r"投资优先级矩阵",
+    r"报告级检索缺口",
+    r"检索缺口",
+    r"存疑",
+    r"评分",
+    r"raw\s+url",
+    r"raw\s+english",
     r"后续影响",
     r"使用边界",
     r"该指标须",
@@ -1115,6 +1124,8 @@ def _public_section_expansion_sentences(section: Dict[str, Any]) -> List[str]:
 
 
 def _expand_short_public_paragraph(text: str, section: Dict[str, Any], citation_refs: Sequence[Any]) -> str:
+    if not _env_flag("REPORT_ENABLE_RENDERER_TEMPLATE_EXPANSION", False):
+        return text
     target = _env_int("REPORT_RENDER_MIN_SECTION_CHARS", 0, min_value=0, max_value=2000)
     if target <= 0 or _compact_char_count(text) >= target:
         return text

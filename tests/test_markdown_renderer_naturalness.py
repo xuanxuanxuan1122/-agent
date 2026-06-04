@@ -36,6 +36,7 @@ def test_metric_fact_is_rendered_as_sentence_not_bare_label():
 
 
 def test_short_cited_section_expands_for_longform_mode(monkeypatch):
+    monkeypatch.setenv("REPORT_ENABLE_RENDERER_TEMPLATE_EXPANSION", "true")
     monkeypatch.setenv("REPORT_RENDER_MIN_SECTION_CHARS", "520")
     lines = render_section(
         {
@@ -191,6 +192,33 @@ def test_manifest_citation_replaces_stale_trailing_render_block_citation():
 
     assert "[1]" in markdown
     assert "[8]" not in markdown
+
+
+def test_hypothesis_id_section_title_is_not_rendered_as_public_h3():
+    markdown = render_chapter_package(
+        {
+            "chapter_title": "Risk boundary",
+            "sections": [
+                {
+                    "section_title": "H4",
+                    "claim": "AI Agent risk boundaries depend on permissions, security, and integration cost.",
+                    "render_blocks": [
+                        {
+                            "type": "paragraph",
+                            "text": "AI Agent risk boundaries depend on permissions, security, and integration cost [1].",
+                        }
+                    ],
+                    "citation_refs": ["[1]"],
+                    "evidence_backed": True,
+                }
+            ],
+            "table_packages": [],
+        },
+        1,
+    )
+
+    assert "### H4" not in markdown
+    assert "risk boundaries" in markdown
 
 
 def test_metric_render_block_is_rewritten_even_when_section_block_is_commercial():
@@ -581,6 +609,31 @@ def test_sanitize_public_markdown_removes_analysis_scaffold_language():
     assert "## 来源附录" in cleaned
 
 
+def test_sanitize_public_markdown_removes_evidence_repair_signals_from_public_body():
+    markdown = (
+        "# AI Agent研究报告\n\n"
+        "## 1. 商业化验证\n"
+        "商业化证据主要集中在金融、采购、政企等少数行业，其他行业缺乏明确案例；多数证据为2025-2026年报告，时效性有限；来源多为B级或C级，可靠性中等。\n\n"
+        "可公开事实显示，采购系统中的智能体部署已经进入供应商、合同和订单管理流程。[1]\n\n"
+        "## 来源附录\n"
+        "- [1] 来源A | https://example.org/a\n"
+    )
+
+    cleaned = sanitize_public_markdown(markdown)
+
+    for phrase in [
+        "商业化证据主要集中",
+        "其他行业缺乏明确案例",
+        "多数证据为2025-2026年报告",
+        "时效性有限",
+        "来源多为B级或C级",
+        "可靠性中等",
+    ]:
+        assert phrase not in cleaned
+    assert "采购系统中的智能体部署" in cleaned
+    assert "## 来源附录" in cleaned
+
+
 def test_render_table_package_drops_public_diagnostic_columns():
     markdown = render_table_package(
         {
@@ -606,3 +659,52 @@ def test_render_table_package_drops_public_diagnostic_columns():
     assert "Risk boundary" not in markdown
     assert "客户部署" in markdown
     assert "产品发布" in markdown
+
+
+def test_render_section_does_not_fill_short_body_with_public_templates(monkeypatch):
+    from rag_pipeline.agents.markdown_renderer import render_section
+
+    monkeypatch.setenv("REPORT_RENDER_MIN_SECTION_CHARS", "900")
+    lines = render_section(
+        {
+            "section_id": "s1",
+            "section_title": "Workflow deployment signal",
+            "block_type": "case_comparison",
+            "evidence_backed": True,
+            "citation_refs": ["[1]"],
+            "render_blocks": [
+                {
+                    "type": "paragraph",
+                    "text": "Enterprise workflows show repeatable AI agent deployment.",
+                }
+            ],
+        }
+    )
+
+    body = "\n".join(lines)
+    assert "Enterprise workflows show repeatable AI agent deployment" in body
+    assert len(body) < 300
+
+
+def test_render_table_package_keeps_investment_diagnostic_table_score_only():
+    markdown = render_table_package(
+        {
+            "should_render": True,
+            "title": "投资优先级矩阵",
+            "table_type": "investment_priority_table",
+            "headers": ["对象", "评分", "存疑", "raw URL"],
+            "rows": [
+                {
+                    "cells": ["Vendor A", "85", "来源仍需核验", "https://example.invalid/raw"],
+                    "evidence_refs": ["[1]"],
+                },
+                {
+                    "cells": ["Vendor B", "72", "口径不一致", "https://example.invalid/raw2"],
+                    "evidence_refs": ["[2]"],
+                },
+            ],
+            "evidence_refs": ["[1]", "[2]"],
+        }
+    )
+
+    assert markdown == ""

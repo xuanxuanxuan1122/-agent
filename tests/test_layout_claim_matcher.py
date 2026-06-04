@@ -136,6 +136,10 @@ def test_chapter_argument_preserves_analysis_claim_identity_and_support_map(monk
     monkeypatch.setenv("REPORT_ENABLE_LLM_BODY_REWRITE", "false")
     claim = _claim(
         claim_id="claim_ch01_1",
+        hypothesis_id="H1",
+        requirement_ids=["H1_case"],
+        claim_strength_ceiling="directional",
+        lineage={"requirement_ids": ["H1_case"], "fact_ids": ["EV-1"], "source_ids": ["SRC-1"]},
         source_support_map={"claim": ["EV-1"], "mechanism": ["EV-1"], "boundary": ["EV-1"]},
         analysis_role="directional",
         paragraph_seed="Enterprise workflow deployment is a directional demand signal.",
@@ -165,6 +169,10 @@ def test_chapter_argument_preserves_analysis_claim_identity_and_support_map(monk
     assert section["claim_id"] == "claim_ch01_1"
     assert section["analysis_role"] == "directional"
     assert section["source_support_map"] == {"claim": ["EV-1"], "mechanism": ["EV-1"], "boundary": ["EV-1"]}
+    assert section["hypothesis_id"] == "H1"
+    assert section["requirement_ids"] == ["H1_case"]
+    assert section["claim_strength_ceiling"] == "directional"
+    assert section["lineage"]["requirement_ids"] == ["H1_case"]
 
 
 def test_claim_builder_prefers_llm_claim_over_chapter_analysis_fallback():
