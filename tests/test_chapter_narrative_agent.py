@@ -101,6 +101,41 @@ def test_chapter_narrative_rewrites_sections_and_preserves_non_paragraph_blocks(
     assert rewritten[0]["sections"][0]["chapter_narrative_status"] == "rewritten"
 
 
+def test_chapter_narrative_rejects_extra_refs(monkeypatch):
+    monkeypatch.setenv("REPORT_ENABLE_LLM_CHAPTER_NARRATIVE", "true")
+    monkeypatch.setenv("REPORT_CHAPTER_NARRATIVE_MIN_EVIDENCE_SECTIONS", "1")
+    monkeypatch.setenv("REPORT_CHAPTER_NARRATIVE_CACHE_ENABLED", "false")
+    monkeypatch.setattr("rag_pipeline.agents.chapter_narrative_agent.llm_config_is_ready", lambda config: True)
+    monkeypatch.setattr(
+        "rag_pipeline.agents.chapter_narrative_agent.call_openai_compatible_json",
+        lambda **kwargs: {
+            "payload": {
+                "sections": [
+                    {
+                        "section_id": "s1",
+                        "paragraph": "Salesforce workflow deployment supports the claim [1].",
+                        "used_fact_refs": ["EV-1", "EV-UNRELATED"],
+                        "citation_refs": ["[1]", "[99]"],
+                    }
+                ]
+            }
+        },
+    )
+
+    chapters = [_chapter(_section("s1"))]
+    rewritten, diagnostics = run_chapter_narrative(
+        chapter_packages=chapters,
+        report_blueprint={"report_profile": "industry_research_report"},
+        llm_config={"url": "https://llm.test", "api_key": "key", "model": "mock"},
+        quality_context={"final_analysis_source": "llm_evidence_analysis"},
+    )
+
+    assert diagnostics["success_count"] == 0
+    assert diagnostics["fallback_count"] == 1
+    assert diagnostics["rejected_reasons"]["unexpected_refs"] == 1
+    assert rewritten == chapters
+
+
 def test_chapter_narrative_default_minimum_allows_two_evidence_sections(monkeypatch):
     monkeypatch.setenv("REPORT_ENABLE_LLM_CHAPTER_NARRATIVE", "true")
     monkeypatch.delenv("REPORT_CHAPTER_NARRATIVE_MIN_EVIDENCE_SECTIONS", raising=False)

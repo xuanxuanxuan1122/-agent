@@ -62,6 +62,35 @@ def as_list(value: Any) -> List[Any]:
     return list(value) if isinstance(value, list) else []
 
 
+REPAIR_TRACE_KEYS = (
+    "evidence_preflight_trace",
+    "layout_refinement_trace",
+    "post_qa_repair_trace",
+)
+
+
+def repair_trace_payload_from_state(
+    *,
+    state_dict: Dict[str, Any],
+    raw_output: Dict[str, Any],
+    writer_report: Dict[str, Any],
+) -> Dict[str, List[Any]]:
+    containers = (
+        as_dict(state_dict),
+        as_dict(raw_output),
+        as_dict(writer_report),
+        as_dict(as_dict(raw_output).get("writer_report")),
+    )
+    payload: Dict[str, List[Any]] = {}
+    for key in REPAIR_TRACE_KEYS:
+        for container in containers:
+            items = as_list(container.get(key))
+            if items:
+                payload[key] = items
+                break
+    return payload
+
+
 def merge_source_registry_candidates(*registries: Any) -> List[Dict[str, Any]]:
     """Merge source registries without letting a compact writer snapshot hide the full evidence pool."""
     from rag_pipeline.agents.citation_manifest import merge_source_registries
@@ -723,6 +752,109 @@ def _analysis_contract_diagnostics(writer_package: Dict[str, Any]) -> Dict[str, 
         "render_artifacts_full": render_full,
         "compacted_artifact_used": not render_full,
     }
+
+
+def _insufficient_analysis_signal(writer_report: Dict[str, Any]) -> Dict[str, Any]:
+    """Detect the "analysis produced no real LLM claims" (vacuous) condition.
+
+    When the LLM analysis stage yields zero usable claims the pipeline falls back
+    to a deterministic template rebuild that reads fluent but is vacuous. Rather
+    than ship that long filler, we emit a short honest stub (P0 guardrail).
+
+    Triggers only on the *positive* ``deterministic_rebuild`` + zero-usable-claim
+    signal, so missing/partial diagnostics can never false-trigger the stub.
+    """
+    diag = _analysis_contract_diagnostics({"writer_report": writer_report})
+    final_source = str(diag.get("final_analysis_source") or "")
+    try:
+        usable = int(float(diag.get("llm_usable_claim_count") or 0))
+    except (TypeError, ValueError):
+        usable = 0
+    insufficient = final_source == "deterministic_rebuild" and usable <= 0
+    return {"insufficient": insufficient, "diagnostics": diag}
+
+
+def _build_insufficient_stub_markdown(
+    query: str,
+    writer_report: Dict[str, Any],
+    diagnostics: Dict[str, Any],
+) -> str:
+    """Short, honest "insufficient analysis" report.
+
+    Instead of a long template-filler report, state plainly: the thesis we could
+    not substantiate, the high-trust sources we *did* gather, and the concrete
+    gaps. This protects trust when the evidence chain breaks.
+    """
+    reason = str(
+        diagnostics.get("quality_path_degradation_reason")
+        or diagnostics.get("llm_analysis_status")
+        or "analysis_produced_no_usable_claims"
+    )
+    render_artifacts = as_dict(writer_report.get("render_artifacts"))
+    sources = merge_source_registry_candidates(
+        as_list(writer_report.get("source_registry")),
+        as_list(render_artifacts.get("source_registry")),
+        as_list(writer_report.get("sources")),
+    )
+
+    def _level(source: Any) -> str:
+        return str(as_dict(source).get("source_level") or as_dict(source).get("credibility") or "").strip().upper()
+
+    def _src_line(source: Any) -> str:
+        item = as_dict(source)
+        title = str(item.get("title") or item.get("name") or item.get("url") or item.get("canonical_url") or "").strip()
+        url = str(item.get("url") or item.get("canonical_url") or "").strip()
+        level = _level(item)
+        tag = f"[{level}] " if level in {"A", "B", "C", "D"} else ""
+        line = f"- {tag}{title}".rstrip()
+        return f"{line} — {url}" if url else line
+
+    preferred = [s for s in sources if _level(s) in {"A", "B"}] or sources
+    chosen = [s for s in preferred if str(as_dict(s).get("title") or as_dict(s).get("url") or "").strip()][:6]
+
+    qa = as_dict(writer_report.get("qa_result"))
+    gap_msgs: List[str] = []
+    for key in (
+        "blocking_followups",
+        "blocking_evidence_repair_followups",
+        "blocking_content_repair_followups",
+        "required_followups",
+        "quality_findings",
+    ):
+        for item in as_list(qa.get(key)):
+            item = as_dict(item)
+            msg = str(
+                item.get("message")
+                or item.get("reason")
+                or item.get("gap_type")
+                or item.get("requirement_id")
+                or ""
+            ).strip()
+            if msg and msg not in gap_msgs:
+                gap_msgs.append(msg)
+
+    lines = [
+        f"# {query} — 研究简报（未达可发布）",
+        "",
+        "> **状态：分析证据不足，未生成可发布报告。**",
+        "> 系统在证据链不足时不再硬凑正式长文，改为如实说明已掌握与缺失，避免输出看似正式实则空洞的报告。",
+        f"> 触发原因：`{reason}`。",
+        "",
+        "## 已掌握的来源",
+    ]
+    lines += [_src_line(s) for s in chosen] if chosen else ["- （本次未沉淀到可信来源）"]
+    lines += ["", "## 主要缺口"]
+    if gap_msgs:
+        lines += [f"- {m}" for m in gap_msgs[:8]]
+    else:
+        lines += ["- 关键章节缺少可绑定的高可信证据，无法形成可发布的方向性判断。"]
+    lines += [
+        "",
+        "## 结论",
+        "- 当前证据不足以支撑可发布的行业判断；需补齐上述缺口后重跑。",
+        "- 完整诊断见同目录 `_score.md` 与 `.trace_summary.md`。",
+    ]
+    return "\n".join(lines).strip() + "\n"
 
 
 def _executive_summary_diagnostics(writer_package: Dict[str, Any], writer_report: Dict[str, Any]) -> Dict[str, Any]:
@@ -4599,9 +4731,27 @@ def main() -> int:
 
     state_dict["writer_package_path"] = str(package_path)
     if formal_report_available:
-        report_markdown, writer_report = finalize_formal_report_and_refresh_audit(report_markdown, writer_report)
-        state_dict["answer_text"] = report_markdown
-        write_formal_markdown(formal_report_md_path, report_markdown)
+        _stub_signal = (
+            _insufficient_analysis_signal(writer_report)
+            if env_flag("REPORT_INSUFFICIENT_STUB_ON_ZERO_CLAIMS", True)
+            else {"insufficient": False}
+        )
+        if _stub_signal.get("insufficient"):
+            # P0 guardrail: analysis produced no usable LLM claims -> emit a short
+            # honest stub instead of a fluent-but-vacuous deterministic long report.
+            report_markdown = _build_insufficient_stub_markdown(
+                query, writer_report, as_dict(_stub_signal.get("diagnostics"))
+            )
+            writer_report["report_status"] = "insufficient_analysis_stub"
+            writer_report["delivery_tier"] = "insufficient_analysis_stub"
+            writer_report["insufficient_analysis_stub"] = True
+            state_dict["answer_text"] = report_markdown
+            write_markdown(formal_report_md_path, report_markdown)
+            log("  [P0] 分析无有效 claim → 输出诚实短稿（非模板长文）", force=True)
+        else:
+            report_markdown, writer_report = finalize_formal_report_and_refresh_audit(report_markdown, writer_report)
+            state_dict["answer_text"] = report_markdown
+            write_formal_markdown(formal_report_md_path, report_markdown)
         writer_report["formal_report_path"] = str(formal_report_md_path)
         writer_report["writer_markdown_path"] = str(formal_report_md_path)
         state_dict["formal_report_path"] = str(formal_report_md_path)
@@ -4671,6 +4821,11 @@ def main() -> int:
         "writer_report": writer_report,
         "review_result": review_result,
         "reformatter_result": reformatter_result,
+        **repair_trace_payload_from_state(
+            state_dict=state_dict,
+            raw_output=raw_output,
+            writer_report=writer_report,
+        ),
         "topic_bundle_cache": {
             "preflight": topic_cache_preflight,
             "hit": bool(topic_cache_preflight.get("status") not in {"missing", "disabled"}),
@@ -5240,6 +5395,19 @@ def main() -> int:
         "topic_bundle_cache_used_for_skip_search": bool(topic_cache_skip_search),
         "topic_bundle_cache_store": topic_bundle_store_summary,
     }
+    artifact_ledger_final_sync = sync_artifact_ledger_package_safe(
+        artifact_ledger_store,
+        run_id=run_id,
+        writer_package=writer_package_payload,
+        writer_report=writer_report,
+        final_audit_result=final_audit_result,
+    )
+    if artifact_ledger_final_sync:
+        artifact_ledger_status.update(artifact_ledger_final_sync)
+        writer_package_payload["artifact_ledger"] = dict(artifact_ledger_status)
+        writer_report["artifact_ledger"] = dict(artifact_ledger_status)
+        state_dict["artifact_ledger"] = dict(artifact_ledger_status)
+        writer_package_payload["writer_report"] = writer_report
     artifact_ledger_final_status = (
         "not_ready"
         if writer_not_ready
@@ -5290,6 +5458,7 @@ def main() -> int:
         writer_report["artifact_ledger"] = dict(artifact_ledger_status)
         state_dict["artifact_ledger"] = dict(artifact_ledger_status)
         writer_package_payload["writer_report"] = writer_report
+    write_state_json(state_path, state_dict)
     write_writer_package()
 
     if writer_not_ready:

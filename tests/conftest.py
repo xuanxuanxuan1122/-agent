@@ -14,11 +14,14 @@ def pytest_configure(config):
 
 
 def pytest_sessionstart(session):
-    os.environ.setdefault("BRAIN_ENABLE_LLM_RESEARCH_PLANNER", "0")
-    os.environ.setdefault("BRAIN_ENABLE_LLM_PROBLEM_FRAMING", "0")
-    os.environ.setdefault("BRAIN_ENABLE_LLM_EVIDENCE_ANALYSIS", "false")
-    os.environ.setdefault("REPORT_ENABLE_FINAL_AUDIT", "0")
-    os.environ.setdefault("BRAIN_ENABLE_POST_QA_REPAIR", "false")
+    os.environ["BRAIN_ENABLE_LLM_RESEARCH_PLANNER"] = "0"
+    os.environ["BRAIN_ENABLE_LLM_PROBLEM_FRAMING"] = "0"
+    os.environ["BRAIN_ENABLE_LLM_EVIDENCE_ANALYSIS"] = "false"
+    os.environ["REPORT_ENABLE_LLM_CHAPTER_NARRATIVE"] = "false"
+    os.environ["REPORT_ENABLE_LLM_BODY_REWRITE"] = "false"
+    os.environ["REPORT_ENABLE_LLM_REWRITE"] = "false"
+    os.environ["REPORT_ENABLE_FINAL_AUDIT"] = "0"
+    os.environ["BRAIN_ENABLE_POST_QA_REPAIR"] = "false"
     os.environ.setdefault("REPORT_BLOCK_ON_QA_FAILURE", "false")
     os.environ.setdefault("REPORT_WRITE_CLEAN_REPORT", "false")
 

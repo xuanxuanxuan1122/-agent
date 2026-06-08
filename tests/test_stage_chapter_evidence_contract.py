@@ -71,3 +71,50 @@ def test_unresolved_refs_are_diagnostic_not_silent_drop():
 
     assert packages[0]["hydrated_evidence"] is False
     assert packages[0]["unresolved_evidence_refs"] == ["missing-ref"]
+
+
+def test_chapter_evidence_rejects_offtopic_source_check_even_with_chapter_id():
+    source_registry = [
+        {
+            "ref": "S1",
+            "url": "https://www.stats.gov.cn/agent-channel",
+            "title": "AI Agent statistics publication channel",
+            "source_level": "B",
+            "traceability_status": "traceable",
+        }
+    ]
+    evidence_package = {
+        "analysis_ready_evidence": [
+            {
+                "ref": "E1",
+                "source_ref": "S1",
+                "source_level": "B",
+                "url": "https://www.stats.gov.cn/agent-channel",
+                "fact": "The statistics office publishes AI Agent statistics through its website, yearbook, and official social media accounts.",
+                "chapter_id": "ch_01",
+                "proof_role": "source_check",
+                "allowed_use": "supporting",
+            }
+        ],
+        "source_registry": source_registry,
+    }
+    report_blueprint = {
+        "chapters": [
+            {
+                "chapter_id": "ch_01",
+                "chapter_title": "Enterprise AI Agent competitive landscape and vendor differentiation",
+                "chapter_question": "Which vendors, products, and deployment patterns shape the competitive landscape?",
+            }
+        ]
+    }
+
+    packages = build_chapter_evidence_packages_from_evidence_package(
+        report_blueprint=report_blueprint,
+        evidence_package=evidence_package,
+        source_registry=source_registry,
+    )
+
+    package = packages[0]
+    assert package["hydrated_evidence"] is False
+    assert package["metadata"]["chapter_relevance_rejected_count"] == 1
+    assert package["metadata"]["chapter_relevance_rejected_refs"] == ["E1"]

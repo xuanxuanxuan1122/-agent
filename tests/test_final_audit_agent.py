@@ -67,6 +67,75 @@ def test_final_audit_fatal_blocks_when_blocking_enabled(monkeypatch):
     assert result["llm_call"]["model"] == "deepseek-v4-pro"
 
 
+def test_final_audit_payload_includes_compact_repair_gap_context(monkeypatch):
+    _configure_deepseek_final_audit(monkeypatch)
+    monkeypatch.setenv("REPORT_ENABLE_FINAL_AUDIT", "true")
+    monkeypatch.setenv("REPORT_FINAL_AUDIT_BLOCKING", "false")
+    captured = {}
+
+    def fake_call_openai_compatible_json(*, config, system_prompt, user_payload):
+        captured["system_prompt"] = system_prompt
+        captured["user_payload"] = user_payload
+        return {
+            "payload": {
+                "status": "warning",
+                "overall_score": 72,
+                "critical_findings": [
+                    {
+                        "type": "evidence_gap",
+                        "severity": "high",
+                        "requirement_id": "H1_metric",
+                        "gap_id": "GAP-metric",
+                        "section_id": "SEC-1",
+                        "message": "Metric period is missing.",
+                    }
+                ],
+                "publish_recommendation": "publish_with_caveats",
+                "summary": "Needs one metric repair.",
+            },
+            "usage": {"total_tokens": 10},
+            "llm_call": {"task": "final_audit", "model": "deepseek-v4-pro", "status": "success"},
+        }
+
+    monkeypatch.setattr(final_audit_agent, "call_openai_compatible_json", fake_call_openai_compatible_json)
+
+    result = final_audit_agent.run_final_audit(
+        report_markdown="# Report\n\nConclusion [1]\n\n## 来源附录\n- [1] Source | https://www.stats.gov.cn/source",
+        validation={"passed": True},
+        clean_evidence={"sources": [{"id": "1", "title": "Source", "url": "https://www.stats.gov.cn/source"}]},
+        writer_package_payload={
+            "score_gaps": [
+                {
+                    "gap_id": "GAP-metric",
+                    "requirement_id": "H1_metric",
+                    "section_id": "SEC-1",
+                    "gap_type": "metric_scope_period_unit_incomplete",
+                    "status": "still_insufficient",
+                    "missing": ["period"],
+                    "retry_plan": {"raw_page": "forbidden raw page", "query_terms": ["AI Agent adoption"]},
+                }
+            ],
+            "requirement_gap_summary": {"H1_metric": {"open_gap_count": 1}},
+            "final_citation_audit": {
+                "final_citation_reconciliation_status": "ok",
+                "final_body_citation_refs": ["1"],
+                "final_appendix_refs": ["1"],
+            },
+        },
+        query="industry report",
+    )
+
+    payload = captured["user_payload"]
+    assert "requirement_id" in captured["system_prompt"]
+    assert payload["score_gaps"][0]["gap_id"] == "GAP-metric"
+    assert payload["score_gaps"][0]["requirement_id"] == "H1_metric"
+    assert payload["score_gaps"][0]["retry_plan"]["query_terms"] == ["AI Agent adoption"]
+    assert "raw_page" not in str(payload["score_gaps"])
+    assert payload["requirement_gap_summary"]["H1_metric"]["open_gap_count"] == 1
+    assert payload["final_citation_audit"]["final_citation_reconciliation_status"] == "ok"
+    assert result["audit"]["critical_findings"][0]["gap_id"] == "GAP-metric"
+
+
 def test_final_audit_drops_false_future_date_fatal_when_date_is_not_future(monkeypatch):
     _configure_deepseek_final_audit(monkeypatch)
     monkeypatch.setenv("REPORT_ENABLE_FINAL_AUDIT", "true")
@@ -143,6 +212,42 @@ def test_deterministic_audit_blocks_placeholder_sources():
     finding_types = {item["type"] for item in result["findings"]}
     assert "fake_or_placeholder_evidence" in finding_types
     assert "fake_or_placeholder_source" in finding_types
+
+
+def test_deterministic_audit_does_not_duplicate_citationless_body_as_final_gap():
+    result = final_audit_agent.run_deterministic_audit(
+        report_markdown=(
+            "# Report\n\n"
+            "Official data shows enterprise adoption signals are rising. [1]\n\n"
+            "30 AI Agent enterprise landing cases.\n\n"
+            "## Sources\n- [1] Official | https://www.stats.gov.cn/source"
+        ),
+        clean_evidence={
+            "sources": [
+                {
+                    "id": "1",
+                    "title": "Official",
+                    "url": "https://www.stats.gov.cn/source",
+                    "source_level": "A",
+                }
+            ]
+        },
+        writer_package_payload={
+            "final_citation_audit": {
+                "final_citation_reconciliation_status": "blocked",
+                "final_missing_appendix_refs": [],
+                "final_body_citation_refs": ["1"],
+                "final_appendix_refs": ["1"],
+                "factual_body_without_citations_count": 1,
+                "citationless_fact_examples": ["30 AI Agent enterprise landing cases."],
+            }
+        },
+    )
+
+    finding_types = [item["type"] for item in result["findings"]]
+    assert "citationless_factual_body" in finding_types
+    assert "final_citation_gap" not in finding_types
+    assert result["fatal"] is True
 
 
 def test_deterministic_audit_title_only_only_fatal_when_cited():

@@ -12,6 +12,21 @@ from rag_pipeline.agents.writer_agent_clean import _expand_chapter_packages_for_
 from rag_pipeline.contracts.report_contract import build_report_contract_from_package
 
 
+def test_evidence_fact_card_drops_internal_enum_tokens_from_variable():
+    # Internal routing labels (analysis_role / block_type) must never become a
+    # public "variable" subject, or they leak into prose like
+    # "用于判断counter是否具备持续性".
+    for token in ("counter", "claimable", "integrated_signal", "risk_trigger"):
+        card = EvidenceFactCard.from_legacy_dict(
+            {"evidence_id": "EV-x", "variable": token, "distilled_fact": "某事实陈述。"}
+        )
+        assert card.variable == "", f"internal token {token!r} leaked into variable"
+    kept = EvidenceFactCard.from_legacy_dict(
+        {"evidence_id": "EV-y", "variable": "渗透率", "distilled_fact": "某事实陈述。"}
+    )
+    assert kept.variable == "渗透率"
+
+
 def test_evidence_fact_card_normalizes_legacy_shapes_and_preserves_zero_source_ref():
     item = {
         "evidence_id": "EV-1",
@@ -110,6 +125,10 @@ def test_claim_unit_preserves_requirement_ids_strength_ceiling_and_lineage():
             "claim": "Agent demand is moving toward workflow deployment.",
             "claim_strength": "moderate",
             "claim_strength_ceiling": "moderate",
+            "evidence_use_level": "directional_signal",
+            "writing_permission": "cautious_with_boundary",
+            "metric_completeness_status": "incomplete",
+            "metric_missing_fields": ["unit", "period"],
             "used_evidence_ids": ["EV-1"],
             "source_support_map": {"claim": ["EV-1"]},
             "lineage": {
@@ -126,9 +145,17 @@ def test_claim_unit_preserves_requirement_ids_strength_ceiling_and_lineage():
     assert unit.hypothesis_id == "H1"
     assert unit.requirement_ids == ["H1_metric", "H1_case"]
     assert unit.claim_strength_ceiling == "moderate"
+    assert unit.evidence_use_level == "directional_signal"
+    assert unit.writing_permission == "cautious_with_boundary"
+    assert unit.metric_completeness_status == "incomplete"
+    assert unit.metric_missing_fields == ["unit", "period"]
     assert unit.lineage["source_ids"] == ["SRC-1"]
     assert legacy["requirement_ids"] == ["H1_metric", "H1_case"]
     assert legacy["claim_strength_ceiling"] == "moderate"
+    assert legacy["evidence_use_level"] == "directional_signal"
+    assert legacy["writing_permission"] == "cautious_with_boundary"
+    assert legacy["metric_completeness_status"] == "incomplete"
+    assert legacy["metric_missing_fields"] == ["unit", "period"]
     assert legacy["lineage"]["fact_ids"] == ["EV-1"]
 
 
@@ -396,6 +423,10 @@ def test_composer_uses_claim_unit_analysis_fields_for_richer_paragraph():
         limitation_boundary="The conclusion remains bounded by whether deployment depth converts into repeatable paid usage.",
         paragraph_seed="The evidence points to a shift from experimentation toward process-level adoption.",
         claim_strength="moderate",
+        evidence_use_level="directional_signal",
+        writing_permission="cautious_with_boundary",
+        metric_completeness_status="incomplete",
+        metric_missing_fields=["unit", "period"],
     )
 
     result = compose_section_paragraph(
@@ -411,6 +442,10 @@ def test_composer_uses_claim_unit_analysis_fields_for_richer_paragraph():
     assert "Customer-service workflow deployment is visible" in paragraph
     assert "requires integration, permission control, and process ownership" in paragraph
     assert "repeatable paid usage" in paragraph
+    assert result["evidence_use_level"] == "directional_signal"
+    assert result["writing_permission"] == "cautious_with_boundary"
+    assert result["metric_completeness_status"] == "incomplete"
+    assert result["metric_missing_fields"] == ["unit", "period"]
     assert len(paragraph) > len(card.distilled_fact) * 2
 
 
@@ -753,6 +788,32 @@ def test_chapter_argument_does_not_render_boundary_as_standalone_public_paragrap
     assert section["counter_evidence"]
 
 
+def test_chapter_argument_does_not_render_context_only_claim_as_public_section():
+    packages = run_chapter_argument_agent(
+        report_blueprint={"chapters": [{"chapter_id": "ch_01", "chapter_title": "Context only"}]},
+        micro_layouts=[],
+        argument_units=[
+            {
+                "chapter_id": "ch_01",
+                "claim_id": "CL-context",
+                "claim": "The statistics office publishes AI Agent statistics through several public channels.",
+                "reasoning": "This is background context, not support for a report claim.",
+                "used_fact_refs": ["EV-context"],
+                "supporting_facts": ["The statistics office publishes statistics through public channels."],
+                "claim_roles": ["context_claim"],
+                "primary_claim_role": "context_claim",
+                "public_render": True,
+            }
+        ],
+        chapter_evidence_packages=[],
+    )
+
+    package = packages[0]
+    assert package["omit_from_report"] is True
+    assert package["sections"] == []
+    assert package["dropped_sections"][0]["reason"] == "context_claim_not_public"
+
+
 def test_chapter_argument_clean_public_text_preserves_long_analysis_after_clipping():
     from rag_pipeline.agents.chapter_argument_agent import _clean_public_text
 
@@ -870,6 +931,59 @@ def test_chapter_argument_inherits_llm_claim_evidence_refs_as_used_fact_refs():
     assert section["evidence_backed"] is True
     assert section["evidence_refs"] == ["EV-LLM"]
     assert section["used_fact_refs"] == ["EV-LLM"]
+
+
+def test_chapter_argument_does_not_expand_claim_refs_from_composer_output(monkeypatch):
+    import rag_pipeline.agents.chapter_argument_agent as chapter_argument_agent
+
+    def noisy_composer(**_kwargs):
+        return {
+            "composition_status": "composed",
+            "body_composition_status": "composed",
+            "paragraph": "Salesforce workflow deployments support the adoption claim.",
+            "claim": "Enterprise AI Agent demand is moving from trials into workflow deployment.",
+            "reasoning": "Workflow deployment indicates repeatable production use.",
+            "supporting_facts": ["Salesforce disclosed workflow deployment pilots."],
+            "used_fact_refs": ["EV-LLM", "EV-UNRELATED"],
+        }
+
+    monkeypatch.setattr(chapter_argument_agent, "compose_section_paragraph", noisy_composer)
+    packages = run_chapter_argument_agent(
+        report_blueprint={"chapters": [{"chapter_id": "ch_01", "chapter_title": "Workflow adoption"}]},
+        micro_layouts=[
+            {
+                "chapter_id": "ch_01",
+                "sections": [
+                    {
+                        "section_id": "s_case",
+                        "block_type": "case_comparison",
+                        "required_evidence_refs": ["EV-UNRELATED"],
+                        "dynamic_section_title": "Workflow deployment signal",
+                    }
+                ],
+            }
+        ],
+        argument_units=[
+            {
+                "chapter_id": "ch_01",
+                "section_id": "s_case",
+                "block_type": "case_comparison",
+                "claim": "Enterprise AI Agent demand is moving from trials into workflow deployment.",
+                "reasoning": "Workflow deployment matters because it requires repeatable operations.",
+                "evidence_refs": ["EV-LLM"],
+                "used_fact_refs": ["EV-LLM"],
+                "source_support_map": {"claim": ["EV-LLM"], "mechanism": ["EV-LLM"], "boundary": ["EV-LLM"]},
+                "public_render": True,
+                "evidence_basis": ["Salesforce disclosed workflow deployment pilots."],
+                "claim_strength": "moderate",
+            }
+        ],
+        chapter_evidence_packages=[{"chapter_id": "ch_01"}],
+    )
+
+    section = packages[0]["sections"][0]
+    assert section["used_fact_refs"] == ["EV-LLM"]
+    assert section["evidence_refs"] == ["EV-LLM"]
 
 
 def test_chapter_argument_inherits_llm_used_evidence_ids_as_used_fact_refs():

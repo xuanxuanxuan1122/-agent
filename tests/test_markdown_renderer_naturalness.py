@@ -1,4 +1,4 @@
-from rag_pipeline.agents.final_writer_agent import run_final_writer_agent
+from rag_pipeline.agents.final_writer_agent import _render_key_data_block, run_final_writer_agent
 from rag_pipeline.agents.markdown_renderer import (
     render_appendix,
     render_chapter_package,
@@ -33,6 +33,28 @@ def test_metric_fact_is_rendered_as_sentence_not_bare_label():
     assert "\u5e02\u573a\u89c4\u6a21: \u8fbe8.2\u4ebf\u5143" not in text
     assert "\u5e02\u573a\u89c4\u6a21" in text
     assert "\u8fbe8.2\u4ebf\u5143" in text
+
+
+def test_key_data_block_requires_public_citation_and_scans_past_first_row():
+    block = _render_key_data_block(
+        "\u5173\u952e\u6570\u636e",
+        {},
+        [
+            {
+                "should_render": True,
+                "headers": ["\u6307\u6807", "\u6570\u503c"],
+                "rows": [
+                    {"metric": "\u65e0\u5f15\u7528\u6307\u6807", "value": "30\u4e2a"},
+                    {"metric": "\u6709\u5f15\u7528\u6307\u6807", "value": "42%", "citation_ref": "[2]"},
+                    {"metric": "\u5907\u9009\u6307\u6807", "value": "12%", "citation_refs": ["[3]"]},
+                ],
+            }
+        ],
+    )
+
+    assert "\u65e0\u5f15\u7528\u6307\u6807" not in block
+    assert "\u6709\u5f15\u7528\u6307\u6807" in block
+    assert "[2]" in block
 
 
 def test_short_cited_section_expands_for_longform_mode(monkeypatch):
@@ -558,6 +580,30 @@ def test_render_appendix_keeps_public_sources_and_omits_diagnostic_tables():
     assert "附录明细" not in rendered
     assert "后续影响" not in rendered
     assert "该指标须" not in rendered
+
+
+def test_render_appendix_keeps_public_table_rows_without_source_registry():
+    rendered = render_appendix(
+        [],
+        {
+            "table_appendix_rows": [
+                {
+                    "title": "Key metric appendix",
+                    "headers": ["metric", "scope", "value"],
+                    "rows": [
+                        ["adoption", "enterprise", "42%"],
+                        ["deployment", "pilot", "18%"],
+                    ],
+                    "should_render": True,
+                    "validation_status": "passed",
+                }
+            ],
+        },
+    )
+
+    assert rendered
+    assert "Key metric appendix" in rendered
+    assert "| metric | scope | value |" in rendered
 
 
 def test_sanitize_public_markdown_removes_analysis_scaffold_language():

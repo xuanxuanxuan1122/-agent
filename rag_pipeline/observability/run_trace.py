@@ -8,6 +8,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+from rag_pipeline.quality.regression import summarize_repair_effectiveness
+
 logger = logging.getLogger(__name__)
 
 VALID_STATUSES = {"ok", "warning", "error", "degraded", "skipped"}
@@ -65,6 +67,8 @@ def _safe_int(value: Any, default: int = 0) -> int:
 
 def _is_sensitive_key(key: Any) -> bool:
     text = str(key or "").strip().lower()
+    if text in {"total_tokens", "input_tokens", "output_tokens", "prompt_tokens", "completion_tokens"}:
+        return False
     return any(fragment in text for fragment in SENSITIVE_KEY_FRAGMENTS)
 
 
@@ -358,6 +362,13 @@ def _repair_diagnostics(
 ) -> Dict[str, Any]:
     metadata = _as_dict(writer_package.get("metadata"))
     render_artifacts = _as_dict(writer_report.get("render_artifacts"))
+    try:
+        repair_effectiveness = summarize_repair_effectiveness(
+            writer_package=writer_package,
+            writer_report=writer_report,
+        )
+    except Exception as exc:  # pragma: no cover - trace diagnostics must not block runs.
+        repair_effectiveness = {"status": "error", "error": str(exc)}
     selected = _first_existing_dict(
         raw_metadata.get("repair_task_selection_summary"),
         raw_output.get("repair_task_selection_summary"),
@@ -366,7 +377,7 @@ def _repair_diagnostics(
         render_artifacts.get("repair_task_selection_summary"),
     )
     planned: Dict[str, Any] = {}
-    if not selected and not planned:
+    if not selected and not planned and _safe_int(repair_effectiveness.get("attempted_gap_count")) <= 0:
         return {}
     selected_by_reason = _as_dict(selected.get("by_proof_role")) or _as_dict(selected.get("by_reason"))
     planned_by_reason = (
@@ -393,6 +404,7 @@ def _repair_diagnostics(
         "self_refine_disabled_reason": "quality_posture" if _as_dict(quality_posture.get("disabled")).get("self_refine") else "",
         "selected_summary": selected,
         "planned_summary": planned,
+        "repair_effectiveness": repair_effectiveness,
     }
 
 
@@ -598,6 +610,8 @@ def write_run_trace_from_package(
                 "llm_failed_chapter_count": analysis_diag.get("llm_failed_chapter_count"),
                 "quality_path_degraded": analysis_diag.get("quality_path_degraded"),
                 "llm_validation_issue_counts": issue_counts,
+                "llm_semantic_judge_counts": analysis_diag.get("llm_semantic_judge_counts"),
+                "llm_semantic_judge_usage": analysis_diag.get("llm_semantic_judge_usage"),
             },
         )
 

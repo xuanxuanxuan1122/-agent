@@ -53,6 +53,9 @@ def test_evidence_admission_marks_c_level_traceable_as_directional_analysis():
     assert item["analysis_eligible"] is True
     assert item["analysis_role"] == "directional"
     assert item["evidence_admission_reason"] == "directional_signal"
+    assert item["evidence_admission_decision"]["verdict"] == "directional"
+    assert item["admission_verdict"] == "directional"
+    assert item["evidence_card"]["admission_verdict"] == "directional"
 
 
 def test_evidence_admission_keeps_incomplete_metric_as_contextual_not_metric_claim():
@@ -73,6 +76,9 @@ def test_evidence_admission_keeps_incomplete_metric_as_contextual_not_metric_cla
     assert item["analysis_eligible"] is True
     assert item["analysis_role"] == "contextual"
     assert item["evidence_admission_reason"] == "metric_scope_period_unit_incomplete"
+    assert item["evidence_admission_decision"]["verdict"] == "directional"
+    assert item["evidence_admission_decision"]["repair_action"] == "repair_metric_fields"
+    assert "metric_fields_incomplete" in item["admission_reasons"]
 
 
 def test_evidence_admission_blocks_rejected_or_untraceable_low_quality_evidence():
@@ -88,3 +94,4 @@ def test_evidence_admission_blocks_rejected_or_untraceable_low_quality_evidence(
     assert item["analysis_eligible"] is False
     assert item["analysis_role"] == "rejected"
     assert item["evidence_admission_reason"] in {"appendix_only", "untraceable_or_low_quality"}
+    assert item["evidence_admission_decision"]["verdict"] in {"appendix_only", "reject"}

@@ -13,7 +13,7 @@ from ..config.search_config import build_llm_config_for_task, build_llm_config_f
 from ..search.memory import call_openai_compatible_json, llm_config_is_ready
 
 
-PROMPT_VERSION = "section_body_rewrite_v1"
+PROMPT_VERSION = "section_body_rewrite_v2"
 DEFAULT_CACHE_PATH = Path("output/cache/section_body_rewrite")
 FORBIDDEN_RE = re.compile(
     r"QA\s*failed|Clean\s*资格|fatal|EV-|evidence_cards|URL:|"
@@ -285,10 +285,14 @@ def _validate_candidate(
     output_fact_refs = set(_dedupe(used_fact_refs))
     if required_fact_refs and not required_fact_refs.issubset(output_fact_refs):
         return False, "missing_required_refs"
+    if output_fact_refs - required_fact_refs:
+        return False, "unexpected_refs"
     required_citations = set(_required_citation_refs(section, facts))
     output_citations = set(_dedupe(citation_refs))
     if required_citations and not required_citations.issubset(output_citations):
         return False, "missing_required_citations"
+    if required_citations and output_citations - required_citations:
+        return False, "unexpected_citations"
     if not paragraph:
         return False, "empty_paragraph"
     if FORBIDDEN_RE.search(paragraph):
@@ -359,9 +363,10 @@ def _system_prompt() -> str:
         "You are a section-level industry research writing editor. Rewrite only the given "
         "composer paragraph into a polished Chinese industry-research paragraph. Use only "
         "the provided facts. Do not add companies, numbers, sources, claims, or citations. "
-        "If target_chars is provided, expand toward that length with mechanism, industry meaning, "
-        "and boundary analysis that is grounded only in the supplied facts. "
+        "If target_chars is provided, treat it as a soft upper target, not a reason to add content. "
+        "When evidence is thin, keep the paragraph concise and state only the supported boundary. "
         "Do not change claim strength. Preserve all used_fact_refs and citation_refs exactly. "
+        "Do not output gap_id, EV ids, QA, Clean, fatal, repair advice, or other internal diagnostics. "
         "Return JSON only: {\"paragraph\":\"...\", \"used_fact_refs\":[...], \"citation_refs\":[...]}."
     )
 

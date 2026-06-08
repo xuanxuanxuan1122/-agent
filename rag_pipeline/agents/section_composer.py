@@ -500,5 +500,9 @@ def compose_section_paragraph(
         "composer_target_section_chars": _section_target_chars(),
         "composer_paragraph_chars": _compact_len(paragraph),
         "claim_strength": claim_unit.claim_strength or selected[0].claim_strength_hint or ("moderate" if has_strong_source else "directional"),
+        "evidence_use_level": claim_unit.evidence_use_level,
+        "writing_permission": claim_unit.writing_permission,
+        "metric_completeness_status": claim_unit.metric_completeness_status,
+        "metric_missing_fields": list(claim_unit.metric_missing_fields),
         "omit_reason": "",
     }

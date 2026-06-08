@@ -16,10 +16,12 @@ from rag_pipeline.agents.brain_agent import (
     _layout_followup_queries_from_writer_report,
     _local_rag_enabled,
     _post_qa_repair_followup_payload,
+    _post_qa_repair_needed,
     _post_qa_repair_plan,
     _post_qa_repair_query_from_item,
     _repair_quality_gain,
     _repair_result_summary,
+    _repair_seen_keys_for_state,
     _repair_tasks_from_items,
     _route_agents,
     _select_high_value_repair_tasks,
@@ -987,6 +989,8 @@ def test_full_report_default_route_is_iqs_only(monkeypatch):
 def test_disabled_local_rag_followups_are_routed_to_iqs(monkeypatch):
     monkeypatch.delenv("BRAIN_ENABLE_LOCAL_RAG", raising=False)
     monkeypatch.delenv("REPORT_ENABLE_LOCAL_RAG", raising=False)
+    monkeypatch.setenv("EVIDENCE_CACHE_EVIDENCE_READ_ENABLED", "false")
+    monkeypatch.setenv("EVIDENCE_CACHE_SEARCH_READ_ENABLED", "false")
     seen_agents = []
 
     def fake_run_single_followup(**kwargs):
@@ -3554,6 +3558,109 @@ def test_repair_tasks_skip_rewrite_only_followups():
     assert tasks[0]["origin_node"] == "unit"
     assert tasks[0]["loop_name"] == "evidence_preflight"
     assert tasks[0]["gap_id"]
+
+
+def test_repair_seen_keys_can_be_shared_across_repair_loops():
+    state = {}
+    seen = _repair_seen_keys_for_state(state)
+
+    first_tasks, first_skipped = _repair_tasks_from_items(
+        [
+            {
+                "type": "insufficient_ab_sources",
+                "hypothesis_id": "H1",
+                "blocking_gaps": ["insufficient_ab_sources"],
+                "query": "enterprise agent official deployment source",
+            }
+        ],
+        origin_node="coverage_evaluation",
+        loop_name="supervisor_coverage",
+        max_tasks=2,
+        seen_keys=seen,
+    )
+    second_tasks, second_skipped = _repair_tasks_from_items(
+        [
+            {
+                "type": "insufficient_ab_sources",
+                "hypothesis_id": "H1",
+                "blocking_gaps": ["insufficient_ab_sources"],
+                "query": "enterprise agent official deployment source",
+            }
+        ],
+        origin_node="writer_qa",
+        loop_name="post_qa_repair",
+        max_tasks=2,
+        seen_keys=_repair_seen_keys_for_state(state),
+    )
+
+    assert len(first_tasks) == 1
+    assert first_skipped == 0
+    assert second_tasks == []
+    assert second_skipped == 1
+    assert seen is _repair_seen_keys_for_state(state)
+
+
+def test_research_reflection_memo_seeds_flow_into_layout_repair_tasks(monkeypatch):
+    monkeypatch.setenv("BRAIN_ENABLE_POST_QA_REPAIR", "true")
+    writer_report = {
+        "report_status": "draft",
+        "research_reflection_memo": {
+            "schema_version": "research_reflection_memo_v1",
+            "next_search_task_seeds": [
+                {
+                    "schema_version": "repair_task_seed_v2",
+                    "query": "enterprise AI agent adoption official metric unit period source",
+                    "gap_id": "GAP-metric",
+                    "requirement_id": "H1_metric",
+                    "chapter_id": "ch_01",
+                    "section_id": "sec_01",
+                    "gap_type": "metric_scope_period_unit_incomplete",
+                    "repair_status": "still_insufficient",
+                    "proof_role": "metric",
+                    "required_fields": ["metric", "value", "unit", "period", "source"],
+                    "required_source_level": ["A", "B"],
+                    "lane_targets": ["official_data"],
+                    "success_criteria": "metric/value/unit/period/source must all be traceable",
+                    "reject_if": ["snippet_only", "no_date", "no_source_url"],
+                    "preferred_source_patterns": ["official_data", "market_research"],
+                    "freshness_required": True,
+                    "max_cache_age_hours": 24,
+                    "source": "research_reflection_memo",
+                    "allowed_for_writing": False,
+                    "avoid_repeating_failed_query": True,
+                }
+            ],
+        },
+    }
+
+    assert _post_qa_repair_needed(writer_report) is True
+
+    followups = _layout_followup_queries_from_writer_report(writer_report, max_queries=4)
+    assert len(followups) == 1
+    followup = followups[0]
+    assert followup["gap_id"] == "GAP-metric"
+    assert followup["requirement_id"] == "H1_metric"
+    assert followup["required_fields"] == ["metric", "value", "unit", "period", "source"]
+    assert followup["reject_if"] == ["snippet_only", "no_date", "no_source_url"]
+    assert followup["success_criteria"] == "metric/value/unit/period/source must all be traceable"
+    assert followup["source"] == "research_reflection_memo"
+
+    tasks, skipped = _repair_tasks_from_items(
+        followups,
+        origin_node="writer_qa",
+        loop_name="post_qa_repair",
+        max_tasks=4,
+    )
+
+    assert skipped == 0
+    assert len(tasks) == 1
+    task = tasks[0]
+    assert task["gap_id"] == "GAP-metric"
+    assert task["requirement_id"] == "H1_metric"
+    assert task["proof_role"] == "metric"
+    assert task["required_fields"] == ["metric", "value", "unit", "period", "source"]
+    assert task["preferred_source_patterns"] == ["official_data", "market_research"]
+    assert task["allowed_for_writing"] is False
 
 
 def test_evidence_merger_filters_empty_followup_results_from_analysis_pool():

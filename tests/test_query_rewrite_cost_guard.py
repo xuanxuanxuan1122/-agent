@@ -39,7 +39,15 @@ def test_llm_query_rewrite_uses_compact_payload_not_full_research_plan(monkeypat
     }
     search_task = {
         "task_id": "task-1",
+        "requirement_id": "H1_metric",
+        "gap_id": "GAP-metric",
         "proof_role": "metric",
+        "required_fields": ["metric", "value", "unit", "period", "source"],
+        "required_source_level": ["A", "B"],
+        "lane_targets": ["official_data", "market_research"],
+        "success_criteria": "Only count repaired when metric/value/unit/period/source are all present.",
+        "reject_if": ["snippet_only", "no_date", "no_source_url"],
+        "freshness_required": True,
         "evidence_goal": "find adoption metrics",
         "must_have_terms": ["AI Agent", "adoption"],
         "forbidden_terms": ["招聘"],
@@ -54,6 +62,11 @@ def test_llm_query_rewrite_uses_compact_payload_not_full_research_plan(monkeypat
                     {
                         "text": "AI Agent adoption official report",
                         "intent": "data",
+                        "requirement_id": "H1_metric",
+                        "gap_id": "GAP-metric",
+                        "proof_role": "metric",
+                        "required_fields": ["metric", "value", "unit", "period", "source"],
+                        "source_priority": ["official_data"],
                         "must_have_terms": ["AI Agent"],
                     }
                 ]
@@ -76,7 +89,50 @@ def test_llm_query_rewrite_uses_compact_payload_not_full_research_plan(monkeypat
     assert "large_internal_notes" not in serialized
     assert len(serialized) <= 6000
     assert payload["search_task"]["task_id"] == "task-1"
+    assert payload["search_task"]["requirement_id"] == "H1_metric"
+    assert payload["search_task"]["gap_id"] == "GAP-metric"
     assert payload["search_task"]["proof_role"] == "metric"
+    assert payload["search_task"]["required_fields"] == ["metric", "value", "unit", "period", "source"]
+    assert payload["search_task"]["required_source_level"] == ["A", "B"]
+    assert payload["search_task"]["success_criteria"].startswith("Only count")
+    assert "snippet_only" in payload["search_task"]["reject_if"]
+    assert payload["search_task"]["freshness_required"] is True
+    assert plan[0]["requirement_id"] == "H1_metric"
+    assert plan[0]["gap_id"] == "GAP-metric"
+    assert plan[0]["required_fields"] == ["metric", "value", "unit", "period", "source"]
+
+
+def test_task_query_plan_metric_queries_use_contract_fields():
+    plan = web.build_task_query_plan(
+        "AI Agent market size",
+        {
+            "search_task": {
+                "task_id": "task-metric",
+                "requirement_id": "H1_metric",
+                "gap_id": "GAP-metric",
+                "query": "AI Agent adoption",
+                "proof_role": "metric",
+                "required_fields": ["metric", "value", "unit", "period", "source"],
+                "required_source_level": ["A", "B"],
+                "lane_targets": ["official_data", "market_research"],
+                "success_criteria": "Only count repaired when metric/value/unit/period/source are all present.",
+                "reject_if": ["snippet_only", "no_date", "no_source_url"],
+                "source_strategy": {
+                    "source_priority": ["official_data", "market_research", "annual_report"],
+                    "query_enhancers": ["report", "survey", "pdf", "annual report"],
+                },
+                "required_field_focus": "period",
+            }
+        },
+    )
+
+    assert plan
+    assert all(item["requirement_id"] == "H1_metric" for item in plan)
+    assert all(item["gap_id"] == "GAP-metric" for item in plan)
+    assert all(item["required_fields"] == ["metric", "value", "unit", "period", "source"] for item in plan)
+    assert all(item["required_field_focus"] == "period" for item in plan)
+    assert all(item["source_strategy"]["source_priority"][0] == "official_data" for item in plan)
+    assert any(any(term in item["text"] for term in ("官方", "统计", "report", "annual report", "survey")) for item in plan)
 
 
 def test_llm_query_rewrite_call_cap_and_cache(monkeypatch):

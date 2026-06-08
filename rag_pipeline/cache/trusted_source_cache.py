@@ -5,7 +5,7 @@ import json
 import os
 import re
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 from urllib.parse import urlparse
@@ -47,6 +47,42 @@ _BLOCKED_SOURCE_TYPES = {
     "social",
     "search",
     "search_result",
+}
+_GENERIC_CACHE_MATCH_TERMS = {
+    "ab",
+    "analysis",
+    "case",
+    "check",
+    "claim",
+    "claims",
+    "company",
+    "content",
+    "data",
+    "evidence",
+    "fact",
+    "facts",
+    "filing",
+    "gap",
+    "gaps",
+    "industry",
+    "market",
+    "metric",
+    "metrics",
+    "missing",
+    "official",
+    "official_data",
+    "proof",
+    "public",
+    "report",
+    "reports",
+    "research",
+    "source",
+    "source_check",
+    "source_quality",
+    "sources",
+    "statistics",
+    "statistic",
+    "support",
 }
 _TRUSTED_DOMAIN_FRAGMENTS = (
     ".gov",
@@ -144,6 +180,18 @@ def _tokenize(value: Any) -> List[str]:
     text = str(value or "").lower()
     tokens = re.findall(r"[\w\u4e00-\u9fff]{2,}", text)
     return [token for token in tokens if token not in {"http", "https", "www"}]
+
+
+def _distinctive_cache_terms(terms: Sequence[str]) -> set[str]:
+    distinctive: set[str] = set()
+    for term in terms:
+        token = str(term or "").strip().lower()
+        if not token or token in _GENERIC_CACHE_MATCH_TERMS:
+            continue
+        if len(token) <= 2 and not re.search(r"[\u4e00-\u9fff]", token):
+            continue
+        distinctive.add(token)
+    return distinctive
 
 
 def _domain(url: str) -> str:
@@ -291,7 +339,7 @@ def _entry_from_evidence(query: str, item: Dict[str, Any], *, report_id: str = "
         "proof_role": proof_role or ("metric" if metric and value else "source_check"),
         "allowed_use": allowed_use or ("core_claim" if source_level in {"A", "B"} else "directional_signal"),
         "supported_chapters": [item for item in [chapter_id, chapter_title] if item],
-        "last_verified_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "last_verified_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
         "traceability_status": "traceable",
         "fact_description": _compact_text(fact, max_chars=1200),
         "metric_name": metric,
@@ -371,6 +419,8 @@ def store_trusted_sources_from_package(
 
 
 def _match_score(entry: Dict[str, Any], terms: Sequence[str], task: Dict[str, Any]) -> float:
+    distinctive_terms = _distinctive_cache_terms(terms)
+    distinctive_hits = 0
     haystack = " ".join(
         str(item or "").lower()
         for item in [
@@ -391,6 +441,8 @@ def _match_score(entry: Dict[str, Any], terms: Sequence[str], task: Dict[str, An
             continue
         if token in haystack:
             score += 1.0
+            if token in distinctive_terms:
+                distinctive_hits += 1
     task_role = str(task.get("proof_role") or task.get("evidence_type") or "").strip().lower()
     entry_role = str(entry.get("proof_role") or "").strip().lower()
     if task_role and entry_role:
@@ -403,6 +455,8 @@ def _match_score(entry: Dict[str, Any], terms: Sequence[str], task: Dict[str, An
     task_chapter = str(task.get("chapter_id") or task.get("dimension_id") or "").strip()
     if task_chapter and task_chapter in _as_list(entry.get("supported_chapters")):
         score += 2.0
+    if distinctive_terms and distinctive_hits <= 0:
+        return 0.0
     return score
 
 

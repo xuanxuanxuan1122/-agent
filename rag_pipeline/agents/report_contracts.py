@@ -25,6 +25,40 @@ def _first_text(*values: Any) -> str:
     return ""
 
 
+# Internal pipeline enum tokens (analysis_role / block_affinity / proof_role /
+# block_type). These are routing labels, never public subjects. When one leaks
+# into a card's ``variable`` it gets rendered into prose like
+# "用于判断counter是否具备持续性", so it must be dropped at the model boundary.
+_INTERNAL_ANALYSIS_TOKENS = frozenset(
+    {
+        "counter",
+        "claimable",
+        "directional",
+        "contextual",
+        "integrated_signal",
+        "risk_trigger",
+        "metric_reconciliation",
+        "case_comparison",
+        "technology_maturity",
+        "claim",
+        "mechanism",
+        "boundary",
+        "observation_only",
+        "directional_ready",
+        "decision_ready",
+    }
+)
+
+
+def _public_variable_text(*values: Any) -> str:
+    """First public-safe variable text; drops internal enum tokens so role
+    labels (e.g. ``counter``) never get rendered as a public subject."""
+    text = _first_text(*values)
+    if text.strip().lower() in _INTERNAL_ANALYSIS_TOKENS:
+        return ""
+    return text
+
+
 def _refs_from_values(values: Iterable[Any]) -> List[str]:
     refs: List[str] = []
     seen = set()
@@ -396,7 +430,7 @@ class EvidenceFactCard:
             requirement_id=requirement_id,
             subject=_first_text(merged.get("subject"), merged.get("company"), merged.get("entity")),
             action_or_signal=_first_text(merged.get("action_or_signal"), merged.get("action"), merged.get("signal")),
-            variable=_first_text(merged.get("variable"), merged.get("analysis_variable"), merged.get("metric"), merged.get("indicator")),
+            variable=_public_variable_text(merged.get("variable"), merged.get("analysis_variable"), merged.get("metric"), merged.get("indicator")),
             value=_first_text(merged.get("value"), merged.get("display_value"), merged.get("numeric_value")),
             unit=_first_text(merged.get("unit"), merged.get("numeric_unit")),
             time_or_scope=_first_text(merged.get("time_or_scope"), merged.get("period"), merged.get("scope"), merged.get("date")),
@@ -476,6 +510,10 @@ class ClaimUnit:
     limitation_boundary: str = ""
     claim_strength: str = "directional"
     claim_strength_ceiling: str = ""
+    evidence_use_level: str = ""
+    writing_permission: str = ""
+    metric_completeness_status: str = ""
+    metric_missing_fields: List[str] = field(default_factory=list)
     analysis_role: str = ""
     source_support_map: Dict[str, List[str]] = field(default_factory=dict)
     paragraph_seed: str = ""
@@ -512,6 +550,10 @@ class ClaimUnit:
             limitation_boundary=_first_text(payload.get("limitation_boundary"), payload.get("counter_evidence"), payload.get("boundary")),
             claim_strength=_first_text(payload.get("claim_strength"), payload.get("strength"), payload.get("claim_status")) or "directional",
             claim_strength_ceiling=_first_text(payload.get("claim_strength_ceiling"), as_dict(payload.get("lineage")).get("claim_strength_ceiling")),
+            evidence_use_level=_first_text(payload.get("evidence_use_level"), payload.get("allowed_use_level")),
+            writing_permission=_first_text(payload.get("writing_permission")),
+            metric_completeness_status=_first_text(payload.get("metric_completeness_status")),
+            metric_missing_fields=[_text(item) for item in as_list(payload.get("metric_missing_fields")) if _text(item)],
             analysis_role=_first_text(payload.get("analysis_role"), payload.get("allowed_use"), payload.get("proof_role")),
             source_support_map={
                 key: [ref for ref in normalize_evidence_refs({"evidence_refs": value}) if ref]
@@ -541,6 +583,10 @@ class ClaimUnit:
             "counter_evidence": self.limitation_boundary,
             "claim_strength": self.claim_strength,
             "claim_strength_ceiling": self.claim_strength_ceiling,
+            "evidence_use_level": self.evidence_use_level,
+            "writing_permission": self.writing_permission,
+            "metric_completeness_status": self.metric_completeness_status,
+            "metric_missing_fields": list(self.metric_missing_fields),
             "analysis_role": self.analysis_role,
             "source_support_map": {key: list(value) for key, value in self.source_support_map.items()},
             "paragraph_seed": self.paragraph_seed,

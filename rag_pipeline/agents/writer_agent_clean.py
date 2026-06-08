@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, TypedDict
 
 try:
     from rag_pipeline.contracts.evidence_quality import apply_evidence_quality_contract
+    from rag_pipeline.contracts.research_reflection import build_research_reflection_memo
     from rag_pipeline.contracts.source_registry import pick_refs as _contract_pick_refs
     from .analytics import run_analytics_agents
     from .chapter_evidence_builder import build_chapter_evidence_packages_from_evidence_package
@@ -33,9 +34,11 @@ try:
 except Exception:  # pragma: no cover - direct script mode fallback
     try:
         from rag_pipeline.contracts.evidence_quality import apply_evidence_quality_contract  # type: ignore
+        from rag_pipeline.contracts.research_reflection import build_research_reflection_memo  # type: ignore
         from rag_pipeline.contracts.source_registry import pick_refs as _contract_pick_refs  # type: ignore
     except Exception:  # pragma: no cover
         apply_evidence_quality_contract = None  # type: ignore
+        build_research_reflection_memo = None  # type: ignore
         _contract_pick_refs = None  # type: ignore
     from analytics import run_analytics_agents  # type: ignore
     from chapter_evidence_builder import build_chapter_evidence_packages_from_evidence_package  # type: ignore
@@ -3209,6 +3212,16 @@ def build_writer_report(
         or _as_dict(_as_dict(evidence_package.get("summary")).get("retrieval_strategy_summary"))
     )
     evidence_health_summary = _evidence_health_summary_from_package(evidence_package)
+    research_reflection_memo = (
+        _as_dict(structured_analysis.get("research_reflection_memo"))
+        or _as_dict(_as_dict(structured_analysis.get("report_insight_package")).get("research_reflection_memo"))
+        or _as_dict(evidence_package.get("research_reflection_memo"))
+    )
+    if not research_reflection_memo and build_research_reflection_memo is not None:
+        research_reflection_memo = build_research_reflection_memo(
+            evidence_package,
+            structured_analysis=structured_analysis,
+        )
     qa_result = run_qa_agent(
         report_markdown=str(writer_output.get("report_markdown") or ""),
         report_blueprint=report_blueprint,
@@ -3499,6 +3512,7 @@ def build_writer_report(
             item for item in list(argument_units or []) if isinstance(item, dict)
         ],
         "evidence_package": evidence_package,
+        "research_reflection_memo": research_reflection_memo,
         "citation_manifest": _as_dict(writer_output.get("citation_manifest")),
         "final_citation_audit": _as_dict(writer_output.get("final_citation_audit")),
         "source_claim_support": _as_dict(writer_output.get("source_claim_support")),
@@ -3547,6 +3561,7 @@ def build_writer_report(
         "table_placement_summary": table_placement_summary,
         "table_gap_summary": table_gap_summary,
         "evidence_health_summary": evidence_health_summary,
+        "research_reflection_memo": research_reflection_memo,
         "evidence_analysis_summary": evidence_analysis_summary,
         "evidence_gap_ledger": evidence_gap_ledger,
         "evidence_analysis_by_chapter": evidence_analysis_by_chapter,

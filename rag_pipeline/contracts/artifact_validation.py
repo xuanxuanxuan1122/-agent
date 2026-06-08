@@ -141,6 +141,13 @@ def validate_claim_unit_lineage(
     errors: List[str] = []
     facts_by_id = {_fact_id(item): item for item in fact_cards if _fact_id(item)}
     refs = _fact_refs(claim_unit)
+    payload = as_dict(claim_unit.get("payload"))
+    requirement_ids = (
+        _as_list(claim_unit.get("requirement_ids"))
+        or _as_list(payload.get("requirement_ids"))
+        or _as_list(as_dict(claim_unit.get("lineage")).get("requirement_ids"))
+    )
+    requirement_ids = [_clean(item) for item in requirement_ids if _clean(item)]
     if not refs:
         errors.append("claim_unit_missing_fact_refs")
     for ref in refs:
@@ -150,6 +157,8 @@ def validate_claim_unit_lineage(
             continue
         if _clean(fact.get("status")).lower() not in USABLE_FACT_STATUSES:
             errors.append("claim_unit_references_unusable_fact")
+    if not requirement_ids:
+        errors.append("claim_unit_missing_requirement_ids")
     if _strength_exceeds(
         claim_unit.get("claim_strength") or claim_unit.get("strength") or "",
         claim_unit.get("claim_strength_ceiling") or "",

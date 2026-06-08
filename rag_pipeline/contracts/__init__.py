@@ -5,6 +5,7 @@ new runtime dependency or changing agent execution order.
 """
 
 from .evidence_ledger import attach_evidence_ledger, build_evidence_ledger
+from .evidence_admission import decide_evidence_admission, summarize_evidence_admission
 from .evidence_quality import (
     EvidenceClassifier,
     EvidenceNormalizer,
@@ -12,9 +13,12 @@ from .evidence_quality import (
     classify_evidence,
     normalize_evidence,
 )
+from .claim_roles import classify_claim_unit_roles
 from .quality_gate import build_quality_gate_state
 from .query_builder import QueryBuilder, build_query_package
+from .research_reflection import build_research_reflection_memo
 from .report_contract import build_report_contract, build_report_contract_from_package
+from .section_audit import audit_section_claim_roles
 from .source_registry import pick_refs, renumber_sources_by_first_citation
 
 __all__ = [
@@ -22,14 +26,19 @@ __all__ = [
     "EvidenceNormalizer",
     "attach_evidence_ledger",
     "apply_evidence_quality_contract",
+    "audit_section_claim_roles",
     "build_evidence_ledger",
     "build_quality_gate_state",
     "build_query_package",
+    "build_research_reflection_memo",
     "build_report_contract",
     "build_report_contract_from_package",
     "classify_evidence",
+    "classify_claim_unit_roles",
+    "decide_evidence_admission",
     "normalize_evidence",
     "pick_refs",
     "QueryBuilder",
     "renumber_sources_by_first_citation",
+    "summarize_evidence_admission",
 ]

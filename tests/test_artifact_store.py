@@ -166,3 +166,37 @@ def test_lineage_edges_allow_requirement_to_score_gap_traversal(tmp_path):
     assert ("fact_card", "EV-1") in {(item["to_type"], item["to_id"]) for item in traversal}
     assert ("section", "SEC-1") in {(item["to_type"], item["to_id"]) for item in traversal}
     assert ("score_gap", "GAP-1") in {(item["to_type"], item["to_id"]) for item in traversal}
+
+
+def test_lineage_edge_insert_is_idempotent(tmp_path):
+    store = _store(tmp_path)
+    store.upsert_run(run_id="run-a", query="q", status="running")
+
+    store.add_lineage_edge("run-a", "requirement", "H1_case", "score_gap", "GAP-1", "gap")
+    store.add_lineage_edge("run-a", "requirement", "H1_case", "score_gap", "GAP-1", "gap")
+
+    with store._connect() as conn:
+        count = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM lineage_edges
+            WHERE run_id = ?
+              AND from_type = ?
+              AND from_id = ?
+              AND to_type = ?
+              AND to_id = ?
+              AND relation = ?
+            """,
+            ("run-a", "requirement", "H1_case", "score_gap", "GAP-1", "gap"),
+        ).fetchone()[0]
+
+    assert count == 1
+
+
+def test_lineage_edge_insert_respects_disabled_store(tmp_path, monkeypatch):
+    monkeypatch.setenv("ARTIFACT_LEDGER_ENABLED", "false")
+    store = _store(tmp_path)
+
+    added = store.add_lineage_edge("run-a", "requirement", "H1_case", "score_gap", "GAP-1", "gap")
+
+    assert added is False

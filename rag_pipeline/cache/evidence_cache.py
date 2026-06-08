@@ -39,6 +39,42 @@ _BYPASS_REASONS: Dict[str, int] = {}
 _SOURCE_LEVEL_RANK = {"A": 4, "B": 3, "C": 2, "D": 1, "UNKNOWN": 0, "": 0}
 _REJECTED_ROLES = {"rejected", "spam", "irrelevant", "blacklisted", "exclude"}
 _APPENDIX_ONLY_USES = {"appendix_only", "rejected"}
+_GENERIC_CACHE_MATCH_TERMS = {
+    "ab",
+    "analysis",
+    "case",
+    "check",
+    "claim",
+    "claims",
+    "company",
+    "content",
+    "data",
+    "evidence",
+    "fact",
+    "facts",
+    "filing",
+    "gap",
+    "gaps",
+    "industry",
+    "market",
+    "metric",
+    "metrics",
+    "missing",
+    "official",
+    "official_data",
+    "proof",
+    "public",
+    "report",
+    "reports",
+    "research",
+    "source",
+    "source_check",
+    "source_quality",
+    "sources",
+    "statistics",
+    "statistic",
+    "support",
+}
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -143,6 +179,18 @@ def _tokenize(value: Any) -> List[str]:
         if len(tokens) >= 80:
             break
     return tokens
+
+
+def _distinctive_cache_terms(terms: Sequence[str]) -> set[str]:
+    distinctive: set[str] = set()
+    for term in terms:
+        text = str(term or "").strip().lower()
+        if not text or text in _GENERIC_CACHE_MATCH_TERMS:
+            continue
+        if len(text) <= 2 and not re.search(r"[\u4e00-\u9fff]", text):
+            continue
+        distinctive.add(text)
+    return distinctive
 
 
 def _domain(url: Any) -> str:
@@ -770,6 +818,8 @@ class EvidenceCache:
 
     def _match_score(self, row: sqlite3.Row, raw: Dict[str, Any], terms: Sequence[str]) -> float:
         query_terms = set(str(item).lower() for item in _json_loads(row["query_terms_json"], []) if str(item).strip())
+        distinctive_terms = _distinctive_cache_terms(terms)
+        distinctive_hits = 0
         haystack = " ".join(
             [
                 str(row["topic_key"] or ""),
@@ -789,8 +839,14 @@ class EvidenceCache:
                 continue
             if term in query_terms:
                 score += 2.0
+                if term in distinctive_terms:
+                    distinctive_hits += 1
             elif term in haystack:
                 score += 1.0
+                if term in distinctive_terms:
+                    distinctive_hits += 1
+        if distinctive_terms and distinctive_hits <= 0:
+            return 0.0
         return score
 
     def store_evidence_from_package(

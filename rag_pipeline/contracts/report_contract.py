@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+from rag_pipeline.contracts.requirement_quality import validate_requirement_quality
+
 try:
     from rag_pipeline.agents.block_schema import select_blocks_for_chapter
 except Exception:  # pragma: no cover - contract can still work without agent helpers
@@ -403,21 +405,35 @@ def _requirement_slots_for_chapters(chapters: Sequence[Dict[str, Any]]) -> List[
                 continue
             seen.add(requirement_id)
             min_source_level = _role_source_level(proof_role, chapter)
-            requirements.append(
+            requirement = {
+                "requirement_id": requirement_id,
+                "chapter_id": chapter_id,
+                "hypothesis_id": f"{chapter_id}_H1",
+                "proof_role": proof_role,
+                "required_fields": ROLE_REQUIRED_FIELDS.get(proof_role, ROLE_REQUIRED_FIELDS["support"]),
+                "min_source_level": min_source_level,
+                "source_family_preference": _as_list(chapter.get("required_evidence_mix")),
+                "claim_strength_ceiling": _role_strength_ceiling(proof_role, min_source_level),
+                "repair_policy": {
+                    "route": "targeted_repair",
+                    "max_tasks_per_chapter": 1,
+                },
+            }
+            quality = validate_requirement_quality(requirement)
+            requirement.update(
                 {
-                    "requirement_id": requirement_id,
-                    "chapter_id": chapter_id,
-                    "hypothesis_id": f"{chapter_id}_H1",
-                    "proof_role": proof_role,
-                    "required_fields": ROLE_REQUIRED_FIELDS.get(proof_role, ROLE_REQUIRED_FIELDS["support"]),
-                    "min_source_level": min_source_level,
-                    "source_family_preference": _as_list(chapter.get("required_evidence_mix")),
-                    "claim_strength_ceiling": _role_strength_ceiling(proof_role, min_source_level),
-                    "repair_policy": {
-                        "route": "targeted_repair",
-                        "max_tasks_per_chapter": 1,
+                    "requirement_quality_check": {
+                        "quality_check_version": quality.get("quality_check_version"),
+                        "status": quality.get("status"),
+                        "issues": quality.get("issues"),
                     },
+                    "source_strategy": quality.get("source_strategy"),
+                    "success_criteria": quality.get("success_criteria"),
+                    "reject_if": quality.get("reject_if"),
                 }
+            )
+            requirements.append(
+                requirement
             )
     return requirements
 

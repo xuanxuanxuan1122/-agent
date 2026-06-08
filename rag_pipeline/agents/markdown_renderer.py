@@ -679,6 +679,51 @@ def _summary_judgment_needs_citation(value: Any) -> bool:
     )
 
 
+def _key_data_bullet_from_table_row(headers: Sequence[Any], row: Dict[str, Any]) -> str:
+    cells = _as_list(row.get("cells"))
+    metric = _compact(row.get("metric_name") or row.get("metric") or (cells[0] if cells else ""), 60)
+    if not metric:
+        return ""
+    value_candidates: List[Any] = [
+        row.get("value_display"),
+        row.get("display_value"),
+        row.get("value"),
+        row.get("numeric_value"),
+    ]
+    for header, cell in zip(headers, cells):
+        header_text = str(header or "").strip().lower()
+        if any(token in header_text for token in ("数值", "信号", "影响", "成熟度", "评分", "value", "score", "signal")):
+            value_candidates.append(cell)
+    for cell in cells:
+        text = str(cell or "").strip()
+        if re.search(r"\d|%|亿|万|元|CAGR", text, re.I):
+            value_candidates.append(cell)
+    value = ""
+    for candidate in value_candidates:
+        text = _compact(candidate, 70)
+        if not text:
+            continue
+        if re.fullmatch(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", text):
+            continue
+        if re.search(r"\d|%|亿|万|元|CAGR", text, re.I):
+            value = text
+            break
+    if not value:
+        return ""
+    unit = _compact(row.get("unit") or row.get("numeric_unit"), 24)
+    if unit and unit not in value and len(unit) <= 8 and re.search(r"%|元|亿|万|吨|台|家|个|pct|percent", unit, re.I):
+        value = f"{value}{unit}"
+    period = _compact(row.get("period"), 40)
+    if not period:
+        for header, cell in zip(headers, cells):
+            header_text = str(header or "").strip().lower()
+            if any(token in header_text for token in ("期间", "时间", "period", "window")):
+                period = _compact(cell, 40)
+                break
+    text = f"{metric}为{value}" + (f"，期间为{period}" if period else "")
+    return _public_text(text, 220)
+
+
 def render_executive_summary(decision_package: Dict[str, Any], table_packages: Sequence[Dict[str, Any]]) -> str:
     lines: List[str] = []
     judgments = [_as_dict(item) for item in _as_list(decision_package.get("core_judgments"))]
@@ -701,20 +746,10 @@ def render_executive_summary(decision_package: Dict[str, Any], table_packages: S
 
     key_rows = []
     for table in _public_tables(table_packages):
+        headers = _as_list(table.get("headers"))
         for row in _as_list(table.get("rows"))[:1]:
             row = _as_dict(row)
-            cells = _as_list(row.get("cells"))
-            if not cells:
-                continue
-            # Prefer the first three NON-EMPTY cells so we don't emit orphan
-            # bullets like ``CAGR；2028年`` (metric + period but no value) when
-            # the upstream table places its value column past position 2.
-            non_empty = [_compact(cell, 60) for cell in cells if str(cell).strip()]
-            if len(non_empty) < 2:
-                # Only one informative cell — not enough for a "key data" bullet.
-                continue
-            text = "；".join(non_empty[:3])
-            text = _public_text(text, 220)
+            text = _key_data_bullet_from_table_row(headers, row)
             # Require the bullet to carry at least one quantitative or date token
             # so we never list a bare metric name.
             if text and re.search(r"\d|%|亿|万|元|美元|CAGR.{0,8}\d", text):
@@ -1644,10 +1679,36 @@ def render_risk_package(risk_package: Dict[str, Any]) -> str:
     return "\n".join(["## 反向信号与风险触发", *rows])
 
 
+def _render_public_table_appendix_rows(appendix_package: Dict[str, Any]) -> List[str]:
+    lines: List[str] = []
+    appendix_tables = [
+        _as_dict(item)
+        for item in _as_list(_as_dict(appendix_package).get("table_appendix_rows"))
+        if isinstance(item, dict)
+        and item.get("should_render") is not False
+        and _table_validation_passed(item)
+    ]
+    for table in appendix_tables[:6]:
+        headers = _as_list(table.get("headers"))
+        rows = [_as_list(row) for row in _as_list(table.get("rows"))[:12]]
+        headers, rows = _public_table_shape(headers, rows)
+        if len(headers) < 2 or len(rows) < 2:
+            continue
+        table_md = _markdown_table(headers, rows)
+        if not table_md:
+            continue
+        title = _compact(table.get("title") or "表格附录明细", 90)
+        lines.extend(["", f"### {title}（附录明细）", table_md])
+    return lines
+
+
 def render_appendix(source_registry: Sequence[Dict[str, Any]], appendix_package: Dict[str, Any]) -> str:
     if not _env_flag("REPORT_RENDER_DIAGNOSTIC_APPENDIX_TABLES", False):
         if not source_registry:
-            return ""
+            table_lines = _render_public_table_appendix_rows(appendix_package)
+            if not table_lines:
+                return ""
+            return "\n".join(["## 来源附录", *table_lines])
         lines = ["## 来源附录"]
         for source in list(source_registry)[:50]:
             source = _as_dict(source)
@@ -1702,25 +1763,7 @@ def render_appendix(source_registry: Sequence[Dict[str, Any]], appendix_package:
         table_md = _markdown_table(["指标", "主体", "范围", "期间", "单位", "值", "来源等级"], rows)
         if table_md:
             lines.extend(["", "### 指标口径表", table_md])
-    appendix_tables = [
-        _as_dict(item)
-        for item in _as_list(_as_dict(appendix_package).get("table_appendix_rows"))
-        if isinstance(item, dict)
-        and item.get("should_render") is not False
-        and _table_validation_passed(item)
-    ]
-    if appendix_tables:
-        for table in appendix_tables[:6]:
-            headers = _as_list(table.get("headers"))
-            rows = [_as_list(row) for row in _as_list(table.get("rows"))[:12]]
-            headers, rows = _public_table_shape(headers, rows)
-            if len(headers) < 2 or len(rows) < 2:
-                continue
-            table_md = _markdown_table(headers, rows)
-            if not table_md:
-                continue
-            title = _compact(table.get("title") or "表格附录明细", 90)
-            lines.extend(["", f"### {title}（附录明细）", table_md])
+    lines.extend(_render_public_table_appendix_rows(appendix_package))
     if not source_registry:
         return "\n".join(lines) if len(lines) > 1 else ""
     lines.extend(["", "## 来源附录"])

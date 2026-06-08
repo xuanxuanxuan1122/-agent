@@ -36,6 +36,7 @@ from ..runtime_cache import TTLCache, make_cache_key
 from .readpage_fact_extractor_agent import extract_fact_cards_from_pages
 from rag_pipeline.cache.evidence_cache import lookup_search as lookup_persistent_search_cache
 from rag_pipeline.cache.evidence_cache import store_search as store_persistent_search_cache
+from rag_pipeline.contracts.source_strategy import source_strategy_for_role
 
 
 AGENT_NAME = "web_analysis_agent"
@@ -786,10 +787,21 @@ def _short_list(value: Any, *, limit: int = 8, item_chars: int = 80) -> List[str
 def _compact_query_rewrite_task(task: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "task_id": str(task.get("task_id") or task.get("id") or "").strip(),
+        "requirement_id": str(task.get("requirement_id") or "").strip(),
+        "gap_id": str(task.get("gap_id") or "").strip(),
+        "search_task_id": str(task.get("search_task_id") or task.get("task_id") or task.get("id") or "").strip(),
         "dimension_id": str(task.get("dimension_id") or task.get("hypothesis_id") or "").strip(),
         "dimension_name": _compact_text(task.get("dimension_name") or task.get("chapter_title"), 120),
+        "chapter_id": str(task.get("chapter_id") or "").strip(),
+        "section_id": str(task.get("section_id") or "").strip(),
         "proof_role": str(task.get("proof_role") or task.get("evidence_type") or "").strip(),
         "evidence_goal": _compact_text(task.get("evidence_goal") or task.get("goal"), 300),
+        "required_fields": _short_list(task.get("required_fields"), limit=8, item_chars=40),
+        "required_source_level": _short_list(task.get("required_source_level") or task.get("min_source_level"), limit=4, item_chars=20),
+        "lane_targets": _short_list(task.get("lane_targets"), limit=5, item_chars=40),
+        "success_criteria": _compact_text(task.get("success_criteria"), 260),
+        "reject_if": _short_list(task.get("reject_if"), limit=8, item_chars=50),
+        "freshness_required": bool(task.get("freshness_required")),
         "must_have_terms": _short_list(task.get("must_have_terms"), limit=8, item_chars=60),
         "forbidden_terms": _short_list(task.get("forbidden_terms"), limit=8, item_chars=60),
         "source_priority": _short_list(task.get("source_priority"), limit=8, item_chars=80),
@@ -827,9 +839,14 @@ def _query_rewrite_payload(
     if payload["search_task"]:
         compact_task = dict(payload["search_task"])
         compact_task["evidence_goal"] = _compact_text(compact_task.get("evidence_goal"), 120)
+        compact_task["success_criteria"] = _compact_text(compact_task.get("success_criteria"), 120)
         compact_task["must_have_terms"] = compact_task.get("must_have_terms", [])[:4]
         compact_task["forbidden_terms"] = compact_task.get("forbidden_terms", [])[:4]
         compact_task["source_priority"] = compact_task.get("source_priority", [])[:4]
+        compact_task["required_fields"] = compact_task.get("required_fields", [])[:6]
+        compact_task["required_source_level"] = compact_task.get("required_source_level", [])[:3]
+        compact_task["lane_targets"] = compact_task.get("lane_targets", [])[:3]
+        compact_task["reject_if"] = compact_task.get("reject_if", [])[:5]
         payload["search_task"] = compact_task
     payload["query"] = _compact_text(payload.get("query"), 160)
     return payload
@@ -1124,17 +1141,33 @@ def build_task_query_plan(query: str, base_options: Dict[str, Any]) -> List[Dict
     current_year = datetime.now().year
     must_terms = _compact_query_terms(_as_list(search_task.get("must_have_terms")), limit=5, max_chars=10)
     forbidden_terms = _compact_query_terms(_as_list(search_task.get("forbidden_terms")), limit=5, max_chars=10)
-    source_priority = _compact_query_terms(_as_list(search_task.get("source_priority")), limit=5, max_chars=14)
+    source_strategy = source_strategy_for_role(search_task.get("proof_role"), overrides=_as_dict(search_task.get("source_strategy")))
+    source_priority = _compact_query_terms(
+        [*_as_list(search_task.get("source_priority")), *_as_list(source_strategy.get("source_priority"))],
+        limit=8,
+        max_chars=18,
+    )
+    required_fields = _compact_query_terms(_as_list(search_task.get("required_fields")), limit=8, max_chars=16)
+    required_source_level = _compact_query_terms(_as_list(search_task.get("required_source_level") or search_task.get("min_source_level")), limit=4, max_chars=8)
+    lane_targets = _compact_query_terms(_as_list(search_task.get("lane_targets")), limit=5, max_chars=18)
+    query_enhancers = _compact_query_terms(
+        [*_as_list(search_task.get("query_enhancers")), *_as_list(source_strategy.get("query_enhancers"))],
+        limit=8,
+        max_chars=18,
+    )
     base = task_query
     must = " ".join(must_terms[:2])
+    field_terms = " ".join(required_fields[:5])
+    lane_terms = " ".join(lane_targets[:3])
+    enhancer_terms = " ".join(query_enhancers[:4])
     variants_with_source = [
         (base, "primary", "dynamic_search_task"),
-        (f"{base} {must} 数据 统计 口径 {current_year}", "数据型", "dynamic_metric"),
-        (f"{base} 官方 统计局 协会 白皮书 政策 文件", "数据型", "dynamic_official_data"),
-        (f"{base} 年报 公告 招股书 交易所 投资者关系", "财报型", "dynamic_filing_company"),
-        (f"{base} 券商研报 行业报告 市场规模 增速", "分析型", "dynamic_market_research"),
+        (f"{base} {must} {field_terms} {enhancer_terms} 数据 统计 口径 {current_year}", "数据型", "dynamic_metric"),
+        (f"{base} {field_terms} {enhancer_terms} 官方 统计局 协会 白皮书 政策 文件", "数据型", "dynamic_official_data"),
+        (f"{base} {field_terms} {enhancer_terms} 年报 公告 招股书 交易所 投资者关系 annual report", "财报型", "dynamic_filing_company"),
+        (f"{base} {field_terms} {enhancer_terms} 券商研报 行业报告 survey 市场规模 增速", "分析型", "dynamic_market_research"),
         (f"{base} 客户 案例 订单 中标 采购 应用场景", "分析型", "dynamic_customer_case"),
-        (f"{base} 风险 反证 下滑 过剩 价格战 失败案例", "新闻型", "dynamic_counter_evidence"),
+        (f"{base} 风险 反证 failure cost ROI unclear security compliance cancellation delay", "新闻型", "dynamic_counter_evidence"),
     ]
     proof_role = str(search_task.get("proof_role") or "").strip().lower()
     if proof_role == "metric":
@@ -1147,6 +1180,8 @@ def build_task_query_plan(query: str, base_options: Dict[str, Any]) -> List[Dict
         variants_with_source = [item for item in variants_with_source if item[2] in {"dynamic_search_task", "dynamic_counter_evidence", "dynamic_market_research"}]
     if source_priority:
         variants_with_source.append((f"{base} {must} {' '.join(source_priority[:3])}", intent, "dynamic_source_priority"))
+    if lane_terms:
+        variants_with_source.append((f"{base} {field_terms} {lane_terms}", intent, "dynamic_lane_target"))
     plan: List[Dict[str, Any]] = []
     seen = set()
     for variant, variant_intent, variant_source in variants_with_source:
@@ -1167,14 +1202,27 @@ def build_task_query_plan(query: str, base_options: Dict[str, Any]) -> List[Dict
                 "timeRange": item_options.get("timeRange", "NoLimit"),
                 "contents": item_options.get("contents", "summary"),
                 "task_id": search_task.get("task_id"),
+                "requirement_id": search_task.get("requirement_id"),
+                "gap_id": search_task.get("gap_id"),
+                "search_task_id": search_task.get("search_task_id") or search_task.get("task_id"),
                 "dimension_id": search_task.get("dimension_id"),
                 "dimension_name": search_task.get("dimension_name"),
                 "chapter_id": search_task.get("chapter_id"),
+                "section_id": search_task.get("section_id"),
                 "chapter_title": search_task.get("chapter_title"),
                 "chapter_question": search_task.get("chapter_question"),
                 "evidence_goal": search_task.get("evidence_goal"),
                 "evidence_goal_id": search_task.get("evidence_goal_id"),
                 "proof_role": search_task.get("proof_role"),
+                "required_fields": required_fields,
+                "required_source_level": required_source_level,
+                "lane_targets": lane_targets,
+                "required_field_focus": search_task.get("required_field_focus"),
+                "source_strategy": source_strategy,
+                "query_enhancers": query_enhancers,
+                "success_criteria": search_task.get("success_criteria"),
+                "reject_if": _as_list(search_task.get("reject_if")),
+                "freshness_required": bool(search_task.get("freshness_required")),
                 "must_have_terms": must_terms,
                 "forbidden_terms": forbidden_terms,
                 "source_priority": source_priority,
@@ -1279,6 +1327,18 @@ def build_llm_query_plan(
 7. 每条查询只服务一个 evidence_goal。
 只返回 JSON。
 """.strip()
+    if dynamic_mode:
+        system_prompt = (
+            f"{system_prompt}\n\n"
+            "Gap-Driven Prompt Contract v2:\n"
+            "- If search_task is provided, rewrite only around that task; do not add unrelated dimensions.\n"
+            "- Each query must serve one required_field or one explicit source type.\n"
+            "- Queries must include the object plus year/period, source type, metric scope, or filing/report path; avoid generic phrases.\n"
+            "- Metric tasks should prioritize official statistics, industry reports, surveys, PDFs, and annual reports.\n"
+            "- Filing/source_check tasks should prioritize annual reports, announcements, prospectuses, exchanges, and investor relations.\n"
+            "- Counter tasks should search for failure, cost, unclear ROI, security, compliance, cancellation, and delay evidence.\n"
+            "- Output each item with requirement_id, gap_id, proof_role, required_fields, and source_priority when present."
+        )
     try:
         budget["query_rewrite_call_count"] = int(budget.get("query_rewrite_call_count") or 0) + 1
         budget["query_rewrite_input_chars_total"] = int(budget.get("query_rewrite_input_chars_total") or 0) + len(serialized_payload)
@@ -1307,6 +1367,10 @@ def build_llm_query_plan(
             intent = _dynamic_intent_label(intent, text)
         routed_options = _route_options_for_intent(intent, base_options)
         task = _as_dict(search_task or base_options.get("search_task"))
+        source_strategy = source_strategy_for_role(task.get("proof_role"), overrides=_as_dict(task.get("source_strategy")))
+        required_fields = _as_list(raw.get("required_fields")) or _as_list(task.get("required_fields"))
+        required_source_level = _as_list(raw.get("required_source_level")) or _as_list(task.get("required_source_level") or task.get("min_source_level"))
+        lane_targets = _as_list(raw.get("lane_targets")) or _as_list(task.get("lane_targets"))
         plan.append(
             {
                 "text": text,
@@ -1318,9 +1382,24 @@ def build_llm_query_plan(
                 "timeRange": routed_options.get("timeRange", "NoLimit"),
                 "contents": routed_options.get("contents", "summary"),
                 "task_id": raw.get("task_id") or task.get("task_id"),
+                "requirement_id": raw.get("requirement_id") or task.get("requirement_id"),
+                "gap_id": raw.get("gap_id") or task.get("gap_id"),
+                "search_task_id": raw.get("search_task_id") or task.get("search_task_id") or task.get("task_id"),
                 "dimension_id": raw.get("dimension_id") or task.get("dimension_id"),
                 "dimension_name": raw.get("dimension_name") or task.get("dimension_name"),
+                "chapter_id": raw.get("chapter_id") or task.get("chapter_id"),
+                "section_id": raw.get("section_id") or task.get("section_id"),
                 "evidence_goal": raw.get("evidence_goal") or task.get("evidence_goal"),
+                "proof_role": raw.get("proof_role") or task.get("proof_role"),
+                "required_fields": required_fields,
+                "required_source_level": required_source_level,
+                "lane_targets": lane_targets,
+                "required_field_focus": raw.get("required_field_focus") or task.get("required_field_focus"),
+                "source_strategy": _as_dict(raw.get("source_strategy")) or source_strategy,
+                "query_enhancers": _as_list(raw.get("query_enhancers")) or _as_list(source_strategy.get("query_enhancers")),
+                "success_criteria": raw.get("success_criteria") or task.get("success_criteria"),
+                "reject_if": _as_list(raw.get("reject_if")) or _as_list(task.get("reject_if")),
+                "freshness_required": bool(raw.get("freshness_required") or task.get("freshness_required")),
                 "must_have_terms": _as_list(raw.get("must_have_terms")) or _as_list(task.get("must_have_terms")),
                 "forbidden_terms": _as_list(raw.get("forbidden_terms")) or _as_list(task.get("forbidden_terms")),
                 "source_priority": _as_list(raw.get("source_priority")) or _as_list(task.get("source_priority")),
@@ -3093,6 +3172,71 @@ def prepare_query_node(state: WebAnalysisAgentState) -> WebAnalysisAgentState:
     }
 
 
+def _search_cache_hydration_allowed(payload: Dict[str, Any]) -> bool:
+    if not _env_flag("EVIDENCE_CACHE_HYDRATED_SEARCH_READ_ENABLED", True):
+        return False
+    cache_meta = _as_dict(payload.get("cache"))
+    return bool(cache_meta.get("hit") and cache_meta.get("layer") == "search_cache")
+
+
+def _hydrated_cached_research_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not _search_cache_hydration_allowed(payload):
+        return {}
+    page_results = [item for item in _as_list(payload.get("page_results")) if isinstance(item, dict)]
+    extracted_fact_cards = [item for item in _as_list(payload.get("extracted_fact_cards")) if isinstance(item, dict)]
+    fact_extractor = dict(_as_dict(payload.get("fact_extractor")) or _as_dict(_as_dict(payload.get("metadata")).get("readpage_fact_extractor")))
+    if not page_results and not extracted_fact_cards:
+        return {}
+    fact_extractor.setdefault("status", "cache_reused")
+    fact_extractor.setdefault("attempted", len(page_results))
+    fact_extractor.setdefault("success_count", len(page_results))
+    fact_extractor["cache_reused"] = True
+    return {
+        "page_results": page_results,
+        "extracted_fact_cards": extracted_fact_cards,
+        "fact_extractor": fact_extractor,
+    }
+
+
+def _store_hydrated_search_cache(
+    *,
+    query: str,
+    search_options: Dict[str, Any],
+    optimized_search: Dict[str, Any],
+    search_results: Sequence[Dict[str, Any]],
+    page_results: Sequence[Dict[str, Any]],
+    extracted_fact_cards: Sequence[Dict[str, Any]],
+    fact_extractor: Dict[str, Any],
+) -> None:
+    if not _env_flag("EVIDENCE_CACHE_HYDRATED_SEARCH_WRITE_ENABLED", True):
+        return
+    if not page_results and not extracted_fact_cards:
+        return
+    options_for_key = _as_dict(optimized_search.get("search_options")) or search_options
+    payload = {
+        "query": query,
+        "search_options": options_for_key,
+        "query_plan": optimized_search.get("query_plan", []),
+        "query_rewrite_diagnostics": optimized_search.get("query_rewrite_diagnostics", {}),
+        "search_tasks": optimized_search.get("search_tasks", []),
+        "search_trace": optimized_search.get("search_trace", []),
+        "quality_processing": optimized_search.get("quality_processing", {}),
+        "results": [dict(item) for item in search_results if isinstance(item, dict)],
+        "page_results": [dict(item) for item in page_results if isinstance(item, dict)],
+        "extracted_fact_cards": [dict(item) for item in extracted_fact_cards if isinstance(item, dict)],
+        "fact_extractor": {key: value for key, value in dict(fact_extractor).items() if key not in {"fact_cards", "rejected_spans"}},
+        "errors": optimized_search.get("errors", []),
+        "cache": {
+            **_as_dict(optimized_search.get("cache")),
+            "enabled": True,
+            "hit": False,
+            "hydrated": True,
+            "hydrated_layer": "page_fact_cache",
+        },
+    }
+    store_persistent_search_cache(query, options_for_key, _as_dict(options_for_key.get("search_task")), payload)
+
+
 def iqs_research_node(state: WebAnalysisAgentState) -> WebAnalysisAgentState:
     if state.get("errors"):
         return {}
@@ -3131,6 +3275,62 @@ def iqs_research_node(state: WebAnalysisAgentState) -> WebAnalysisAgentState:
         except Exception as exc:
             logger.exception("IQS optimized search failed", extra={"query": query})
             errors.append(f"搜索失败：{exc}")
+    hydrated_cache = _hydrated_cached_research_payload(optimized_search)
+    if hydrated_cache and not urls:
+        cached_pages = [item for item in _as_list(hydrated_cache.get("page_results")) if isinstance(item, dict)]
+        search_results, page_results = assign_source_ids(search_results, cached_pages)
+        extracted_fact_cards = [item for item in _as_list(hydrated_cache.get("extracted_fact_cards")) if isinstance(item, dict)]
+        fact_extractor = dict(_as_dict(hydrated_cache.get("fact_extractor")))
+        output: WebAnalysisAgentState = {
+            "search_results": search_results,
+            "page_results": page_results,
+            "extracted_fact_cards": extracted_fact_cards,
+            "fact_extractor": {
+                key: value
+                for key, value in dict(fact_extractor).items()
+                if key not in {"fact_cards", "rejected_spans"}
+            },
+            "metadata": {
+                **dict(state.get("metadata") or {}),
+                "agent_stage": "iqs_research",
+                "result_count": len(search_results),
+                "page_count": len(page_results),
+                "readpage_fact_extractor": {
+                    key: value
+                    for key, value in dict(fact_extractor).items()
+                    if key not in {"fact_cards", "rejected_spans"}
+                },
+                "query_plan": optimized_search.get("query_plan", []),
+                "query_rewrite_diagnostics": optimized_search.get("query_rewrite_diagnostics", {}),
+                "search_tasks": optimized_search.get("search_tasks", []),
+                "search_trace": optimized_search.get("search_trace", []),
+                "quality_processing": optimized_search.get("quality_processing", {}),
+                "auto_readpage": {
+                    "enabled": _env_flag("IQS_AUTO_READPAGE_ENABLED", True),
+                    "attempted": 0,
+                    "succeeded": len(page_results),
+                    "failed": 0,
+                    "urls": [],
+                    "errors": [],
+                    "skipped_by_hydrated_cache": True,
+                },
+                "hydrated_search_cache": {
+                    "hit": True,
+                    "page_count": len(page_results),
+                    "fact_card_count": len(extracted_fact_cards),
+                },
+            },
+        }
+        _progress(
+            "web-agent",
+            "IQS hydrated search cache reused",
+            search_results=len(search_results),
+            page_results=len(page_results),
+            fact_cards=len(extracted_fact_cards),
+            elapsed=f"{time.perf_counter() - started:.1f}s",
+        )
+        return output
+
     readpage_urls = select_auto_readpage_urls(search_results, explicit_urls=urls, search_options=search_options)
     explicit_url_set = {str(url or "").strip() for url in urls if str(url or "").strip()}
     readpage_timeout_ms = _env_int("IQS_READPAGE_TIMEOUT_MS", 30000, min_value=5000, max_value=120000)
@@ -3244,6 +3444,21 @@ def iqs_research_node(state: WebAnalysisAgentState) -> WebAnalysisAgentState:
         output["errors"] = list(state.get("errors") or []) + errors
     elif errors:
         output["metadata"] = {**dict(output["metadata"]), "partial_errors": errors}
+    try:
+        _store_hydrated_search_cache(
+            query=query,
+            search_options=search_options,
+            optimized_search=optimized_search,
+            search_results=search_results,
+            page_results=page_results,
+            extracted_fact_cards=extracted_fact_cards,
+            fact_extractor=_as_dict(output.get("fact_extractor")),
+        )
+    except Exception as exc:
+        output["metadata"] = {
+            **dict(output.get("metadata") or {}),
+            "hydrated_search_cache_store_error": str(exc),
+        }
     _progress(
         "web-agent",
         "IQS 检索阶段完成",

@@ -26,6 +26,34 @@ def test_persistent_search_cache_roundtrip(tmp_path, monkeypatch):
     assert cached["results"][0]["url"] == "https://www.sec.gov/filing"
 
 
+def test_persistent_search_cache_preserves_hydrated_page_and_fact_payload(tmp_path, monkeypatch):
+    monkeypatch.setenv("EVIDENCE_CACHE_PATH", str(tmp_path / "evidence_cache.sqlite"))
+    monkeypatch.setenv("EVIDENCE_CACHE_SQLITE_JOURNAL_MODE", "MEMORY")
+    monkeypatch.setenv("IQS_SEARCH_CACHE_ENABLED", "true")
+    query = "AI Agent official adoption metric"
+    options = {"engineType": "Deep", "timeRange": "NoLimit", "contents": "mainText"}
+    task = {"proof_role": "metric", "chapter_id": "ch_01"}
+    payload = {
+        "query": query,
+        "results": [{"title": "Official report", "url": "https://example.gov/ai-agent"}],
+        "page_results": [{"title": "Official report", "url": "https://example.gov/ai-agent", "content": "body"}],
+        "extracted_fact_cards": [{"fact_id": "FC-1", "fact": "Adoption metric", "source_url": "https://example.gov/ai-agent"}],
+        "fact_extractor": {"attempted": 1, "success_count": 1},
+        "search_trace": [],
+        "errors": [],
+        "cache": {"hydrated": True},
+    }
+
+    store_search(query, options, task, payload)
+    cached = lookup_search(query, options, task)
+
+    assert cached["cache"]["hit"] is True
+    assert cached["cache"]["layer"] == "search_cache"
+    assert cached["page_results"][0]["url"] == "https://example.gov/ai-agent"
+    assert cached["extracted_fact_cards"][0]["fact_id"] == "FC-1"
+    assert cached["fact_extractor"]["success_count"] == 1
+
+
 def test_negative_search_cache_is_query_specific(tmp_path, monkeypatch):
     monkeypatch.setenv("EVIDENCE_CACHE_PATH", str(tmp_path / "evidence_cache.sqlite"))
     monkeypatch.setenv("EVIDENCE_CACHE_SQLITE_JOURNAL_MODE", "MEMORY")
@@ -219,6 +247,47 @@ def test_evidence_cache_respects_lane_source_type(tmp_path, monkeypatch):
     assert research_hits
 
 
+def test_evidence_cache_rejects_generic_cross_topic_match(tmp_path, monkeypatch):
+    monkeypatch.setenv("EVIDENCE_CACHE_PATH", str(tmp_path / "evidence_cache.sqlite"))
+    monkeypatch.setenv("EVIDENCE_CACHE_SQLITE_JOURNAL_MODE", "MEMORY")
+    store_evidence_from_package(
+        query="ai agent official data",
+        evidence_package={
+            "analysis_ready_evidence": [
+                {
+                    "fact": "Official data reports enterprise AI agent adoption reached 42% in 2025.",
+                    "metric": "enterprise AI agent adoption",
+                    "value": "42",
+                    "unit": "%",
+                    "period": "2025",
+                    "source_level": "A",
+                    "proof_role": "source_check",
+                    "confidence": 0.82,
+                    "source": {
+                        "title": "Official AI Agent Statistics",
+                        "url": "https://example.gov/ai-agent-data",
+                        "source_type": "official",
+                    },
+                }
+            ]
+        },
+    )
+
+    generic_only_hits = lookup_evidence(
+        {"query": "foldable hinge official data", "proof_role": "source_check", "lane_targets": ["official_data"]},
+        min_source_level=["A", "B"],
+        required_fields=["source"],
+    )
+    exact_topic_hits = lookup_evidence(
+        {"query": "ai agent official data", "proof_role": "source_check", "lane_targets": ["official_data"]},
+        min_source_level=["A", "B"],
+        required_fields=["source"],
+    )
+
+    assert generic_only_hits == []
+    assert exact_topic_hits
+
+
 def test_brain_core_cache_hit_becomes_seed_and_keeps_live_task(tmp_path, monkeypatch):
     monkeypatch.setenv("EVIDENCE_CACHE_PATH", str(tmp_path / "evidence_cache.sqlite"))
     monkeypatch.setenv("EVIDENCE_CACHE_SQLITE_JOURNAL_MODE", "MEMORY")
@@ -303,6 +372,67 @@ def test_brain_non_core_cache_hit_skips_network(tmp_path, monkeypatch):
     assert cache_only_skipped
     assert cache_results[0]["cache_seed"] is True
     assert cache_results[0]["live_refresh_required"] is False
+
+
+def test_brain_cache_hit_preserves_repair_lineage_and_gap_summary(tmp_path, monkeypatch):
+    monkeypatch.setenv("EVIDENCE_CACHE_PATH", str(tmp_path / "evidence_cache.sqlite"))
+    monkeypatch.setenv("EVIDENCE_CACHE_SQLITE_JOURNAL_MODE", "MEMORY")
+    query = "enterprise ai agent adoption metric official source"
+    store_evidence_from_package(
+        query=query,
+        evidence_package={
+            "analysis_ready_evidence": [
+                {
+                    "fact": "Official data reports enterprise AI agent adoption reached 42% in 2025.",
+                    "metric": "enterprise AI agent adoption",
+                    "value": "42",
+                    "unit": "%",
+                    "period": "2025",
+                    "source_level": "A",
+                    "proof_role": "metric",
+                    "confidence": 0.82,
+                    "source": {"title": "Official data", "url": "https://www.sec.gov/ai-agent-data", "source_type": "official_data"},
+                }
+            ]
+        },
+    )
+    search_task = brain_agent_module.normalize_search_task(
+        {
+            "query": query,
+            "agent": "iqs",
+            "gap_id": "GAP-metric",
+            "requirement_id": "H1_metric",
+            "proof_role": "metric",
+            "required_fields": ["metric", "value", "unit", "period", "source"],
+            "lane_targets": ["official_data"],
+        },
+        fallback_index=1,
+    )
+    state = {"metadata": {}}
+
+    cache_results, remaining, cache_only_skipped = brain_agent_module._apply_evidence_cache_to_followup_tasks(
+        [{"query": query, "agent": "iqs", "targets_gap": "metric", "search_task": search_task}],
+        state=state,
+        round_number=2,
+    )
+
+    assert cache_results
+    result = cache_results[0]
+    assert result["gap_id"] == "GAP-metric"
+    assert result["requirement_id"] == "H1_metric"
+    assert result["proof_role"] == "metric"
+    assert result["required_fields"] == ["metric", "value", "unit", "period", "source"]
+    assert result["cache"]["gap_id"] == "GAP-metric"
+    assert result["cache"]["requirement_id"] == "H1_metric"
+    assert result["raw_data_points"][0]["gap_id"] == "GAP-metric"
+    assert result["raw_data_points"][0]["requirement_id"] == "H1_metric"
+    assert not remaining
+    assert cache_only_skipped
+    gap_summary = state["metadata"]["evidence_cache_summary"]["by_gap"]["GAP-metric"]
+    assert gap_summary["requirement_id"] == "H1_metric"
+    assert gap_summary["cache_hit_count"] == 1
+    assert gap_summary["cache_only_skip_count"] == 1
+    assert gap_summary["live_refresh_required_count"] == 0
 
 
 def test_brain_core_ab_cache_hit_requires_source(tmp_path, monkeypatch):

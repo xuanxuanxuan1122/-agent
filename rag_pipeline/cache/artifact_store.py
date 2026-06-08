@@ -61,6 +61,43 @@ def _compact_text(value: Any, max_chars: int = 1000) -> str:
     return text[:max_chars]
 
 
+def _enforced_claim_status(
+    status: str,
+    *,
+    facts: Sequence[Any],
+    sources: Sequence[Any],
+    claim_text: str,
+    requirement_ids: Sequence[Any],
+) -> str:
+    """P5 integrity floor for claim_units.
+
+    A claim is only ``validated`` when it has real evidence backing (>=1 fact AND
+    >=1 source) AND actual claim text. ``requirement_ids`` are intentionally NOT
+    part of the floor: the upstream evidence-id granularity gap (line-level
+    ``EV-04-L22`` cited while requirements bind ``EV-04-22``) leaves them
+    legitimately empty, so a missing requirement only downgrades to ``directional``
+    — it never rejects an otherwise evidence-backed claim.
+    """
+    if str(status).strip().lower() != "validated":
+        return status
+    if not (list(facts) and list(sources) and str(claim_text).strip()):
+        return "unsupported"
+    if not list(requirement_ids):
+        return "directional"
+    return "validated"
+
+
+def _enforced_section_status(status: str, *, claim_ids: Sequence[Any], used_fact_refs: Sequence[Any]) -> str:
+    """P5 integrity floor for sections: only ``validated`` when the section
+    actually references a claim or a fact. An empty section must not be
+    ``validated`` so the writer/context-view never renders it as long body."""
+    if str(status).strip().lower() != "validated":
+        return status
+    if not (list(claim_ids) or list(used_fact_refs)):
+        return "unsupported"
+    return status
+
+
 class ArtifactStore:
     def __init__(
         self,
@@ -776,6 +813,10 @@ class ArtifactStore:
         reqs = [str(item) for item in (requirement_ids or as_list(payload.get("requirement_ids"))) if str(item).strip()]
         facts = [str(item) for item in (fact_ids or as_list(payload.get("fact_ids")) or as_list(payload.get("used_fact_refs")) or as_list(payload.get("evidence_refs"))) if str(item).strip()]
         sources = [str(item) for item in (source_ids or as_list(payload.get("source_ids"))) if str(item).strip()]
+        claim_text = str(payload.get("claim") or payload.get("claim_text") or "").strip()
+        effective_status = _enforced_claim_status(
+            status, facts=facts, sources=sources, claim_text=claim_text, requirement_ids=reqs
+        )
         now = _now_iso()
         with self._connect() as conn:
             conn.execute(
@@ -806,7 +847,7 @@ class ArtifactStore:
                     _json_dumps(sources),
                     payload.get("claim_strength") or payload.get("strength") or "",
                     payload.get("claim_strength_ceiling") or "",
-                    status,
+                    effective_status,
                     input_hash,
                     output_hash,
                     now,
@@ -860,6 +901,7 @@ class ArtifactStore:
         reqs = [str(item) for item in (requirement_ids or as_list(payload.get("requirement_ids"))) if str(item).strip()]
         claims = [str(item) for item in (claim_ids or as_list(payload.get("claim_ids")) or ([payload.get("claim_id")] if payload.get("claim_id") else [])) if str(item).strip()]
         refs = [str(item) for item in (used_fact_refs or as_list(payload.get("used_fact_refs")) or as_list(payload.get("evidence_refs"))) if str(item).strip()]
+        effective_status = _enforced_section_status(status, claim_ids=claims, used_fact_refs=refs)
         now = _now_iso()
         with self._connect() as conn:
             conn.execute(
@@ -888,7 +930,7 @@ class ArtifactStore:
                     _json_dumps(claims),
                     _json_dumps(refs),
                     1 if evidence_backed else 0,
-                    status,
+                    effective_status,
                     input_hash,
                     output_hash,
                     now,
@@ -1007,17 +1049,56 @@ class ArtifactStore:
         to_type: str,
         to_id: str,
         relation: str = "related",
-    ) -> None:
+    ) -> bool:
+        if not self.enabled():
+            return False
         self._ensure_schema()
         with self._connect() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """
                 INSERT INTO lineage_edges(run_id, from_type, from_id, to_type, to_id, relation, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                SELECT ?, ?, ?, ?, ?, ?, ?
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM lineage_edges
+                    WHERE run_id = ?
+                      AND from_type = ?
+                      AND from_id = ?
+                      AND to_type = ?
+                      AND to_id = ?
+                      AND relation = ?
+                )
                 """,
-                (run_id, from_type, from_id, to_type, to_id, relation, _now_iso()),
+                (
+                    run_id,
+                    from_type,
+                    from_id,
+                    to_type,
+                    to_id,
+                    relation,
+                    _now_iso(),
+                    run_id,
+                    from_type,
+                    from_id,
+                    to_type,
+                    to_id,
+                    relation,
+                ),
             )
             conn.commit()
+            return cursor.rowcount > 0
+
+    def count_lineage_edges(self, run_id: str) -> int:
+        """Total persisted lineage edges for a run (not just edges added this call)."""
+        if not self.enabled():
+            return 0
+        self._ensure_schema()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM lineage_edges WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+        return int(row[0]) if row else 0
 
     def traverse_lineage(self, run_id: str, from_type: str, from_id: str, *, max_depth: int = 4) -> List[Dict[str, Any]]:
         self._ensure_schema()

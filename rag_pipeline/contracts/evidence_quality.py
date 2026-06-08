@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
+from rag_pipeline.contracts.evidence_admission import decide_evidence_admission
+
 
 QUALITY_CONTRACT_VERSION = "0.1.0"
 
@@ -837,10 +839,57 @@ def apply_evidence_quality_contract(
     merged = {**normalized, **classification}
     admission = _analysis_admission_fields(merged)
     merged.update(admission)
+    decision = decide_evidence_admission(merged)
+    merged.update(_admission_decision_fields(decision))
+    _align_analysis_fields_with_admission_decision(merged, decision)
     if isinstance(merged.get("evidence_card"), dict):
-        merged["evidence_card"] = {**merged["evidence_card"], **admission}
+        merged["evidence_card"] = {
+            **merged["evidence_card"],
+            **admission,
+            **_admission_decision_fields(decision, include_decision=False),
+        }
     merged["quality_contract_version"] = QUALITY_CONTRACT_VERSION
     return merged
+
+
+def _admission_decision_fields(decision: Dict[str, Any], *, include_decision: bool = True) -> Dict[str, Any]:
+    fields = {
+        "admission_verdict": decision.get("verdict"),
+        "admission_allowed_use": decision.get("allowed_use"),
+        "admission_reasons": decision.get("reasons") or [],
+        "admission_repair_action": decision.get("repair_action"),
+        "admission_confidence": decision.get("confidence"),
+    }
+    if include_decision:
+        fields["evidence_admission_decision"] = decision
+    return fields
+
+
+def _align_analysis_fields_with_admission_decision(item: Dict[str, Any], decision: Dict[str, Any]) -> None:
+    verdict = str(decision.get("verdict") or "").strip().lower()
+    reasons = [str(reason or "").strip() for reason in _as_list(decision.get("reasons")) if str(reason or "").strip()]
+    reason = reasons[0] if reasons else verdict
+    if verdict == "reject":
+        item["analysis_eligible"] = False
+        item["analysis_role"] = "rejected"
+        item["evidence_admission_reason"] = reason or item.get("evidence_admission_reason") or "rejected"
+        return
+    if verdict == "appendix_only":
+        item["analysis_eligible"] = False
+        item["analysis_role"] = "rejected"
+        item["evidence_admission_reason"] = item.get("evidence_admission_reason") or "appendix_only"
+        return
+    if verdict == "directional":
+        if item.get("analysis_eligible") is not False:
+            role = str(item.get("analysis_role") or "").strip().lower()
+            if role not in {"contextual", "directional", "counter", "risk"}:
+                item["analysis_role"] = "directional"
+            if reason == "metric_fields_incomplete":
+                item["evidence_admission_reason"] = "metric_scope_period_unit_incomplete"
+            elif not item.get("evidence_admission_reason"):
+                item["evidence_admission_reason"] = reason or "directional_signal"
+    elif verdict == "publishable" and item.get("analysis_eligible") is None:
+        item["analysis_eligible"] = True
 
 
 def _analysis_admission_fields(item: Dict[str, Any]) -> Dict[str, Any]:

@@ -107,6 +107,36 @@ def test_rewrite_section_body_rejects_missing_refs(monkeypatch, tmp_path):
     assert result["failure_reason"] == "missing_required_refs"
 
 
+def test_rewrite_section_body_rejects_extra_refs(monkeypatch, tmp_path):
+    monkeypatch.setenv("REPORT_ENABLE_LLM_BODY_REWRITE", "true")
+    monkeypatch.setenv("REPORT_BODY_REWRITE_CACHE_ENABLED", "false")
+    monkeypatch.setenv("REPORT_BODY_REWRITE_CACHE_PATH", str(tmp_path))
+    monkeypatch.setattr(
+        "rag_pipeline.agents.section_body_rewrite_agent.llm_config_is_ready",
+        lambda config: True,
+    )
+    monkeypatch.setattr(
+        "rag_pipeline.agents.section_body_rewrite_agent.call_openai_compatible_json",
+        lambda **kwargs: {
+            "payload": {
+                "paragraph": "Salesforce deployments show operating workflow demand [1].",
+                "used_fact_refs": ["EV-1", "EV-UNRELATED"],
+                "citation_refs": ["[1]", "[99]"],
+            }
+        },
+    )
+
+    result = rewrite_section_body(
+        section=_section(),
+        facts=_facts(),
+        chapter_question="Can AI agents convert into workflow deployment?",
+        llm_config={"url": "https://llm.test", "api_key": "key", "model": "mock-model"},
+    )
+
+    assert result["status"] == "rejected"
+    assert result["failure_reason"] == "unexpected_refs"
+
+
 def test_rewrite_section_body_accepts_shorter_safe_polished_paragraph(monkeypatch, tmp_path):
     monkeypatch.setenv("REPORT_ENABLE_LLM_BODY_REWRITE", "true")
     monkeypatch.setenv("REPORT_BODY_REWRITE_CACHE_ENABLED", "false")

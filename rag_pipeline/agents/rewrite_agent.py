@@ -222,7 +222,8 @@ def _llm_rewrite(
 1. 保留原文已有事实和引用编号，不能把没有引用的新增事实写进正文。
 2. 如果 QA 指出证据不足、反证缺失、覆盖不足或证明强度不足，把强结论改成方向性观察、阶段性判断或需验证事项。
 3. 删除内部过程标签、QA 标记、证据缺口黑话和空标题。
-4. 输出 JSON：{"markdown":"...","change_summary":["..."]}。
+4. 不得新增未在原文中出现的数字、公司名、日期、政策名或来源；证据不足时宁可缩短，不要扩写。
+5. 输出 JSON：{"markdown":"...","change_summary":["..."]}。
 """.strip()
     # qa_result is the dominant source of payload bloat (it can carry the full
     # evidence_health_summary, chapter packages and dimension scores). The

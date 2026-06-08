@@ -11,9 +11,10 @@ from urllib.parse import urlparse
 
 from ..config.search_config import build_llm_config_for_task, build_llm_config_from_profile
 from ..search.memory import call_openai_compatible_json, llm_config_is_ready, normalize_llm_config
+from rag_pipeline.contracts.repair_dispatcher import rejected_span_repair_summary
 
 
-SCHEMA_VERSION = "readpage_fact_card_v1"
+SCHEMA_VERSION = "readpage_fact_card_v2"
 
 _RUN_BUDGET_STATE: Dict[str, int] = {}
 
@@ -42,6 +43,52 @@ NAVIGATION_PATTERNS = re.compile(
 LOW_QUALITY_HOST_RE = re.compile(
     r"(?:twitter|x|instagram|facebook|baike|baijiahao|csdn|cnblogs|juejin|wenku|doc88|book118)\.",
     re.I,
+)
+
+# HTTP error pages / bot walls / sales chrome that scraping captures verbatim.
+# These are unambiguous non-facts; length-independent because error sentences
+# (e.g. "If the problem continues, contact the site owner.") are long enough to
+# slip past the navigation filter and end up as evidence in the report.
+ERROR_PAGE_PATTERNS = re.compile(
+    r"this page (?:isn['’]?t|is not) working"
+    r"|if the problem continues"
+    r"|contact the site owner"
+    r"|http error \d"
+    r"|took too long to respond"
+    r"|can['’]?t be reached"
+    r"|verify (?:you are|you['’]?re) (?:a )?human"
+    r"|checking your browser before"
+    r"|please enable javascript"
+    r"|(?:book|request) a demo"
+    r"|(?:accept all|we use) cookies",
+    re.I,
+)
+
+# Structural markup scraping captured as a "fact": headings, table cells/headers,
+# and financial-report table markers (e.g. ``<h5>Company Name</h5>`` or
+# ``<th>[Table_StockNameRptType] ...</th>``) are titles/structure, not verifiable
+# facts. The LLM analyst correctly abstains when a chapter's evidence is mostly
+# these, which is exactly why most chapters produced zero claims — so reject them
+# at extraction before they ever reach the analysis stage.
+STRUCTURAL_MARKUP_RE = re.compile(
+    r"^\s*<\s*/?\s*(?:h[1-6]|th|td|tr|thead|tbody|table|title|caption|nav|ul|ol|li)\b"
+    r"|\[Table_[A-Za-z]"
+    r"|</?(?:th|td|tr|thead|tbody|table)\b",
+    re.I,
+)
+
+# Institutional "how we publish" boilerplate that scraping captures from agency
+# pages (e.g. "国家统计局通过官方网站、数据发布库、《中国统计年鉴》、两微一端等渠道
+# 发布统计数据"). It is off-topic for an industry report yet binds to chapters and
+# gets glued into paragraphs with mismatched citations -> FinalAudit "引用来源与内容
+# 不匹配" fatal. These markers are specific enough to be near-zero false-positive.
+INSTITUTIONAL_BOILERPLATE_RE = re.compile(
+    r"两微一端"
+    r"|数据发布库"
+    r"|统计出版物"
+    r"|《?中国统计年鉴》?"
+    r"|通过[^。]{0,40}(?:官方网站|新闻发布会)[^。]{0,40}发布统计数据"
+    r"|满足不同用户群体获取统计数据",
 )
 
 
@@ -239,13 +286,16 @@ def _build_llm_config() -> Dict[str, Any]:
 def _system_prompt() -> str:
     return (
         "You extract structured public fact cards from verified web page body text for industry research. "
-        "Use only the supplied page text and source metadata. Do not write a report, do not give repair advice, "
+        "Use only the supplied page text and source metadata. Do not use search snippets, cached summaries, or model knowledge. "
+        "Do not write a report, do not give repair advice, "
         "and do not create claims unsupported by the page. Return strict JSON only. "
         "Each fact card must include subject, action_or_signal, variable, distilled_fact, fact_type, "
         "source_url or source_ref, source_level, source_verification_status, proof_role, block_affinity, "
-        "claim_strength_hint. Metric cards must include subject, scope or time_or_scope, value, unit, and source. "
+        "claim_strength_hint. Metric cards must include metric, value, unit, period or time_or_scope, and source. "
+        "If any search_task.required_fields cannot be filled from the current page text and source metadata, reject the span. "
+        "Counter evidence cards must be allowed only as counter/risk evidence, not as support for positive strong claims. "
         "Reject navigation, login, download notices, SEO text, search-result summaries, social/wiki/forum text, "
-        "and diagnostic phrases such as evidence is insufficient or suggest repair."
+        "HTTP error pages, marketing copy without traceable facts, and diagnostic phrases such as evidence is insufficient or suggest repair."
     )
 
 
@@ -255,10 +305,18 @@ def _user_payload(*, query: str, page: Dict[str, Any], search_task: Dict[str, An
         "query": query,
         "search_task": {
             "task_id": search_task.get("task_id"),
+            "search_task_id": search_task.get("search_task_id") or search_task.get("task_id"),
+            "requirement_id": search_task.get("requirement_id"),
+            "gap_id": search_task.get("gap_id"),
             "chapter_id": search_task.get("chapter_id") or search_task.get("dimension_id"),
+            "section_id": search_task.get("section_id"),
             "dimension_id": search_task.get("dimension_id"),
             "proof_role": search_task.get("proof_role") or search_task.get("evidence_type"),
             "evidence_goal": search_task.get("evidence_goal"),
+            "required_fields": _as_list(search_task.get("required_fields")),
+            "required_source_level": _as_list(search_task.get("required_source_level") or search_task.get("min_source_level")),
+            "success_criteria": search_task.get("success_criteria"),
+            "reject_if": _as_list(search_task.get("reject_if")),
             "must_have_terms": _as_list(search_task.get("must_have_terms")),
             "forbidden_terms": _as_list(search_task.get("forbidden_terms")),
         },
@@ -302,6 +360,12 @@ def _looks_bad_text(text: str) -> bool:
         return True
     if INTERNAL_OR_CLAIM_PATTERNS.search(value):
         return True
+    if ERROR_PAGE_PATTERNS.search(value):
+        return True
+    if STRUCTURAL_MARKUP_RE.search(value):
+        return True
+    if INSTITUTIONAL_BOILERPLATE_RE.search(value):
+        return True
     if NAVIGATION_PATTERNS.search(value) and len(value) < 120:
         return True
     if re.search(r"^\s*(?:https?://|www\.)", value, flags=re.I):
@@ -309,17 +373,150 @@ def _looks_bad_text(text: str) -> bool:
     return False
 
 
-def _metric_missing_fields(card: Dict[str, Any]) -> List[str]:
+def _metric_missing_fields(card: Dict[str, Any], required_fields: Optional[Sequence[Any]] = None) -> List[str]:
+    required = {
+        str(item or "").strip().lower()
+        for item in _as_list(list(required_fields or []))
+        if str(item or "").strip()
+    }
+    if not required:
+        required = {"subject", "period", "value", "unit"}
     missing: List[str] = []
-    if not str(card.get("subject") or "").strip():
+    if "subject" in required and not str(card.get("subject") or "").strip():
         missing.append("subject")
-    if not (str(card.get("scope") or "").strip() or str(card.get("time_or_scope") or "").strip()):
-        missing.append("scope_or_period")
-    if not str(card.get("value") or "").strip():
+    if "metric" in required and not str(card.get("metric") or card.get("variable") or "").strip():
+        missing.append("metric")
+    if ("period" in required or "scope" in required or "date" in required) and not (
+        str(card.get("period") or "").strip()
+        or str(card.get("scope") or "").strip()
+        or str(card.get("time_or_scope") or "").strip()
+        or str(card.get("date") or "").strip()
+    ):
+        missing.append("period")
+    if "value" in required and not str(card.get("value") or "").strip():
         missing.append("value")
-    if not str(card.get("unit") or "").strip():
+    value_text = str(card.get("value") or "").strip().lower()
+    value_carries_unit = bool(
+        value_text
+        and (
+            "%"
+            in value_text
+            or "percent" in value_text
+            or "percentage point" in value_text
+            or "百分点" in value_text
+            or "百分比" in value_text
+        )
+    )
+    if "unit" in required and not str(card.get("unit") or "").strip() and not value_carries_unit:
         missing.append("unit")
+    if "source" in required and not (
+        str(card.get("source_url") or "").strip()
+        or str(card.get("source_ref") or "").strip()
+        or str(card.get("source") or "").strip()
+    ):
+        missing.append("source")
     return missing
+
+
+def _metric_text_for_inference(card: Dict[str, Any]) -> str:
+    return _compact_text(
+        " ".join(
+            str(card.get(key) or "")
+            for key in (
+                "distilled_fact",
+                "fact",
+                "action_or_signal",
+                "summary",
+                "metric",
+                "variable",
+                "value",
+            )
+        ),
+        max_chars=1200,
+    )
+
+
+def _infer_metric_period_from_text(text: str) -> str:
+    match = re.search(r"\b((?:19|20)\d{2})(?:\s*(?:年|年度|财年|calendar year|fiscal year|fy)?)\b", text, flags=re.I)
+    return match.group(1) if match else ""
+
+
+METRIC_UNIT_PATTERN = (
+    r"%|percent|percentage points?|"
+    r"billion yuan|million yuan|trillion yuan|yuan|rmb|"
+    r"billion usd|million usd|usd|dollars?|"
+    r"users?|customers?|companies|enterprises|units?|shipments?|"
+    r"\u4ebf\u5143|\u4e07\u5143|\u5143|\u4ebf\u7f8e\u5143|\u4e07\u7f8e\u5143|\u7f8e\u5143|"
+    r"\u4e07\u4eba|\u4ebf\u4eba|\u4eba|\u4e07\u6237|\u6237|\u5bb6|\u53f0|\u5957"
+)
+
+
+def _infer_metric_value_from_text(text: str) -> str:
+    normalized = re.sub(r"\s+", " ", text or "").strip()
+    match = re.search(rf"\b(\d+(?:,\d{{3}})*(?:\.\d+)?)\s*(?:{METRIC_UNIT_PATTERN})", normalized, flags=re.I)
+    if match:
+        return match.group(1).replace(",", "")
+    percent = re.search(r"\b(\d+(?:\.\d+)?)\s*%", normalized)
+    return percent.group(1) if percent else ""
+
+
+def _infer_metric_unit_from_text(text: str, value: Any) -> str:
+    value_text = str(value or "").strip()
+    if re.search(r"%|percent|percentage point|百分点|百分比", value_text, flags=re.I):
+        return "%"
+    normalized = re.sub(r"\s+", " ", text or "").strip()
+    if value_text:
+        value_re = re.escape(value_text).replace(r"\ ", r"\s*")
+        match = re.search(rf"{value_re}\s*({METRIC_UNIT_PATTERN})", normalized, flags=re.I)
+        if match:
+            return match.group(1).strip()
+    match = re.search(rf"\b\d+(?:\.\d+)?\s*({METRIC_UNIT_PATTERN})", normalized, flags=re.I)
+    return match.group(1).strip() if match else ""
+
+
+def _infer_metric_name_from_text(text: str, card: Dict[str, Any]) -> str:
+    lower = str(text or "").lower()
+    patterns = [
+        (r"\bmarket size\b|\bmarket scale\b", "market size"),
+        (r"\bmarket share\b", "market share"),
+        (r"\badoption rate\b|\bpenetration rate\b", "adoption rate"),
+        (r"\bcagr\b|\bcompound annual growth rate\b", "CAGR"),
+        (r"\bgrowth rate\b|\byoy\b|year[- ]over[- ]year", "growth rate"),
+        (r"\brevenue\b|\bsales\b", "revenue"),
+        (r"\bshipments?\b", "shipments"),
+        (r"\busers?\b|\bcustomers?\b", "user count"),
+        (r"\bprice\b|\bpricing\b", "price"),
+        (r"\broi\b|return on investment", "ROI"),
+    ]
+    for pattern, name in patterns:
+        if re.search(pattern, lower, flags=re.I):
+            return name
+    action = _compact_text(card.get("action_or_signal"), max_chars=80)
+    action = re.split(r"\b(?:reached|was|were|is|are|stood at|amounted to)\b|[:：,;，；]", action, maxsplit=1, flags=re.I)[0]
+    return _compact_text(action, max_chars=48)
+
+
+def _repair_metric_fields_from_text(card: Dict[str, Any]) -> Dict[str, Any]:
+    text = _metric_text_for_inference(card)
+    if not str(card.get("value") or "").strip():
+        value = _infer_metric_value_from_text(text)
+        if value:
+            card["value"] = value
+    if not str(card.get("period") or card.get("time_or_scope") or "").strip():
+        period = _infer_metric_period_from_text(text)
+        if period:
+            card["period"] = period
+            card.setdefault("time_or_scope", period)
+    if not str(card.get("unit") or "").strip():
+        unit = _infer_metric_unit_from_text(text, card.get("value"))
+        if unit:
+            card["unit"] = unit
+    if not str(card.get("metric") or card.get("variable") or "").strip():
+        metric = _infer_metric_name_from_text(text, card)
+        if metric:
+            card["metric"] = metric
+            card.setdefault("variable", metric)
+    return card
 
 
 def _rejection(reason: str, card: Dict[str, Any]) -> Dict[str, Any]:
@@ -351,6 +548,10 @@ def _validated_card(
         "source_ref": str(source_ref or card.get("source_ref") or "").strip(),
         "proof_role": str(proof_role or task.get("proof_role") or task.get("evidence_type") or card.get("proof_role") or "").strip(),
         "chapter_id": str(chapter_id or task.get("chapter_id") or task.get("dimension_id") or card.get("chapter_id") or "").strip(),
+        "section_id": str(task.get("section_id") or card.get("section_id") or "").strip(),
+        "requirement_id": str(task.get("requirement_id") or card.get("requirement_id") or "").strip(),
+        "gap_id": str(task.get("gap_id") or card.get("gap_id") or "").strip(),
+        "search_task_id": str(task.get("search_task_id") or task.get("task_id") or card.get("search_task_id") or "").strip(),
     }
     for key in ("task_id", "dimension_id", "dimension_name", "evidence_goal", "hypothesis_id"):
         if key in task:
@@ -380,6 +581,8 @@ def _validated_card(
     card["clean_fact"] = distilled
     card["block_affinity"] = _normalize_affinity(card.get("block_affinity"), fact_type, card["proof_role"])
     card["claim_strength_hint"] = str(card.get("claim_strength_hint") or ("strong" if card["source_level"] in {"A", "B"} and card["source_verification_status"] in {"readpage_verified", "document_verified"} else "directional")).strip()
+    if fact_type == "metric":
+        card = _repair_metric_fields_from_text(card)
 
     if not (card_source_url or card_source_ref):
         rejected.append(_rejection("missing_source_ref", card))
@@ -393,13 +596,17 @@ def _validated_card(
         reason = "internal_or_claim_like_text" if INTERNAL_OR_CLAIM_PATTERNS.search(distilled) else "navigation_or_low_quality_text"
         rejected.append(_rejection(reason, card))
     if fact_type == "metric":
-        missing = _metric_missing_fields(card)
+        missing = _metric_missing_fields(card, task.get("required_fields"))
         if missing:
             rejected.append({**_rejection("metric_missing_scope_or_period", card), "missing_fields": missing})
+    required_source_levels = {str(item or "").strip().upper() for item in _as_list(task.get("required_source_level") or task.get("min_source_level")) if str(item or "").strip()}
+    if required_source_levels and card["source_level"] not in required_source_levels:
+        rejected.append({**_rejection("source_level_below_required", card), "required_source_level": sorted(required_source_levels)})
     if card.get("source_title_url_mismatch_suspected"):
         rejected.append(_rejection("source_mismatch", card))
 
     if rejected:
+        rejected.sort(key=lambda item: 0 if str(item.get("reason") or "").startswith("metric_") else 1)
         return None, rejected
 
     card.setdefault("metric", card.get("variable"))
@@ -409,6 +616,13 @@ def _validated_card(
     card.setdefault("evidence_origin", "readpage_fact_extractor")
     card.setdefault("extraction_schema_version", SCHEMA_VERSION)
     card.setdefault("source_verified", card["source_verification_status"] in {"readpage_verified", "document_verified"})
+    role = str(card.get("proof_role") or "").strip().lower()
+    if role == "counter" or fact_type == "counter":
+        card.setdefault("allowed_use", "counter")
+    elif card["source_level"] in {"A", "B"} and card["source_verification_status"] in {"readpage_verified", "document_verified"}:
+        card.setdefault("allowed_use", "supporting")
+    else:
+        card.setdefault("allowed_use", "directional_signal")
     card.setdefault("public_fact_card", copy.deepcopy(card))
     card.setdefault("public_fact_quality", {"eligible_for_report": True, "eligible_for_citation": True, "public_fact_card": copy.deepcopy(card)})
     # Make evidence_id collision-resistant: encode the (task_id, proof_role)
@@ -424,12 +638,20 @@ def _validated_card(
     card.setdefault("ref", card["evidence_id"])
     for key in (
         "task_id",
+        "search_task_id",
+        "requirement_id",
+        "gap_id",
+        "section_id",
         "dimension_id",
         "dimension_name",
         "evidence_goal",
         "must_have_terms",
         "forbidden_terms",
         "source_priority",
+        "required_fields",
+        "required_source_level",
+        "success_criteria",
+        "reject_if",
         "hypothesis_id",
     ):
         if key in task and key not in card:
@@ -443,6 +665,10 @@ def _cacheable_extractor_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "ref",
         "evidence_id",
         "chapter_id",
+        "section_id",
+        "requirement_id",
+        "gap_id",
+        "search_task_id",
         "dimension_id",
         "dimension_name",
         "task_id",
@@ -450,6 +676,10 @@ def _cacheable_extractor_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "must_have_terms",
         "forbidden_terms",
         "source_priority",
+        "required_fields",
+        "required_source_level",
+        "success_criteria",
+        "reject_if",
         "hypothesis_id",
         "search_task",
         "cached_context",
@@ -593,6 +823,7 @@ def extract_fact_cards_from_pages(
         "fallback_used": False,
         "fact_cards": [],
         "rejected_spans": [],
+        "rejected_span_repair_summary": {},
         "errors": [],
         "model": "",
         "budget_limit": _budget_limit(),
@@ -675,6 +906,10 @@ def extract_fact_cards_from_pages(
         result["invalid_metric_count"] += int(validated.get("invalid_metric_count") or 0)
     result["fact_card_count"] = len(result["fact_cards"])
     result["rejected_span_count"] = len(result["rejected_spans"])
+    result["rejected_span_repair_summary"] = rejected_span_repair_summary(
+        [item for item in result["rejected_spans"] if isinstance(item, dict)],
+        search_task=task,
+    )
     result["budget_used"] = max(0, _budget_used() - start_budget_used)
     if result["budget_exhausted"] and result["fact_card_count"]:
         result["status"] = "partial_budget_exhausted"

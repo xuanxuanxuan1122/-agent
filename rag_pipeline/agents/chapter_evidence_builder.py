@@ -46,6 +46,22 @@ GENERIC_CHAPTER_TERMS = {
     "什么",
 }
 
+GENERIC_ENGLISH_CHAPTER_TERMS = {
+    "and",
+    "the",
+    "which",
+    "what",
+    "when",
+    "where",
+    "why",
+    "how",
+    "with",
+    "from",
+    "into",
+    "this",
+    "that",
+}
+
 
 BAD_FACT_PATTERNS = [
     r"^\s*-?\d{2,6}(?:\.\d+)?\s*(?:$|[;,\.\u3002\uff1b\uff0c])",
@@ -842,7 +858,7 @@ def _chapter_terms(chapter: Dict[str, Any]) -> List[str]:
     )
     terms = set()
     for token in re.findall(r"[A-Za-z][A-Za-z0-9+.-]{2,}|[\u4e00-\u9fff]{2,}", text):
-        if token.lower() in GENERIC_CHAPTER_TERMS:
+        if token.lower() in GENERIC_CHAPTER_TERMS or token.lower() in GENERIC_ENGLISH_CHAPTER_TERMS:
             continue
         terms.add(token.lower())
     return list(terms)
@@ -904,6 +920,70 @@ def _item_chapter_score(item: Dict[str, Any], chapter: Dict[str, Any], chapter_i
     if any(term in metric for term in terms):
         score += 10
     return score
+
+
+def _chapter_term_matches(item: Dict[str, Any], terms: Sequence[str]) -> List[str]:
+    if not terms:
+        return []
+    evidence_key = _text_key(
+        " ".join(
+            str(item.get(key) or "")
+            for key in (
+                "fact",
+                "distilled_fact",
+                "clean_fact",
+                "content",
+                "summary",
+                "title",
+                "source_title",
+                "metric",
+                "indicator",
+            )
+        )
+    )
+    matches: List[str] = []
+    for term in terms:
+        term_key = _text_key(term)
+        if term_key and term_key in evidence_key:
+            matches.append(str(term))
+    return matches
+
+
+def _chapter_relevance_rejection_reason(item: Dict[str, Any], terms: Sequence[str]) -> str:
+    """Reject generic source/directional facts that only match by chapter_id.
+
+    Exact chapter_id is useful for recall, but it is not enough to prove that a
+    generic source-check fact semantically supports the chapter. Metric/case/
+    counter/technology facts keep their role-based path; broad source-check and
+    directional facts need at least one non-generic chapter term match.
+    """
+
+    if not terms or _chapter_term_matches(item, terms):
+        return ""
+    fact_type = str(item.get("fact_type") or _as_dict(item.get("public_fact_quality")).get("fact_type") or _fact_type(item)).strip().lower()
+    if fact_type in {"metric", "case", "counter", "technology"}:
+        return ""
+    if fact_type in {"source_check", "directional"}:
+        return "weak_chapter_relevance"
+    allowed_use = str(item.get("allowed_use") or "").strip().lower()
+    if allowed_use in {"supporting", "core_claim"} and str(item.get("binding_reason") or "") == "chapter_id":
+        return "weak_chapter_relevance"
+    return ""
+
+
+def _filter_chapter_relevant_items(items: Sequence[Dict[str, Any]], terms: Sequence[str]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    kept: List[Dict[str, Any]] = []
+    rejected: List[Dict[str, Any]] = []
+    for item in items:
+        reason = _chapter_relevance_rejection_reason(item, terms)
+        if reason:
+            copied = dict(item)
+            copied["chapter_relevance_status"] = "rejected"
+            copied["chapter_relevance_rejection_reason"] = reason
+            rejected.append(copied)
+        else:
+            kept.append(item)
+    return kept, rejected
 
 
 def _binding_reason(score: int) -> str:
@@ -1154,6 +1234,7 @@ def build_chapter_evidence_packages_from_evidence_package(
             for item in _items_from_existing_chapter(chapter, chapter_id, source_lookup)
         ]
         matched = _dedupe_items([*resolved, *existing_items, *[item for _, item in scored]])
+        matched, chapter_relevance_rejected = _filter_chapter_relevant_items(matched, terms)
         layered = _layer_evidence(matched)
         chapter_analysis = _chapter_analysis_from_fact_cards(chapter, layered)
         hydrated_count = sum(len(layered.get(key, [])) for key in EVIDENCE_LAYER_KEYS)
@@ -1177,6 +1258,21 @@ def build_chapter_evidence_packages_from_evidence_package(
         metadata["chapter_analysis_valid"] = bool(chapter_analysis.get("chapter_analysis_valid"))
         metadata["existing_chapter_evidence_count"] = len(existing_items)
         metadata["matched_evidence_count"] = len(matched)
+        metadata["chapter_relevance_rejected_count"] = len(chapter_relevance_rejected)
+        metadata["chapter_relevance_rejected_refs"] = [
+            str(item.get("evidence_id") or item.get("ref") or item.get("id") or _evidence_ref(item)).strip()
+            for item in chapter_relevance_rejected
+            if str(item.get("evidence_id") or item.get("ref") or item.get("id") or _evidence_ref(item)).strip()
+        ][:12]
+        metadata["chapter_relevance_rejection_reasons"] = {
+            reason: len([item for item in chapter_relevance_rejected if item.get("chapter_relevance_rejection_reason") == reason])
+            for reason in sorted(
+                {
+                    str(item.get("chapter_relevance_rejection_reason") or "unknown")
+                    for item in chapter_relevance_rejected
+                }
+            )
+        }
         metadata["binding_reasons"] = binding_reasons
         metadata["unresolved_evidence_refs"] = unresolved_refs
         metadata["evidence_binding_counts"] = {

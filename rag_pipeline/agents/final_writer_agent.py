@@ -17,6 +17,7 @@ from .citation_manifest import (
 from .chapter_narrative_agent import run_chapter_narrative
 
 from .markdown_renderer import (
+    _key_data_bullet_from_table_row,
     collect_format_warnings,
     normalize_markdown_spacing,
     render_appendix,
@@ -1978,17 +1979,39 @@ def _rename_first_h2(markdown: str, title: str) -> str:
 
 
 def _render_key_data_block(title: str, decision_package: Dict[str, Any], table_packages: Sequence[Dict[str, Any]]) -> str:
+    del decision_package
+
+    def row_citation_suffix(row: Dict[str, Any]) -> str:
+        refs: List[str] = []
+        for key in ("citation_refs", "source_refs"):
+            refs.extend(_as_list(row.get(key)))
+        for key in ("source_ref", "citation_ref", "ref"):
+            value = str(row.get(key) or "").strip()
+            if value:
+                refs.append(value)
+        public_refs = [
+            ref
+            for ref in (_normalize_citation_ref(item) for item in refs)
+            if re.fullmatch(r"\[\d{1,5}\]", ref)
+        ]
+        return "".join(_dedupe_strings(public_refs)[:2])
+
     rows: List[str] = []
     for table in table_packages:
         table = _as_dict(table)
         if not _table_passed_for_public(table):
             continue
-        for row in _as_list(table.get("rows"))[:1]:
-            cells = _as_list(_as_dict(row).get("cells"))
-            if cells:
-                text = "；".join(str(cell or "").strip() for cell in cells[:3] if str(cell or "").strip())
-                if text:
-                    rows.append(text)
+        headers = _as_list(table.get("headers"))
+        for row in _as_list(table.get("rows"))[:3]:
+            row = _as_dict(row)
+            suffix = row_citation_suffix(row)
+            if not suffix:
+                continue
+            text = _key_data_bullet_from_table_row(headers, row)
+            if text:
+                if not re.search(r"(?:\[\d{1,5}\])+\s*$", text):
+                    text = text.rstrip("銆傦紱; ") + " " + suffix
+                rows.append(text)
     if not rows:
         return ""
     return "\n".join([f"## {title}", *[f"- {item}" for item in rows[:6]]])
@@ -2026,9 +2049,12 @@ def _render_global_block(
         if "summary" in rendered_groups:
             return ""
         rendered_groups.add("summary")
-        return _rename_first_h2(render_executive_summary(decision_package, table_packages), title)
+        rendered = _rename_first_h2(render_executive_summary(decision_package, table_packages), title)
+        if re.search(r"(?m)^##\s*关键数据(?:\s|$)", rendered):
+            rendered_groups.add("key_data")
+        return rendered
     if key == "key_data":
-        if "key_data" in rendered_groups or "summary" in rendered_groups:
+        if "key_data" in rendered_groups:
             return ""
         rendered_groups.add("key_data")
         return _render_key_data_block(title, decision_package, table_packages)

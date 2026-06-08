@@ -392,10 +392,53 @@ def _by_chapter(items: Sequence[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any
     return result
 
 
+PUBLIC_CLAIM_ROLES = {
+    "metric_claim",
+    "counter_claim",
+    "case_claim",
+    "mechanism_claim",
+    "technology_claim",
+    "boundary_claim",
+    "core_claim",
+}
+
+
+def _claim_roles(unit: Dict[str, Any]) -> set[str]:
+    roles = {
+        str(role or "").strip()
+        for role in _as_list(unit.get("claim_roles"))
+        if str(role or "").strip()
+    }
+    primary = str(unit.get("primary_claim_role") or "").strip()
+    if primary:
+        roles.add(primary)
+    return roles
+
+
+def _context_only_claim(unit: Dict[str, Any]) -> bool:
+    roles = _claim_roles(unit)
+    if not roles:
+        return False
+    return "context_claim" in roles and not roles.intersection(PUBLIC_CLAIM_ROLES)
+
+
+def _apply_argument_unit_public_policy(unit: Dict[str, Any]) -> Dict[str, Any]:
+    copied = dict(unit)
+    if (
+        _context_only_claim(copied)
+        and not copied.get("force_public_render_context")
+        and not _env_flag("REPORT_RENDER_CONTEXT_CLAIMS", False)
+    ):
+        copied["public_render"] = False
+        copied["omit_from_report"] = True
+        copied.setdefault("internal_reason", "context_claim_not_public")
+    return copied
+
+
 def public_argument_units(units: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [
         unit
-        for unit in list(units or [])
+        for unit in [_apply_argument_unit_public_policy(item) for item in list(units or []) if isinstance(item, dict)]
         if isinstance(unit, dict)
         and unit.get("public_render") is True
         and not unit.get("omit_from_report")
@@ -957,8 +1000,12 @@ def _section_from_unit(
     collections = _collections_for_layout_section({"block_type": block_type, "output_type": output_type}) if block_type else list(PUBLIC_EVIDENCE_COLLECTIONS)
     used_fact_refs = _as_list(unit.get("used_fact_refs"))
     evidence_refs = used_fact_refs or _as_list(unit.get("evidence_refs")) or _as_list(layout_section.get("required_evidence_refs"))
+    source_support_map = _as_dict(unit.get("source_support_map"))
+    claim_support_refs = _dedupe(_as_list(source_support_map.get("claim")) or used_fact_refs or evidence_refs, limit=8)
     if not evidence_refs and evidence_package:
         evidence_refs = _refs_from_collections(evidence_package, collections, limit=6)
+    if not claim_support_refs:
+        claim_support_refs = _dedupe(used_fact_refs or evidence_refs, limit=8)
     unit_supporting_facts = [
         cleaned
         for item in (_as_list(unit.get("evidence_basis")) + _as_list(unit.get("supporting_facts")))
@@ -1057,8 +1104,13 @@ def _section_from_unit(
         mechanism = str(composition.get("mechanism") or mechanism)
         counter_evidence = str(composition.get("counter_evidence") or counter_evidence)
         supporting_facts = _as_list(composition.get("supporting_facts")) or supporting_facts
-        used_fact_refs = _as_list(composition.get("used_fact_refs")) or used_fact_refs
-        evidence_refs = _dedupe([*evidence_refs, *used_fact_refs], limit=8)
+        composed_refs = _as_list(composition.get("used_fact_refs"))
+        if claim_support_refs:
+            used_fact_refs = [ref for ref in _dedupe(composed_refs or used_fact_refs, limit=8) if ref in claim_support_refs] or claim_support_refs
+            evidence_refs = list(used_fact_refs)
+        else:
+            used_fact_refs = composed_refs or used_fact_refs
+            evidence_refs = _dedupe([*evidence_refs, *used_fact_refs], limit=8)
         variable_explanation = str(composition.get("variable_explanation") or "").strip()
         claim_key = _fact_text_key(claim)
         reasoning_key = _fact_text_key(reasoning)
@@ -1505,7 +1557,11 @@ def run_chapter_argument_agent(
     del llm_client
     report_blueprint = _as_dict(report_blueprint)
     layout_by_chapter = _layout_by_chapter(micro_layouts)
-    all_units = [item for item in list(argument_units or []) if isinstance(item, dict)]
+    all_units = [
+        _apply_argument_unit_public_policy(item)
+        for item in list(argument_units or [])
+        if isinstance(item, dict)
+    ]
     all_units_by_chapter = _by_chapter(all_units)
     units_by_chapter = _by_chapter(public_argument_units(all_units))
     tables_by_chapter = _by_chapter([item for item in list(table_packages or []) if isinstance(item, dict)])

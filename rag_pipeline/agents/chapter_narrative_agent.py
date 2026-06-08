@@ -15,7 +15,7 @@ from .section_body_rewrite_agent import (
 )
 
 
-PROMPT_VERSION = "chapter_narrative_v1"
+PROMPT_VERSION = "chapter_narrative_v2"
 DEFAULT_CACHE_PATH = Path("output/cache/chapter_narrative")
 ALLOWED_FINAL_ANALYSIS_SOURCES = {"llm_evidence_analysis", "llm_partial_merged"}
 
@@ -184,7 +184,7 @@ def _system_prompt() -> str:
         "改写成更连贯、专业、自然的章节叙事。只能使用输入 facts 和原段落中的事实。"
         "不得新增事实、数字、公司、来源或引用；不得提高 claim_strength；不得输出补证建议、"
         "QA、Clean、fatal、EV、URL 或内部诊断语言。每个 section 必须保留原 used_fact_refs "
-        "和 citation_refs。返回 JSON："
+        "和 citation_refs。证据不足时保持短，不为了篇幅扩写或推断。返回 JSON："
         "{\"chapter_lead\":\"...\", \"sections\":[{\"section_id\":\"...\", "
         "\"paragraph\":\"...\", \"used_fact_refs\":[...], \"citation_refs\":[...]}]}。"
     )

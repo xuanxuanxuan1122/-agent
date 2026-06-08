@@ -20,6 +20,9 @@ Return only a valid JSON object with this shape:
     {
       "type": "unsupported_claim|evidence_gap|citation_issue|data_conflict|logic_jump|risk_understated|scope_issue",
       "severity": "low|medium|high|fatal",
+      "requirement_id": "optional requirement id",
+      "gap_id": "optional gap id",
+      "section_id": "optional section id",
       "message": "short finding",
       "evidence_hint": "where to inspect",
       "suggested_fix": "concrete fix"
@@ -36,6 +39,7 @@ Return only a valid JSON object with this shape:
 Use fatal only when the report should not be delivered as clean output without human repair.
 Focus on missing sources, weak evidence, conflicting metric scope, inconsistent time windows,
 investment conclusions that overreach the evidence, and risk sections that are too weak.
+When a finding maps to a known gap, include requirement_id, gap_id, and section_id so the repair ledger can create the next search task.
 Also treat leaked internal pipeline markers (for example ch_01, policy_summary in a non-policy report,
 绗?杞?traces, malformed metric tables, or source appendix gaps) as fatal unless clearly intentional.
 """
@@ -124,6 +128,80 @@ def _validation_snapshot(validation: Optional[Dict[str, Any]]) -> Dict[str, Any]
         "body_chars_without_sources",
     ]
     return {key: payload.get(key) for key in keys if key in payload}
+
+
+def _compact_retry_plan_for_audit(value: Any) -> Dict[str, Any]:
+    payload = _as_dict(value)
+    allowed = {
+        "query",
+        "query_terms",
+        "proof_role",
+        "required_fields",
+        "required_source_level",
+        "lane_targets",
+        "success_criteria",
+        "reject_if",
+        "current_insufficiency",
+        "repair_route",
+        "source_stage",
+        "live_refresh_required_count",
+        "result_count",
+        "signal_count",
+    }
+    return {
+        key: payload.get(key)
+        for key in allowed
+        if payload.get(key) not in (None, "", [], {})
+    }
+
+
+def _compact_score_gaps_for_audit(package: Dict[str, Any], writer_report: Dict[str, Any], *, limit: int = 40) -> List[Dict[str, Any]]:
+    raw_gaps = (
+        _as_list(package.get("score_gaps"))
+        or _as_list(package.get("score_gap_ledger"))
+        or _as_list(writer_report.get("score_gaps"))
+        or _as_list(_as_dict(package.get("evidence_package")).get("evidence_gap_ledger"))
+    )
+    result: List[Dict[str, Any]] = []
+    for raw in raw_gaps[:limit]:
+        item = _as_dict(raw)
+        if not item:
+            continue
+        result.append(
+            {
+                key: value
+                for key, value in {
+                    "gap_id": item.get("gap_id") or item.get("id"),
+                    "requirement_id": item.get("requirement_id"),
+                    "chapter_id": item.get("chapter_id"),
+                    "section_id": item.get("section_id"),
+                    "gap_type": item.get("gap_type") or item.get("type"),
+                    "status": item.get("status"),
+                    "severity": item.get("severity"),
+                    "missing": _as_list(item.get("missing")) or _as_list(item.get("missing_fields")),
+                    "retry_plan": _compact_retry_plan_for_audit(item.get("retry_plan")),
+                    "message": _compact_text(item.get("message") or item.get("reason") or item.get("why_current_evidence_insufficient"), 260),
+                }.items()
+                if value not in (None, "", [], {})
+            }
+        )
+    return result
+
+
+def _compact_final_citation_audit(value: Any) -> Dict[str, Any]:
+    payload = _as_dict(value)
+    keys = [
+        "final_citation_reconciliation_status",
+        "final_body_citation_refs",
+        "final_appendix_refs",
+        "final_missing_appendix_refs",
+        "final_unresolved_citation_refs",
+        "final_unresolved_citation_removed_count",
+        "final_duplicate_citation_removed_count",
+        "factual_body_without_citations_count",
+        "citationless_fact_examples",
+    ]
+    return {key: payload.get(key) for key in keys if payload.get(key) not in (None, "", [], {})}
 
 
 def _is_fatal_audit(payload: Dict[str, Any]) -> bool:
@@ -330,6 +408,16 @@ def run_deterministic_audit(
         final_missing = _as_list(final_citation_audit.get("final_missing_appendix_refs"))
         final_status = str(final_citation_audit.get("final_citation_reconciliation_status") or "").strip().lower()
         citationless_count = int(final_citation_audit.get("factual_body_without_citations_count") or 0)
+        final_unresolved = _as_list(
+            final_citation_audit.get("final_unresolved_citation_refs")
+            or final_citation_audit.get("unresolved_citation_refs")
+        )
+        final_body_refs = [_normalize_source_ref(ref) for ref in _as_list(final_citation_audit.get("final_body_citation_refs"))]
+        final_appendix_refs = [_normalize_source_ref(ref) for ref in _as_list(final_citation_audit.get("final_appendix_refs"))]
+        appendix_ref_set = {ref for ref in final_appendix_refs if ref}
+        body_refs_missing_from_appendix = [
+            ref for ref in final_body_refs if ref and appendix_ref_set and ref not in appendix_ref_set
+        ]
         if citationless_count:
             findings.append(
                 {
@@ -340,15 +428,23 @@ def run_deterministic_audit(
                     "examples": _as_list(final_citation_audit.get("citationless_fact_examples"))[:5],
                 }
             )
-        if final_missing or final_status == "blocked":
+        has_explicit_final_gap = bool(final_missing or final_unresolved or body_refs_missing_from_appendix)
+        has_unknown_final_gap = (
+            final_status == "blocked"
+            and not citationless_count
+            and not has_explicit_final_gap
+            and not (final_body_refs and final_appendix_refs)
+        )
+        if has_explicit_final_gap or has_unknown_final_gap:
             findings.append(
                 {
                     "type": "final_citation_gap",
                     "severity": "fatal",
                     "message": "Final rendered body citations and source appendix are inconsistent.",
-                    "final_missing_appendix_refs": final_missing[:10],
-                    "final_body_citation_refs": _as_list(final_citation_audit.get("final_body_citation_refs"))[:20],
-                    "final_appendix_refs": _as_list(final_citation_audit.get("final_appendix_refs"))[:20],
+                    "final_missing_appendix_refs": (final_missing or body_refs_missing_from_appendix)[:10],
+                    "final_unresolved_citation_refs": final_unresolved[:10],
+                    "final_body_citation_refs": final_body_refs[:20],
+                    "final_appendix_refs": final_appendix_refs[:20],
                 }
             )
 
@@ -506,6 +602,7 @@ def run_final_audit(
         return {"enabled": False, "success": True, "status": "skipped", "skipped_reason": "disabled"}
 
     package = _as_dict(writer_package_payload)
+    writer_report = _as_dict(package.get("writer_report"))
     deterministic_audit = run_deterministic_audit(
         report_markdown=report_markdown,
         validation=validation,
@@ -562,6 +659,9 @@ def run_final_audit(
         "evidence_handoff_diagnostics": _as_dict(package.get("evidence_handoff_diagnostics")),
         "qa_blocker_summary": _as_dict(package.get("qa_blocker_summary")),
         "quality_gate_state": _as_dict(package.get("quality_gate_state")),
+        "score_gaps": _compact_score_gaps_for_audit(package, writer_report),
+        "requirement_gap_summary": _as_dict(package.get("requirement_gap_summary") or writer_report.get("requirement_gap_summary")),
+        "final_citation_audit": _compact_final_citation_audit(package.get("final_citation_audit") or writer_report.get("final_citation_audit")),
     }
     try:
         response = call_openai_compatible_json(

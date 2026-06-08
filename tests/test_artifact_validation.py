@@ -33,6 +33,21 @@ def test_claim_unit_strength_cannot_exceed_ceiling():
     assert "claim_strength_exceeds_ceiling" in result.errors
 
 
+def test_claim_unit_requires_requirement_ids_for_lineage():
+    result = validate_claim_unit_lineage(
+        {
+            "claim_id": "CL-1",
+            "claim_strength": "directional",
+            "claim_strength_ceiling": "directional",
+            "fact_ids": ["EV-1"],
+        },
+        [{"fact_id": "EV-1", "status": "validated"}],
+    )
+
+    assert result.ok is False
+    assert "claim_unit_missing_requirement_ids" in result.errors
+
+
 def test_section_validation_rejects_missing_or_stale_fact_refs():
     result = validate_section_lineage(
         {"section_id": "SEC-1", "used_fact_refs": ["EV-1", "EV-stale"], "claim_ids": ["CL-1"]},

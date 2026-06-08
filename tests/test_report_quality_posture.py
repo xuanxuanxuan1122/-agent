@@ -1,5 +1,7 @@
 import os
 
+import pytest
+
 from rag_pipeline.flows.report import full_report
 
 
@@ -74,6 +76,17 @@ QWEN_WEB_SEARCH_MODEL_KEYS = [
 MODEL_ROUTING_KEYS = [*DEEPSEEK_QUALITY_MODEL_KEYS, *QWEN_WEB_SEARCH_MODEL_KEYS]
 
 POSTURE_KEYS = [*HIGH_COST_POSTURE_KEYS, *EVIDENCE_BUDGET_KEYS, *WRITING_BUDGET_KEYS, *MODEL_ROUTING_KEYS]
+
+
+@pytest.fixture(autouse=True)
+def restore_posture_env():
+    previous = {key: os.environ.get(key) for key in POSTURE_KEYS}
+    yield
+    for key, value in previous.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
 
 
 def _clear_posture_env(monkeypatch):

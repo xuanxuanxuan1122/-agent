@@ -133,6 +133,8 @@ def test_write_run_trace_from_package_extracts_core_pipeline_events(tmp_path, mo
                 "llm_usable_claim_count": 3,
                 "llm_dropped_claim_count": 1,
                 "llm_validation_issue_counts": {"missing_refs": 1},
+                "llm_semantic_judge_counts": {"attempted": 3, "supported": 2, "unsupported": 1},
+                "llm_semantic_judge_usage": {"total_tokens": 1200},
                 "final_analysis_source": "llm_partial_merged",
             }
         },
@@ -176,6 +178,10 @@ def test_write_run_trace_from_package_extracts_core_pipeline_events(tmp_path, mo
         "final_audit_result": {"status": "passed", "blocked": False},
         "report_delivery_status": {"formal_report_written": True, "score_report_written": True},
         "writer_report": {"quality_score": 78, "clean_content_eligible": False},
+        "score_gaps": [
+            {"gap_id": "GAP-1", "status": "evidence_found", "gap_type": "metric_scope_period_unit_incomplete"},
+            {"gap_id": "GAP-2", "status": "still_insufficient", "gap_type": "counter_evidence_missing"},
+        ],
     }
 
     result = write_run_trace_from_package(
@@ -217,7 +223,13 @@ def test_write_run_trace_from_package_extracts_core_pipeline_events(tmp_path, mo
         "counter": 1,
         "case": 1,
     }
+    assert repair_event["diagnostics"]["repair_effectiveness"]["attempted_gap_count"] == 3
+    assert repair_event["diagnostics"]["repair_effectiveness"]["closed_gap_count"] == 1
+    assert repair_event["diagnostics"]["repair_effectiveness"]["closure_rate"] == 1 / 3
     assert repair_event["diagnostics"]["self_refine_disabled_reason"] == "quality_posture"
+    llm_event = next(event for event in events if event["stage"] == "llm_analysis")
+    assert llm_event["diagnostics"]["llm_semantic_judge_counts"]["attempted"] == 3
+    assert llm_event["diagnostics"]["llm_semantic_judge_usage"]["total_tokens"] == 1200
     public_gate_event = next(event for event in events if event["stage"] == "public_narrative_gate")
     assert public_gate_event["status"] == "ok"
     assert public_gate_event["drop_count"] == 3

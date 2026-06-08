@@ -33,9 +33,14 @@ def sample_items() -> List[Dict[str, Any]]:
                     "confidence": 0.82,
                     "source": {
                         "title": f"{title}{item_index}",
-                        "url": f"https://example.com/{dimension_index}/{item_index}",
+                        "url": (
+                            f"https://www.stats.gov.cn/sample/{dimension_index}/{item_index}"
+                            if source_level == "A"
+                            else f"https://www.idc.com/sample/{dimension_index}/{item_index}"
+                        ),
                         "date": "2026-05-08",
                         "credibility": source_level,
+                        "source_type": "official" if source_level == "A" else "research",
                     },
                 }
             )
@@ -55,4 +60,3 @@ def sample_structured_analysis() -> Dict[str, Any]:
             for dimension in INDUSTRY_DIMENSIONS
         },
     }
-

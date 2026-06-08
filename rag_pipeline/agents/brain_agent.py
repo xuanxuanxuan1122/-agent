@@ -29,6 +29,7 @@ from rag_pipeline.cache.evidence_cache import lookup_evidence as lookup_cached_e
 from rag_pipeline.cache.evidence_cache import record_cache_activity
 from rag_pipeline.cache.trusted_source_cache import lookup_trusted_sources
 from rag_pipeline.contracts.query_builder import build_query_package
+from rag_pipeline.contracts.repair_dispatcher import dispatch_repair_seed
 from .analysis_agent import run_analysis_agent
 from .article_brief import normalize_article_brief, planning_query_from_brief
 from .dynamic_search_schema import normalize_search_task
@@ -1641,6 +1642,47 @@ def _blocking_dropped_task_count(tasks: Sequence[Dict[str, Any]]) -> int:
     return len([task for task in tasks if isinstance(task, dict) and _is_blocking_dropped_task(task)])
 
 
+def _apply_global_task_budget(
+    scheduled_tasks: Sequence[Dict[str, Any]],
+    budget: int,
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """P2 hard global cap on total scheduled search tasks.
+
+    The per-lane caps are multiplicative (lanes x per-lane x rounds) with a strict
+    floor, so they cannot guarantee a total ceiling — this is the single hard gate.
+    Selection is round-robin across lanes so the cap preserves cross-lane / proof-role
+    coverage instead of starving later lanes by a flat truncation.
+
+    Returns ``(kept, overflow)``; ``overflow`` carries a ``global_task_budget`` drop
+    reason so the caller can record them as dropped tasks.
+    """
+    from collections import OrderedDict
+
+    by_lane: "OrderedDict[str, List[Dict[str, Any]]]" = OrderedDict()
+    for task in scheduled_tasks:
+        by_lane.setdefault(str(task.get("scheduled_lane") or ""), []).append(task)
+    queues = [list(tasks) for tasks in by_lane.values()]
+    kept: List[Dict[str, Any]] = []
+    while len(kept) < budget and any(queues):
+        for queue in queues:
+            if not queue:
+                continue
+            kept.append(queue.pop(0))
+            if len(kept) >= budget:
+                break
+    overflow = [
+        {
+            **task,
+            "drop_reason": "global_task_budget",
+            "dropped_lane": task.get("scheduled_lane"),
+            "dropped_lane_type": task.get("scheduled_lane_type"),
+        }
+        for queue in queues
+        for task in queue
+    ]
+    return kept, overflow
+
+
 def _summarize_dropped_search_tasks(tasks: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     by_chapter: Dict[str, int] = {}
     by_proof_role: Dict[str, int] = {}
@@ -1778,6 +1820,29 @@ def build_query_analysis(query: str, route: str, article_brief: Optional[Dict[st
             agent_queries[role_key] = _unique_strings([_dynamic_role_query(task) for task in tasks], max_items=max_queries)
     else:
         deduped_tasks = []
+    # P2: hard global budget on total search tasks. Per-lane caps multiply and
+    # cannot bound the total (the explosion that drags the run into timeout
+    # fail-open). Default 48 = a generous safety ceiling that prevents the
+    # 140-task explosion while leaving headroom; set ``BRAIN_GLOBAL_MAX_SEARCH_TASKS``
+    # lower (e.g. 32, the validated thin value) or 0 to disable entirely.
+    global_task_budget = _env_int("BRAIN_GLOBAL_MAX_SEARCH_TASKS", 48, min_value=0, max_value=400)
+    global_budget_applied = False
+    if global_task_budget > 0 and len(scheduled_tasks) > global_task_budget:
+        scheduled_tasks, _budget_overflow = _apply_global_task_budget(scheduled_tasks, global_task_budget)
+        dropped_tasks.extend(_budget_overflow)
+        global_budget_applied = True
+        # Rebuild the per-lane dispatch structures (agent_tasks / agent_queries are
+        # what actually drive IQS calls) so the cap cuts real search work, not just
+        # the reported count.
+        capped_by_lane: Dict[str, List[Dict[str, Any]]] = {}
+        for task in scheduled_tasks:
+            capped_by_lane.setdefault(str(task.get("scheduled_lane") or ""), []).append(task)
+        for role_key in list(agent_tasks.keys()):
+            kept_lane_tasks = capped_by_lane.get(role_key, [])
+            agent_tasks[role_key] = kept_lane_tasks
+            agent_queries[role_key] = _unique_strings(
+                [_dynamic_role_query(task) for task in kept_lane_tasks], max_items=max_queries
+            )
     dropped_summary = _summarize_dropped_search_tasks(dropped_tasks)
     dropped_by_lane = _count_tasks_by_key(dropped_tasks, "scheduled_lane_type", fallback_key="dropped_lane_type")
     scheduled_by_lane = _count_tasks_by_key(scheduled_tasks, "scheduled_lane_type")
@@ -1808,6 +1873,8 @@ def build_query_analysis(query: str, route: str, article_brief: Optional[Dict[st
         "dynamic_search_tasks": dynamic_tasks,
         "search_task_schedule": {
             "max_tasks_per_lane": max_tasks_per_lane,
+            "global_task_budget": global_task_budget,
+            "global_budget_applied": global_budget_applied,
             "scheduled_tasks": scheduled_tasks,
             "dropped_tasks": dropped_tasks,
             "deduped_tasks": deduped_tasks,
@@ -2573,11 +2640,28 @@ def _run_iqs_role_agent_node(state: BrainAgentState, role_key: str) -> BrainAgen
             for index, task in indexed_tasks
         }
         completed: set[Any] = set()
+
+        def _cancel_pending(reason: str) -> None:
+            for pending_future, pending_index in future_map.items():
+                if pending_future in completed:
+                    continue
+                pending_future.cancel()
+                completed.add(pending_future)
+                task_payloads.append(
+                    {"index": pending_index, "status": "cancelled", "cancel_reason": reason}
+                )
+
         try:
             wall_timeout = None
             if task_timeout:
                 waves = max(1, math.ceil(len(indexed_tasks) / max(lane_workers, 1)))
                 wall_timeout = task_timeout * waves + max(30.0, min(task_timeout, 60.0))
+            # Hard global deadline: cap the lane wait by the remaining run budget so
+            # the parallel branch never blocks past the deadline (per-lane wall_timeout
+            # alone did not enforce the run deadline -> tasks ran on past it).
+            deadline_remaining = _deadline_remaining_seconds(state)
+            if deadline_remaining != float("inf") and deadline_remaining > 0:
+                wall_timeout = deadline_remaining if wall_timeout is None else min(wall_timeout, deadline_remaining)
             for future in as_completed(future_map, timeout=wall_timeout):
                 completed.add(future)
                 try:
@@ -2589,31 +2673,19 @@ def _run_iqs_role_agent_node(state: BrainAgentState, role_key: str) -> BrainAgen
                             "errors": [f"{config['label']} parallel task failed: {exc}"],
                         }
                     )
+                # Stop the moment the run deadline is hit: cancel everything still
+                # pending instead of continuing to collect past the deadline.
+                if _deadline_exceeded(state, min_remaining=1.0):
+                    _cancel_pending("deadline_exceeded")
+                    break
                 early_stop_state = _lane_early_stop_decision(task_payloads, started_at=node_started)
                 if early_stop_state.get("early_stopped"):
-                    for pending_future, pending_index in future_map.items():
-                        if pending_future in completed:
-                            continue
-                        pending_future.cancel()
-                        task_payloads.append(
-                            {
-                                "index": pending_index,
-                                "status": "cancelled",
-                                "cancel_reason": "cancelled_by_early_stop",
-                            }
-                        )
+                    _cancel_pending("cancelled_by_early_stop")
                     break
         except FutureTimeoutError:
-            for future, index in future_map.items():
-                if future in completed:
-                    continue
-                future.cancel()
-                task_payloads.append(
-                    {
-                        "index": index,
-                        "errors": [f"{config['label']} parallel task timed out after {task_timeout:.0f}s"],
-                    }
-                )
+            # as_completed hit the (deadline-capped) wall timeout -> hard stop.
+            reason = "deadline_exceeded" if _deadline_exceeded(state, min_remaining=1.0) else "lane_wall_timeout"
+            _cancel_pending(reason)
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 
@@ -4250,7 +4322,7 @@ def normalize_web_child_output(
         for index, item in enumerate(extracted_fact_cards, start=1):
             point = dict(item)
             point.setdefault("evidence_origin", "readpage_fact_extractor")
-            point.setdefault("extraction_schema_version", "readpage_fact_card_v1")
+            point.setdefault("extraction_schema_version", "readpage_fact_card_v2")
             point.setdefault("confidence", confidence)
             point.setdefault("evidence", point.get("distilled_fact") or point.get("fact") or point.get("clean_fact"))
             point.setdefault("content", point.get("distilled_fact") or point.get("fact") or point.get("clean_fact"))
@@ -5373,6 +5445,7 @@ def _child_output_to_pool_item(
             {
                 "task_id": task.get("task_id"),
                 "gap_id": task.get("gap_id") or _followup_gap_id(task),
+                "requirement_id": task.get("requirement_id") or task.get("evidence_requirement_id"),
                 "dimension_id": task.get("dimension_id"),
                 "dimension_name": task.get("dimension_name"),
                 "chapter_id": task.get("chapter_id"),
@@ -5383,6 +5456,9 @@ def _child_output_to_pool_item(
                 "must_have_terms": _as_list(task.get("must_have_terms")),
                 "forbidden_terms": _as_list(task.get("forbidden_terms")),
                 "source_priority": _as_list(task.get("source_priority")),
+                "proof_role": task.get("proof_role"),
+                "required_fields": _as_list(task.get("required_fields")),
+                "blocking_gaps": _as_list(task.get("blocking_gaps")),
                 "retrieval_mode": task.get("retrieval_mode"),
                 "retrieval_reason": task.get("retrieval_reason"),
                 "primary_provider": task.get("primary_provider"),
@@ -5777,6 +5853,10 @@ def _layout_followup_queries_from_writer_report(writer_report: Dict[str, Any], *
     for item in _as_list(refinement_plan.get("top_priorities")) + _as_list(refinement_plan.get("follow_up_queries")):
         if isinstance(item, dict):
             add_query(item)
+    reflection = _research_reflection_memo_from_writer_report(writer_report)
+    for item in _as_list(reflection.get("next_search_task_seeds")):
+        if isinstance(item, dict):
+            add_query({**item, "source": item.get("source") or "research_reflection_memo"})
     for item in _as_list(writer_report.get("required_followups")):
         item = _as_dict(item)
         payload = _normalize_followup_payload(item)
@@ -5855,11 +5935,29 @@ def _layout_followup_queries_from_writer_report(writer_report: Dict[str, Any], *
                 "hypothesis_statement": item.get("hypothesis_statement"),
                 "proof_profile_id": item.get("proof_profile_id"),
                 "mandatory_proof_id": item.get("mandatory_proof_id") or item.get("proof_id"),
+                "requirement_id": item.get("requirement_id"),
+                "chapter_id": item.get("chapter_id"),
+                "section_id": item.get("section_id"),
+                "gap_type": item.get("gap_type") or item.get("type"),
+                "repair_status": item.get("repair_status"),
                 "missing_mandatory_proofs": _as_list(item.get("missing_mandatory_proofs")),
                 "proof_role": item.get("proof_role"),
                 "proof_standard": item.get("proof_standard"),
                 "evidence_type": item.get("evidence_type"),
                 "required_evidence_mix": _as_list(item.get("required_evidence_mix")),
+                "required_fields": _as_list(item.get("required_fields")),
+                "required_source_level": _as_list(item.get("required_source_level")),
+                "success_criteria": item.get("success_criteria"),
+                "reject_if": _as_list(item.get("reject_if")),
+                "preferred_source_patterns": _as_list(item.get("preferred_source_patterns")),
+                "freshness_required": bool(item.get("freshness_required")),
+                "max_cache_age_hours": item.get("max_cache_age_hours"),
+                "source_stage": item.get("source_stage"),
+                "source": item.get("source"),
+                "allowed_for_writing": bool(item.get("allowed_for_writing", False)),
+                "live_refresh_required": bool(item.get("live_refresh_required")),
+                "avoid_repeating_failed_query": bool(item.get("avoid_repeating_failed_query")),
+                "failed_queries": _as_list(item.get("failed_queries") or item.get("avoid_queries")),
                 "counter_evidence": item.get("counter_evidence"),
             }
         )
@@ -7783,6 +7881,19 @@ def _cache_live_refresh_required(task: Dict[str, Any]) -> bool:
     return False
 
 
+def _repair_lineage_from_task(task: Dict[str, Any]) -> Dict[str, Any]:
+    payload = _as_dict(task)
+    return {
+        "gap_id": payload.get("gap_id") or _followup_gap_id(payload),
+        "requirement_id": payload.get("requirement_id") or payload.get("evidence_requirement_id") or "",
+        "proof_role": payload.get("proof_role") or payload.get("evidence_type") or "",
+        "required_fields": _required_cache_fields_for_task(payload) or _as_list(payload.get("required_fields")),
+        "blocking_gaps": _as_list(payload.get("blocking_gaps")),
+        "loop_name": payload.get("loop_name") or "",
+        "origin_node": payload.get("origin_node") or "",
+    }
+
+
 def _cache_hit_followup_result(
     *,
     task: Dict[str, Any],
@@ -7794,6 +7905,7 @@ def _cache_hit_followup_result(
     key_sources: List[Dict[str, Any]] = []
     raw_points: List[Dict[str, Any]] = []
     answer_parts: List[str] = []
+    lineage = _repair_lineage_from_task(task)
     for hit in list(hits or []):
         raw = _as_dict(hit.get("raw"))
         source = _as_dict(raw.get("source"))
@@ -7809,6 +7921,8 @@ def _cache_hit_followup_result(
             "evidence_origin": origin,
             "cache_seed": True,
             "live_verified": False,
+            "gap_id": lineage.get("gap_id"),
+            "requirement_id": lineage.get("requirement_id"),
         }
         if source_item not in key_sources:
             key_sources.append(source_item)
@@ -7828,6 +7942,8 @@ def _cache_hit_followup_result(
                     "evidence_origin": origin,
                     "cache_seed": True,
                     "live_verified": False,
+                    "gap_id": lineage.get("gap_id"),
+                    "requirement_id": lineage.get("requirement_id"),
                 }
             )
         fact_text = _compact_text(hit.get("fact_description") or raw.get("fact") or raw.get("content"), max_chars=320)
@@ -7839,6 +7955,7 @@ def _cache_hit_followup_result(
         "child_agent": IQS_ROLE_CONFIGS.get(str(routed_task.get("agent") or ""), {}).get("child", "web_analysis_agent"),
         "query": routed_task.get("query"),
         "targets_gap": routed_task.get("targets_gap"),
+        **lineage,
         "status": "success",
         "confidence": max([float(_safe_float(hit.get("confidence_score"), 0.55)) for hit in list(hits or [])] or [0.55]),
         "answer": "；".join(answer_parts[:4]),
@@ -7858,8 +7975,41 @@ def _cache_hit_followup_result(
             "cache_seed": True,
             "live_refresh_required": bool(live_refresh_required),
             "source_levels": sorted({str(hit.get("source_level") or "") for hit in list(hits or []) if str(hit.get("source_level") or "")}),
+            "gap_id": lineage.get("gap_id"),
+            "requirement_id": lineage.get("requirement_id"),
+            "proof_role": lineage.get("proof_role"),
+            "required_fields": lineage.get("required_fields"),
         },
     }
+
+
+def _evidence_cache_gap_summary(cache_results: Sequence[Dict[str, Any]], cache_only_skipped: Sequence[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    cache_only_gap_ids = {
+        _repair_lineage_from_task(_as_dict(item).get("search_task") or _as_dict(item)).get("gap_id")
+        for item in list(cache_only_skipped or [])
+        if isinstance(item, dict)
+    }
+    result: Dict[str, Dict[str, Any]] = {}
+    for item in list(cache_results or []):
+        payload = _as_dict(item)
+        gap_id = str(payload.get("gap_id") or "").strip()
+        if not gap_id:
+            continue
+        entry = dict(result.get(gap_id) or {})
+        entry["requirement_id"] = entry.get("requirement_id") or str(payload.get("requirement_id") or "")
+        entry["proof_role"] = entry.get("proof_role") or str(payload.get("proof_role") or "")
+        entry["required_fields"] = entry.get("required_fields") or _as_list(payload.get("required_fields"))
+        entry["cache_hit_count"] = int(_safe_float(entry.get("cache_hit_count"), 0.0)) + 1
+        if payload.get("live_refresh_required"):
+            entry["live_refresh_required_count"] = int(_safe_float(entry.get("live_refresh_required_count"), 0.0)) + 1
+        else:
+            entry.setdefault("live_refresh_required_count", 0)
+        if gap_id in cache_only_gap_ids:
+            entry["cache_only_skip_count"] = int(_safe_float(entry.get("cache_only_skip_count"), 0.0)) + 1
+        else:
+            entry.setdefault("cache_only_skip_count", 0)
+        result[gap_id] = entry
+    return result
 
 
 def _is_fake_cache_hit(hit: Dict[str, Any]) -> bool:
@@ -7953,6 +8103,16 @@ def _apply_evidence_cache_to_followup_tasks(
     if cache_results:
         metadata = dict(state.get("metadata") or {})
         summary = dict(metadata.get("evidence_cache_summary") or {})
+        by_gap = dict(summary.get("by_gap") or {})
+        for gap_id, gap_summary in _evidence_cache_gap_summary(cache_results, cache_only_skipped).items():
+            existing = dict(by_gap.get(gap_id) or {})
+            merged = {
+                **existing,
+                **{key: value for key, value in gap_summary.items() if value not in (None, "", [], {})},
+            }
+            for counter_key in ("cache_hit_count", "live_refresh_required_count", "cache_only_skip_count"):
+                merged[counter_key] = int(_safe_float(existing.get(counter_key), 0.0)) + int(_safe_float(gap_summary.get(counter_key), 0.0))
+            by_gap[gap_id] = merged
         live_required_count = len([item for item in cache_results if item.get("live_refresh_required")])
         cache_only_count = len(cache_only_skipped)
         summary["evidence_hit"] = int(_safe_float(summary.get("evidence_hit"), 0.0)) + len(cache_results)
@@ -7960,6 +8120,8 @@ def _apply_evidence_cache_to_followup_tasks(
         summary["live_refresh_required_count"] = int(_safe_float(summary.get("live_refresh_required_count"), 0.0)) + live_required_count
         summary["cache_only_skip_count"] = int(_safe_float(summary.get("cache_only_skip_count"), 0.0)) + cache_only_count
         summary["skipped_network_tasks"] = int(_safe_float(summary.get("skipped_network_tasks"), 0.0)) + cache_only_count
+        if by_gap:
+            summary["by_gap"] = by_gap
         metadata["evidence_cache_summary"] = summary
         state["metadata"] = metadata
     return cache_results, remaining, cache_only_skipped
@@ -8158,6 +8320,7 @@ def _followup_query_key(item: Dict[str, Any]) -> str:
         agent = "both"
     target = re.sub(r"\s+", " ", str(item.get("targets_gap") or item.get("dimension_name") or "").strip()).lower()
     gap_id = _followup_gap_id(item)
+    requirement_id = str(item.get("requirement_id") or "").strip().lower()
     lanes = ",".join(
         sorted(
             {
@@ -8168,7 +8331,16 @@ def _followup_query_key(item: Dict[str, Any]) -> str:
         )
     )
     proof_role = str(item.get("proof_role") or item.get("evidence_type") or "").strip().lower()
-    return f"{agent}|{gap_id}|{target}|{proof_role}|{lanes}|{query}"
+    required_fields = ",".join(
+        sorted(
+            {
+                str(field or "").strip().lower()
+                for field in _as_list(item.get("required_fields"))
+                if str(field or "").strip()
+            }
+        )
+    )
+    return f"{agent}|{requirement_id}|{gap_id}|{target}|{proof_role}|{required_fields}|{lanes}|{query}"
 
 
 def _gap_attempt_key(task: Dict[str, Any]) -> str:
@@ -8339,6 +8511,49 @@ def _dedupe_followups(
     return deduped, skipped
 
 
+def _repair_contract_reject_if(proof_role: Any, required_fields: Sequence[Any]) -> List[str]:
+    role = str(proof_role or "").strip().lower()
+    fields = {str(item or "").strip().lower() for item in _as_list(list(required_fields)) if str(item or "").strip()}
+    reject = ["snippet_only", "no_source_url", "marketing_copy_only"]
+    if role in {"metric", "source_check", "filing"} or {"period", "date", "source"} & fields:
+        reject.append("no_date")
+    if role == "metric" or {"metric", "value", "unit", "period"} & fields:
+        reject.extend(["missing_metric_value", "missing_unit", "missing_period"])
+    if role == "counter":
+        reject.append("support_only_counter_missing")
+    return _unique_strings(reject, max_items=12)
+
+
+def _repair_contract_success_criteria(proof_role: Any, required_fields: Sequence[Any]) -> str:
+    role = str(proof_role or "").strip().lower()
+    fields = [str(item or "").strip() for item in _as_list(list(required_fields)) if str(item or "").strip()]
+    if role == "metric" or {"metric", "value", "unit", "period", "source"}.issubset({item.lower() for item in fields}):
+        return "Only count as repaired when metric/value/unit/period/source are all present and traceable to the page source."
+    if role == "counter":
+        return "Only count as repaired when the result provides traceable counter/risk evidence rather than support-only evidence."
+    if role in {"source_check", "filing"}:
+        return "Only count as repaired when an authoritative original source, filing, announcement, or research source is traceable by URL."
+    if fields:
+        return f"Only count as repaired when required fields are present: {', '.join(fields)}."
+    return "Only count as repaired when the missing evidence can be traced to a concrete source URL."
+
+
+def _repair_contract_source_patterns(proof_role: Any, lane_targets: Sequence[Any]) -> List[str]:
+    role = str(proof_role or "").strip().lower()
+    patterns = _unique_strings([str(item or "").strip() for item in _as_list(list(lane_targets))], max_items=8)
+    if role == "metric":
+        patterns.extend(["official_data", "market_research", "survey", "pdf", "annual_report"])
+    elif role in {"source_check", "filing"}:
+        patterns.extend(["official_data", "filing_company", "exchange_announcement", "investor_relations"])
+    elif role == "counter":
+        patterns.extend(["counter_evidence", "failure", "cost", "roi_unclear", "security", "compliance"])
+    elif role == "case":
+        patterns.extend(["customer_case", "company_disclosure", "procurement", "filing_company"])
+    else:
+        patterns.extend(["market_research", "official_data"])
+    return _unique_strings(patterns, max_items=10)
+
+
 def _repair_payload_from_gap_ledger(item: Dict[str, Any]) -> Dict[str, Any]:
     gap = dict(_as_dict(item))
     gap_type = str(gap.get("gap_type") or gap.get("type") or "").strip()
@@ -8370,8 +8585,11 @@ def _repair_payload_from_gap_ledger(item: Dict[str, Any]) -> Dict[str, Any]:
     query = _compose_iqs_query([terms, role_terms, _as_list(gap.get("source_priority"))], max_chars=96)
     if not query:
         query = _post_qa_repair_query_from_item({**gap, "proof_role": role, "topic_terms": terms})
+    required_fields = _as_list(gap.get("required_fields")) or _required_fields_for_proof_role(role)
+    lane_targets = _as_list(gap.get("lane_targets"))
     payload = {
         **gap,
+        "schema_version": gap.get("schema_version") or "repair_task_seed_v2",
         "type": gap_type or gap.get("type") or "evidence_gap",
         "query": query,
         "suggested_query": query,
@@ -8382,10 +8600,17 @@ def _repair_payload_from_gap_ledger(item: Dict[str, Any]) -> Dict[str, Any]:
         "blocking_gaps": _unique_strings([gap_type, *_as_list(gap.get("blocking_gaps"))], max_items=6),
         "proof_role": role or "source_check",
         "evidence_type": gap.get("evidence_type") or role or "source_check",
-        "lane_targets": _as_list(gap.get("lane_targets")),
-        "required_fields": _as_list(gap.get("required_fields")),
+        "lane_targets": lane_targets,
+        "required_fields": required_fields,
+        "required_source_level": _as_list(gap.get("required_source_level") or gap.get("min_source_level")),
+        "success_criteria": gap.get("success_criteria") or _repair_contract_success_criteria(role, required_fields),
+        "reject_if": _as_list(gap.get("reject_if")) or _repair_contract_reject_if(role, required_fields),
+        "preferred_source_patterns": _as_list(gap.get("preferred_source_patterns")) or _repair_contract_source_patterns(role, lane_targets),
+        "freshness_required": bool(gap.get("freshness_required") or gap.get("live_refresh_required")),
+        "max_cache_age_hours": gap.get("max_cache_age_hours"),
         "source": gap.get("source") or "evidence_gap_ledger",
         "agent": gap.get("agent") or "iqs",
+        "allowed_for_writing": False,
     }
     return payload
 
@@ -8408,6 +8633,7 @@ def _repair_task_from_item(
         return {}
     task = {
         **normalized,
+        "schema_version": normalized.get("schema_version") or payload.get("schema_version") or "repair_task_seed_v2",
         "query": query,
         "gap_id": normalized.get("gap_id") or _followup_gap_id(normalized) or _followup_target_key(normalized),
         "origin_node": origin_node,
@@ -8417,11 +8643,270 @@ def _repair_task_from_item(
         "proof_role": normalized.get("proof_role") or payload.get("proof_role") or payload.get("evidence_type") or "source_check",
         "lane_targets": _as_list(normalized.get("lane_targets")),
         "required_fields": _as_list(normalized.get("required_fields")),
+        "required_source_level": _as_list(normalized.get("required_source_level") or payload.get("required_source_level")),
+        "success_criteria": normalized.get("success_criteria") or payload.get("success_criteria") or "",
+        "reject_if": _as_list(normalized.get("reject_if") or payload.get("reject_if")),
+        "preferred_source_patterns": _as_list(normalized.get("preferred_source_patterns") or payload.get("preferred_source_patterns")),
+        "freshness_required": bool(normalized.get("freshness_required") or payload.get("freshness_required")),
+        "max_cache_age_hours": normalized.get("max_cache_age_hours") or payload.get("max_cache_age_hours"),
         "agent": normalized.get("agent") or payload.get("agent") or "iqs",
     }
     if not task["required_fields"] and str(task.get("proof_role") or "").strip().lower() == "metric":
-        task["required_fields"] = ["metric", "period", "unit", "source"]
-    return task
+        task["required_fields"] = ["metric", "value", "unit", "period", "source"]
+    if not task["success_criteria"]:
+        task["success_criteria"] = _repair_contract_success_criteria(task.get("proof_role"), task["required_fields"])
+    if not task["reject_if"]:
+        task["reject_if"] = _repair_contract_reject_if(task.get("proof_role"), task["required_fields"])
+    if not task["preferred_source_patterns"]:
+        task["preferred_source_patterns"] = _repair_contract_source_patterns(task.get("proof_role"), task["lane_targets"])
+    return dispatch_repair_seed(task, failed_queries=_as_list(task.get("failed_queries") or task.get("avoid_queries")))
+
+
+def _repair_seen_keys_for_state(state: Dict[str, Any]) -> set[str]:
+    runtime = state.get("_repair_runtime")
+    if not isinstance(runtime, dict):
+        runtime = {}
+        state["_repair_runtime"] = runtime
+    seen = runtime.get("seen_followup_keys")
+    if isinstance(seen, set):
+        return seen
+    if isinstance(seen, list):
+        seen_set = {str(item) for item in seen if str(item or "").strip()}
+    else:
+        seen_set = set()
+    runtime["seen_followup_keys"] = seen_set
+    return seen_set
+
+
+REPAIR_CONTEXT_SEED_ALLOWED_KEYS = {
+    "schema_version",
+    "query",
+    "suggested_query",
+    "agent",
+    "task_id",
+    "gap_id",
+    "requirement_id",
+    "chapter_id",
+    "section_id",
+    "gap_type",
+    "type",
+    "repair_status",
+    "proof_role",
+    "evidence_type",
+    "required_fields",
+    "required_source_level",
+    "lane_targets",
+    "source_priority",
+    "success_criteria",
+    "reject_if",
+    "preferred_source_patterns",
+    "freshness_required",
+    "max_cache_age_hours",
+    "blocking_gaps",
+    "targets_gap",
+    "evidence_goal",
+    "repair_route",
+    "repair_priority_score",
+    "repair_priority_reason",
+    "source_stage",
+    "source",
+    "cache_seed_available",
+    "live_refresh_required",
+    "avoid_repeating_failed_query",
+    "previous_result_count",
+    "previous_signal_count",
+    "cache_hit_count",
+    "cache_lookup_key",
+    "cache_scope",
+    "allowed_for_writing",
+}
+
+
+def _sanitize_repair_context_seed(seed: Dict[str, Any]) -> Dict[str, Any]:
+    payload = {
+        key: value
+        for key, value in dict(_as_dict(seed)).items()
+        if key in REPAIR_CONTEXT_SEED_ALLOWED_KEYS and value not in (None, "", [])
+    }
+    query = _compact_text(payload.get("query") or payload.get("suggested_query"), max_chars=220)
+    if not query:
+        return {}
+    payload["query"] = query
+    payload["source"] = payload.get("source") or "repair_context_view"
+    payload["agent"] = payload.get("agent") or "iqs"
+    payload["allowed_for_writing"] = False
+    return payload
+
+
+def _repair_tasks_from_context_view(
+    view: Dict[str, Any],
+    *,
+    origin_node: str,
+    loop_name: str,
+    max_tasks: int,
+    seen_keys: Optional[set[str]] = None,
+) -> tuple[List[Dict[str, Any]], int]:
+    if max_tasks <= 0:
+        return [], 0
+    schedule_tasks = [
+        item
+        for item in _as_list(_as_dict(_as_dict(view).get("search_task_schedule")).get("tasks"))
+        if isinstance(item, dict)
+    ]
+    source_items = schedule_tasks or [
+        item
+        for item in _as_list(_as_dict(view).get("repair_task_seeds"))
+        if isinstance(item, dict)
+    ]
+    seeds = [
+        _sanitize_repair_context_seed(item)
+        for item in source_items
+    ]
+    return _repair_tasks_from_items(
+        [item for item in seeds if item],
+        origin_node=origin_node,
+        loop_name=loop_name,
+        max_tasks=max_tasks,
+        seen_keys=seen_keys,
+    )
+
+
+def _repair_context_run_id_from_state(state: Dict[str, Any]) -> str:
+    return str(
+        state.get("artifact_ledger_run_id")
+        or state.get("stage_snapshot_run_id")
+        or os.getenv("REPORT_STAGE_SNAPSHOT_RUN_ID")
+        or ""
+    ).strip()
+
+
+def _sync_evidence_gap_ledger_to_artifact_ledger(
+    *,
+    state: Dict[str, Any],
+    evidence_package: Dict[str, Any],
+    structured_analysis: Optional[Dict[str, Any]] = None,
+    writer_report: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if not _env_flag("BRAIN_SYNC_EVIDENCE_GAPS_TO_LEDGER", True):
+        return {"status": "disabled", "reason": "gap_ledger_sync_disabled"}
+    run_id = _repair_context_run_id_from_state(state)
+    if not run_id:
+        return {"status": "disabled", "reason": "missing_run_id"}
+    package = _as_dict(evidence_package)
+    gaps = [item for item in _as_list(package.get("evidence_gap_ledger")) if isinstance(item, dict)]
+    if not gaps:
+        return {"status": "skipped", "reason": "no_evidence_gap_ledger"}
+    try:
+        from rag_pipeline.cache.artifact_pipeline_bridge import ingest_writer_package_artifacts
+        from rag_pipeline.cache.artifact_store import default_artifact_store
+
+        store = default_artifact_store()
+        if not store.enabled():
+            return {"status": "disabled", "reason": "artifact_ledger_disabled"}
+        query = str(state.get("query") or package.get("query") or "").strip()
+        research_plan = _research_plan_from_state(state) or _as_dict(package.get("research_plan"))
+        store.upsert_run(run_id=run_id, query=query, report_type="full_report", status="running")
+        package_payload = {**package, "evidence_gap_ledger": gaps}
+        structured_payload = dict(_as_dict(structured_analysis))
+        if research_plan:
+            package_payload.setdefault("research_plan", research_plan)
+            package_payload.setdefault("metadata", {})
+            package_payload["metadata"] = {**_as_dict(package_payload.get("metadata")), "research_plan": research_plan}
+            structured_payload.setdefault("research_plan", research_plan)
+        writer_package = {
+            "query": query,
+            "research_plan": research_plan,
+            "evidence_package": package_payload,
+            "structured_analysis": structured_payload,
+            "source_registry": _as_list(package.get("source_registry")) or _as_list(package.get("sources")),
+        }
+        summary = ingest_writer_package_artifacts(
+            store,
+            run_id=run_id,
+            writer_package=writer_package,
+            writer_report=_as_dict(writer_report),
+        )
+        return {"status": "synced", **_as_dict(summary)}
+    except Exception as exc:  # pragma: no cover - ledger sync is an optional accelerator.
+        return {"status": "error", "reason": "gap_ledger_sync_failed", "error": str(exc)}
+
+
+def _sync_writer_artifacts_to_artifact_ledger(
+    *,
+    state: Dict[str, Any],
+    evidence_package: Dict[str, Any],
+    structured_analysis: Optional[Dict[str, Any]] = None,
+    writer_report: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if not _env_flag("BRAIN_SYNC_WRITER_ARTIFACTS_TO_LEDGER", True):
+        return {"status": "disabled", "reason": "writer_artifact_sync_disabled"}
+    run_id = _repair_context_run_id_from_state(state)
+    if not run_id:
+        return {"status": "disabled", "reason": "missing_run_id"}
+    report = _as_dict(writer_report)
+    if not report:
+        return {"status": "skipped", "reason": "missing_writer_report"}
+    writer_fields = _writer_pipeline_state_fields(report)
+    if not (_as_list(writer_fields.get("argument_units")) or _as_list(writer_fields.get("chapter_packages"))):
+        return {"status": "skipped", "reason": "missing_writer_claim_section_artifacts"}
+    try:
+        from rag_pipeline.cache.artifact_pipeline_bridge import ingest_writer_package_artifacts
+        from rag_pipeline.cache.artifact_store import default_artifact_store
+
+        store = default_artifact_store()
+        if not store.enabled():
+            return {"status": "disabled", "reason": "artifact_ledger_disabled"}
+        package = _as_dict(evidence_package)
+        query = str(state.get("query") or package.get("query") or "").strip()
+        research_plan = _research_plan_from_state(state) or _as_dict(package.get("research_plan"))
+        store.upsert_run(run_id=run_id, query=query, report_type="full_report", status="running")
+        writer_package = {
+            "query": query,
+            "research_plan": research_plan,
+            "evidence_package": package,
+            "structured_analysis": _as_dict(structured_analysis),
+            "source_registry": _as_list(report.get("source_registry"))
+            or _as_list(package.get("source_registry"))
+            or _as_list(package.get("sources")),
+            **writer_fields,
+            "writer_report": report,
+        }
+        summary = ingest_writer_package_artifacts(
+            store,
+            run_id=run_id,
+            writer_package=writer_package,
+            writer_report=report,
+        )
+        return {"status": "synced", **_as_dict(summary)}
+    except Exception as exc:  # pragma: no cover - optional ledger sync must not block writer.
+        return {"status": "error", "reason": "writer_artifact_sync_failed", "error": str(exc)}
+
+
+def _ledger_repair_items_from_state(
+    *,
+    state: Dict[str, Any],
+    max_tasks: int,
+    seen_keys: Optional[set[str]],
+) -> tuple[List[Dict[str, Any]], Dict[str, Any], int]:
+    if not _env_flag("BRAIN_ENABLE_LEDGER_REPAIR_CONTEXT", True):
+        return [], {"status": "disabled", "reason": "ledger_repair_context_disabled"}, 0
+    run_id = _repair_context_run_id_from_state(state)
+    if not run_id:
+        return [], {"status": "disabled", "reason": "missing_run_id"}, 0
+    try:
+        from rag_pipeline.context.context_view_builder import build_repair_context_view
+
+        view = build_repair_context_view(run_id)
+        tasks, skipped = _repair_tasks_from_context_view(
+            view,
+            origin_node="artifact_ledger",
+            loop_name="ledger_repair",
+            max_tasks=max_tasks,
+            seen_keys=seen_keys,
+        )
+        return tasks, _as_dict(view), skipped
+    except Exception as exc:  # pragma: no cover - repair context is an optional accelerator.
+        return [], {"status": "error", "reason": "repair_context_view_failed", "error": str(exc)}, 0
 
 
 def _repair_tasks_from_items(
@@ -8432,6 +8917,8 @@ def _repair_tasks_from_items(
     max_tasks: int,
     seen_keys: Optional[set[str]] = None,
 ) -> tuple[List[Dict[str, Any]], int]:
+    if max_tasks <= 0:
+        return [], 0
     seen = seen_keys if seen_keys is not None else set()
     tasks: List[Dict[str, Any]] = []
     skipped = 0
@@ -8498,6 +8985,9 @@ def _post_qa_repair_needed(writer_report: Dict[str, Any], *, respect_env: bool =
     report = _as_dict(writer_report)
     if str(report.get("report_status") or "").strip().lower() in {"final", "final_clean"}:
         return False
+    reflection = _research_reflection_memo_from_writer_report(report)
+    if _as_list(reflection.get("next_search_task_seeds")):
+        return True
     qa = _as_dict(report.get("qa_result")) or _as_dict(report.get("validation"))
     render_gate = _as_dict(qa.get("render_gate"))
     if _as_list(render_gate.get("blockers")):
@@ -8513,6 +9003,22 @@ def _post_qa_repair_needed(writer_report: Dict[str, Any], *, respect_env: bool =
             bool(_as_list(report.get("review_evidence_followups"))),
             bool(_as_list(report.get("review_logic_issues"))),
         ]
+    )
+
+
+def _research_reflection_memo_from_writer_report(writer_report: Dict[str, Any]) -> Dict[str, Any]:
+    report = _as_dict(writer_report)
+    structured = _as_dict(report.get("structured_analysis"))
+    insight = _as_dict(report.get("report_insight_package")) or _as_dict(structured.get("report_insight_package"))
+    render_artifacts = _as_dict(report.get("render_artifacts"))
+    render_structured = _as_dict(render_artifacts.get("structured_analysis"))
+    return (
+        _as_dict(report.get("research_reflection_memo"))
+        or _as_dict(insight.get("research_reflection_memo"))
+        or _as_dict(structured.get("research_reflection_memo"))
+        or _as_dict(render_artifacts.get("research_reflection_memo"))
+        or _as_dict(render_structured.get("research_reflection_memo"))
+        or _as_dict(_as_dict(render_structured.get("report_insight_package")).get("research_reflection_memo"))
     )
 
 
@@ -8931,20 +9437,51 @@ def _run_evidence_preflight_round(
         if isinstance(item, dict) and str(item.get("repair_route") or "evidence_search") == "evidence_search"
     ]
     package_gap_ledger.sort(key=_post_qa_repair_sort_key)
-    raw_items = [*package_gap_ledger, *_preflight_repair_items_from_binder(binder_result)]
-    max_tasks = max(1, min(max_followups, _env_int("BRAIN_EVIDENCE_PREFLIGHT_MAX_FOLLOWUPS", 6, min_value=1, max_value=12)))
-    tasks, skipped = _repair_tasks_from_items(
-        raw_items,
-        origin_node="evidence_binder",
-        loop_name="evidence_preflight",
-        max_tasks=max_tasks,
+    ledger_gap_sync = _sync_evidence_gap_ledger_to_artifact_ledger(
+        state=state,
+        evidence_package=current_package,
+        structured_analysis=_as_dict(structured_analysis),
     )
+    max_tasks = max(1, min(max_followups, _env_int("BRAIN_EVIDENCE_PREFLIGHT_MAX_FOLLOWUPS", 6, min_value=1, max_value=12)))
+    seen_keys = _repair_seen_keys_for_state(state)
+    ledger_tasks, ledger_view, ledger_skipped = _ledger_repair_items_from_state(
+        state=state,
+        max_tasks=max_tasks,
+        seen_keys=seen_keys,
+    )
+    ledger_tasks = [
+        {
+            **_as_dict(task),
+            "origin_node": _as_dict(task).get("origin_node") or "artifact_ledger",
+            "loop_name": _as_dict(task).get("loop_name") or "ledger_repair",
+        }
+        for task in ledger_tasks
+        if isinstance(task, dict)
+    ]
+    raw_items = [*package_gap_ledger, *_preflight_repair_items_from_binder(binder_result)]
+    remaining_task_budget = max(0, max_tasks - len(ledger_tasks))
+    if remaining_task_budget > 0:
+        binder_tasks, binder_skipped = _repair_tasks_from_items(
+            raw_items,
+            origin_node="evidence_binder",
+            loop_name="evidence_preflight",
+            max_tasks=remaining_task_budget,
+            seen_keys=seen_keys,
+        )
+    else:
+        binder_tasks, binder_skipped = [], 0
+    tasks = [*ledger_tasks, *binder_tasks]
+    skipped = ledger_skipped + binder_skipped
     trace.update(
         {
             "binder_status": binder_plan.get("status"),
             "coverage_gap_counts": _as_dict(binder_plan.get("gap_counts")),
             "missing_proof_count": len(_as_list(binder_result.get("missing_proof_standards"))),
             "evidence_gap_ledger_count": len(package_gap_ledger),
+            "ledger_gap_sync": ledger_gap_sync,
+            "ledger_repair_view_status": _as_dict(ledger_view).get("status"),
+            "ledger_repair_seed_count": len(ledger_tasks),
+            "ledger_repair_skipped_count": ledger_skipped,
             "attempted_task_count": len(tasks),
             "repair_task_summary": _repair_task_summary(tasks),
             "skipped_task_count": skipped,
@@ -9053,14 +9590,47 @@ def _run_post_qa_repair_round(
 
     plan = _post_qa_repair_plan(best_report, max_queries=max_followups)
     trace.update({"enabled": True, "plan": plan})
-    evidence_followups, skipped_repair_tasks = _repair_tasks_from_items(
-        [item for item in _as_list(plan.get("evidence_followups")) if isinstance(item, dict)],
-        origin_node="writer_qa",
-        loop_name="post_qa_repair",
-        max_tasks=max_followups,
+    max_tasks = max(0, int(max_followups or 0))
+    seen_keys = _repair_seen_keys_for_state(state)
+    writer_artifact_ledger_sync = _sync_writer_artifacts_to_artifact_ledger(
+        state=state,
+        evidence_package=_as_dict(best.get("evidence_package")),
+        structured_analysis=_as_dict(best.get("structured_analysis")),
+        writer_report=best_report,
     )
+    ledger_followups, ledger_view, ledger_skipped = _ledger_repair_items_from_state(
+        state=state,
+        max_tasks=max_tasks,
+        seen_keys=seen_keys,
+    )
+    ledger_followups = [
+        {
+            **_as_dict(task),
+            "origin_node": _as_dict(task).get("origin_node") or "artifact_ledger",
+            "loop_name": _as_dict(task).get("loop_name") or "ledger_repair",
+        }
+        for task in ledger_followups
+        if isinstance(task, dict)
+    ]
+    remaining_task_budget = max(0, max_tasks - len(ledger_followups))
+    if remaining_task_budget > 0:
+        qa_followups, qa_skipped = _repair_tasks_from_items(
+            [item for item in _as_list(plan.get("evidence_followups")) if isinstance(item, dict)],
+            origin_node="writer_qa",
+            loop_name="post_qa_repair",
+            max_tasks=remaining_task_budget,
+            seen_keys=seen_keys,
+        )
+    else:
+        qa_followups, qa_skipped = [], 0
+    evidence_followups = [*ledger_followups, *qa_followups]
+    skipped_repair_tasks = ledger_skipped + qa_skipped
     trace["repair_task_summary"] = _repair_task_summary(evidence_followups)
     trace["skipped_repair_task_count"] = skipped_repair_tasks
+    trace["writer_artifact_ledger_sync"] = writer_artifact_ledger_sync
+    trace["ledger_repair_view_status"] = _as_dict(ledger_view).get("status")
+    trace["ledger_repair_seed_count"] = len(ledger_followups)
+    trace["ledger_repair_skipped_count"] = ledger_skipped
     rewrite_required = bool(plan.get("rewrite_required"))
     if not evidence_followups and not rewrite_required:
         trace["status"] = "no_repair_tasks"
@@ -9417,15 +9987,46 @@ def run_writer_with_layout_refinement(
             max_rounds = max(0, min(6, int(state.get("layout_max_refinement_rounds") or max_rounds)))
         except Exception:
             logger.exception("Invalid layout_max_refinement_rounds", extra={"value": state.get("layout_max_refinement_rounds")})
-    seen_followup_keys = set()
-    followups = _layout_followup_queries_from_writer_report(current_writer_report, max_queries=max_followups * 4)
-    new_followups, skipped_duplicate_followups = _repair_tasks_from_items(
-        followups,
-        origin_node="writer_layout",
-        loop_name="layout_followup",
+    seen_followup_keys = _repair_seen_keys_for_state(state)
+    layout_seen_followup_keys: set[str] = set()
+    before_seen_followup_keys = set(seen_followup_keys)
+    writer_artifact_ledger_sync = _sync_writer_artifacts_to_artifact_ledger(
+        state=state,
+        evidence_package=current_evidence_package,
+        structured_analysis=current_structured_analysis,
+        writer_report=current_writer_report,
+    )
+    ledger_followups, ledger_view, ledger_skipped = _ledger_repair_items_from_state(
+        state=state,
         max_tasks=max_followups,
         seen_keys=seen_followup_keys,
     )
+    ledger_followups = [
+        {
+            **_as_dict(task),
+            "origin_node": _as_dict(task).get("origin_node") or "artifact_ledger",
+            "loop_name": _as_dict(task).get("loop_name") or "ledger_repair",
+        }
+        for task in ledger_followups
+        if isinstance(task, dict)
+    ]
+    layout_seen_followup_keys.update(seen_followup_keys - before_seen_followup_keys)
+    remaining_task_budget = max(0, max_followups - len(ledger_followups))
+    followups = _layout_followup_queries_from_writer_report(current_writer_report, max_queries=max_followups * 4)
+    if remaining_task_budget > 0:
+        before_seen_followup_keys = set(seen_followup_keys)
+        layout_followups, layout_skipped_duplicate_followups = _repair_tasks_from_items(
+            followups,
+            origin_node="writer_layout",
+            loop_name="layout_followup",
+            max_tasks=remaining_task_budget,
+            seen_keys=seen_followup_keys,
+        )
+        layout_seen_followup_keys.update(seen_followup_keys - before_seen_followup_keys)
+    else:
+        layout_followups, layout_skipped_duplicate_followups = [], 0
+    new_followups = [*ledger_followups, *layout_followups]
+    skipped_duplicate_followups = ledger_skipped + layout_skipped_duplicate_followups
     best = {
         "writer_state": current_writer_state,
         "writer_report": current_writer_report,
@@ -9443,6 +10044,10 @@ def run_writer_with_layout_refinement(
             "follow_up_queries": new_followups,
             "repair_task_summary": _repair_task_summary(new_followups),
             "skipped_duplicate_followups": skipped_duplicate_followups,
+            "writer_artifact_ledger_sync": writer_artifact_ledger_sync,
+            "ledger_repair_view_status": _as_dict(ledger_view).get("status"),
+            "ledger_repair_seed_count": len(ledger_followups),
+            "ledger_repair_skipped_count": ledger_skipped,
             "enabled": enable_layout_followup,
             "max_rounds": max_rounds,
             "max_followups_per_round": max_followups,
@@ -9606,6 +10211,7 @@ def run_writer_with_layout_refinement(
                 "analysis_state": current_analysis_state,
             }
         candidate_followups = _layout_followup_queries_from_writer_report(current_writer_report, max_queries=max_followups * 4)
+        before_seen_followup_keys = set(seen_followup_keys)
         pending_followups, skipped_duplicate_followups = _repair_tasks_from_items(
             candidate_followups,
             origin_node="writer_layout",
@@ -9613,6 +10219,7 @@ def run_writer_with_layout_refinement(
             max_tasks=max_followups,
             seen_keys=seen_followup_keys,
         )
+        layout_seen_followup_keys.update(seen_followup_keys - before_seen_followup_keys)
         trace.append(
             {
                 "round": round_number,
@@ -9661,7 +10268,7 @@ def run_writer_with_layout_refinement(
             "stop_reason": stop_reason,
             "best_quality": _writer_quality_snapshot(_as_dict(best.get("writer_report"))),
             "total_rounds": len([item for item in trace if isinstance(item.get("round"), int) and item.get("round", 0) > 0]),
-            "unique_followup_queries": len(seen_followup_keys),
+            "unique_followup_queries": len(layout_seen_followup_keys),
         }
     )
     best_with_trace = {
@@ -10874,7 +11481,7 @@ def run_supervisor_evidence_loop(
     evidence_pool = build_initial_evidence_pool(original_query=original_query, children=initial_children)
     coverage_units = coverage_units_from_state(state)
     previous_queries = [original_query]
-    seen_followup_keys: set[str] = set()
+    seen_followup_keys = _repair_seen_keys_for_state(state)
     loop_trace: List[Dict[str, Any]] = []
     evaluation_errors: List[str] = []
     prev_coverage = 0.0
@@ -11332,6 +11939,12 @@ SUPERVISOR_COVERAGE_SYSTEM_PROMPT = """
 - agent 可以是 rag、iqs、both，或明确 IQS lane（iqs_lane_1 到 iqs_lane_6）。
 - targets_gap 填动态证据目标名称。
 - 如果能定位章节，补充问题携带 chapter_id、chapter_title、chapter_question。
+- follow_up_queries 只能输出补证方向和 search task seed，不允许生成事实、结论或正文句子。
+- 每个缺口必须映射 proof_role：metric/source_check/case/counter/support。
+- metric 缺口必须显式 required_fields=["metric","value","unit","period","source"]。
+- A/B 来源不足必须要求 lane_targets 包含 official_data、filing_company 或 market_research。
+- counter 缺口必须搜索反向证据，不得写成支持性证据搜索。
+- 输出 is_sufficient=false 时必须带 instruction="do_not_infer"。
 
 ## 输出格式（严格 JSON）
 {
@@ -11340,6 +11953,7 @@ SUPERVISOR_COVERAGE_SYSTEM_PROMPT = """
     "章节标题": {"score": 0, "reason": "..."}
   },
   "is_sufficient": false,
+  "instruction": "do_not_infer",
   "stop_reason": null,
   "knowledge_gaps": [
     {
@@ -11350,9 +11964,22 @@ SUPERVISOR_COVERAGE_SYSTEM_PROMPT = """
   ],
   "follow_up_queries": [
     {
+      "schema_version": "repair_task_seed_v2",
       "query": "补充搜索问题",
       "agent": "rag | iqs | both",
-      "targets_gap": "对应动态证据目标"
+      "targets_gap": "对应动态证据目标",
+      "gap_id": "可稳定复用的缺口ID",
+      "requirement_id": "若可定位则填写",
+      "chapter_id": "若可定位则填写",
+      "section_id": "若可定位则填写",
+      "gap_type": "metric_scope_period_unit_incomplete | insufficient_ab_sources | counter_evidence_missing | evidence_gap",
+      "proof_role": "metric | source_check | case | counter | support",
+      "required_fields": ["metric", "value", "unit", "period", "source"],
+      "required_source_level": ["A", "B"],
+      "lane_targets": ["official_data", "market_research"],
+      "success_criteria": "只有补齐所需字段且来源可追溯才算修复",
+      "reject_if": ["snippet_only", "no_date", "no_source_url", "marketing_copy_only"],
+      "allowed_for_writing": false
     }
   ]
 }
