@@ -497,6 +497,51 @@ def test_bridge_persists_evidence_gap_ledger_as_repair_score_gaps(tmp_path, monk
     assert ("score_gap", "evidence_gap_ch_01_metric") in edge_targets
 
 
+def test_bridge_persists_claim_repair_priorities_as_score_gaps(tmp_path, monkeypatch):
+    monkeypatch.setenv("ARTIFACT_LEDGER_PATH", str(tmp_path / "artifact_ledger.sqlite"))
+    monkeypatch.setenv("ARTIFACT_OBJECT_ROOT", str(tmp_path / "objects"))
+    store = ArtifactStore()
+    store.upsert_run(run_id="run-claim-repair", query="AI Agent", status="running")
+
+    writer_package = {
+        "structured_analysis": {
+            "llm_analysis_synthesis": {
+                "evidence_repair_priorities": [
+                    {
+                        "schema_version": "claim_support_repair_priority_v1",
+                        "gap_id": "ch_02_bad_claim_claim_support_entity_or_metric_mismatch",
+                        "gap_type": "claim_support_entity_or_metric_mismatch",
+                        "chapter_id": "ch_02",
+                        "claim_id": "bad_claim",
+                        "requirement_ids": ["H2_competition"],
+                        "evidence_refs": ["EV-GTC"],
+                        "required_fields": ["source", "entity_match"],
+                        "proof_role": "support",
+                        "success_criteria": "Only rebuild when the cited facts directly support the claim.",
+                        "reject_if": ["off_topic_source"],
+                        "writing_permission": "not_allowed_until_repaired",
+                    }
+                ]
+            }
+        }
+    }
+
+    summary = ingest_writer_package_artifacts(
+        store,
+        run_id="run-claim-repair",
+        writer_package=writer_package,
+        writer_report={},
+    )
+
+    assert summary["score_gap_count"] == 1
+    gap = store.list_score_gaps("run-claim-repair", requirement_id="H2_competition")[0]
+    assert gap["gap_type"] == "claim_support_entity_or_metric_mismatch"
+    assert gap["missing"] == ["source", "entity_match"]
+    assert gap["retry_plan"]["source_stage"] == "claim_repair_priority"
+    assert gap["retry_plan"]["success_criteria"] == "Only rebuild when the cited facts directly support the claim."
+    assert gap["retry_plan"]["reject_if"] == ["off_topic_source"]
+
+
 def test_bridge_persists_research_reflection_memo_as_artifact_and_repair_gaps(tmp_path, monkeypatch):
     monkeypatch.setenv("ARTIFACT_LEDGER_PATH", str(tmp_path / "artifact_ledger.sqlite"))
     monkeypatch.setenv("ARTIFACT_OBJECT_ROOT", str(tmp_path / "objects"))

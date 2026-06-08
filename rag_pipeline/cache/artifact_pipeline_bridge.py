@@ -862,7 +862,7 @@ def _iter_evidence_gap_ledger_payloads(
     for source_name, container in containers:
         if not container:
             continue
-        for key in ("evidence_gap_ledger", "score_gap_ledger"):
+        for key in ("evidence_gap_ledger", "score_gap_ledger", "claim_repair_priorities"):
             for index, item in enumerate(_as_list(container.get(key)), start=1):
                 if not isinstance(item, dict):
                     continue
@@ -874,8 +874,24 @@ def _iter_evidence_gap_ledger_payloads(
                     "source": f"{source_name}.{key}",
                     "index": index,
                     "payload": item,
-                    "artifact_class": "evidence_gap_ledger",
+                    "artifact_class": "claim_repair_priority" if key == "claim_repair_priorities" else "evidence_gap_ledger",
                 }
+        synthesis = _as_dict(container.get("llm_analysis_synthesis"))
+        for index, item in enumerate(_as_list(synthesis.get("evidence_repair_priorities")), start=1):
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("schema_version") or "") != "claim_support_repair_priority_v1":
+                continue
+            gap_key = _first_text(item.get("gap_id"), item.get("id")) or _json_hash(item)
+            if gap_key in seen:
+                continue
+            seen.add(gap_key)
+            yield {
+                "source": f"{source_name}.llm_analysis_synthesis.evidence_repair_priorities",
+                "index": index,
+                "payload": item,
+                "artifact_class": "claim_repair_priority",
+            }
 
 
 def _research_reflection_memo_from_payloads(

@@ -573,3 +573,43 @@ def test_repair_context_view_returns_direction_only_without_quoteable_payload(tm
     assert "Forbidden cached fact text" not in view_text
     assert "Forbidden old section body" not in view_text
     assert "Forbidden raw page" not in view_text
+
+
+def test_repair_context_view_turns_claim_support_gap_into_search_task_seed(tmp_path, monkeypatch):
+    store = _configure(tmp_path, monkeypatch)
+    store.upsert_run(run_id="run-claim-gap", query="q", status="running")
+    store.upsert_score_gap(
+        run_id="run-claim-gap",
+        gap_id="GAP-claim-support",
+        requirement_id="H2_competition",
+        chapter_id="ch_02",
+        section_id="",
+        gap_type="claim_support_entity_or_metric_mismatch",
+        severity="blocking",
+        missing=["source", "entity_match"],
+        retry_plan={
+            "source_stage": "claim_repair_priority",
+            "proof_role": "support",
+            "required_fields": ["source", "entity_match"],
+            "current_evidence_refs": ["EV-GTC"],
+            "success_criteria": "Only rebuild when cited facts directly support the claim.",
+            "reject_if": ["off_topic_source"],
+            "allowed_for_writing": False,
+        },
+        status="open",
+    )
+
+    view = build_repair_context_view("run-claim-gap", requirement_id="H2_competition")
+    seed = view["repair_task_seeds"][0]
+    task = view["search_task_schedule"]["tasks"][0]
+
+    assert view["status"] == "ready"
+    assert seed["gap_type"] == "claim_support_entity_or_metric_mismatch"
+    assert seed["source_stage"] == "claim_repair_priority"
+    assert seed["required_fields"] == ["source", "entity_match"]
+    assert seed["success_criteria"] == "Only rebuild when cited facts directly support the claim."
+    assert seed["reject_if"] == ["off_topic_source"]
+    assert seed["allowed_for_writing"] is False
+    assert task["gap_id"] == "GAP-claim-support"
+    assert task["cache_scope"]["requirement_id"] == "H2_competition"
+    assert task["cache_scope"]["required_fields"] == ["source", "entity_match"]

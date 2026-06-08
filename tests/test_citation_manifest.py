@@ -154,6 +154,26 @@ def test_final_citation_reconciliation_blocks_factual_body_without_citations():
     assert diagnostics["citationless_fact_examples"]
 
 
+def test_final_citation_reconciliation_drops_citationless_factual_bullets():
+    body = "\n".join(
+        [
+            "- \u673a\u4f1a\u5224\u65ad\uff1aOpenAI \u4e0e Microsoft \u7684\u6280\u672f\u548c\u76d1\u7ba1\u7ea6\u675f\u4f1a\u5982\u4f55\u6539\u53d8\u673a\u4f1a\u6392\u5e8f",
+            "- \u6e17\u900f\u7387\u4e3a10%\uff0c\u671f\u95f4\u4e3a2011\u5e74",
+            "- Directional synthesis without a concrete factual assertion.",
+        ]
+    )
+
+    rewritten, appendix_sources, diagnostics = finalize_markdown_citations(body, {"appendix_sources": []}, [])
+
+    assert "\u673a\u4f1a\u5224\u65ad" in rewritten
+    assert "\u6e17\u900f\u7387\u4e3a10%" not in rewritten
+    assert "Directional synthesis" in rewritten
+    assert appendix_sources == []
+    assert diagnostics["final_citation_reconciliation_status"] == "ok"
+    assert diagnostics["citationless_factual_bullet_removed_count"] == 1
+    assert diagnostics["factual_body_without_citations_count"] == 0
+
+
 def test_manifest_maps_section_evidence_ref_to_public_citation():
     chapters = [
         {

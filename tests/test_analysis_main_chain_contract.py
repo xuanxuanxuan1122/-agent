@@ -33,6 +33,7 @@ from rag_pipeline.agents.final_writer_agent import (
     _source_allowed_for_report,
     _strip_orphan_citations,
 )
+from rag_pipeline.agents.report_contracts import text_has_factual_claim
 from rag_pipeline.agents.readpage_fact_extractor_agent import _validated_card
 from rag_pipeline.agents.chapter_evidence_builder import _public_fact_quality
 from rag_pipeline.agents.markdown_renderer import render_table_package
@@ -54,6 +55,14 @@ def _evidence(ref="EV-1", *, chapter_id="ch_01", level="B", allowed_use="core_cl
             "source_verification_status": "readpage_verified",
         },
     }
+
+
+def test_factual_detector_does_not_block_opportunity_framing_line():
+    framing = "\u673a\u4f1a\u5224\u65ad\uff1aOpenAI \u4e0e Microsoft \u7684\u6280\u672f\u3001\u4f9b\u5e94\u548c\u76d1\u7ba1\u7ea6\u675f\u4f1a\u5982\u4f55\u6539\u53d8\u673a\u4f1a\u6392\u5e8f"
+    factual = "\u6e17\u900f\u7387\u4e3a10%\uff0c\u671f\u95f4\u4e3a2011\u5e74"
+
+    assert text_has_factual_claim(framing) is False
+    assert text_has_factual_claim(factual) is True
 
 
 def test_public_fact_card_v2_rejects_isolated_metric_and_navigation_text():
@@ -297,7 +306,7 @@ def test_llm_claim_with_valid_used_evidence_ids_is_accepted():
     assert unit["reasoning"] == "Workflow deployments indicate operational adoption."
 
 
-def test_llm_claim_with_unsupported_entity_and_metric_is_rejected():
+def test_llm_claim_with_unsupported_entity_and_metric_is_deferred_for_repair():
     evidence_package = {
         "analysis_ready_evidence": [
             {
@@ -329,14 +338,19 @@ def test_llm_claim_with_unsupported_entity_and_metric_is_rejected():
     validation = validate_llm_analysis_output(payload, evidence_package)
 
     assert validation["usable_claim_count"] == 0
+    assert validation["deferred_claim_count"] == 1
+    assert validation["dropped_claim_count"] == 0
     assert validation["status"] == "invalid_output_no_usable_claims"
-    assert validation["llm_validation_issue_counts"]["llm_claim_unsupported_by_cited_facts"] == 1
-    assert validation["llm_rejected_claim_examples"][0]["unsupported_terms"]
+    assert validation["llm_validation_issue_counts"]["claim_support_needs_repair"] == 1
+    assert validation["llm_deferred_claim_examples"][0]["unsupported_terms"]
+    repair = validation["claim_repair_priorities"][0]
+    assert repair["claim_id"] == "bad-price-claim"
+    assert repair["gap_type"] == "claim_support_entity_or_metric_mismatch"
+    assert repair["writing_permission"] == "not_allowed_until_repaired"
+    assert repair["evidence_refs"] == ["EV-GTC"]
     assert validation["correctness_filter_summary"]["thin_report_risk"] is True
-    assert validation["correctness_filter_summary"]["recommended_mode"] == "insufficient_analysis_stub"
-    assert validation["correctness_filter_summary"]["drop_issue_counts"] == {
-        "llm_claim_unsupported_by_cited_facts": 1
-    }
+    assert validation["correctness_filter_summary"]["recommended_mode"] == "repair_then_rebuild"
+    assert validation["correctness_filter_summary"]["deferred_issue_counts"] == {"claim_support_needs_repair": 1}
 
 
 def test_llm_semantic_judge_rejects_semantically_unsupported_claim(monkeypatch):
@@ -563,9 +577,11 @@ def test_llm_chinese_qualitative_claim_with_offtopic_fact_is_rejected():
     validation = validate_llm_analysis_output(payload, evidence_package)
 
     assert validation["usable_claim_count"] == 0
+    assert validation["deferred_claim_count"] == 1
     assert validation["status"] == "invalid_output_no_usable_claims"
-    assert validation["llm_validation_issue_counts"]["llm_claim_unsupported_by_cited_facts"] == 1
-    assert "竞争格局" in validation["llm_rejected_claim_examples"][0]["unsupported_terms"]
+    assert validation["llm_validation_issue_counts"]["claim_support_needs_repair"] == 1
+    assert "竞争格局" in validation["llm_deferred_claim_examples"][0]["unsupported_terms"]
+    assert validation["claim_repair_priorities"][0]["gap_type"] == "claim_support_anchor_mismatch"
 
 
 def test_llm_numeric_claim_with_incomplete_metric_fact_is_downgraded():

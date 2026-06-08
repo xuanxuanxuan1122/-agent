@@ -2724,8 +2724,13 @@ def _refs_from_llm_chapter(chapter: Dict[str, Any], valid_refs: set[str]) -> Lis
 
 
 NON_DROPPING_CLAIM_ISSUES = {
+    "claim_support_needs_repair",
     "decision_claim_downgraded_no_valid_ref",
     "llm_numeric_claim_incomplete_metric_fact",
+}
+
+REPAIRABLE_CLAIM_ISSUES = {
+    "claim_support_needs_repair",
 }
 
 
@@ -2748,6 +2753,14 @@ def _claim_drop_issue_counts(issue_counts: Dict[str, int]) -> Dict[str, int]:
     return drop_counts
 
 
+def _claim_repair_issue_counts(issue_counts: Dict[str, int]) -> Dict[str, int]:
+    return {
+        issue_type: count
+        for issue_type, count in issue_counts.items()
+        if issue_type in REPAIRABLE_CLAIM_ISSUES and count > 0
+    }
+
+
 def _correctness_filter_summary(
     *,
     raw_claim_count: int,
@@ -2755,7 +2768,9 @@ def _correctness_filter_summary(
     issue_counts: Dict[str, int],
 ) -> Dict[str, Any]:
     drop_issue_counts = _claim_drop_issue_counts(issue_counts)
+    deferred_issue_counts = _claim_repair_issue_counts(issue_counts)
     dropped_by_filter_count = sum(drop_issue_counts.values())
+    deferred_by_filter_count = sum(deferred_issue_counts.values())
     min_usable_claims = _env_int(
         "BRAIN_LLM_ANALYSIS_THIN_REPORT_MIN_USABLE_CLAIMS",
         3,
@@ -2763,18 +2778,101 @@ def _correctness_filter_summary(
         max_value=50,
     )
     required_usable = min(min_usable_claims, max(raw_claim_count, 1))
-    thin_report_risk = bool(raw_claim_count > 0 and usable_claim_count < required_usable and dropped_by_filter_count > 0)
+    thin_report_risk = bool(
+        raw_claim_count > 0
+        and usable_claim_count < required_usable
+        and (dropped_by_filter_count > 0 or deferred_by_filter_count > 0)
+    )
     recommended_mode = "normal"
     if thin_report_risk:
-        recommended_mode = "insufficient_analysis_stub" if usable_claim_count <= 0 else "limited_evidence_draft"
+        if deferred_by_filter_count > 0:
+            recommended_mode = "repair_then_rebuild"
+        else:
+            recommended_mode = "insufficient_analysis_stub" if usable_claim_count <= 0 else "limited_evidence_draft"
     return {
         "raw_claim_count": raw_claim_count,
         "usable_claim_count": usable_claim_count,
         "dropped_by_filter_count": dropped_by_filter_count,
+        "deferred_by_filter_count": deferred_by_filter_count,
         "drop_issue_counts": drop_issue_counts,
+        "deferred_issue_counts": deferred_issue_counts,
         "min_usable_claims": min_usable_claims,
         "thin_report_risk": thin_report_risk,
         "recommended_mode": recommended_mode,
+    }
+
+
+def _support_gap_type(support_payload: Dict[str, Any]) -> str:
+    unsupported_numbers = _as_list(support_payload.get("unsupported_numbers"))
+    unsupported_entities = _as_list(support_payload.get("unsupported_entities"))
+    unsupported_terms = _as_list(support_payload.get("unsupported_terms"))
+    if "no_cited_fact_cards" in {str(item) for item in unsupported_terms}:
+        return "claim_missing_cited_fact_cards"
+    if unsupported_numbers or unsupported_entities:
+        return "claim_support_entity_or_metric_mismatch"
+    return "claim_support_anchor_mismatch"
+
+
+def _support_required_fields(support_payload: Dict[str, Any]) -> List[str]:
+    fields: List[str] = ["source"]
+    if _as_list(support_payload.get("unsupported_numbers")):
+        fields.extend(["metric", "value", "unit", "period"])
+    if _as_list(support_payload.get("unsupported_entities")):
+        fields.append("entity_match")
+    unsupported_terms = _as_list(support_payload.get("unsupported_terms"))
+    if unsupported_terms and len(fields) <= 1:
+        fields.extend(["supporting_fact", "source_text"])
+    return _dedupe(fields)
+
+
+def _claim_support_repair_priority(
+    *,
+    chapter: Dict[str, Any],
+    unit: Dict[str, Any],
+    claim_text: str,
+    refs: Sequence[str],
+    cited_cards: Sequence[Dict[str, Any]],
+    support_payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    requirement_ids = _dedupe(
+        [
+            *[str(req or "").strip() for req in _as_list(unit.get("requirement_ids")) if str(req or "").strip()],
+            *[
+                str(card.get("requirement_id") or "").strip()
+                for card in cited_cards
+                if str(card.get("requirement_id") or "").strip()
+            ],
+        ]
+    )
+    source_ids = _dedupe(
+        [
+            str(card.get("source_id") or _as_dict(card.get("lineage")).get("source_id") or "").strip()
+            for card in cited_cards
+            if str(card.get("source_id") or _as_dict(card.get("lineage")).get("source_id") or "").strip()
+        ]
+    )
+    gap_type = _support_gap_type(support_payload)
+    claim_id = str(unit.get("claim_id") or "").strip()
+    return {
+        "schema_version": "claim_support_repair_priority_v1",
+        "gap_type": gap_type,
+        "gap_id": f"{chapter.get('chapter_id') or 'chapter'}_{claim_id or 'claim'}_{gap_type}",
+        "chapter_id": chapter.get("chapter_id"),
+        "claim_id": claim_id,
+        "requirement_ids": requirement_ids,
+        "evidence_refs": list(refs),
+        "source_ids": source_ids,
+        "claim": _compact(claim_text, 360),
+        "unsupported_terms": _as_list(support_payload.get("unsupported_terms")),
+        "unsupported_numbers": _as_list(support_payload.get("unsupported_numbers")),
+        "unsupported_entities": _as_list(support_payload.get("unsupported_entities")),
+        "required_fields": _support_required_fields(support_payload),
+        "proof_role": unit.get("proof_role") or "support",
+        "success_criteria": "Only rebuild this claim when cited fact cards directly support the claim text and all required fields are present.",
+        "reject_if": ["snippet_only", "no_source_url", "off_topic_source", "unsupported_entity_or_number"],
+        "allowed_for_writing": False,
+        "writing_permission": "not_allowed_until_repaired",
+        "recommended_action": "repair_evidence_binding_then_rebuild_claim",
     }
 
 
@@ -2985,6 +3083,8 @@ def validate_llm_analysis_output(
     chapters: List[Dict[str, Any]] = []
     valid_examples: List[Dict[str, Any]] = []
     rejected_examples: List[Dict[str, Any]] = []
+    deferred_examples: List[Dict[str, Any]] = []
+    claim_repair_priorities: List[Dict[str, Any]] = []
     semantic_judge_counts: Dict[str, int] = {}
     semantic_judge_usage: Dict[str, Any] = {}
     if not valid_refs:
@@ -3004,6 +3104,9 @@ def validate_llm_analysis_output(
             "llm_validation_issue_examples": [{"type": "no_valid_input_evidence_refs"}],
             "llm_valid_claim_examples": [],
             "llm_rejected_claim_examples": [],
+            "llm_deferred_claim_examples": [],
+            "claim_repair_priorities": [],
+            "deferred_claim_count": 0,
             "llm_semantic_judge_counts": {},
             "llm_semantic_judge_usage": {},
             "correctness_filter_summary": _correctness_filter_summary(
@@ -3168,16 +3271,35 @@ def validate_llm_analysis_output(
                 support_result = validate_claim_supported_by_facts(claim_text, cited_cards)
                 if not getattr(support_result, "supported", False):
                     support_payload = support_result.to_dict() if hasattr(support_result, "to_dict") else {}
+                    repair_priority = _claim_support_repair_priority(
+                        chapter=chapter,
+                        unit=unit,
+                        claim_text=claim_text,
+                        refs=refs,
+                        cited_cards=cited_cards,
+                        support_payload=support_payload,
+                    )
                     issue = {
-                        "type": "llm_claim_unsupported_by_cited_facts",
+                        "type": "claim_support_needs_repair",
                         "chapter_id": chapter.get("chapter_id"),
                         "claim_id": unit.get("claim_id"),
                         "evidence_refs": refs,
+                        "gap_type": repair_priority.get("gap_type"),
+                        "writing_permission": "not_allowed_until_repaired",
                         **support_payload,
                     }
                     issues.append(issue)
-                    if len(rejected_examples) < 5:
-                        rejected_examples.append({**issue, "claim": claim_text})
+                    claim_repair_priorities.append(repair_priority)
+                    if len(deferred_examples) < 8:
+                        deferred_examples.append(
+                            {
+                                **issue,
+                                "claim": claim_text,
+                                "repair_priority": repair_priority,
+                                "claim_status": "needs_repair",
+                                "evidence_use_level": "diagnostic_only",
+                            }
+                        )
                     continue
                 unit["claim_support_status"] = support_result.status
             semantic_judge = _llm_semantic_claim_support_judge(
@@ -3390,6 +3512,9 @@ def validate_llm_analysis_output(
         "llm_validation_issue_examples": issues[:8],
         "llm_valid_claim_examples": valid_examples,
         "llm_rejected_claim_examples": rejected_examples,
+        "llm_deferred_claim_examples": deferred_examples,
+        "claim_repair_priorities": claim_repair_priorities,
+        "deferred_claim_count": len(claim_repair_priorities),
         "llm_semantic_judge_counts": semantic_judge_counts,
         "llm_semantic_judge_usage": semantic_judge_usage,
         "correctness_filter_summary": _correctness_filter_summary(
@@ -3656,15 +3781,30 @@ def merge_llm_analysis_with_fallback(
             merged_units.append(unit)
         merged["claim_units"] = merged_units
         merged["key_judgments"] = _rank_key_judgments(key_judgments + _as_list(merged.get("key_judgments")))
+    evidence_repair_priorities: List[Dict[str, Any]] = []
+    seen_repair_ids: set[str] = set()
+    for item in [
+        *_as_list(llm_payload.get("evidence_repair_priorities")),
+        *_as_list(validation.get("claim_repair_priorities")),
+    ]:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("gap_id") or item.get("claim_id") or item.get("claim") or len(evidence_repair_priorities)).strip()
+        if key in seen_repair_ids:
+            continue
+        seen_repair_ids.add(key)
+        evidence_repair_priorities.append(item)
     merged["llm_analysis_synthesis"] = {
         "chapter_synthesis": chapters,
         "cross_chapter_conflicts": _as_list(llm_payload.get("cross_chapter_conflicts")),
-        "evidence_repair_priorities": _as_list(llm_payload.get("evidence_repair_priorities")),
+        "evidence_repair_priorities": evidence_repair_priorities,
         "rewrite_priorities": _as_list(llm_payload.get("rewrite_priorities")),
         "usage": llm_payload.get("_llm_usage", {}),
         "model": llm_payload.get("_llm_model", ""),
         "validation": validation,
     }
+    if evidence_repair_priorities:
+        merged["evidence_repair_priorities"] = evidence_repair_priorities
     return merged
 
 
@@ -4213,6 +4353,7 @@ def run_analysis_agent(
             "llm_input_valid_ref_count": llm_validation.get("valid_ref_count"),
             "llm_usable_claim_count": llm_validation.get("usable_claim_count", 0),
             "llm_dropped_claim_count": llm_validation.get("dropped_claim_count", 0),
+            "llm_deferred_claim_count": llm_validation.get("deferred_claim_count", 0),
             "llm_usable_chapter_count": llm_validation.get("usable_chapter_count", 0),
             "llm_valid_chapter_count": llm_validation.get("usable_chapter_count", 0),
             "llm_failed_chapter_count": (
@@ -4230,6 +4371,8 @@ def run_analysis_agent(
             "llm_validation_issue_examples": llm_validation.get("llm_validation_issue_examples", []),
             "llm_valid_claim_examples": llm_validation.get("llm_valid_claim_examples", []),
             "llm_rejected_claim_examples": llm_validation.get("llm_rejected_claim_examples", []),
+            "llm_deferred_claim_examples": llm_validation.get("llm_deferred_claim_examples", []),
+            "claim_repair_priorities": llm_validation.get("claim_repair_priorities", []),
             "llm_semantic_judge_counts": llm_validation.get("llm_semantic_judge_counts", {}),
             "llm_semantic_judge_usage": llm_validation.get("llm_semantic_judge_usage", {}),
             "llm_validation_status": llm_validation.get("status") or ("not_run" if llm_status in {"disabled", "fallback_config_missing"} else llm_status),

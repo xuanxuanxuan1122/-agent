@@ -255,6 +255,14 @@ NON_FACTUAL_FRAMING_RE = re.compile(
     r"|尚不足以支撑强结论)"
 )
 
+ANALYTICAL_QUESTION_FRAMING_RE = re.compile(
+    r"^(?:[-*]\s*)?"
+    r"(?:\u673a\u4f1a\u5224\u65ad|\u98ce\u9669\u5224\u65ad|\u5206\u6790\u65b9\u5411|\u8865\u6b63\u65b9\u5411)"
+    r"[:\uff1a].{0,160}"
+    r"(?:\u5982\u4f55|\u600e\u4e48|\u54ea\u4e9b|\u662f\u5426|\u4f1a\u4e0d\u4f1a|\u6392\u5e8f|\u8bc4\u4f30|\u5224\u65ad)",
+    re.I,
+)
+
 
 def _iter_public_text_values(payload: Dict[str, Any]) -> Iterable[str]:
     for key in (
@@ -304,6 +312,8 @@ def _iter_public_text_values(payload: Dict[str, Any]) -> Iterable[str]:
 def text_has_factual_claim(text: Any) -> bool:
     value = _text(text)
     if not value:
+        return False
+    if ANALYTICAL_QUESTION_FRAMING_RE.search(value):
         return False
     if NON_FACTUAL_TRANSITION_RE.match(value):
         return False
