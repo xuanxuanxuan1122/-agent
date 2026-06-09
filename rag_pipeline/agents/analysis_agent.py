@@ -12,12 +12,14 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, TypedDict
 
 try:
     from rag_pipeline.contracts.claim_roles import classify_claim_unit_roles
+    from rag_pipeline.contracts.evidence_identity import build_evidence_alias_map
     from rag_pipeline.contracts.evidence_support_validation import (
         incomplete_metric_cards_for_numeric_claim,
         validate_claim_supported_by_facts,
     )
     from rag_pipeline.contracts.research_reflection import build_research_reflection_memo
     from rag_pipeline.contracts.evidence_quality import classify_evidence
+    from rag_pipeline.contracts.ref_normalizer import normalize_claim_refs
     from rag_pipeline.search.memory import call_openai_compatible_json, llm_config_is_ready, normalize_llm_config
     from .evidence_merger import get_dynamic_dimensions
     from .summary_quality import sanitize_summary_judgments
@@ -26,6 +28,10 @@ except Exception:  # pragma: no cover - script mode fallback
         from rag_pipeline.contracts.claim_roles import classify_claim_unit_roles  # type: ignore
     except Exception:  # pragma: no cover
         classify_claim_unit_roles = None  # type: ignore
+    try:
+        from rag_pipeline.contracts.evidence_identity import build_evidence_alias_map  # type: ignore
+    except Exception:  # pragma: no cover
+        build_evidence_alias_map = None  # type: ignore
     try:
         from rag_pipeline.contracts.evidence_quality import classify_evidence  # type: ignore
     except Exception:  # pragma: no cover
@@ -42,6 +48,10 @@ except Exception:  # pragma: no cover - script mode fallback
         from rag_pipeline.contracts.research_reflection import build_research_reflection_memo  # type: ignore
     except Exception:  # pragma: no cover
         build_research_reflection_memo = None  # type: ignore
+    try:
+        from rag_pipeline.contracts.ref_normalizer import normalize_claim_refs  # type: ignore
+    except Exception:  # pragma: no cover
+        normalize_claim_refs = None  # type: ignore
     try:
         from rag_pipeline.search.memory import call_openai_compatible_json, llm_config_is_ready, normalize_llm_config  # type: ignore
     except Exception:  # pragma: no cover
@@ -2081,6 +2091,10 @@ def _evidence_cards_for_llm(
         cards.append(
             {
                 "evidence_id": evidence_id,
+                "aliases": _as_list(item.get("aliases"))
+                or _as_list(item.get("alias_ids"))
+                or _as_list(item.get("legacy_ids"))
+                or _as_list(item.get("legacy_evidence_ids")),
                 "chapter_id": chapter_id,
                 "hypothesis_id": hypothesis_id,
                 "requirement_id": requirement_id,
@@ -3107,6 +3121,7 @@ def validate_llm_analysis_output(
         for item in input_cards
         if str(item.get("evidence_id") or "").strip()
     }
+    evidence_alias_map = build_evidence_alias_map(input_cards) if build_evidence_alias_map is not None else {}
     requirement_contract_required = bool(
         any(str(item.get("requirement_id") or "").strip() for item in input_cards)
         or _as_list(
@@ -3183,18 +3198,48 @@ def validate_llm_analysis_output(
             if not isinstance(raw_unit, dict):
                 continue
             unit = dict(raw_unit)
-            refs = [
+            raw_refs = [
                 str(ref or "").strip()
                 for ref in _as_list(unit.get("used_evidence_ids"))
                 if str(ref or "").strip()
             ]
-            if not refs:
+            if not raw_refs:
                 issue = {"type": "llm_claim_missing_used_evidence_ids", "chapter_id": chapter.get("chapter_id")}
                 issues.append(issue)
                 if len(rejected_examples) < 5:
                     rejected_examples.append({**issue, "claim": _compact(unit.get("claim"), 160)})
                 continue
-            invalid_refs = [ref for ref in refs if valid_refs and ref not in valid_refs]
+            if normalize_claim_refs is not None:
+                normalized_refs = normalize_claim_refs(
+                    {**unit, "used_evidence_ids": raw_refs},
+                    alias_map=evidence_alias_map,
+                    fact_cards=input_cards,
+                )
+                refs = [
+                    str(ref or "").strip()
+                    for ref in _as_list(normalized_refs.get("fact_ids"))
+                    if str(ref or "").strip()
+                ]
+                unit["ref_resolution"] = _as_dict(normalized_refs.get("ref_resolution"))
+                unit["legacy_ref_fields"] = _as_dict(normalized_refs.get("legacy_ref_fields"))
+                if _as_list(normalized_refs.get("ambiguous_refs")):
+                    issue = {
+                        "type": "ambiguous_llm_evidence_ref",
+                        "refs": _as_list(normalized_refs.get("ambiguous_refs")),
+                        "chapter_id": chapter.get("chapter_id"),
+                    }
+                    issues.append(issue)
+                    if len(rejected_examples) < 5:
+                        rejected_examples.append({**issue, "claim": _compact(unit.get("claim"), 160)})
+                    continue
+                invalid_refs = [
+                    ref
+                    for ref in _as_list(normalized_refs.get("unresolved_refs"))
+                    if str(ref or "").strip()
+                ]
+            else:
+                refs = raw_refs
+                invalid_refs = [ref for ref in refs if valid_refs and ref not in valid_refs]
             if invalid_refs:
                 issue = {"type": "invalid_llm_evidence_ref", "refs": invalid_refs, "chapter_id": chapter.get("chapter_id")}
                 issues.append(issue)
@@ -3871,6 +3916,8 @@ def merge_llm_analysis_with_fallback(
                 "primary_claim_role": unit.get("primary_claim_role"),
                 "claim_role_contract_version": unit.get("claim_role_contract_version"),
                 "role_reasons": _as_list(unit.get("role_reasons")),
+                "ref_resolution": _as_dict(unit.get("ref_resolution")),
+                "legacy_ref_fields": _as_dict(unit.get("legacy_ref_fields")),
                 "mechanism": reasoning,
                 "reasoning": reasoning,
                 "counter_evidence": unit.get("counter_boundary") or "；".join(str(item) for item in _as_list(chapter.get("counter_evidence_boundary"))[:3]),
@@ -3914,6 +3961,8 @@ def merge_llm_analysis_with_fallback(
                     "primary_claim_role": claim_payload["primary_claim_role"],
                     "claim_role_contract_version": claim_payload["claim_role_contract_version"],
                     "role_reasons": claim_payload["role_reasons"],
+                    "ref_resolution": claim_payload["ref_resolution"],
+                    "legacy_ref_fields": claim_payload["legacy_ref_fields"],
                     "supporting_evidence": refs,
                     "evidence_refs": refs,
                     "confidence": claim_payload["confidence"],

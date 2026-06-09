@@ -122,6 +122,24 @@ def _metadata(package: Dict[str, Any], report: Dict[str, Any]) -> Dict[str, Any]
     return _first_dict(package.get("metadata"), report.get("metadata"))
 
 
+def _handoff_contract_summary(package: Dict[str, Any], report: Dict[str, Any]) -> Dict[str, Any]:
+    render_artifacts = _as_dict(report.get("render_artifacts"))
+    metadata = _metadata(package, report)
+    stage_card = _first_dict(
+        package.get("stage_quality_card"),
+        report.get("stage_quality_card"),
+        render_artifacts.get("stage_quality_card"),
+        metadata.get("stage_quality_card"),
+    )
+    return _first_dict(
+        package.get("handoff_contract_summary"),
+        report.get("handoff_contract_summary"),
+        render_artifacts.get("handoff_contract_summary"),
+        metadata.get("handoff_contract_summary"),
+        stage_card.get("handoff"),
+    )
+
+
 def _score_gaps(package: Dict[str, Any], report: Dict[str, Any]) -> List[Dict[str, Any]]:
     return [
         _as_dict(item)
@@ -232,6 +250,12 @@ def build_run_quality_snapshot(
     correctness_summary = _as_dict(analysis_diag.get("correctness_filter_summary"))
     final_audit = _as_dict(package.get("final_audit_result")) or _as_dict(report.get("final_audit_result"))
     run_metrics = _run_metrics(package, report)
+    handoff = _handoff_contract_summary(package, report)
+    handoff_failed_contracts = [
+        _text(item)
+        for item in _as_list(handoff.get("failed_contracts"))
+        if _text(item)
+    ]
     evidence_package = _as_dict(package.get("evidence_package")) or _as_dict(report.get("evidence_package"))
     fact_cards = (
         _as_list(evidence_package.get("analysis_ready_evidence"))
@@ -266,6 +290,9 @@ def build_run_quality_snapshot(
         "cost_usd": run_metrics["cost_usd"],
         "repair_effectiveness": summarize_repair_effectiveness(writer_package=package, writer_report=report),
         "evidence_admission_summary": summarize_evidence_admission(fact_cards),
+        "handoff_contract_summary": handoff,
+        "handoff_failed_contracts": handoff_failed_contracts,
+        "handoff_failed_contract_count": len(handoff_failed_contracts),
     }
 
 
@@ -310,8 +337,10 @@ def summarize_topic_regression(
     score_mean = round(_mean(scores), 2)
     score_stddev = round(_stddev(scores), 2)
     fatal_counter: Counter[str] = Counter()
+    handoff_counter: Counter[str] = Counter()
     for item in runs:
         fatal_counter.update(_as_list(item.get("fatal_types")))
+        handoff_counter.update(_as_list(item.get("handoff_failed_contracts")))
     thin_count = sum(1 for item in runs if bool(item.get("thin_report_risk")))
 
     recommended_actions: List[str] = []
@@ -323,6 +352,8 @@ def summarize_topic_regression(
         recommended_actions.append("fix_recurring_fatal_findings")
     if thin_count:
         recommended_actions.append("inspect_filter_stacking")
+    if handoff_counter:
+        recommended_actions.append("inspect_handoff_contracts")
     if (max_tokens_per_run and any(value > max_tokens_per_run for value in tokens)) or (
         max_duration_seconds and any(value > max_duration_seconds for value in durations)
     ):
@@ -349,8 +380,13 @@ def summarize_topic_regression(
         "cost_usd_total": round(sum(costs), 4),
         "cost_usd_mean": round(_mean(costs), 4),
         "fatal_type_counts": dict(fatal_counter),
+        "handoff_failed_contract_counts": dict(handoff_counter),
         "thin_report_risk_count": thin_count,
-        "stability_status": "stable" if pass_rate >= min_pass_rate and score_stddev <= max_score_stddev and not fatal_counter else "unstable",
+        "stability_status": (
+            "stable"
+            if pass_rate >= min_pass_rate and score_stddev <= max_score_stddev and not fatal_counter and not handoff_counter
+            else "unstable"
+        ),
         "recommended_actions": recommended_actions,
         "runs": runs,
     }

@@ -63,6 +63,17 @@ def test_stage_quality_card_aggregates_binding_table_and_citation_signals():
             "citation_rebind_required": True,
             "citationless_factual_removed_count": 3,
         },
+        handoff_contract_summary={
+            "ok": False,
+            "failed_contracts": ["analysis_to_writer"],
+            "results": {
+                "analysis_to_writer": {
+                    "ok": False,
+                    "errors": ["claim_missing_fact_or_evidence_refs"],
+                    "summary": {"claim_count": 2, "missing_fact_or_evidence_refs_count": 1},
+                }
+            },
+        },
     )
 
     assert card["schema_version"] == "stage_quality_card_v1"
@@ -74,6 +85,10 @@ def test_stage_quality_card_aggregates_binding_table_and_citation_signals():
     assert card["table"]["reject_reason_distribution"]["body_rows_lt_2"] == 1
     assert card["analysis"]["usable_claim_count"] == 7
     assert card["citation"]["citation_rebind_required"] is True
+    assert card["handoff"]["ok"] is False
+    assert card["handoff"]["failed_contracts"] == ["analysis_to_writer"]
+    assert card["handoff"]["results"]["analysis_to_writer"]["summary"]["missing_fact_or_evidence_refs_count"] == 1
+    assert "handoff_contract_failed" in card["top_blockers"]
     assert "citation_rebind_required" in card["top_blockers"]
 
 
@@ -85,6 +100,73 @@ def test_writer_report_exposes_stage_quality_card_in_all_debug_surfaces():
     )
 
     assert report["stage_quality_card"]["schema_version"] == "stage_quality_card_v1"
+    assert report["stage_quality_card"]["handoff"]["schema_version"] == "handoff_contract_summary_v1"
+    assert report["handoff_contract_summary"]["schema_version"] == "handoff_contract_summary_v1"
     assert report["debug_snapshot"]["stage_quality_card"]["schema_version"] == "stage_quality_card_v1"
     assert report["render_artifacts"]["stage_quality_card"]["schema_version"] == "stage_quality_card_v1"
     assert report["metadata"]["stage_quality_card"]["schema_version"] == "stage_quality_card_v1"
+    assert report["metadata"]["handoff_contract_summary"]["schema_version"] == "handoff_contract_summary_v1"
+
+
+def test_writer_report_normalizes_argument_unit_refs_to_canonical_fields():
+    report = build_writer_report(
+        query="AI Agent adoption",
+        evidence_package={
+            "analysis_ready_evidence": [
+                {
+                    "evidence_id": "EV-04-22",
+                    "aliases": ["EV-04-L22"],
+                    "source_id": "SRC-1",
+                    "requirement_id": "REQ-1",
+                    "data_point": "Enterprise deployments are moving into workflow automation.",
+                    "source": {"title": "Official report", "url": "https://example.com/report"},
+                }
+            ],
+            "source_registry": [{"source_id": "SRC-1", "url": "https://example.com/report"}],
+        },
+        structured_analysis={
+            "claim_units": [
+                {
+                    "claim_id": "CL-1",
+                    "chapter_id": "ch_01",
+                    "claim": "Enterprise deployments are moving into workflow automation.",
+                    "evidence_refs": ["EV-04-L22"],
+                    "requirement_ids": ["REQ-1"],
+                }
+            ]
+        },
+        argument_units=[
+            {
+                "claim_id": "CL-1",
+                "chapter_id": "ch_01",
+                "claim": "Enterprise deployments are moving into workflow automation.",
+                "evidence_refs": ["EV-04-L22"],
+                "public_render": True,
+            }
+        ],
+        chapter_packages=[
+            {
+                "chapter_id": "ch_01",
+                "chapter_title": "Adoption",
+                "sections": [
+                    {
+                        "section_id": "s1",
+                        "claim_id": "CL-1",
+                        "claim": "Enterprise deployments are moving into workflow automation.",
+                        "evidence_refs": ["EV-04-L22"],
+                    }
+                ],
+            }
+        ],
+        source_registry=[{"source_id": "SRC-1", "ref": "[1]", "url": "https://example.com/report"}],
+    )
+
+    unit = report["render_artifacts"]["argument_units"][0]
+    assert unit["fact_ids"] == ["EV-04-22"]
+    assert unit["evidence_refs"] == ["EV-04-22"]
+    assert unit["source_ids"] == ["SRC-1"]
+    assert unit["requirement_ids"] == ["REQ-1"]
+    assert unit["ref_resolution"]["alias_resolved_ref_count"] == 1
+    section = report["render_artifacts"]["chapter_packages"][0]["sections"][0]
+    assert section["fact_ids"] == ["EV-04-22"]
+    assert section["evidence_refs"] == ["EV-04-22"]

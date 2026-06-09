@@ -9,6 +9,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, TypedDict
 
 try:
     from rag_pipeline.contracts.evidence_quality import apply_evidence_quality_contract
+    from rag_pipeline.contracts.handoff_contracts import build_handoff_contract_summary
+    from rag_pipeline.contracts.evidence_identity import build_evidence_alias_map
+    from rag_pipeline.contracts.ref_normalizer import normalize_claim_refs
     from rag_pipeline.contracts.research_reflection import build_research_reflection_memo
     from rag_pipeline.contracts.source_registry import pick_refs as _contract_pick_refs
     from .analytics import run_analytics_agents
@@ -34,10 +37,16 @@ try:
 except Exception:  # pragma: no cover - direct script mode fallback
     try:
         from rag_pipeline.contracts.evidence_quality import apply_evidence_quality_contract  # type: ignore
+        from rag_pipeline.contracts.handoff_contracts import build_handoff_contract_summary  # type: ignore
+        from rag_pipeline.contracts.evidence_identity import build_evidence_alias_map  # type: ignore
+        from rag_pipeline.contracts.ref_normalizer import normalize_claim_refs  # type: ignore
         from rag_pipeline.contracts.research_reflection import build_research_reflection_memo  # type: ignore
         from rag_pipeline.contracts.source_registry import pick_refs as _contract_pick_refs  # type: ignore
     except Exception:  # pragma: no cover
         apply_evidence_quality_contract = None  # type: ignore
+        build_handoff_contract_summary = None  # type: ignore
+        build_evidence_alias_map = None  # type: ignore
+        normalize_claim_refs = None  # type: ignore
         build_research_reflection_memo = None  # type: ignore
         _contract_pick_refs = None  # type: ignore
     from analytics import run_analytics_agents  # type: ignore
@@ -1370,6 +1379,7 @@ def _stage_quality_card(
     table_gap_summary: Dict[str, Any],
     analysis_stage_diagnostics: Dict[str, Any],
     final_citation_audit: Dict[str, Any],
+    handoff_contract_summary: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     evidence_totals: Dict[str, int] = {
         "chapter_count": 0,
@@ -1430,6 +1440,7 @@ def _stage_quality_card(
     table_gap = _as_dict(table_gap_summary)
     analysis = _as_dict(analysis_stage_diagnostics)
     citation = _as_dict(final_citation_audit)
+    handoff = _as_dict(handoff_contract_summary)
     citationless_removed_count = (
         _count_value(citation.get("citationless_factual_removed_count"))
         or _count_value(citation.get("citationless_factual_sentence_removed_count"))
@@ -1453,6 +1464,8 @@ def _stage_quality_card(
         top_blockers.append("citation_rebind_required")
     if str(citation.get("final_citation_reconciliation_status") or "").strip().lower() not in {"", "ok"}:
         top_blockers.append("final_citation_not_ok")
+    if handoff and not bool(handoff.get("ok", True)):
+        top_blockers.append("handoff_contract_failed")
 
     status = "green"
     if top_blockers:
@@ -1497,6 +1510,7 @@ def _stage_quality_card(
             "factual_body_without_citations_count": _count_value(citation.get("factual_body_without_citations_count")),
             "final_unresolved_citation_removed_count": _count_value(citation.get("final_unresolved_citation_removed_count")),
         },
+        "handoff": handoff,
     }
 
 
@@ -1554,6 +1568,118 @@ def _merge_table_followups_into_refinement_plan(plan: Dict[str, Any], table_foll
     merged["follow_up_queries"] = existing
     merged["table_follow_up_count"] = len(table_followups)
     return merged
+
+
+def _handoff_fact_cards_from_inputs(
+    evidence_package: Dict[str, Any],
+    structured_analysis: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    cards: List[Dict[str, Any]] = []
+    for source in (_as_dict(evidence_package), _as_dict(structured_analysis)):
+        for key in (
+            "analysis_ready_evidence",
+            "fact_cards",
+            "fact_card_pool",
+            "clean_evidence_list",
+            "evidence_analyses",
+        ):
+            cards.extend(item for item in _as_list(source.get(key)) if isinstance(item, dict))
+    seen = set()
+    deduped: List[Dict[str, Any]] = []
+    for card in cards:
+        key = str(card.get("canonical_evidence_id") or card.get("evidence_id") or card.get("fact_id") or card.get("id") or "").strip()
+        if not key:
+            key = str(card.get("data_point") or card.get("fact") or card.get("content") or len(deduped))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(card)
+    return deduped
+
+
+def _normalize_argument_units_for_handoff(
+    argument_units: Sequence[Dict[str, Any]],
+    *,
+    evidence_package: Dict[str, Any],
+    structured_analysis: Dict[str, Any],
+) -> Dict[str, Any]:
+    units = [item for item in list(argument_units or []) if isinstance(item, dict)]
+    if normalize_claim_refs is None:
+        return {
+            "argument_units": units,
+            "summary": {"status": "skipped", "reason": "ref_normalizer_unavailable"},
+        }
+    fact_cards = _handoff_fact_cards_from_inputs(evidence_package, structured_analysis)
+    alias_map = build_evidence_alias_map(fact_cards) if build_evidence_alias_map else {}
+    normalized_units: List[Dict[str, Any]] = []
+    unresolved_count = 0
+    ambiguous_count = 0
+    alias_resolved_count = 0
+    for unit in units:
+        normalized = normalize_claim_refs(unit, alias_map=alias_map, fact_cards=fact_cards)
+        resolution = _as_dict(normalized.get("ref_resolution"))
+        unresolved_count += _count_value(resolution.get("unresolved_ref_count"))
+        ambiguous_count += _count_value(resolution.get("ambiguous_ref_count"))
+        alias_resolved_count += _count_value(resolution.get("alias_resolved_ref_count"))
+        normalized_units.append(normalized)
+    return {
+        "argument_units": normalized_units,
+        "summary": {
+            "schema_version": "argument_unit_ref_normalization_v1",
+            "status": "ok",
+            "argument_unit_count": len(normalized_units),
+            "fact_card_count": len(fact_cards),
+            "alias_resolved_ref_count": alias_resolved_count,
+            "unresolved_ref_count": unresolved_count,
+            "ambiguous_ref_count": ambiguous_count,
+        },
+    }
+
+
+def _normalize_chapter_packages_for_handoff(
+    chapter_packages: Sequence[Dict[str, Any]],
+    *,
+    evidence_package: Dict[str, Any],
+    structured_analysis: Dict[str, Any],
+) -> Dict[str, Any]:
+    packages = [copy.deepcopy(item) for item in list(chapter_packages or []) if isinstance(item, dict)]
+    if normalize_claim_refs is None:
+        return {
+            "chapter_packages": packages,
+            "summary": {"status": "skipped", "reason": "ref_normalizer_unavailable"},
+        }
+    fact_cards = _handoff_fact_cards_from_inputs(evidence_package, structured_analysis)
+    alias_map = build_evidence_alias_map(fact_cards) if build_evidence_alias_map else {}
+    unresolved_count = 0
+    ambiguous_count = 0
+    alias_resolved_count = 0
+    section_count = 0
+    for package in packages:
+        sections = []
+        for section in _as_list(package.get("sections")):
+            if not isinstance(section, dict):
+                continue
+            normalized = normalize_claim_refs(section, alias_map=alias_map, fact_cards=fact_cards)
+            resolution = _as_dict(normalized.get("ref_resolution"))
+            unresolved_count += _count_value(resolution.get("unresolved_ref_count"))
+            ambiguous_count += _count_value(resolution.get("ambiguous_ref_count"))
+            alias_resolved_count += _count_value(resolution.get("alias_resolved_ref_count"))
+            section_count += 1
+            sections.append(normalized)
+        package["sections"] = sections
+    return {
+        "chapter_packages": packages,
+        "summary": {
+            "schema_version": "chapter_package_ref_normalization_v1",
+            "status": "ok",
+            "chapter_package_count": len(packages),
+            "section_count": section_count,
+            "fact_card_count": len(fact_cards),
+            "alias_resolved_ref_count": alias_resolved_count,
+            "unresolved_ref_count": unresolved_count,
+            "ambiguous_ref_count": ambiguous_count,
+        },
+    }
 
 
 def _table_appendix_rows(table_packages: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -3245,6 +3371,20 @@ def build_writer_report(
     chapter_packages = _as_list(package_normalization.get("chapter_packages"))
     package_normalization_summary = _as_dict(package_normalization.get("summary"))
     package_normalization_summary["public_rebuild"] = public_rebuild_summary
+    argument_ref_normalization = _normalize_argument_units_for_handoff(
+        argument_units,
+        evidence_package=evidence_package,
+        structured_analysis=structured_analysis,
+    )
+    argument_units = _as_list(argument_ref_normalization.get("argument_units"))
+    package_normalization_summary["argument_ref_normalization"] = _as_dict(argument_ref_normalization.get("summary"))
+    chapter_ref_normalization = _normalize_chapter_packages_for_handoff(
+        chapter_packages,
+        evidence_package=evidence_package,
+        structured_analysis=structured_analysis,
+    )
+    chapter_packages = _as_list(chapter_ref_normalization.get("chapter_packages"))
+    package_normalization_summary["chapter_ref_normalization"] = _as_dict(chapter_ref_normalization.get("summary"))
     table_followups = _table_follow_up_queries(table_packages)
     evidence_refinement_plan = _merge_table_followups_into_refinement_plan(evidence_refinement_plan, table_followups)
     public_chapter_packages = [
@@ -3644,12 +3784,31 @@ def build_writer_report(
     analysis_stage_diagnostics = _as_dict(structured_analysis.get("analysis_stage_diagnostics"))
     llm_analysis_synthesis = _as_dict(structured_analysis.get("llm_analysis_synthesis"))
     claim_binding_feedback_summary = _as_dict(structured_analysis.get("claim_binding_feedback_summary"))
+    handoff_contract_summary: Dict[str, Any] = {}
+    if build_handoff_contract_summary:
+        try:
+            handoff_contract_summary = build_handoff_contract_summary(
+                evidence_package=evidence_package,
+                structured_analysis=structured_analysis,
+                writer_report=writer_output,
+                markdown=str(writer_output.get("report_markdown") or ""),
+                citation_manifest=_as_dict(writer_output.get("citation_manifest")),
+                source_registry=[item for item in list(rendered_source_registry or []) if isinstance(item, dict)],
+            )
+        except Exception as exc:  # pragma: no cover - handoff diagnostics must not block report rendering.
+            handoff_contract_summary = {
+                "schema_version": "handoff_contract_summary_v1",
+                "ok": False,
+                "failed_contracts": ["handoff_contract_exception"],
+                "error": str(exc),
+            }
     stage_quality_card = _stage_quality_card(
         chapter_evidence_packages=[item for item in list(chapter_evidence_packages or []) if isinstance(item, dict)],
         table_quality_summary=table_quality_summary,
         table_gap_summary=table_gap_summary,
         analysis_stage_diagnostics=analysis_stage_diagnostics,
         final_citation_audit=_as_dict(writer_output.get("final_citation_audit")),
+        handoff_contract_summary=handoff_contract_summary,
     )
     debug_snapshot["stage_quality_card"] = stage_quality_card
     render_artifacts = {
@@ -3682,6 +3841,7 @@ def build_writer_report(
         "ref_lineage_diagnostics": _as_dict(writer_output.get("ref_lineage_diagnostics")),
         "chapter_narrative": chapter_narrative_diagnostics,
         "stage_quality_card": stage_quality_card,
+        "handoff_contract_summary": handoff_contract_summary,
     }
     return {
         **writer_output,
@@ -3724,6 +3884,7 @@ def build_writer_report(
         "table_placement_summary": table_placement_summary,
         "table_gap_summary": table_gap_summary,
         "stage_quality_card": stage_quality_card,
+        "handoff_contract_summary": handoff_contract_summary,
         "evidence_health_summary": evidence_health_summary,
         "research_reflection_memo": research_reflection_memo,
         "evidence_analysis_summary": evidence_analysis_summary,
@@ -3774,6 +3935,7 @@ def build_writer_report(
             "claim_binding_feedback_summary": claim_binding_feedback_summary,
             "chapter_narrative": chapter_narrative_diagnostics,
             "stage_quality_card": stage_quality_card,
+            "handoff_contract_summary": handoff_contract_summary,
         },
     }
 

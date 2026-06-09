@@ -1005,6 +1005,54 @@ def test_llm_validator_normalizes_analysis_first_claim_contract():
     assert unit["analysis_role"] == "directional"
 
 
+def test_llm_validator_resolves_evidence_alias_to_canonical_fact_id(monkeypatch):
+    monkeypatch.setattr(
+        analysis_agent,
+        "_llm_semantic_claim_support_judge",
+        lambda **_kwargs: {"status": "supported", "reason": "Supported by cited evidence.", "confidence": 0.9},
+    )
+    evidence = _evidence("EV-agent")
+    evidence["aliases"] = ["EV-agent-L1"]
+    evidence["source_id"] = "SRC-agent"
+    evidence["requirement_id"] = "REQ-agent"
+    evidence_package = {"analysis_ready_evidence": [evidence]}
+    payload = {
+        "chapter_synthesis": [
+            {
+                "chapter_id": "ch_01",
+                "chapter_title": "Demand validation",
+                "claim_units": [
+                    {
+                        "claim_id": "CL-alias",
+                        "claim": "Enterprise agent deployments are moving from pilots into workflow automation.",
+                        "claim_strength": "directional",
+                        "analysis_role": "directional",
+                        "used_evidence_ids": ["EV-agent-L1"],
+                        "evidence_basis": ["Enterprise workflow evidence is present."],
+                        "reasoning_chain": ["Workflow deployments indicate operational adoption."],
+                        "limitation_boundary": ["The claim is limited to disclosed customer samples."],
+                    }
+                ],
+            }
+        ]
+    }
+
+    validation = validate_llm_analysis_output(payload, evidence_package, llm_config={"model": "judge"})
+    unit = validation["chapter_synthesis"][0]["claim_units"][0]
+
+    assert validation["status"] == "valid"
+    assert unit["fact_ids"] == ["EV-agent"]
+    assert unit["evidence_refs"] == ["EV-agent"]
+    assert unit["source_ids"] == ["SRC-agent"]
+    assert unit["requirement_ids"] == ["REQ-agent"]
+    assert unit["ref_resolution"]["alias_resolved_ref_count"] == 1
+    merged = merge_llm_analysis_with_fallback({"claim_units": []}, payload, validation)
+    merged_unit = merged["claim_units"][0]
+    assert merged_unit["fact_ids"] == ["EV-agent"]
+    assert merged_unit["evidence_refs"] == ["EV-agent"]
+    assert merged_unit["ref_resolution"]["alias_resolved_ref_count"] == 1
+
+
 def test_llm_input_v2_carries_requirement_contract_fields():
     evidence = _evidence("EV-REQ")
     evidence.update(

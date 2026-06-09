@@ -104,6 +104,29 @@ def test_topic_regression_summary_measures_pass_rate_variance_and_fatals():
     assert "reduce_cost_or_latency" in summary["recommended_actions"]
 
 
+def test_quality_snapshot_and_topic_summary_track_handoff_contract_failures():
+    package = _writer_package(run_id="run-handoff", score=71, blocked=False, usable_claims=18)
+    package["writer_report"]["handoff_contract_summary"] = {
+        "schema_version": "handoff_contract_summary_v1",
+        "ok": False,
+        "failed_contracts": ["analysis_to_writer", "citation_reconciliation"],
+        "results": {
+            "analysis_to_writer": {"ok": False, "errors": ["claim_missing_fact_or_evidence_refs"]},
+            "citation_reconciliation": {"ok": False, "errors": ["citation_ref_missing_from_manifest"]},
+        },
+    }
+
+    snapshot = build_run_quality_snapshot(package)
+    summary = summarize_topic_regression([snapshot], min_publish_score=70)
+
+    assert snapshot["handoff_failed_contracts"] == ["analysis_to_writer", "citation_reconciliation"]
+    assert snapshot["handoff_failed_contract_count"] == 2
+    assert summary["handoff_failed_contract_counts"]["analysis_to_writer"] == 1
+    assert summary["handoff_failed_contract_counts"]["citation_reconciliation"] == 1
+    assert summary["stability_status"] == "unstable"
+    assert "inspect_handoff_contracts" in summary["recommended_actions"]
+
+
 def test_repair_effectiveness_tracks_closed_gaps_not_just_task_count():
     writer_package = {
         "metadata": {
