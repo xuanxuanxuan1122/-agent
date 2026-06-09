@@ -1226,9 +1226,12 @@ def _table_quality_summary(table_packages: Sequence[Dict[str, Any]]) -> Dict[str
     rendered_count = 0
     repaired_count = 0
     demoted_count = 0
+    drop_count = 0
     calculation_error_count = 0
     missing_claim_binding_count = 0
     type_distribution: Dict[str, int] = {}
+    render_tier_distribution: Dict[str, int] = {}
+    reject_reason_distribution: Dict[str, int] = {}
     demoted_samples: List[Dict[str, Any]] = []
     for table in table_packages:
         if not isinstance(table, dict):
@@ -1239,6 +1242,17 @@ def _table_quality_summary(table_packages: Sequence[Dict[str, Any]]) -> Dict[str
         validation = _as_dict(table.get("validation") or table.get("table_validation_for_clean"))
         errors = _as_list(validation.get("errors")) + _as_list(table.get("validation_errors"))
         warnings = _as_list(validation.get("warnings"))
+        reject_reasons = [str(reason or "").strip() for reason in _as_list(table.get("reject_reasons")) if str(reason or "").strip()]
+        for reason in reject_reasons:
+            reject_reason_distribution[reason] = reject_reason_distribution.get(reason, 0) + 1
+        if table.get("should_render") and not table.get("appendix_only"):
+            render_tier = "body_high_value" if str(table.get("table_value_tier") or "") == "high" else "body"
+        elif table.get("appendix_only"):
+            render_tier = "appendix"
+        else:
+            render_tier = "drop"
+            drop_count += 1
+        render_tier_distribution[render_tier] = render_tier_distribution.get(render_tier, 0) + 1
         if validation:
             validated_count += 1
         if table.get("should_render") and not table.get("appendix_only"):
@@ -1266,9 +1280,12 @@ def _table_quality_summary(table_packages: Sequence[Dict[str, Any]]) -> Dict[str
         "rendered_count": rendered_count,
         "repaired_count": repaired_count,
         "demoted_count": demoted_count,
+        "drop_count": drop_count,
         "calculation_error_count": calculation_error_count,
         "missing_claim_binding_count": missing_claim_binding_count,
         "table_type_distribution": type_distribution,
+        "render_tier_distribution": render_tier_distribution,
+        "reject_reason_distribution": reject_reason_distribution,
         "demoted_samples": demoted_samples,
     }
 
@@ -1343,6 +1360,143 @@ def _table_gap_summary(table_packages: Sequence[Dict[str, Any]]) -> Dict[str, An
         "rendered_high_value_table_count": rendered_high_value_table_count,
         "missing_field_distribution": missing_fields,
         "samples": samples,
+    }
+
+
+def _stage_quality_card(
+    *,
+    chapter_evidence_packages: Sequence[Dict[str, Any]],
+    table_quality_summary: Dict[str, Any],
+    table_gap_summary: Dict[str, Any],
+    analysis_stage_diagnostics: Dict[str, Any],
+    final_citation_audit: Dict[str, Any],
+) -> Dict[str, Any]:
+    evidence_totals: Dict[str, int] = {
+        "chapter_count": 0,
+        "candidate_fact_count": 0,
+        "eligible_fact_count": 0,
+        "filtered_fact_count": 0,
+        "resolved_diagnostic_ref_count": 0,
+        "unresolved_ref_count": 0,
+        "relevance_rejected_count": 0,
+        "matched_after_relevance_count": 0,
+        "hydrated_evidence_count": 0,
+        "empty_chapter_count": 0,
+    }
+    layer_counts: Dict[str, int] = {}
+    weakest_chapters: List[Dict[str, Any]] = []
+    for package in chapter_evidence_packages:
+        if not isinstance(package, dict):
+            continue
+        evidence_totals["chapter_count"] += 1
+        funnel = _as_dict(package.get("evidence_binding_funnel") or _as_dict(package.get("metadata")).get("evidence_binding_funnel"))
+        if not funnel:
+            funnel = {
+                "hydrated_evidence_count": _count_value(package.get("hydrated_evidence_count")),
+                "unresolved_ref_count": _count_value(package.get("unresolved_evidence_ref_count")),
+                "matched_after_relevance_count": _count_value(package.get("matched_evidence_count")),
+                "eligible_fact_count": _count_value(package.get("writable_fact_count")),
+                "layer_counts": _as_dict(package.get("evidence_binding_counts")),
+            }
+        for key in (
+            "candidate_fact_count",
+            "eligible_fact_count",
+            "filtered_fact_count",
+            "resolved_diagnostic_ref_count",
+            "unresolved_ref_count",
+            "relevance_rejected_count",
+            "matched_after_relevance_count",
+            "hydrated_evidence_count",
+        ):
+            evidence_totals[key] += _count_value(funnel.get(key))
+        if _count_value(funnel.get("hydrated_evidence_count")) <= 0:
+            evidence_totals["empty_chapter_count"] += 1
+            if len(weakest_chapters) < 8:
+                weakest_chapters.append(
+                    {
+                        "chapter_id": package.get("chapter_id"),
+                        "chapter_title": package.get("chapter_title"),
+                        "reason": "no_hydrated_evidence",
+                        "unresolved_ref_count": _count_value(funnel.get("unresolved_ref_count")),
+                        "relevance_rejected_count": _count_value(funnel.get("relevance_rejected_count")),
+                    }
+                )
+        for layer, count in _as_dict(funnel.get("layer_counts")).items():
+            key = str(layer or "").strip()
+            if key:
+                layer_counts[key] = layer_counts.get(key, 0) + _count_value(count)
+
+    table_summary = _as_dict(table_quality_summary)
+    table_gap = _as_dict(table_gap_summary)
+    analysis = _as_dict(analysis_stage_diagnostics)
+    citation = _as_dict(final_citation_audit)
+    citationless_removed_count = (
+        _count_value(citation.get("citationless_factual_removed_count"))
+        or _count_value(citation.get("citationless_factual_sentence_removed_count"))
+        + _count_value(citation.get("citationless_factual_bullet_removed_count"))
+        + _count_value(citation.get("citationless_short_factual_line_removed_count"))
+    )
+    top_blockers: List[str] = []
+    if evidence_totals["empty_chapter_count"]:
+        top_blockers.append("chapter_evidence_empty")
+    if evidence_totals["unresolved_ref_count"]:
+        top_blockers.append("unresolved_evidence_refs")
+    if evidence_totals["relevance_rejected_count"]:
+        top_blockers.append("chapter_relevance_rejections")
+    if _count_value(table_summary.get("drop_count")):
+        top_blockers.append("table_drop")
+    if _as_dict(table_gap.get("missing_field_distribution")):
+        top_blockers.append("table_metric_fields_missing")
+    if _count_value(analysis.get("llm_failed_chapter_count") or analysis.get("failed_chapter_count")):
+        top_blockers.append("analysis_partial_failure")
+    if bool(citation.get("citation_rebind_required")):
+        top_blockers.append("citation_rebind_required")
+    if str(citation.get("final_citation_reconciliation_status") or "").strip().lower() not in {"", "ok"}:
+        top_blockers.append("final_citation_not_ok")
+
+    status = "green"
+    if top_blockers:
+        status = "yellow"
+    if bool(citation.get("citation_rebind_required")) or "final_citation_not_ok" in top_blockers:
+        status = "red"
+    return {
+        "schema_version": "stage_quality_card_v1",
+        "status": status,
+        "top_blockers": _dedupe(top_blockers),
+        "evidence_binding": {
+            **evidence_totals,
+            "layer_counts": layer_counts,
+            "weakest_chapters": weakest_chapters,
+        },
+        "table": {
+            "candidate_count": _count_value(table_summary.get("candidate_count")),
+            "rendered_count": _count_value(table_summary.get("rendered_count")),
+            "rendered_high_value_table_count": _count_value(table_gap.get("rendered_high_value_table_count")),
+            "drop_count": _count_value(table_summary.get("drop_count")),
+            "demoted_count": _count_value(table_summary.get("demoted_count")),
+            "render_tier_distribution": _as_dict(table_summary.get("render_tier_distribution")),
+            "reject_reason_distribution": _as_dict(table_summary.get("reject_reason_distribution")),
+            "missing_field_distribution": _as_dict(table_gap.get("missing_field_distribution")),
+            "table_follow_up_count": _count_value(table_gap.get("table_follow_up_count")),
+        },
+        "analysis": {
+            "final_analysis_source": analysis.get("final_analysis_source"),
+            "usable_claim_count": _count_value(
+                analysis.get("llm_usable_claim_count")
+                or analysis.get("usable_claim_count")
+                or analysis.get("output_claim_count")
+            ),
+            "failed_chapter_count": _count_value(analysis.get("llm_failed_chapter_count") or analysis.get("failed_chapter_count")),
+            "semantic_judge_counts": _as_dict(analysis.get("llm_semantic_judge_counts")),
+            "validation_issue_counts": _as_dict(analysis.get("llm_validation_issue_counts")),
+        },
+        "citation": {
+            "final_citation_reconciliation_status": citation.get("final_citation_reconciliation_status"),
+            "citation_rebind_required": bool(citation.get("citation_rebind_required")),
+            "citationless_factual_removed_count": citationless_removed_count,
+            "factual_body_without_citations_count": _count_value(citation.get("factual_body_without_citations_count")),
+            "final_unresolved_citation_removed_count": _count_value(citation.get("final_unresolved_citation_removed_count")),
+        },
     }
 
 
@@ -3490,6 +3644,14 @@ def build_writer_report(
     analysis_stage_diagnostics = _as_dict(structured_analysis.get("analysis_stage_diagnostics"))
     llm_analysis_synthesis = _as_dict(structured_analysis.get("llm_analysis_synthesis"))
     claim_binding_feedback_summary = _as_dict(structured_analysis.get("claim_binding_feedback_summary"))
+    stage_quality_card = _stage_quality_card(
+        chapter_evidence_packages=[item for item in list(chapter_evidence_packages or []) if isinstance(item, dict)],
+        table_quality_summary=table_quality_summary,
+        table_gap_summary=table_gap_summary,
+        analysis_stage_diagnostics=analysis_stage_diagnostics,
+        final_citation_audit=_as_dict(writer_output.get("final_citation_audit")),
+    )
+    debug_snapshot["stage_quality_card"] = stage_quality_card
     render_artifacts = {
         "payload_mode": "full",
         "structured_analysis": structured_analysis,
@@ -3519,6 +3681,7 @@ def build_writer_report(
         "analysis_transfer": _as_dict(writer_output.get("analysis_transfer")),
         "ref_lineage_diagnostics": _as_dict(writer_output.get("ref_lineage_diagnostics")),
         "chapter_narrative": chapter_narrative_diagnostics,
+        "stage_quality_card": stage_quality_card,
     }
     return {
         **writer_output,
@@ -3560,6 +3723,7 @@ def build_writer_report(
         "table_quality_summary": table_quality_summary,
         "table_placement_summary": table_placement_summary,
         "table_gap_summary": table_gap_summary,
+        "stage_quality_card": stage_quality_card,
         "evidence_health_summary": evidence_health_summary,
         "research_reflection_memo": research_reflection_memo,
         "evidence_analysis_summary": evidence_analysis_summary,
@@ -3609,6 +3773,7 @@ def build_writer_report(
             "analysis_stage_diagnostics": analysis_stage_diagnostics,
             "claim_binding_feedback_summary": claim_binding_feedback_summary,
             "chapter_narrative": chapter_narrative_diagnostics,
+            "stage_quality_card": stage_quality_card,
         },
     }
 

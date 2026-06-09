@@ -70,6 +70,39 @@ def test_search_task_carries_requirement_contract_fields():
     assert task["claim_strength_ceiling"] == "directional"
 
 
+def test_search_task_query_uses_required_fields_and_source_contract_terms():
+    chapter = {
+        "chapter_id": "ch_01",
+        "chapter_title": "AI Agent enterprise deployment demand",
+        "core_question": "Is enterprise AI Agent deployment demand real?",
+        "required_evidence_mix": ["official_data", "market_research"],
+    }
+    goal = {
+        "goal_id": "H1_metric",
+        "requirement_id": "H1_metric",
+        "question": "Find 2025 enterprise AI Agent adoption metrics with value, unit, period, and source.",
+        "proof_role": "metric",
+        "required_fields": ["metric", "value", "unit", "period", "source_ref"],
+        "lane_targets": ["official_data", "market_research"],
+    }
+    research_plan = {
+        "query": "AI Agent enterprise deployment market report",
+        "research_object": "AI Agent enterprise deployment",
+        "global_required_terms": ["enterprise AI Agent"],
+        "report_family": "industry_deep_report",
+    }
+
+    task = build_search_tasks_for_goal(chapter=chapter, goal=goal, research_plan=research_plan)[0]
+
+    query = task["query"].lower()
+    contract = task["query_contract"]
+    assert "ai agent" in query
+    assert any(term in query for term in ["metric", "value", "unit", "period", "source"])
+    assert any(term in query for term in ["official", "report", "research"])
+    assert contract["requirement_id"] == "H1_metric"
+    assert contract["required_fields"] == ["metric", "value", "unit", "period", "source_ref"]
+
+
 def test_generated_evidence_goals_default_requirement_id_to_goal_id():
     from rag_pipeline.agents.brain_agent import build_evidence_goals_for_chapter
 

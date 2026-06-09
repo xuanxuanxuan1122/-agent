@@ -400,6 +400,7 @@ def normalize_search_task(raw: Dict[str, Any], *, fallback_index: int = 1) -> Di
         "chapter_title": chapter_title,
         "chapter_question": chapter_question,
         "query": query,
+        "query_contract": _as_dict(task.get("query_contract")),
         "evidence_goal": evidence_goal,
         "targets_gap": str(task.get("targets_gap") or evidence_goal).strip(),
         "evidence_goal_id": str(task.get("evidence_goal_id") or task.get("goal_id") or "").strip(),

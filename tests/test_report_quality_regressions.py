@@ -61,7 +61,11 @@ from rag_pipeline.agents.problem_framing_agent import run_problem_framing_agent
 from rag_pipeline.agents.research_proof_registry import mandatory_proof_checks, select_research_proof_profile
 from rag_pipeline.agents.table_agent import _row_for_item, _row_has_valid_leading_cell, _subject, run_table_agent
 from rag_pipeline.agents.public_report_sanitizer import sanitize_public_markdown
-from rag_pipeline.agents.writer_agent_clean import _normalize_public_packages_for_contract, _qa_has_pending_repair, _writer_ready_for_final
+from rag_pipeline.agents.writer_agent_clean import (
+    _normalize_public_packages_for_contract,
+    _qa_has_pending_repair,
+    _writer_ready_for_final,
+)
 from rag_pipeline.contracts.evidence_quality import apply_evidence_quality_contract
 from rag_pipeline.contracts.quality_gate import build_quality_gate_state
 from rag_pipeline.contracts.query_builder import build_query_package

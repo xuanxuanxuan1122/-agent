@@ -118,3 +118,77 @@ def test_chapter_evidence_rejects_offtopic_source_check_even_with_chapter_id():
     assert package["hydrated_evidence"] is False
     assert package["metadata"]["chapter_relevance_rejected_count"] == 1
     assert package["metadata"]["chapter_relevance_rejected_refs"] == ["E1"]
+
+
+def test_chapter_evidence_exports_binding_funnel_for_loss_diagnostics():
+    source_registry = [
+        {
+            "ref": "S1",
+            "url": "https://research.example/agent-demand",
+            "title": "Agent demand report",
+            "source_level": "B",
+            "traceability_status": "traceable",
+        },
+        {
+            "ref": "S2",
+            "url": "https://research.example/offtopic",
+            "title": "Agent publication channel",
+            "source_level": "B",
+            "traceability_status": "traceable",
+        },
+    ]
+    evidence_package = {
+        "analysis_ready_evidence": [
+            {
+                "ref": "E1",
+                "source_ref": "S1",
+                "source_level": "B",
+                "url": "https://research.example/agent-demand",
+                "fact": "Enterprise AI Agent deployment cases indicate workflow automation demand.",
+                "chapter_id": "ch_01",
+                "proof_role": "case",
+                "allowed_use": "directional_signal",
+            },
+            {
+                "ref": "E2",
+                "source_ref": "S2",
+                "source_level": "B",
+                "url": "https://research.example/offtopic",
+                "fact": "The statistics office publishes AI Agent statistics through its website and yearbook.",
+                "chapter_id": "ch_01",
+                "proof_role": "source_check",
+                "allowed_use": "supporting",
+            },
+        ],
+        "evidence_analysis_by_chapter": {
+            "ch_01": {"sample_evidence_refs": ["E1", "missing-ref"]},
+        },
+        "source_registry": source_registry,
+    }
+    report_blueprint = {
+        "chapters": [
+            {
+                "chapter_id": "ch_01",
+                "chapter_title": "Enterprise AI Agent deployment demand",
+                "chapter_question": "Which customer cases indicate AI Agent demand?",
+            }
+        ]
+    }
+
+    packages = build_chapter_evidence_packages_from_evidence_package(
+        report_blueprint=report_blueprint,
+        evidence_package=evidence_package,
+        source_registry=source_registry,
+    )
+
+    package = packages[0]
+    funnel = package["evidence_binding_funnel"]
+    assert funnel["candidate_fact_count"] == 2
+    assert funnel["eligible_fact_count"] == 2
+    assert funnel["resolved_diagnostic_ref_count"] == 1
+    assert funnel["unresolved_ref_count"] == 1
+    assert funnel["matched_before_relevance_count"] >= 1
+    assert funnel["matched_after_relevance_count"] >= 1
+    assert funnel["hydrated_evidence_count"] == package["hydrated_evidence_count"]
+    assert funnel["layer_counts"]["case_evidence"] >= 1
+    assert package["metadata"]["evidence_binding_funnel"] == funnel

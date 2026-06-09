@@ -756,6 +756,37 @@ def test_llm_semantic_judge_uses_cache_and_temperature_zero(monkeypatch, tmp_pat
     assert second["llm_semantic_judge_usage"] == {}
 
 
+def test_llm_analysis_prompts_request_typed_claims_without_two_to_three_cap(monkeypatch):
+    chapter_prompt = analysis_agent._llm_chapter_system_prompt()
+    assert "4-6 claim_units" in chapter_prompt
+    assert "claim_type" in chapter_prompt
+    assert "contextual" in chapter_prompt
+    assert "boundary" in chapter_prompt
+    assert "2-3 claim_units" not in chapter_prompt
+
+    captured = {}
+
+    def fake_llm(*, config, system_prompt, user_payload):
+        captured["system_prompt"] = system_prompt
+        return {"payload": {"chapter_synthesis": [], "evidence_repair_priorities": []}, "usage": {}}
+
+    monkeypatch.setattr(analysis_agent, "call_openai_compatible_json", fake_llm)
+    monkeypatch.setattr(analysis_agent, "llm_config_is_ready", lambda cfg: True)
+    monkeypatch.setattr(analysis_agent, "normalize_llm_config", lambda cfg: {"model": "fake"})
+
+    analysis_agent.synthesize_with_llm_analysis(
+        evidence_package={"analysis_ready_evidence": [_evidence("EV-1")]},
+        fallback={},
+        llm_config={"provider": "fake", "model": "fake"},
+    )
+
+    global_prompt = captured["system_prompt"]
+    assert "4-6 claim_units" in global_prompt
+    assert "claim_type" in global_prompt
+    assert "contextual" in global_prompt
+    assert "2-3 claim_units" not in global_prompt
+
+
 def test_llm_claim_support_validator_unavailable_is_not_silent(monkeypatch):
     monkeypatch.setattr(analysis_agent, "validate_claim_supported_by_facts", None)
     evidence_package = {

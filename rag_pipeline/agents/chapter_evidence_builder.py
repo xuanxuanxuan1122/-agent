@@ -1233,8 +1233,8 @@ def build_chapter_evidence_packages_from_evidence_package(
             _with_binding(item, reason="existing_chapter_package", score=110, chapter_id=chapter_id)
             for item in _items_from_existing_chapter(chapter, chapter_id, source_lookup)
         ]
-        matched = _dedupe_items([*resolved, *existing_items, *[item for _, item in scored]])
-        matched, chapter_relevance_rejected = _filter_chapter_relevant_items(matched, terms)
+        matched_before_relevance = _dedupe_items([*resolved, *existing_items, *[item for _, item in scored]])
+        matched, chapter_relevance_rejected = _filter_chapter_relevant_items(matched_before_relevance, terms)
         layered = _layer_evidence(matched)
         chapter_analysis = _chapter_analysis_from_fact_cards(chapter, layered)
         hydrated_count = sum(len(layered.get(key, [])) for key in EVIDENCE_LAYER_KEYS)
@@ -1245,6 +1245,29 @@ def build_chapter_evidence_packages_from_evidence_package(
         for item in matched:
             reason = str(item.get("binding_reason") or "unknown")
             binding_reasons[reason] = binding_reasons.get(reason, 0) + 1
+        layer_counts = {
+            key: len(value)
+            for key, value in layered.items()
+            if isinstance(value, list)
+        }
+        binding_funnel = {
+            "schema_version": "chapter_evidence_binding_funnel_v1",
+            "candidate_fact_count": int(public_filter_summary.get("candidate_fact_count") or 0),
+            "eligible_fact_count": int(public_filter_summary.get("eligible_fact_count") or 0),
+            "filtered_fact_count": int(public_filter_summary.get("filtered_fact_count") or 0),
+            "resolved_diagnostic_ref_count": len(resolved),
+            "unresolved_ref_count": len(unresolved_refs),
+            "scored_match_count": len(scored),
+            "existing_chapter_evidence_count": len(existing_items),
+            "matched_before_relevance_count": len(matched_before_relevance),
+            "relevance_rejected_count": len(chapter_relevance_rejected),
+            "matched_after_relevance_count": len(matched),
+            "hydrated_evidence_count": hydrated_count,
+            "writable_fact_count": writable_fact_count,
+            "eligible_citation_count": eligible_citation_count,
+            "binding_reasons": binding_reasons,
+            "layer_counts": layer_counts,
+        }
         metadata = _as_dict(chapter.get("metadata"))
         metadata["chapter_evidence_rebuilt"] = True
         metadata["hydrated_evidence"] = bool(hydrated_count)
@@ -1275,11 +1298,8 @@ def build_chapter_evidence_packages_from_evidence_package(
         }
         metadata["binding_reasons"] = binding_reasons
         metadata["unresolved_evidence_refs"] = unresolved_refs
-        metadata["evidence_binding_counts"] = {
-            key: len(value)
-            for key, value in layered.items()
-            if isinstance(value, list)
-        }
+        metadata["evidence_binding_counts"] = layer_counts
+        metadata["evidence_binding_funnel"] = binding_funnel
         chapter.update(layered)
         chapter.update(
             {
@@ -1298,6 +1318,7 @@ def build_chapter_evidence_packages_from_evidence_package(
                 "case_evidence_count": len(layered["case_evidence"]),
                 "directional_evidence_count": len(layered["directional_evidence"]),
                 "unresolved_evidence_ref_count": len(unresolved_refs),
+                "evidence_binding_funnel": binding_funnel,
                 "public_fact_filter_summary": chapter_public_filter_summary,
                 "global_public_fact_filter_summary": public_filter_summary,
                 "writable_fact_count": writable_fact_count,

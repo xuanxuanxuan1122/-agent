@@ -1066,6 +1066,82 @@ def _required_fields_for_proof_role(proof_role: Any) -> List[str]:
     return list(_SEARCH_REQUIRED_FIELDS_BY_ROLE.get(role) or _SEARCH_REQUIRED_FIELDS_BY_ROLE["support"])
 
 
+_SEARCH_FIELD_QUERY_TERMS: Dict[str, str] = {
+    "metric": "metric",
+    "value": "value",
+    "unit": "unit",
+    "period": "period",
+    "scope": "scope",
+    "source": "source",
+    "source_ref": "source",
+    "source_url": "source",
+    "source_title": "source",
+    "company": "company",
+    "use_case": "use case",
+    "deployment_scope": "deployment",
+    "counter_signal": "risk",
+    "filing_type": "filing",
+}
+
+
+_SEARCH_LANE_QUERY_TERMS: Dict[str, str] = {
+    "official_data": "official",
+    "market_research": "research report",
+    "customer_case": "customer case",
+    "counter_evidence": "risk",
+    "filing_company": "filing",
+    "filing": "filing",
+    "association": "association",
+    "technology_product": "product",
+    "technical_standard": "standard",
+}
+
+
+def _search_query_contract_terms(
+    *,
+    proof_role: str,
+    required_fields: Sequence[Any],
+    lane_targets: Sequence[Any],
+    source_priority: Sequence[Any],
+    max_terms: int = 7,
+) -> Dict[str, Any]:
+    field_terms: List[str] = []
+    source_terms: List[str] = []
+
+    role_terms = {
+        "metric": ["metric"],
+        "source_check": ["source"],
+        "counter": ["risk"],
+        "case": ["customer case"],
+        "filing": ["filing"],
+        "technology_product": ["product"],
+        "support": ["evidence"],
+    }.get(proof_role, ["evidence"])
+
+    for field in required_fields:
+        term = _SEARCH_FIELD_QUERY_TERMS.get(str(field or "").strip().lower())
+        if term:
+            _append_unique_text(field_terms, term, max_items=5)
+
+    for lane in list(lane_targets or []) + list(source_priority or []):
+        term = _SEARCH_LANE_QUERY_TERMS.get(str(lane or "").strip().lower())
+        if term:
+            _append_unique_text(source_terms, term, max_items=4)
+
+    query_terms: List[str] = []
+    for term in [*role_terms, *field_terms, *source_terms]:
+        _append_unique_text(query_terms, term, max_items=max_terms)
+
+    return {
+        "schema_version": "search_query_contract_v2",
+        "proof_role": proof_role,
+        "required_fields": [str(item) for item in required_fields if str(item or "").strip()],
+        "field_query_terms": field_terms,
+        "source_query_terms": source_terms,
+        "query_terms": query_terms,
+    }
+
+
 def _claim_strength_ceiling_for_goal(goal: Dict[str, Any], proof_role: str) -> str:
     explicit = str(goal.get("claim_strength_ceiling") or goal.get("claim_strength") or "").strip().lower()
     if explicit:
@@ -1221,8 +1297,15 @@ def build_search_tasks_for_goal(
         "technology_product": "技术 产品 专利 标准",
     }[proof_role]
     topic_terms = _topic_seed_terms(query, chapter, goal)[:3]
-    query_focus = _compact_iqs_terms(terms, max_terms=1, max_chars=10)
-    base_query = _compose_iqs_query([topic_terms, query_focus, query_hint])
+    required_fields = _as_list(goal.get("required_fields")) or _required_fields_for_proof_role(proof_role)
+    query_contract = _search_query_contract_terms(
+        proof_role=proof_role,
+        required_fields=required_fields,
+        lane_targets=lanes,
+        source_priority=source_priority,
+    )
+    query_focus = _compact_iqs_terms([research_object, *global_required_terms, *terms], max_terms=2, max_chars=16)
+    base_query = _compose_iqs_query([topic_terms[:1], query_contract["query_terms"], query_focus, query_hint])
     task = {
         "task_id": f"{chapter_id}_{str(goal.get('goal_id') or proof_role).replace(' ', '_')}_{proof_role}",
         "agent": "iqs",
@@ -1243,8 +1326,14 @@ def build_search_tasks_for_goal(
         "required_evidence_mix": required_mix,
         "proof_role": proof_role,
         "requirement_id": _requirement_id_for_goal(goal),
-        "required_fields": _as_list(goal.get("required_fields")) or _required_fields_for_proof_role(proof_role),
+        "required_fields": required_fields,
         "claim_strength_ceiling": goal.get("claim_strength_ceiling") or _claim_strength_ceiling_for_goal(goal, proof_role),
+        "query_contract": {
+            **query_contract,
+            "requirement_id": _requirement_id_for_goal(goal),
+            "lane_targets": lanes,
+            "source_priority": source_priority,
+        },
         "counter_evidence": proof_role == "counter",
         "research_object": research_object,
         "global_required_terms": global_required_terms,

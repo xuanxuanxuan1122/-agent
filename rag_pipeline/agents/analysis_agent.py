@@ -2467,11 +2467,15 @@ Each claim_unit must include:
 - limitation_boundary: specific boundary conditions;
 - claim_strength: strong, moderate, directional, or limited_evidence;
 - claim_strength_ceiling: maximum claim strength allowed by the cited fact cards;
+- claim_type: core_claim, mechanism_claim, counter_boundary_claim, contextual_claim, decision_claim, directional_claim, metric_claim, case_claim, or technology_claim;
 - analysis_role: claimable, directional, contextual, counter, metric, case, or technology;
 - source_support_map: object mapping claim/mechanism/boundary to used evidence ids;
 - paragraph_seed: one concise paragraph seed for downstream composition;
 - block_affinity: metric_reconciliation, case_comparison, technology_maturity, risk_trigger, or integrated_signal.
 
+Produce 4-6 claim_units when the chapter has enough distinct evidence signals.
+Fewer claim_units are acceptable only when the input evidence genuinely supports fewer distinct judgments.
+Relevant but incomplete evidence must become a contextual_claim, counter_boundary_claim, or limited_evidence directional claim instead of disappearing.
 A/B verified evidence may support strong or moderate claims.
 B/C traceable or qualitative evidence may still support a directional or limited_evidence claim.
 claim_strength must never exceed claim_strength_ceiling.
@@ -2503,7 +2507,7 @@ def synthesize_chapter_with_llm_analysis(
     normalized_config = normalize_llm_config(config) if normalize_llm_config is not None else {}
     cache_input = {
         **user_payload,
-        "prompt_version": "llm_analysis_v2_2026_06_roles",
+        "prompt_version": "llm_analysis_v3_2026_06_typed_claims",
         "model": normalized_config.get("model", ""),
     }
     cache_path = _llm_analysis_cache_path(evidence_package, chapter_id, cache_input)
@@ -2694,14 +2698,16 @@ Return one JSON object with chapter_synthesis, cross_chapter_conflicts, evidence
 
 For each chapter_synthesis item:
 - include chapter_id and chapter_title when available;
-- include at most 2-3 claim_units;
-- every claim_unit must include claim, used_evidence_ids, evidence_basis, reasoning_chain, limitation_boundary, and claim_strength;
+- include 4-6 claim_units when there are enough distinct evidence signals; fewer is fine only when the cited evidence supports fewer distinct judgments;
+- every claim_unit must include claim, claim_type, used_evidence_ids, evidence_basis, reasoning_chain, limitation_boundary, and claim_strength;
 - used_evidence_ids must be exact evidence_id values from input fact_cards;
 - A/B readpage_verified or document_verified cards may support moderate/strong claims;
 - B/C or directional cards may only support directional/limited claims.
+- relevant but incomplete evidence should become a contextual, counter/boundary, or limited_evidence directional claim instead of being omitted.
+- each chapter should prefer a mix of core_claim, mechanism_claim, counter_boundary_claim, contextual_claim, decision_claim, directional_claim, metric_claim, case_claim, or technology_claim when the evidence supports those roles.
 
 Never output internal diagnostics as public claims. Forbidden claim language includes: 证据不足, 建议补证, 正文应以, 方向性观察, 后续验证, 可追溯来源继续校准.
-If a chapter lacks usable evidence, put the limitation in analysis_limits and do not create a claim_unit for that chapter.
+Only when a chapter has no relevant evidence at all should you put the limitation in analysis_limits without creating a claim_unit.
 Output public analysis in Chinese unless the evidence itself is English-only.
 """.strip()
     response = call_openai_compatible_json(
@@ -3271,6 +3277,24 @@ def validate_llm_analysis_output(
                     if strength_text in {"strong", "moderate"}
                     else ("contextual" if strength_text in {"contextual"} else "directional")
                 )
+            claim_type = str(unit.get("claim_type") or unit.get("conclusion_type") or "").strip().lower()
+            analysis_role = str(unit.get("analysis_role") or "").strip().lower()
+            if not claim_type:
+                if analysis_role == "counter":
+                    claim_type = "counter_boundary_claim"
+                elif analysis_role == "contextual":
+                    claim_type = "contextual_claim"
+                elif analysis_role == "metric":
+                    claim_type = "metric_claim"
+                elif analysis_role == "case":
+                    claim_type = "case_claim"
+                elif analysis_role == "technology":
+                    claim_type = "technology_claim"
+                elif strength_text in {"strong", "moderate"}:
+                    claim_type = "core_claim"
+                else:
+                    claim_type = "directional_claim"
+            unit["claim_type"] = claim_type
             block_affinity = unit.get("block_affinity")
             if isinstance(block_affinity, str) and block_affinity.strip():
                 unit["block_affinity"] = [block_affinity.strip()]
