@@ -5988,6 +5988,79 @@ def _attach_research_plan(evidence_package: Dict[str, Any], structured_analysis:
     structured_analysis["research_plan"] = research_plan
 
 
+def _sync_analysis_repair_priorities_to_evidence_package(
+    evidence_package: Dict[str, Any],
+    structured_analysis: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Expose analysis-generated repair gaps where repair loops already read.
+
+    Analysis validators can create claim repair priorities after the evidence
+    package has been built. Post-QA repair and evidence preflight primarily read
+    ``evidence_package.evidence_gap_ledger``, so mirror these analysis gaps back
+    into the package before writer/repair stages run.
+    """
+
+    package = _as_dict(evidence_package)
+    analysis = _as_dict(structured_analysis)
+    existing_ledger = [item for item in _as_list(package.get("evidence_gap_ledger")) if isinstance(item, dict)]
+    existing_repair = [item for item in _as_list(package.get("evidence_repair_priorities")) if isinstance(item, dict)]
+    seen = {
+        str(item.get("gap_id") or item.get("id") or item.get("claim_id") or "").strip()
+        for item in [*existing_ledger, *existing_repair]
+        if str(item.get("gap_id") or item.get("id") or item.get("claim_id") or "").strip()
+    }
+    added = 0
+
+    candidates: List[Dict[str, Any]] = []
+    for item in [
+        *_as_list(analysis.get("evidence_repair_priorities")),
+        *_as_list(analysis.get("claim_repair_priorities")),
+        *_as_list(analysis.get("evidence_gap_ledger")),
+        *_as_list(_as_dict(analysis.get("llm_analysis_synthesis")).get("evidence_repair_priorities")),
+        *_as_list(_as_dict(_as_dict(analysis.get("llm_analysis_synthesis")).get("validation")).get("claim_repair_priorities")),
+    ]:
+        if isinstance(item, dict):
+            candidates.append(item)
+
+    for candidate in candidates:
+        gap_key = str(candidate.get("gap_id") or candidate.get("id") or candidate.get("claim_id") or "").strip()
+        if gap_key and gap_key in seen:
+            continue
+        copied = dict(candidate)
+        copied.setdefault("repair_route", "evidence_search")
+        copied.setdefault("source_stage", copied.get("source_stage") or "analysis_claim_support")
+        copied.setdefault("status", "open")
+        copied.setdefault("allowed_for_writing", False)
+        copied.setdefault("source", "structured_analysis_repair_priority")
+        if not str(copied.get("gap_id") or "").strip():
+            copied["gap_id"] = _stable_short_hash(
+                "analysis_repair_gap",
+                copied.get("claim_id"),
+                copied.get("gap_type"),
+                copied.get("type"),
+            )
+            gap_key = str(copied["gap_id"])
+        existing_ledger.append(copied)
+        if str(copied.get("schema_version") or "") == "claim_support_repair_priority_v1":
+            existing_repair.append(copied)
+        seen.add(str(gap_key or copied.get("gap_id") or copied.get("claim_id") or ""))
+        added += 1
+
+    if added:
+        package["evidence_gap_ledger"] = existing_ledger
+        package["evidence_repair_priorities"] = existing_repair
+        package.setdefault("metadata", {})["analysis_repair_sync"] = {
+            "added_gap_count": added,
+            "evidence_gap_ledger_count": len(existing_ledger),
+            "evidence_repair_priority_count": len(existing_repair),
+        }
+    return {
+        "added_gap_count": added,
+        "evidence_gap_ledger_count": len(existing_ledger),
+        "evidence_repair_priority_count": len(existing_repair),
+    }
+
+
 def _lane_coverage_from_state(state: BrainAgentState) -> Dict[str, Any]:
     coverage: Dict[str, Any] = {}
     query_analysis = _as_dict(state.get("query_analysis"))
@@ -9707,6 +9780,7 @@ def _run_post_qa_repair_round(
         current_structured_analysis = _as_dict(current_analysis_state.get("structured_analysis"))
         _attach_report_plan(current_evidence_package, current_structured_analysis, report_plan)
         _attach_research_plan(current_evidence_package, current_structured_analysis, _research_plan_from_state(state))
+        _sync_analysis_repair_priorities_to_evidence_package(current_evidence_package, current_structured_analysis)
         trace["evidence_pool_size_after"] = len(current_evidence_pool)
         trace["evidence_delta_summary"] = _evidence_delta_summary(before_package, current_evidence_package)
 
@@ -9946,6 +10020,7 @@ def run_writer_with_layout_refinement(
         current_structured_analysis = _as_dict(current_analysis_state.get("structured_analysis"))
         _attach_report_plan(current_evidence_package, current_structured_analysis, report_plan)
         _attach_research_plan(current_evidence_package, current_structured_analysis, _research_plan_from_state(state))
+        _sync_analysis_repair_priorities_to_evidence_package(current_evidence_package, current_structured_analysis)
     current_writer_state = run_writer_agent(
         query=query,
         child_outputs=children,
@@ -10160,6 +10235,7 @@ def run_writer_with_layout_refinement(
         current_structured_analysis = _as_dict(current_analysis_state.get("structured_analysis"))
         _attach_report_plan(current_evidence_package, current_structured_analysis, report_plan)
         _attach_research_plan(current_evidence_package, current_structured_analysis, _research_plan_from_state(state))
+        _sync_analysis_repair_priorities_to_evidence_package(current_evidence_package, current_structured_analysis)
         current_writer_state = run_writer_agent(
             query=query,
             child_outputs=children,
@@ -12315,6 +12391,7 @@ def merge_outputs_node(state: BrainAgentState) -> BrainAgentState:
         if report_plan:
             structured_analysis["report_plan"] = report_plan
         _attach_research_plan(evidence_package, structured_analysis, research_plan)
+        _sync_analysis_repair_priorities_to_evidence_package(evidence_package, structured_analysis)
         _emit_pre_writer_snapshots(state, evidence_package, structured_analysis)
         topic_bundle_store = _store_topic_bundle_from_brain(
             state=state,
@@ -12519,6 +12596,7 @@ def merge_outputs_node(state: BrainAgentState) -> BrainAgentState:
     if report_plan:
         structured_analysis["report_plan"] = report_plan
     _attach_research_plan(evidence_package, structured_analysis, research_plan)
+    _sync_analysis_repair_priorities_to_evidence_package(evidence_package, structured_analysis)
     _emit_pre_writer_snapshots(state, evidence_package, structured_analysis)
     if _deadline_exceeded(state, min_remaining=1.0):
         timeout_payload = _deadline_timeout_payload(state, stage="merge_outputs_pre_writer")

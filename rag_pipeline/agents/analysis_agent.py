@@ -2730,11 +2730,13 @@ NON_DROPPING_CLAIM_ISSUES = {
     "llm_claim_semantic_judge_partial_downgraded",
     "llm_claim_semantic_judge_adjacent_downgraded",
     "llm_claim_semantic_judge_error",
+    "llm_claim_semantic_judge_unsupported",
     "llm_numeric_claim_incomplete_metric_fact",
 }
 
 REPAIRABLE_CLAIM_ISSUES = {
     "claim_support_needs_repair",
+    "llm_claim_semantic_judge_unsupported",
 }
 
 

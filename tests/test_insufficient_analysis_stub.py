@@ -6,6 +6,7 @@ from rag_pipeline.flows.report.full_report import (
     _build_insufficient_stub_markdown,
     _insufficient_analysis_delivery_action,
     _insufficient_analysis_signal,
+    _sync_analysis_repair_priorities_to_evidence_package,
 )
 
 _TEMPLATE_FINGERPRINT = "是把事实转成判断的核心连接点"
@@ -91,6 +92,26 @@ def test_zero_usable_claims_still_uses_stub_for_empty_or_tiny_report():
 
     assert action["mode"] == "insufficient_analysis_stub"
     assert action["replace_with_stub"] is True
+
+
+def test_full_report_syncs_analysis_repair_priorities_to_evidence_package():
+    evidence_package = {"evidence_gap_ledger": []}
+    structured_analysis = {
+        "evidence_repair_priorities": [
+            {
+                "schema_version": "claim_support_repair_priority_v1",
+                "gap_id": "gap-direct",
+                "claim_id": "claim-direct",
+                "gap_type": "claim_semantic_support_mismatch",
+            }
+        ]
+    }
+
+    summary = _sync_analysis_repair_priorities_to_evidence_package(evidence_package, structured_analysis)
+
+    assert summary["added_gap_count"] == 1
+    assert evidence_package["evidence_gap_ledger"][0]["gap_id"] == "gap-direct"
+    assert evidence_package["evidence_gap_ledger"][0]["allowed_for_writing"] is False
 
 
 def test_missing_diagnostics_never_false_triggers_stub():

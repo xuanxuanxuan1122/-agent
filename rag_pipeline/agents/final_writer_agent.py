@@ -82,6 +82,14 @@ PUBLIC_SECTION_KEYS = {
 }
 CITATION_RE = re.compile(r"\[\d{1,5}\]")
 
+
+def _env_int(name: str, default: int, *, min_value: int = 0, max_value: int = 100_000) -> int:
+    try:
+        value = int(os.getenv(name, str(default)) or default)
+    except (TypeError, ValueError):
+        value = default
+    return max(min_value, min(max_value, value))
+
 SUMMARY_BLOCKS = {
     "executive_summary",
     "key_judgments",
@@ -1199,6 +1207,18 @@ def finalize_markdown_citations(
     missing_appendix_refs = [ref for ref in final_body_refs if ref not in set(final_appendix_refs)]
     citationless_examples = _citationless_factual_segments(rewritten_body)
     reconciliation_status = "blocked" if (missing_appendix_refs or citationless_examples) else "ok"
+    citationless_removed_count = (
+        int(bullet_drop_diagnostics.get("citationless_factual_bullet_removed_count") or 0)
+        + int(short_line_drop_diagnostics.get("citationless_short_factual_line_removed_count") or 0)
+        + int(sentence_drop_diagnostics.get("citationless_factual_sentence_removed_count") or 0)
+    )
+    rebind_threshold = _env_int(
+        "REPORT_FINAL_CITATION_REBIND_REMOVAL_THRESHOLD",
+        5,
+        min_value=0,
+        max_value=1000,
+    )
+    citation_rebind_required = bool(citationless_removed_count > rebind_threshold)
     diagnostics = {
         "final_citation_reconciliation_status": reconciliation_status,
         "final_body_citation_refs": final_body_refs,
@@ -1210,6 +1230,12 @@ def finalize_markdown_citations(
         **bullet_drop_diagnostics,
         **short_line_drop_diagnostics,
         **sentence_drop_diagnostics,
+        "citationless_factual_removed_count": citationless_removed_count,
+        "citation_rebind_required": citation_rebind_required,
+        "citation_rebind_reason": (
+            "citationless_factual_removal_exceeded_threshold" if citation_rebind_required else ""
+        ),
+        "clean_report_eligible": not citation_rebind_required and reconciliation_status == "ok",
         "factual_body_without_citations_count": len(citationless_examples),
         "citationless_fact_examples": citationless_examples,
     }

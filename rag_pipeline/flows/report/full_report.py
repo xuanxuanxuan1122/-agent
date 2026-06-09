@@ -62,6 +62,71 @@ def as_list(value: Any) -> List[Any]:
     return list(value) if isinstance(value, list) else []
 
 
+def _repair_gap_key(item: Dict[str, Any]) -> str:
+    return str(item.get("gap_id") or item.get("id") or item.get("claim_id") or "").strip()
+
+
+def _sync_analysis_repair_priorities_to_evidence_package(
+    evidence_package: Dict[str, Any],
+    structured_analysis: Dict[str, Any],
+) -> Dict[str, Any]:
+    package = as_dict(evidence_package)
+    analysis = as_dict(structured_analysis)
+    existing_ledger = [item for item in as_list(package.get("evidence_gap_ledger")) if isinstance(item, dict)]
+    existing_repair = [item for item in as_list(package.get("evidence_repair_priorities")) if isinstance(item, dict)]
+    seen = {_repair_gap_key(item) for item in [*existing_ledger, *existing_repair] if _repair_gap_key(item)}
+    candidates = [
+        *[item for item in as_list(analysis.get("evidence_repair_priorities")) if isinstance(item, dict)],
+        *[item for item in as_list(analysis.get("claim_repair_priorities")) if isinstance(item, dict)],
+        *[item for item in as_list(analysis.get("evidence_gap_ledger")) if isinstance(item, dict)],
+        *[
+            item
+            for item in as_list(as_dict(analysis.get("llm_analysis_synthesis")).get("evidence_repair_priorities"))
+            if isinstance(item, dict)
+        ],
+        *[
+            item
+            for item in as_list(
+                as_dict(as_dict(analysis.get("llm_analysis_synthesis")).get("validation")).get("claim_repair_priorities")
+            )
+            if isinstance(item, dict)
+        ],
+    ]
+    added = 0
+    for candidate in candidates:
+        key = _repair_gap_key(candidate)
+        if key and key in seen:
+            continue
+        copied = dict(candidate)
+        copied.setdefault("repair_route", "evidence_search")
+        copied.setdefault("source_stage", copied.get("source_stage") or "analysis_claim_support")
+        copied.setdefault("status", "open")
+        copied.setdefault("allowed_for_writing", False)
+        copied.setdefault("source", "structured_analysis_repair_priority")
+        if not str(copied.get("gap_id") or "").strip():
+            copied["gap_id"] = safe_filename(f"analysis_repair_{copied.get('claim_id') or copied.get('gap_type') or added}", max_chars=64)
+            key = str(copied["gap_id"])
+        existing_ledger.append(copied)
+        if str(copied.get("schema_version") or "") == "claim_support_repair_priority_v1":
+            existing_repair.append(copied)
+        if key:
+            seen.add(key)
+        added += 1
+    if added:
+        package["evidence_gap_ledger"] = existing_ledger
+        package["evidence_repair_priorities"] = existing_repair
+        package.setdefault("metadata", {})["analysis_repair_sync"] = {
+            "added_gap_count": added,
+            "evidence_gap_ledger_count": len(existing_ledger),
+            "evidence_repair_priority_count": len(existing_repair),
+        }
+    return {
+        "added_gap_count": added,
+        "evidence_gap_ledger_count": len(existing_ledger),
+        "evidence_repair_priority_count": len(existing_repair),
+    }
+
+
 REPAIR_TRACE_KEYS = (
     "evidence_preflight_trace",
     "layout_refinement_trace",
@@ -4035,6 +4100,7 @@ def _run_topic_bundle_cached_flow(query: str, cache_context: Dict[str, Any]) -> 
         structured_analysis = as_dict(analysis_state.get("structured_analysis"))
     else:
         analysis_state = {"structured_analysis": structured_analysis, "errors": [], "metadata": {"source": "topic_bundle_cache"}}
+    _sync_analysis_repair_priorities_to_evidence_package(evidence_package, structured_analysis)
 
     micro_layouts = as_list(inputs.get("micro_layouts"))
     table_packages = as_list(inputs.get("table_packages"))
@@ -4251,6 +4317,7 @@ def _run_fail_open_rebuild_from_package(
         else:
             os.environ["BRAIN_ENABLE_LLM_EVIDENCE_ANALYSIS"] = previous_analysis_llm_flag
     structured_analysis = as_dict(analysis_state.get("structured_analysis"))
+    _sync_analysis_repair_priorities_to_evidence_package(evidence_package, structured_analysis)
     micro_layouts = as_list(render_artifacts.get("micro_layouts")) or run_micro_layout_agent(
         report_blueprint=report_blueprint,
         chapter_evidence_packages=chapter_evidence_packages,

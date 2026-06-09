@@ -65,6 +65,12 @@ def test_factual_detector_does_not_block_opportunity_framing_line():
     assert text_has_factual_claim(factual) is True
 
 
+def test_factual_detector_does_not_treat_enterprise_or_institution_as_fact_alone():
+    assert text_has_factual_claim("\u4f01\u4e1a\u843d\u5730\u7684\u6838\u5fc3\u95ee\u9898\u5728\u4e8e\u6d41\u7a0b\u6539\u9020\u3002") is False
+    assert text_has_factual_claim("\u673a\u6784\u5ba2\u6237\u66f4\u5173\u6ce8\u79c1\u6709\u5316\u90e8\u7f72\u3002") is False
+    assert text_has_factual_claim("\u4f01\u4e1a2025\u5e74\u8425\u6536\u589e\u957f\u3002") is True
+
+
 def test_public_fact_card_v2_rejects_isolated_metric_and_navigation_text():
     isolated_metric = {
         "evidence_id": "EV-METRIC",
@@ -504,10 +510,16 @@ def test_llm_semantic_judge_rejects_semantically_unsupported_claim(monkeypatch):
 
     assert calls and calls[0]["claim_id"] == "semantic-mismatch"
     assert validation["usable_claim_count"] == 0
+    assert validation["dropped_claim_count"] == 0
+    assert validation["deferred_claim_count"] == 1
     assert validation["llm_validation_issue_counts"]["llm_claim_semantic_judge_unsupported"] == 1
     assert validation["llm_semantic_judge_counts"]["attempted"] == 1
     assert validation["llm_semantic_judge_counts"]["unsupported"] == 1
     assert validation["llm_rejected_claim_examples"][0]["semantic_judge"]["status"] == "unsupported"
+    assert validation["correctness_filter_summary"]["drop_issue_counts"] == {}
+    assert validation["correctness_filter_summary"]["deferred_issue_counts"] == {
+        "llm_claim_semantic_judge_unsupported": 1
+    }
 
 
 def test_llm_semantic_judge_partial_downgrades_claim(monkeypatch):

@@ -3,6 +3,47 @@ from __future__ import annotations
 from rag_pipeline.agents import brain_agent as brain_agent_module
 
 
+def test_analysis_repair_priorities_sync_back_to_evidence_package():
+    evidence_package = {
+        "evidence_gap_ledger": [
+            {"gap_id": "existing-gap", "gap_type": "counter_evidence_missing"}
+        ]
+    }
+    structured_analysis = {
+        "evidence_repair_priorities": [
+            {
+                "schema_version": "claim_support_repair_priority_v1",
+                "gap_id": "semantic-gap",
+                "claim_id": "claim-1",
+                "gap_type": "claim_semantic_support_mismatch",
+                "required_fields": ["source"],
+                "source_stage": "semantic_claim_support_judge",
+            }
+        ],
+        "evidence_gap_ledger": [
+            {
+                "gap_id": "binding-gap",
+                "claim_id": "claim-2",
+                "gap_type": "claim_support_entity_or_metric_mismatch",
+                "required_fields": ["metric", "value", "source"],
+            }
+        ],
+    }
+
+    summary = brain_agent_module._sync_analysis_repair_priorities_to_evidence_package(
+        evidence_package,
+        structured_analysis,
+    )
+
+    gap_ids = {item["gap_id"] for item in evidence_package["evidence_gap_ledger"]}
+    assert {"existing-gap", "semantic-gap", "binding-gap"} <= gap_ids
+    assert summary["added_gap_count"] == 2
+    semantic_gap = next(item for item in evidence_package["evidence_gap_ledger"] if item["gap_id"] == "semantic-gap")
+    assert semantic_gap["repair_route"] == "evidence_search"
+    assert semantic_gap["allowed_for_writing"] is False
+    assert evidence_package["evidence_repair_priorities"][0]["gap_id"] == "semantic-gap"
+
+
 def test_repair_context_seeds_become_sanitized_followup_tasks():
     view = {
         "status": "ready",

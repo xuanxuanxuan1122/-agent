@@ -209,7 +209,8 @@ FACTUAL_CLAIM_RE = re.compile(
     r"CAGR|market\s+size|forecast|revenue|funding|"
     r"市场规模|融资|收入|营收|预测|白皮书|报告|发布|财报|公告|政策|补贴|"
     r"OpenAI|Microsoft|Google|Salesforce|AWS|Anthropic|Gartner|IDC|"
-    r"阿里|百度|腾讯|华为|字节|九科信息|机构|企业"
+    r"阿里|百度|腾讯|华为|字节|九科信息|"
+    r"(?:机构|企业).{0,20}(?:发布|融资|收入|营收|财报|公告|政策|补贴|采购|中标|报告|白皮书)"
     r")",
     re.I,
 )
