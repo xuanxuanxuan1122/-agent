@@ -2725,7 +2725,11 @@ def _refs_from_llm_chapter(chapter: Dict[str, Any], valid_refs: set[str]) -> Lis
 
 NON_DROPPING_CLAIM_ISSUES = {
     "claim_support_needs_repair",
+    "claim_support_anchor_mismatch_downgraded",
     "decision_claim_downgraded_no_valid_ref",
+    "llm_claim_semantic_judge_partial_downgraded",
+    "llm_claim_semantic_judge_adjacent_downgraded",
+    "llm_claim_semantic_judge_error",
     "llm_numeric_claim_incomplete_metric_fact",
 }
 
@@ -2876,12 +2880,35 @@ def _claim_support_repair_priority(
     }
 
 
+def _downgrade_claim_unit_to_directional(
+    unit: Dict[str, Any],
+    *,
+    status: str,
+    boundary_note: str,
+) -> None:
+    unit["claim_status"] = "directional"
+    unit["claim_strength"] = "directional"
+    unit["claim_strength_ceiling"] = "directional"
+    unit["analysis_role"] = "directional"
+    unit["evidence_use_level"] = "directional_signal"
+    unit["writing_permission"] = "cautious_with_boundary"
+    if status:
+        unit["claim_support_status"] = status
+    limitation_boundary = _as_list(unit.get("limitation_boundary"))
+    if boundary_note:
+        limitation_boundary = _dedupe([*limitation_boundary, boundary_note])
+        unit["limitation_boundary"] = limitation_boundary
+        unit["counter_boundary"] = "\n".join(str(item) for item in limitation_boundary if str(item or "").strip())
+
+
 def _semantic_judge_status(value: Any) -> str:
     text = str(value or "").strip().lower()
     if text in {"yes", "true", "supported", "support", "pass", "passed"}:
         return "supported"
     if text in {"partial", "partially_supported", "partially supported"}:
         return "partial"
+    if text in {"adjacent", "related", "background", "context", "contextual"}:
+        return "adjacent"
     if text in {"no", "false", "unsupported", "not_supported", "fail", "failed"}:
         return "unsupported"
     return text or "unknown"
@@ -2901,10 +2928,10 @@ def _semantic_judge_enabled(llm_config: Optional[Dict[str, Any]]) -> bool:
 
 
 def _semantic_judge_fail_closed() -> bool:
-    return _env_flag("BRAIN_LLM_SEMANTIC_JUDGE_FAIL_CLOSED", True)
+    return _env_flag("BRAIN_LLM_SEMANTIC_JUDGE_FAIL_CLOSED", False)
 
 
-SEMANTIC_JUDGE_PROMPT_VERSION = "semantic_claim_support_judge_v1_2026_06_strict"
+SEMANTIC_JUDGE_PROMPT_VERSION = "semantic_claim_support_judge_v2_2026_06_tiered"
 
 
 def _semantic_judge_fact_payload(cards: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -2947,8 +2974,11 @@ Rules:
 - Use only the provided fact cards; never use outside knowledge.
 - A source merely mentioning the same topic is not support.
 - Numbers, dates, companies, scope, causality, competitive claims, and risk claims must be directly grounded in the cited facts.
-- Return unsupported when support is only partial, adjacent, speculative, or too generic.
-- Output one JSON object only: {"status":"supported|unsupported","reason":"...","confidence":0.0-1.0,"unsupported_terms":[]}.
+- Return supported when the facts directly support the full claim.
+- Return partial when the facts support the direction but not the full strength, scope, or completeness of the claim.
+- Return adjacent when the facts are useful background but not direct support for the claim.
+- Return unsupported when the facts contradict the claim, miss key numbers/entities/dates, or are too generic to use.
+- Output one JSON object only: {"status":"supported|partial|adjacent|unsupported","reason":"...","confidence":0.0-1.0,"unsupported_terms":[]}.
 """.strip()
 
 
@@ -3024,7 +3054,7 @@ def _llm_semantic_claim_support_judge(
                 "claim_id": str(claim_id or ""),
                 "claim": claim_text,
                 "cited_fact_cards": _semantic_judge_fact_payload(cited_cards),
-                "instruction": "Return supported only if the cited facts directly support the full claim.",
+                "instruction": "Classify support as supported, partial, adjacent, or unsupported. Do not collapse partial or adjacent support into unsupported.",
             },
         )
     except Exception as exc:
@@ -3279,29 +3309,50 @@ def validate_llm_analysis_output(
                         cited_cards=cited_cards,
                         support_payload=support_payload,
                     )
-                    issue = {
-                        "type": "claim_support_needs_repair",
-                        "chapter_id": chapter.get("chapter_id"),
-                        "claim_id": unit.get("claim_id"),
-                        "evidence_refs": refs,
-                        "gap_type": repair_priority.get("gap_type"),
-                        "writing_permission": "not_allowed_until_repaired",
-                        **support_payload,
-                    }
-                    issues.append(issue)
-                    claim_repair_priorities.append(repair_priority)
-                    if len(deferred_examples) < 8:
-                        deferred_examples.append(
-                            {
-                                **issue,
-                                "claim": claim_text,
-                                "repair_priority": repair_priority,
-                                "claim_status": "needs_repair",
-                                "evidence_use_level": "diagnostic_only",
-                            }
+                    gap_type = str(repair_priority.get("gap_type") or "")
+                    if gap_type == "claim_support_anchor_mismatch":
+                        issue = {
+                            "type": "claim_support_anchor_mismatch_downgraded",
+                            "chapter_id": chapter.get("chapter_id"),
+                            "claim_id": unit.get("claim_id"),
+                            "evidence_refs": refs,
+                            "gap_type": gap_type,
+                            "downgraded_to": "directional",
+                            **support_payload,
+                        }
+                        issues.append(issue)
+                        _downgrade_claim_unit_to_directional(
+                            unit,
+                            status="anchor_mismatch_downgraded",
+                            boundary_note="claim support is adjacent rather than direct; use only as a directional signal until stronger evidence is repaired",
                         )
-                    continue
-                unit["claim_support_status"] = support_result.status
+                        unit["support_gap_type"] = gap_type
+                        unit["support_unsupported_terms"] = _as_list(support_payload.get("unsupported_terms"))
+                    else:
+                        issue = {
+                            "type": "claim_support_needs_repair",
+                            "chapter_id": chapter.get("chapter_id"),
+                            "claim_id": unit.get("claim_id"),
+                            "evidence_refs": refs,
+                            "gap_type": gap_type,
+                            "writing_permission": "not_allowed_until_repaired",
+                            **support_payload,
+                        }
+                        issues.append(issue)
+                        claim_repair_priorities.append(repair_priority)
+                        if len(deferred_examples) < 8:
+                            deferred_examples.append(
+                                {
+                                    **issue,
+                                    "claim": claim_text,
+                                    "repair_priority": repair_priority,
+                                    "claim_status": "needs_repair",
+                                    "evidence_use_level": "diagnostic_only",
+                                }
+                            )
+                        continue
+                else:
+                    unit["claim_support_status"] = support_result.status
             semantic_judge = _llm_semantic_claim_support_judge(
                 claim_text=claim_text,
                 cited_cards=cited_cards,
@@ -3323,18 +3374,67 @@ def validate_llm_analysis_output(
             if semantic_status.startswith("skipped"):
                 unit["semantic_judge_skipped_reason"] = semantic_status
             elif semantic_status == "error":
+                fail_closed = _semantic_judge_fail_closed()
                 issue = {
-                    "type": "llm_claim_semantic_judge_error",
+                    "type": "llm_claim_semantic_judge_error_blocked" if fail_closed else "llm_claim_semantic_judge_error",
                     "chapter_id": chapter.get("chapter_id"),
                     "claim_id": unit.get("claim_id"),
                     "evidence_refs": refs,
                     "semantic_judge": semantic_judge,
                 }
                 issues.append(issue)
-                if _semantic_judge_fail_closed():
+                if fail_closed:
                     if len(rejected_examples) < 5:
                         rejected_examples.append({**issue, "claim": claim_text})
                     continue
+                unit["semantic_judge"] = {
+                    key: value
+                    for key, value in semantic_judge.items()
+                    if key not in {"usage"}
+                }
+                unit["semantic_judge_risk"] = "judge_error_rule_fallback"
+            elif semantic_status == "partial":
+                issue = {
+                    "type": "llm_claim_semantic_judge_partial_downgraded",
+                    "chapter_id": chapter.get("chapter_id"),
+                    "claim_id": unit.get("claim_id"),
+                    "evidence_refs": refs,
+                    "semantic_judge": semantic_judge,
+                    "downgraded_to": "directional",
+                }
+                issues.append(issue)
+                _downgrade_claim_unit_to_directional(
+                    unit,
+                    status="semantic_partial_downgraded",
+                    boundary_note="semantic judge found only partial support; keep as cautious directional analysis until stronger evidence is bound",
+                )
+                unit["semantic_judge"] = {
+                    key: value
+                    for key, value in semantic_judge.items()
+                    if key not in {"usage"}
+                }
+            elif semantic_status == "adjacent":
+                issue = {
+                    "type": "llm_claim_semantic_judge_adjacent_downgraded",
+                    "chapter_id": chapter.get("chapter_id"),
+                    "claim_id": unit.get("claim_id"),
+                    "evidence_refs": refs,
+                    "semantic_judge": semantic_judge,
+                    "downgraded_to": "contextual",
+                }
+                issues.append(issue)
+                _downgrade_claim_unit_to_directional(
+                    unit,
+                    status="semantic_adjacent_downgraded",
+                    boundary_note="semantic judge found adjacent background rather than direct support; use only as contextual framing until stronger evidence is bound",
+                )
+                unit["analysis_role"] = "contextual"
+                unit["evidence_use_level"] = "background"
+                unit["semantic_judge"] = {
+                    key: value
+                    for key, value in semantic_judge.items()
+                    if key not in {"usage"}
+                }
             elif not _semantic_judge_accepts(semantic_judge):
                 issue = {
                     "type": "llm_claim_semantic_judge_unsupported",
@@ -3344,6 +3444,21 @@ def validate_llm_analysis_output(
                     "semantic_judge": semantic_judge,
                 }
                 issues.append(issue)
+                semantic_repair_priority = _claim_support_repair_priority(
+                    chapter=chapter,
+                    unit=unit,
+                    claim_text=claim_text,
+                    refs=refs,
+                    cited_cards=cited_cards,
+                    support_payload={
+                        "status": "unsupported",
+                        "unsupported_terms": _as_list(semantic_judge.get("unsupported_terms"))
+                        or [_compact(semantic_judge.get("reason") or "semantic judge did not support the claim", 180)],
+                    },
+                )
+                semantic_repair_priority["gap_type"] = "claim_semantic_support_mismatch"
+                semantic_repair_priority["source_stage"] = "semantic_claim_support_judge"
+                claim_repair_priorities.append(semantic_repair_priority)
                 if len(rejected_examples) < 5:
                     rejected_examples.append({**issue, "claim": claim_text})
                 continue
@@ -3504,7 +3619,7 @@ def validate_llm_analysis_output(
         "chapter_synthesis": chapters,
         "valid_ref_count": len(valid_refs),
         "usable_claim_count": usable_claim_count,
-        "dropped_claim_count": len([item for item in issues if str(item.get("type") or "").startswith("llm_claim")]),
+        "dropped_claim_count": sum(_claim_drop_issue_counts(issue_counts).values()),
         "usable_chapter_count": len(chapters),
         "llm_raw_chapter_count": raw_chapter_count,
         "llm_raw_claim_count": raw_claim_count,
@@ -3571,13 +3686,96 @@ def _rank_key_judgments(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     )
 
 
+def _dedup_analysis_repair_priorities(
+    llm_payload: Dict[str, Any],
+    validation: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    evidence_repair_priorities: List[Dict[str, Any]] = []
+    seen_repair_ids: set[str] = set()
+    for item in [
+        *_as_list(llm_payload.get("evidence_repair_priorities")),
+        *_as_list(validation.get("claim_repair_priorities")),
+    ]:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("gap_id") or item.get("claim_id") or item.get("claim") or len(evidence_repair_priorities)).strip()
+        if key in seen_repair_ids:
+            continue
+        seen_repair_ids.add(key)
+        evidence_repair_priorities.append(item)
+    return evidence_repair_priorities
+
+
+def _attach_repair_priorities_to_analysis(
+    merged: Dict[str, Any],
+    evidence_repair_priorities: Sequence[Dict[str, Any]],
+) -> None:
+    if not evidence_repair_priorities:
+        return
+    merged["evidence_repair_priorities"] = list(evidence_repair_priorities)
+    existing_gap_ledger = [item for item in _as_list(merged.get("evidence_gap_ledger")) if isinstance(item, dict)]
+    seen_gap_ids = {
+        str(item.get("gap_id") or item.get("id") or item.get("claim_id") or "").strip()
+        for item in existing_gap_ledger
+    }
+    for priority in evidence_repair_priorities:
+        if not isinstance(priority, dict):
+            continue
+        gap_id = str(priority.get("gap_id") or priority.get("id") or priority.get("claim_id") or "").strip()
+        if gap_id and gap_id in seen_gap_ids:
+            continue
+        copied = dict(priority)
+        copied.setdefault("repair_route", "evidence_search")
+        copied.setdefault("source_stage", "analysis_claim_support")
+        copied.setdefault("status", "open")
+        copied.setdefault("allowed_for_writing", False)
+        existing_gap_ledger.append(copied)
+        if gap_id:
+            seen_gap_ids.add(gap_id)
+    merged["evidence_gap_ledger"] = existing_gap_ledger
+
+
+def _repair_priorities_from_analysis_payload(parsed: Dict[str, Any]) -> List[Dict[str, Any]]:
+    synthesis = _as_dict(parsed.get("llm_analysis_synthesis"))
+    validation = _as_dict(synthesis.get("validation"))
+    priorities: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in [
+        *_as_list(parsed.get("evidence_repair_priorities")),
+        *_as_list(parsed.get("claim_repair_priorities")),
+        *_as_list(synthesis.get("evidence_repair_priorities")),
+        *_as_list(validation.get("claim_repair_priorities")),
+    ]:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("gap_id") or item.get("claim_id") or item.get("claim") or len(priorities)).strip()
+        if key in seen:
+            continue
+        seen.add(key)
+        priorities.append(item)
+    return priorities
+
+
 def merge_llm_analysis_with_fallback(
     fallback: Dict[str, Any],
     llm_payload: Dict[str, Any],
     validation: Dict[str, Any],
 ) -> Dict[str, Any]:
     if str(validation.get("status") or "") != "valid":
-        return fallback
+        merged = dict(fallback)
+        evidence_repair_priorities = _dedup_analysis_repair_priorities(llm_payload, validation)
+        _attach_repair_priorities_to_analysis(merged, evidence_repair_priorities)
+        if evidence_repair_priorities:
+            merged["llm_analysis_synthesis"] = {
+                "chapter_synthesis": [],
+                "cross_chapter_conflicts": _as_list(llm_payload.get("cross_chapter_conflicts")),
+                "evidence_repair_priorities": evidence_repair_priorities,
+                "rewrite_priorities": _as_list(llm_payload.get("rewrite_priorities")),
+                "usage": llm_payload.get("_llm_usage", {}),
+                "model": llm_payload.get("_llm_model", ""),
+                "validation": validation,
+            }
+        return merged
     merged = dict(fallback)
     chapters: List[Dict[str, Any]] = []
     claim_units: List[Dict[str, Any]] = []
@@ -3804,7 +4002,7 @@ def merge_llm_analysis_with_fallback(
         "validation": validation,
     }
     if evidence_repair_priorities:
-        merged["evidence_repair_priorities"] = evidence_repair_priorities
+        _attach_repair_priorities_to_analysis(merged, evidence_repair_priorities)
     return merged
 
 
@@ -4174,6 +4372,7 @@ def ensure_valid_structured_analysis(
     structural_reasons = _structural_reasons(rebuild_reasons)
     quality_only_reasons = _quality_only_reasons(rebuild_reasons)
     llm_validation = _as_dict(_as_dict(parsed.get("llm_analysis_synthesis")).get("validation"))
+    preserved_repair_priorities = _repair_priorities_from_analysis_payload(parsed)
     valid_llm_claims_present = (
         str(llm_validation.get("status") or "") == "valid"
         and _int_or_zero(llm_validation.get("usable_claim_count")) > 0
@@ -4211,6 +4410,7 @@ def ensure_valid_structured_analysis(
         return parsed
     rebuilt = build_fallback_analysis(evidence_package)
     rebuilt = _public_normalize_analysis_payload(rebuilt)
+    _attach_repair_priorities_to_analysis(rebuilt, preserved_repair_priorities)
     rebuilt_contract = _structured_analysis_contract(rebuilt)
     rebuilt["analysis_rebuilt_from_evidence"] = True
     rebuilt["analysis_contract_status"] = {
@@ -4286,6 +4486,7 @@ def run_analysis_agent(
                         failed_chapters = _int_or_zero(llm_payload.get("_llm_failed_chapter_count"))
                         llm_status = "partial_success" if use_v2_analysis and (failed_chapters or valid_chapters < submitted_chapters) else "success"
                     else:
+                        structured = merge_llm_analysis_with_fallback(structured, llm_payload, validation)
                         llm_status = "invalid_output"
                         llm_error = "LLM evidence analysis returned no usable chapter_synthesis."
                 except Exception as exc:
@@ -4373,6 +4574,7 @@ def run_analysis_agent(
             "llm_rejected_claim_examples": llm_validation.get("llm_rejected_claim_examples", []),
             "llm_deferred_claim_examples": llm_validation.get("llm_deferred_claim_examples", []),
             "claim_repair_priorities": llm_validation.get("claim_repair_priorities", []),
+            "llm_chapter_results": llm_payload.get("_llm_chapter_results", []) if "llm_payload" in locals() else [],
             "llm_semantic_judge_counts": llm_validation.get("llm_semantic_judge_counts", {}),
             "llm_semantic_judge_usage": llm_validation.get("llm_semantic_judge_usage", {}),
             "llm_validation_status": llm_validation.get("status") or ("not_run" if llm_status in {"disabled", "fallback_config_missing"} else llm_status),

@@ -142,16 +142,43 @@ def test_final_citation_reconciliation_manifest_public_refs_override_manifest_al
     assert diagnostics["final_citation_reconciliation_status"] == "ok"
 
 
-def test_final_citation_reconciliation_blocks_factual_body_without_citations():
-    body = "2025年 AI 生成视音频内容超过 20 亿条，企业级 Agent 市场规模继续扩张。"
+def test_final_citation_reconciliation_drops_long_factual_body_without_citations():
+    body = (
+        "2025年 AI 生成视音频内容超过 20 亿条，企业级 Agent 市场规模继续扩张，"
+        "并且该判断同时涉及市场规模、企业采购、产业政策和收入预测等多个可核验事实，"
+        "因此不能作为无引用短句被静默删除。这个段落还继续描述供应商竞争、客户预算、"
+        "产品部署周期和监管约束对行业增长的影响，长度足以代表正文段落而不是孤立数据行。"
+    )
 
     rewritten, appendix_sources, diagnostics = finalize_markdown_citations(body, {"appendix_sources": []}, [])
 
-    assert rewritten == body
+    assert rewritten == ""
     assert appendix_sources == []
-    assert diagnostics["final_citation_reconciliation_status"] == "blocked"
-    assert diagnostics["factual_body_without_citations_count"] == 1
-    assert diagnostics["citationless_fact_examples"]
+    assert diagnostics["final_citation_reconciliation_status"] == "ok"
+    assert diagnostics["citationless_factual_sentence_removed_count"] == 1
+    assert diagnostics["factual_body_without_citations_count"] == 0
+    assert diagnostics["citationless_fact_examples"] == []
+
+
+def test_final_citation_reconciliation_drops_trailing_uncited_factual_sentence_in_cited_paragraph():
+    body = (
+        "Enterprise AI Agent adoption is moving from pilots into workflow automation [1]. "
+        "OpenAI revenue reached 20 billion in 2025."
+    )
+    manifest = {
+        "appendix_sources": [
+            {"ref": "[1]", "title": "Enterprise AI adoption", "url": "https://example.org/adoption"}
+        ]
+    }
+
+    rewritten, appendix_sources, diagnostics = finalize_markdown_citations(body, manifest, manifest["appendix_sources"])
+
+    assert "workflow automation [1]" in rewritten
+    assert "OpenAI revenue reached 20 billion" not in rewritten
+    assert appendix_sources[0]["ref"] == "[1]"
+    assert diagnostics["final_citation_reconciliation_status"] == "ok"
+    assert diagnostics["citationless_factual_sentence_removed_count"] == 1
+    assert diagnostics["factual_body_without_citations_count"] == 0
 
 
 def test_final_citation_reconciliation_drops_citationless_factual_bullets():
@@ -171,6 +198,24 @@ def test_final_citation_reconciliation_drops_citationless_factual_bullets():
     assert appendix_sources == []
     assert diagnostics["final_citation_reconciliation_status"] == "ok"
     assert diagnostics["citationless_factual_bullet_removed_count"] == 1
+    assert diagnostics["factual_body_without_citations_count"] == 0
+
+
+def test_final_citation_reconciliation_drops_short_citationless_factual_lines():
+    body = "\n".join(
+        [
+            "\u6e17\u900f\u7387\u4e3a10%\uff0c\u671f\u95f4\u4e3a2011\u5e74",
+            "This longer paragraph is analytical framing without a concrete numeric claim.",
+        ]
+    )
+
+    rewritten, appendix_sources, diagnostics = finalize_markdown_citations(body, {"appendix_sources": []}, [])
+
+    assert "\u6e17\u900f\u7387\u4e3a10%" not in rewritten
+    assert "analytical framing" in rewritten
+    assert appendix_sources == []
+    assert diagnostics["final_citation_reconciliation_status"] == "ok"
+    assert diagnostics["citationless_short_factual_line_removed_count"] == 1
     assert diagnostics["factual_body_without_citations_count"] == 0
 
 

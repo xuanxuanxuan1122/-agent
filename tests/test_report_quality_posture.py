@@ -40,6 +40,7 @@ EVIDENCE_BUDGET_KEYS = [
 
 WRITING_BUDGET_KEYS = [
     "BRAIN_ENABLE_LLM_EVIDENCE_ANALYSIS",
+    "BRAIN_ENABLE_POST_QA_REPAIR",
     "REPORT_ENABLE_LLM_BODY_REWRITE",
     "REPORT_BODY_REWRITE_MAX_SECTIONS",
     "REPORT_BODY_REWRITE_MAX_ELAPSED_SECONDS",
@@ -134,6 +135,7 @@ def test_high_quality_posture_enables_quality_writing_without_hard_longform_targ
 
     assert posture["mode"] == "high"
     assert os.environ["BRAIN_ENABLE_LLM_EVIDENCE_ANALYSIS"] == "true"
+    assert os.environ["BRAIN_ENABLE_POST_QA_REPAIR"] == "true"
     assert os.environ["REPORT_ENABLE_LLM_BODY_REWRITE"] == "true"
     assert int(os.environ["REPORT_BODY_REWRITE_MAX_SECTIONS"]) >= 24
     assert int(os.environ["REPORT_BODY_REWRITE_MAX_ELAPSED_SECONDS"]) >= 900

@@ -205,6 +205,60 @@ def test_structured_analysis_needs_rewrite_triggers_evidence_rebuild():
     assert result["analysis_stage_diagnostics"]["analysis_rebuilt_from_evidence"] is True
 
 
+def test_rebuild_preserves_llm_claim_repair_priorities():
+    evidence_package = {
+        "query": "AI Agent industry report",
+        "analysis_ready_evidence": [_evidence("EV-1")],
+        "chapter_evidence_packages": [
+            {
+                "chapter_id": "ch_01",
+                "chapter_title": "Demand validation",
+                "core_evidence": [_evidence("EV-1")],
+            }
+        ],
+    }
+    repair_priority = {
+        "schema_version": "claim_support_repair_priority_v1",
+        "gap_id": "ch_01_bad_claim_claim_support_entity_or_metric_mismatch",
+        "gap_type": "claim_support_entity_or_metric_mismatch",
+        "chapter_id": "ch_01",
+        "claim_id": "bad_claim",
+        "claim": "Unsupported market-size claim",
+        "required_fields": ["source", "metric", "value", "unit", "period"],
+        "allowed_for_writing": False,
+    }
+    structured = {
+        "claim_units": [{"chapter_id": "ch_01", "claim": "generic", "evidence_refs": []}],
+        "chapter_insights": [{"chapter_id": "ch_01", "chapter_question": "Demand validation"}],
+        "evidence_analyses": [{"evidence_id": "EV-1", "fact": "x"}],
+        "analysis_depth_quality": {"status": "needs_rewrite", "repeated_claim_ratio": 0.95},
+        "claim_binding_feedback_summary": {"available_ab_not_bound_count": 1},
+        "evidence_repair_priorities": [repair_priority],
+        "evidence_gap_ledger": [],
+        "llm_analysis_synthesis": {
+            "chapter_synthesis": [],
+            "evidence_repair_priorities": [repair_priority],
+            "validation": {
+                "status": "invalid_output_no_usable_claims",
+                "claim_repair_priorities": [repair_priority],
+            },
+        },
+    }
+
+    result = ensure_valid_structured_analysis(structured, evidence_package)
+
+    assert result["analysis_rebuilt_from_evidence"] is True
+    assert result["evidence_repair_priorities"][0]["gap_id"] == repair_priority["gap_id"]
+    preserved_gap = [
+        item
+        for item in result["evidence_gap_ledger"]
+        if item.get("gap_id") == repair_priority["gap_id"]
+    ][0]
+    assert preserved_gap["gap_type"] == "claim_support_entity_or_metric_mismatch"
+    assert preserved_gap["source_stage"] == "analysis_claim_support"
+    assert preserved_gap["allowed_for_writing"] is False
+
+
 def test_valid_llm_claims_are_not_rebuilt_due_to_legacy_binding_warnings():
     structured = {
         "claim_units": [
@@ -353,6 +407,51 @@ def test_llm_claim_with_unsupported_entity_and_metric_is_deferred_for_repair():
     assert validation["correctness_filter_summary"]["deferred_issue_counts"] == {"claim_support_needs_repair": 1}
 
 
+def test_llm_claim_with_anchor_mismatch_is_downgraded_directional_candidate():
+    claim_text = "\u4f01\u4e1a\u7ea7AI Agent\u7ade\u4e89\u683c\u5c40\u6b63\u5728\u5411\u573a\u666f\u843d\u5730\u548c\u6e20\u9053\u751f\u6001\u5206\u5316\u3002"
+    evidence_text = "\u7edf\u8ba1\u90e8\u95e8\u901a\u8fc7\u5b98\u7f51\u548c\u7edf\u8ba1\u5e74\u9274\u53d1\u5e03AI Agent\u76f8\u5173\u7edf\u8ba1\u6570\u636e\u3002"
+    evidence_package = {
+        "analysis_ready_evidence": [
+            {
+                **_evidence("EV-channel", chapter_id="ch_02", level="B"),
+                "fact": evidence_text,
+                "distilled_fact": evidence_text,
+                "source_title": "\u7edf\u8ba1\u53d1\u5e03\u6e20\u9053\u8bf4\u660e",
+            }
+        ]
+    }
+    payload = {
+        "chapter_synthesis": [
+            {
+                "chapter_id": "ch_02",
+                "claim_units": [
+                    {
+                        "claim_id": "anchor-mismatch",
+                        "claim": claim_text,
+                        "claim_strength": "moderate",
+                        "used_evidence_ids": ["EV-channel"],
+                        "evidence_basis": [evidence_text],
+                        "reasoning": "\u5f53\u524d\u8bc1\u636e\u53ea\u80fd\u4f5c\u4e3a\u65b9\u5411\u6027\u80cc\u666f\u3002",
+                    }
+                ],
+            }
+        ]
+    }
+
+    validation = validate_llm_analysis_output(payload, evidence_package)
+    unit = validation["chapter_synthesis"][0]["claim_units"][0]
+
+    assert validation["status"] == "valid"
+    assert validation["usable_claim_count"] == 1
+    assert validation["deferred_claim_count"] == 0
+    assert validation["llm_validation_issue_counts"]["claim_support_anchor_mismatch_downgraded"] == 1
+    assert unit["claim_strength"] == "directional"
+    assert unit["claim_status"] == "directional"
+    assert unit["claim_support_status"] == "anchor_mismatch_downgraded"
+    assert unit["writing_permission"] == "cautious_with_boundary"
+    assert unit["evidence_use_level"] == "directional_signal"
+
+
 def test_llm_semantic_judge_rejects_semantically_unsupported_claim(monkeypatch):
     calls = []
 
@@ -409,6 +508,143 @@ def test_llm_semantic_judge_rejects_semantically_unsupported_claim(monkeypatch):
     assert validation["llm_semantic_judge_counts"]["attempted"] == 1
     assert validation["llm_semantic_judge_counts"]["unsupported"] == 1
     assert validation["llm_rejected_claim_examples"][0]["semantic_judge"]["status"] == "unsupported"
+
+
+def test_llm_semantic_judge_partial_downgrades_claim(monkeypatch):
+    monkeypatch.setattr(
+        analysis_agent,
+        "_llm_semantic_claim_support_judge",
+        lambda **_kwargs: {"status": "partial", "reason": "Evidence supports direction, not the full strength.", "confidence": 0.72},
+    )
+    evidence_package = {
+        "analysis_ready_evidence": [
+            {
+                **_evidence("EV-agent", chapter_id="ch_02", level="B"),
+                "fact": "Enterprise AI Agent adoption is moving from pilots into workflow automation.",
+                "distilled_fact": "Enterprise AI Agent adoption is moving from pilots into workflow automation.",
+                "source_title": "AI Agent adoption",
+            }
+        ]
+    }
+    payload = {
+        "chapter_synthesis": [
+            {
+                "chapter_id": "ch_02",
+                "claim_units": [
+                    {
+                        "claim_id": "semantic-partial",
+                        "claim": "Enterprise AI Agent adoption is moving from pilots into workflow automation.",
+                        "claim_strength": "moderate",
+                        "used_evidence_ids": ["EV-agent"],
+                        "evidence_basis": ["Enterprise AI Agent adoption is moving from pilots into workflow automation."],
+                        "reasoning": "The cited evidence supports the adoption transition direction.",
+                    }
+                ],
+            }
+        ]
+    }
+
+    validation = validate_llm_analysis_output(payload, evidence_package, llm_config={"model": "judge"})
+    unit = validation["chapter_synthesis"][0]["claim_units"][0]
+
+    assert validation["usable_claim_count"] == 1
+    assert validation["llm_validation_issue_counts"]["llm_claim_semantic_judge_partial_downgraded"] == 1
+    assert validation["llm_semantic_judge_counts"]["partial"] == 1
+    assert unit["semantic_judge_status"] == "partial"
+    assert unit["claim_strength"] == "directional"
+    assert unit["writing_permission"] == "cautious_with_boundary"
+
+
+def test_llm_semantic_judge_adjacent_downgrades_claim(monkeypatch):
+    monkeypatch.setattr(
+        analysis_agent,
+        "_llm_semantic_claim_support_judge",
+        lambda **_kwargs: {"status": "adjacent", "reason": "Evidence is relevant background but not direct support.", "confidence": 0.68},
+    )
+    evidence_package = {
+        "analysis_ready_evidence": [
+            {
+                **_evidence("EV-agent", chapter_id="ch_02", level="B"),
+                "fact": "Enterprise AI Agent adoption signals demand formation.",
+                "distilled_fact": "Enterprise AI Agent adoption signals demand formation.",
+                "source_title": "AI Agent adoption",
+            }
+        ]
+    }
+    payload = {
+        "chapter_synthesis": [
+            {
+                "chapter_id": "ch_02",
+                "claim_units": [
+                    {
+                        "claim_id": "semantic-adjacent",
+                        "claim": "Enterprise AI Agent adoption signals demand formation.",
+                        "claim_strength": "moderate",
+                        "used_evidence_ids": ["EV-agent"],
+                        "evidence_basis": ["Enterprise AI Agent adoption signals demand formation."],
+                        "reasoning": "The cited evidence is relevant to the demand signal.",
+                    }
+                ],
+            }
+        ]
+    }
+
+    validation = validate_llm_analysis_output(payload, evidence_package, llm_config={"model": "judge"})
+    unit = validation["chapter_synthesis"][0]["claim_units"][0]
+
+    assert validation["usable_claim_count"] == 1
+    assert validation["dropped_claim_count"] == 0
+    assert validation["llm_validation_issue_counts"]["llm_claim_semantic_judge_adjacent_downgraded"] == 1
+    assert validation["llm_semantic_judge_counts"]["adjacent"] == 1
+    assert unit["semantic_judge_status"] == "adjacent"
+    assert unit["claim_strength"] == "directional"
+    assert unit["analysis_role"] == "contextual"
+    assert unit["evidence_use_level"] == "background"
+    assert unit["writing_permission"] == "cautious_with_boundary"
+
+
+def test_llm_semantic_judge_error_does_not_drop_formal_claim_by_default(monkeypatch):
+    monkeypatch.delenv("BRAIN_LLM_SEMANTIC_JUDGE_FAIL_CLOSED", raising=False)
+    monkeypatch.setattr(
+        analysis_agent,
+        "_llm_semantic_claim_support_judge",
+        lambda **_kwargs: {"status": "error", "reason": "judge timeout"},
+    )
+    evidence_package = {
+        "analysis_ready_evidence": [
+            {
+                **_evidence("EV-agent", chapter_id="ch_02", level="B"),
+                "fact": "Enterprise AI Agent adoption is moving from pilots into workflow automation.",
+                "distilled_fact": "Enterprise AI Agent adoption is moving from pilots into workflow automation.",
+                "source_title": "AI Agent adoption",
+            }
+        ]
+    }
+    payload = {
+        "chapter_synthesis": [
+            {
+                "chapter_id": "ch_02",
+                "claim_units": [
+                    {
+                        "claim_id": "semantic-error",
+                        "claim": "Enterprise AI Agent adoption is moving from pilots into workflow automation.",
+                        "claim_strength": "directional",
+                        "used_evidence_ids": ["EV-agent"],
+                        "evidence_basis": ["Enterprise AI Agent adoption is moving from pilots into workflow automation."],
+                        "reasoning": "The cited evidence directly supports the transition.",
+                    }
+                ],
+            }
+        ]
+    }
+
+    validation = validate_llm_analysis_output(payload, evidence_package, llm_config={"model": "judge"})
+    unit = validation["chapter_synthesis"][0]["claim_units"][0]
+
+    assert validation["usable_claim_count"] == 1
+    assert validation["dropped_claim_count"] == 0
+    assert validation["llm_validation_issue_counts"]["llm_claim_semantic_judge_error"] == 1
+    assert unit["semantic_judge_status"] == "error"
 
 
 def test_llm_semantic_judge_pass_allows_claim(monkeypatch):
@@ -576,12 +812,15 @@ def test_llm_chinese_qualitative_claim_with_offtopic_fact_is_rejected():
 
     validation = validate_llm_analysis_output(payload, evidence_package)
 
-    assert validation["usable_claim_count"] == 0
-    assert validation["deferred_claim_count"] == 1
-    assert validation["status"] == "invalid_output_no_usable_claims"
-    assert validation["llm_validation_issue_counts"]["claim_support_needs_repair"] == 1
-    assert "竞争格局" in validation["llm_deferred_claim_examples"][0]["unsupported_terms"]
-    assert validation["claim_repair_priorities"][0]["gap_type"] == "claim_support_anchor_mismatch"
+    unit = validation["chapter_synthesis"][0]["claim_units"][0]
+
+    assert validation["usable_claim_count"] == 1
+    assert validation["deferred_claim_count"] == 0
+    assert validation["status"] == "valid"
+    assert validation["llm_validation_issue_counts"]["claim_support_anchor_mismatch_downgraded"] == 1
+    assert unit["claim_support_status"] == "anchor_mismatch_downgraded"
+    assert unit["claim_strength"] == "directional"
+    assert unit["writing_permission"] == "cautious_with_boundary"
 
 
 def test_llm_numeric_claim_with_incomplete_metric_fact_is_downgraded():
@@ -642,6 +881,48 @@ def test_llm_numeric_claim_with_incomplete_metric_fact_is_downgraded():
         assert item["writing_permission"] == "cautious_with_boundary"
         assert item["metric_completeness_status"] == "incomplete"
         assert item["metric_missing_fields"] == ["unit", "period"]
+
+
+def test_llm_claim_repair_priorities_are_promoted_to_evidence_gap_ledger():
+    evidence_package = {
+        "analysis_ready_evidence": [
+            {
+                **_evidence("EV-GTC", chapter_id="ch_02", level="A"),
+                "fact": "NVIDIA announced GTC sessions for enterprise AI infrastructure.",
+                "distilled_fact": "NVIDIA announced GTC sessions for enterprise AI infrastructure.",
+                "source_title": "NVIDIA GTC",
+            }
+        ]
+    }
+    payload = {
+        "chapter_synthesis": [
+            {
+                "chapter_id": "ch_02",
+                "claim_units": [
+                    {
+                        "claim_id": "bad-price-claim",
+                        "claim": "MiniMax M2.5 API price is about 1/15 of Claude Opus 4.6.",
+                        "claim_strength": "directional",
+                        "used_evidence_ids": ["EV-GTC"],
+                        "evidence_basis": ["NVIDIA announced GTC sessions for enterprise AI infrastructure."],
+                        "reasoning": "The cited evidence discusses NVIDIA infrastructure events.",
+                    }
+                ],
+            }
+        ]
+    }
+
+    validation = validate_llm_analysis_output(payload, evidence_package)
+    merged = merge_llm_analysis_with_fallback({"evidence_gap_ledger": []}, payload, validation)
+
+    assert validation["status"] == "invalid_output_no_usable_claims"
+    assert merged["evidence_repair_priorities"][0]["gap_type"] == "claim_support_entity_or_metric_mismatch"
+    gap = merged["evidence_gap_ledger"][0]
+    assert gap["gap_type"] == "claim_support_entity_or_metric_mismatch"
+    assert gap["repair_route"] == "evidence_search"
+    assert gap["source_stage"] == "analysis_claim_support"
+    assert gap["status"] == "open"
+    assert gap["allowed_for_writing"] is False
 
 
 def test_llm_validator_normalizes_analysis_first_claim_contract():
@@ -1189,6 +1470,7 @@ def test_per_chapter_llm_analysis_partial_success_is_preserved(monkeypatch, tmp_
     assert diagnostics["llm_valid_chapter_count"] == 1
     assert diagnostics["llm_failed_chapter_count"] == 1
     assert diagnostics["llm_semantic_judge_counts"]["supported"] == 1
+    assert {item["chapter_id"] for item in diagnostics["llm_chapter_results"]} == {"ch_01", "ch_02"}
 
 
 def test_per_chapter_llm_analysis_uses_cache_hit(monkeypatch, tmp_path):
@@ -1440,6 +1722,70 @@ def test_quality_mode_marks_invalid_llm_analysis_as_degraded(monkeypatch):
     assert diagnostics["uses_llm_analysis"] is False
     assert diagnostics["quality_path_degraded"] is True
     assert diagnostics["quality_path_degradation_reason"] == "invalid_output"
+
+
+def test_invalid_llm_analysis_promotes_claim_repair_priorities_to_structured_output(monkeypatch, tmp_path):
+    evidence_package = {
+        "query": "AI Agent",
+        "analysis_ready_evidence": [
+            {
+                **_evidence("EV-1", chapter_id="ch_01", level="A"),
+                "fact": "The source discusses enterprise AI workflow pilots.",
+                "distilled_fact": "The source discusses enterprise AI workflow pilots.",
+                "source_title": "Enterprise AI pilots",
+            }
+        ],
+        "chapter_evidence_diagnostics": {"ch_01": {"chapter_id": "ch_01"}},
+        "chapter_evidence_packages": [
+            {
+                "chapter_id": "ch_01",
+                "chapter_title": "Demand validation",
+                "core_evidence": [_evidence("EV-1", chapter_id="ch_01", level="A")],
+            }
+        ],
+    }
+
+    def fake_llm(**kwargs):
+        if kwargs["user_payload"].get("schema_version") == "semantic_claim_support_judge_v1":
+            return {"payload": {"status": "unsupported", "reason": "not direct", "confidence": 0.9}, "usage": {}}
+        return {
+            "payload": {
+                "chapter_id": "ch_01",
+                "claim_units": [
+                    {
+                        "claim_id": "bad_metric_claim",
+                        "claim": "AI Agent market size reached 3158 billion dollars in 2024.",
+                        "used_evidence_ids": ["EV-1"],
+                        "evidence_basis": ["The source discusses enterprise AI workflow pilots."],
+                        "reasoning_chain": ["A market-size claim needs direct metric evidence."],
+                        "limitation_boundary": ["Needs direct market-size evidence."],
+                        "claim_strength": "moderate",
+                    }
+                ],
+            },
+            "usage": {},
+        }
+
+    monkeypatch.setattr(analysis_agent, "call_openai_compatible_json", fake_llm)
+    monkeypatch.setattr(analysis_agent, "llm_config_is_ready", lambda cfg: True)
+    monkeypatch.setattr(analysis_agent, "normalize_llm_config", lambda cfg: {"model": "fake"})
+    monkeypatch.setenv("BRAIN_ENABLE_LLM_EVIDENCE_ANALYSIS", "true")
+    monkeypatch.setenv("REPORT_QUALITY_MODE", "high")
+    monkeypatch.setenv("BRAIN_LLM_ANALYSIS_MODE", "per_chapter")
+    monkeypatch.setenv("BRAIN_LLM_ANALYSIS_INPUT_VERSION", "v2")
+    monkeypatch.setenv("BRAIN_LLM_ANALYSIS_CACHE_ENABLED", "false")
+    monkeypatch.setenv("BRAIN_LLM_ANALYSIS_CACHE_PATH", str(tmp_path))
+
+    result = run_analysis_agent(evidence_package, llm_config={"provider": "fake", "model": "fake"})
+    structured = result["structured_analysis"]
+    diagnostics = structured["analysis_stage_diagnostics"]
+
+    assert diagnostics["llm_analysis_status"] == "invalid_output"
+    assert diagnostics["claim_repair_priorities"]
+    assert structured["evidence_repair_priorities"][0]["claim_id"] == "bad_metric_claim"
+    gap = structured["evidence_gap_ledger"][0]
+    assert gap["claim_id"] == "bad_metric_claim"
+    assert gap["source_stage"] == "analysis_claim_support"
 
 
 def test_claim_builder_strict_layout_does_not_fill_metric_block_from_core_evidence():

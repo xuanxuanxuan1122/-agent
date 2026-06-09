@@ -629,6 +629,18 @@ def run_final_audit(
         }
 
     config = dict(build_llm_config_for_task("final_audit"))
+    min_output_tokens = _env_int(
+        "REPORT_FINAL_AUDIT_MAX_OUTPUT_TOKENS",
+        8192,
+        min_value=2048,
+        max_value=64000,
+    )
+    try:
+        configured_output_tokens = int(config.get("max_output_tokens") or 0)
+    except (TypeError, ValueError):
+        configured_output_tokens = 0
+    if configured_output_tokens < min_output_tokens:
+        config["max_output_tokens"] = min_output_tokens
     normalized = normalize_llm_config(config)
     if not llm_config_is_ready(normalized):
         return {

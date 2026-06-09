@@ -1005,15 +1005,14 @@ def _citationless_factual_segments(markdown: str, *, limit: int = 8) -> List[str
         line = raw_line.strip()
         if not line or line.startswith("#") or line.startswith("|"):
             continue
-        if CITATION_RE.search(line):
+        if _line_has_terminal_citation(line):
             continue
         if re.match(r"^\s*[-*]\s*$", line):
             continue
-        if not text_has_factual_claim(line):
-            continue
-        examples.append(line[:260])
-        if len(examples) >= limit:
-            break
+        for segment in _citationless_factual_sentence_examples(line):
+            examples.append(segment[:260])
+            if len(examples) >= limit:
+                return examples
     return examples
 
 
@@ -1038,6 +1037,103 @@ def _drop_citationless_factual_bullets(markdown: str, *, limit: int = 12) -> tup
     return "\n".join(kept_lines), {
         "citationless_factual_bullet_removed_count": removed_count,
         "citationless_factual_bullet_removed_examples": removed_examples,
+    }
+
+
+def _drop_short_citationless_factual_lines(markdown: str, *, limit: int = 12) -> tuple[str, Dict[str, Any]]:
+    kept_lines: List[str] = []
+    removed_examples: List[str] = []
+    removed_count = 0
+    for raw_line in str(markdown or "").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or line.startswith("|"):
+            kept_lines.append(raw_line)
+            continue
+        if CITATION_RE.search(line) or re.match(r"^\s*[-*]\s+\S", raw_line):
+            kept_lines.append(raw_line)
+            continue
+        if len(line) >= 120 or not text_has_factual_claim(line):
+            kept_lines.append(raw_line)
+            continue
+        removed_count += 1
+        if len(removed_examples) < limit:
+            removed_examples.append(line[:260])
+    return "\n".join(kept_lines), {
+        "citationless_short_factual_line_removed_count": removed_count,
+        "citationless_short_factual_line_removed_examples": removed_examples,
+    }
+
+
+_SENTENCE_SPLIT_RE = re.compile(r"[^。！？!?.；;\n]+[。！？!?.；;]?")
+
+
+def _line_has_terminal_citation(line: str) -> bool:
+    return bool(re.search(r"(?:\[\d{1,5}\]\s*)+$", str(line or "").strip()))
+
+
+def _sentence_units(line: str) -> List[str]:
+    units = [match.group(0).strip() for match in _SENTENCE_SPLIT_RE.finditer(str(line or "")) if match.group(0).strip()]
+    return units or ([str(line or "").strip()] if str(line or "").strip() else [])
+
+
+def _citationless_factual_sentence_examples(line: str) -> List[str]:
+    text = str(line or "").strip()
+    if not text or not text_has_factual_claim(text):
+        return []
+    if _line_has_terminal_citation(text):
+        return []
+    if not CITATION_RE.search(text):
+        return [text] if text_has_factual_claim(text) else []
+    examples: List[str] = []
+    for unit in _sentence_units(text):
+        if CITATION_RE.search(unit):
+            continue
+        if text_has_factual_claim(unit):
+            examples.append(unit)
+    return examples
+
+
+def _drop_citationless_factual_sentences(markdown: str, *, limit: int = 12) -> tuple[str, Dict[str, Any]]:
+    kept_lines: List[str] = []
+    removed_examples: List[str] = []
+    removed_count = 0
+    for raw_line in str(markdown or "").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or line.startswith("|") or re.match(r"^\s*[-*]\s+\S", raw_line):
+            kept_lines.append(raw_line)
+            continue
+        if not text_has_factual_claim(line) or _line_has_terminal_citation(line):
+            kept_lines.append(raw_line)
+            continue
+        if not CITATION_RE.search(line):
+            removed_count += 1
+            if len(removed_examples) < limit:
+                removed_examples.append(line[:260])
+            continue
+        units = _sentence_units(raw_line)
+        if not units:
+            kept_lines.append(raw_line)
+            continue
+        kept_units: List[str] = []
+        line_removed = 0
+        for unit in units:
+            stripped_unit = unit.strip()
+            if stripped_unit and not CITATION_RE.search(stripped_unit) and text_has_factual_claim(stripped_unit):
+                removed_count += 1
+                line_removed += 1
+                if len(removed_examples) < limit:
+                    removed_examples.append(stripped_unit[:260])
+                continue
+            kept_units.append(unit)
+        if line_removed and kept_units:
+            kept_line = "".join(part.strip() for part in kept_units if str(part or "").strip()).strip()
+            if kept_line:
+                kept_lines.append(kept_line)
+        elif not line_removed:
+            kept_lines.append(raw_line)
+    return "\n".join(kept_lines), {
+        "citationless_factual_sentence_removed_count": removed_count,
+        "citationless_factual_sentence_removed_examples": removed_examples,
     }
 
 
@@ -1096,6 +1192,8 @@ def finalize_markdown_citations(
     rewritten_body = re.sub(r"\[(\d{1,5})\]", replace, original_body)
     rewritten_body, duplicate_removed_count = _collapse_adjacent_duplicate_citations(rewritten_body)
     rewritten_body, bullet_drop_diagnostics = _drop_citationless_factual_bullets(rewritten_body)
+    rewritten_body, short_line_drop_diagnostics = _drop_short_citationless_factual_lines(rewritten_body)
+    rewritten_body, sentence_drop_diagnostics = _drop_citationless_factual_sentences(rewritten_body)
     final_body_refs = _body_citation_refs(rewritten_body)
     final_appendix_refs = [str(source.get("ref") or "").strip() for source in appendix_sources if str(source.get("ref") or "").strip()]
     missing_appendix_refs = [ref for ref in final_body_refs if ref not in set(final_appendix_refs)]
@@ -1110,6 +1208,8 @@ def finalize_markdown_citations(
         "final_unresolved_citation_refs": unresolved,
         "final_duplicate_citation_removed_count": duplicate_removed_count,
         **bullet_drop_diagnostics,
+        **short_line_drop_diagnostics,
+        **sentence_drop_diagnostics,
         "factual_body_without_citations_count": len(citationless_examples),
         "citationless_fact_examples": citationless_examples,
     }

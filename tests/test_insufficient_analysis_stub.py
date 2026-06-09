@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from rag_pipeline.flows.report.full_report import (
     _build_insufficient_stub_markdown,
+    _insufficient_analysis_delivery_action,
     _insufficient_analysis_signal,
 )
 
@@ -49,6 +50,47 @@ def test_zero_usable_claims_triggers_short_honest_stub():
 def test_real_llm_claims_do_not_trigger_stub():
     wr = _writer_report(final_source="llm_evidence_analysis", usable_claims=8)
     assert _insufficient_analysis_signal(wr)["insufficient"] is False
+
+
+def test_zero_usable_claims_keeps_existing_fact_backed_formal_report():
+    wr = _writer_report(final_source="deterministic_rebuild", usable_claims=0)
+    markdown = "\n".join(
+        [
+            "# AI Agent企业落地机会与风险",
+            "",
+            "## 已有证据能够支持的事实观察",
+            "公开资料显示，企业 AI 应用已经从试点工具进入流程自动化探索阶段[1]。这一判断只能作为方向性观察，不能直接推导出市场规模。",
+            "",
+            "## 证据边界",
+            "当前材料仍缺少统一口径的市场规模、渗透率和失败案例，因此报告应标记为内部研判而非 Clean 发布。",
+            "在这种状态下，报告可以保留事实观察、证据边界和下一步补证任务，但不能把方向性观察包装成强结论。",
+            "例如，企业流程自动化探索可以说明需求正在形成，却不能单独证明整体市场规模、商业化速度或竞争格局已经确定。",
+            "因此正文应把已验证事实、可写判断和不可写判断分开呈现：已验证事实进入事实观察，可写判断进入方向性研判，不可写判断进入补正清单。",
+            "这种交付形态比短稿更适合内部阅读，因为它保留了当前证据能支持的上下文，也明确告诉读者哪些结论仍然不能发布。",
+            "同时，报告必须继续保留引用和来源附录，避免在降级交付时把硬事实变成无来源陈述。",
+            "后续补证应优先围绕市场规模口径、渗透率、采购/落地案例、失败或延期案例以及监管约束展开。",
+            "只要这些缺口没有补齐，该报告就只能作为 formal_scored 或 internal_review 使用，不能进入 Clean publishable。",
+            "",
+            "## 来源附录",
+            "- [1] Official A source | https://a.example.com",
+        ]
+    )
+
+    action = _insufficient_analysis_delivery_action(markdown, wr)
+
+    assert action["mode"] == "limited_evidence_formal_report"
+    assert action["replace_with_stub"] is False
+    assert action["report_status"] == "formal_scored"
+    assert action["delivery_tier"] == "limited_evidence_formal_report"
+
+
+def test_zero_usable_claims_still_uses_stub_for_empty_or_tiny_report():
+    wr = _writer_report(final_source="deterministic_rebuild", usable_claims=0)
+
+    action = _insufficient_analysis_delivery_action("# Empty\n\n需要补证。", wr)
+
+    assert action["mode"] == "insufficient_analysis_stub"
+    assert action["replace_with_stub"] is True
 
 
 def test_missing_diagnostics_never_false_triggers_stub():

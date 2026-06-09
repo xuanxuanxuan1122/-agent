@@ -774,6 +774,78 @@ def _insufficient_analysis_signal(writer_report: Dict[str, Any]) -> Dict[str, An
     return {"insufficient": insufficient, "diagnostics": diag}
 
 
+_TEMPLATE_FILLER_FINGERPRINT = "是把事实转成判断的核心连接点"
+
+
+def _insufficient_analysis_delivery_action(
+    report_markdown: str,
+    writer_report: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Decide whether zero-usable-claim analysis should replace or downgrade.
+
+    Zero usable LLM claims means "not Clean", not automatically "no formal
+    report". Keep a fact-backed formal draft when the writer already produced a
+    citation-bearing body with traceable sources; fall back to the short honest
+    stub only when the public surface is too small or cannot be cited.
+    """
+
+    signal = _insufficient_analysis_signal(writer_report)
+    if not signal.get("insufficient"):
+        return {"mode": "normal", "replace_with_stub": False, "diagnostics": signal.get("diagnostics") or {}}
+
+    text = str(report_markdown or "").strip()
+    dense_chars = len(re.sub(r"\s+", "", _public_body_markdown_for_health(text)))
+    citations = re.findall(r"\[\d{1,5}\]", text)
+    render_artifacts = as_dict(writer_report.get("render_artifacts"))
+    sources = merge_source_registry_candidates(
+        as_list(writer_report.get("source_registry")),
+        as_list(render_artifacts.get("source_registry")),
+        as_list(writer_report.get("sources")),
+    )
+    traceable_sources = [
+        source
+        for source in sources
+        if str(as_dict(source).get("url") or as_dict(source).get("canonical_url") or "").strip()
+    ]
+    has_source_appendix = bool(
+        re.search(r"(?mi)^##\s*(来源附录|数据来源|参考来源|参考资料|Source Appendix|Sources)\b", text)
+    )
+    min_dense_chars = env_large_int(
+        "REPORT_INSUFFICIENT_FORMAL_MIN_DENSE_CHARS",
+        500,
+        min_value=200,
+        max_value=5000,
+    )
+    template_risk = _TEMPLATE_FILLER_FINGERPRINT in text or has_legacy_decision_sections(text)
+    can_keep_formal = bool(
+        dense_chars >= min_dense_chars
+        and citations
+        and (traceable_sources or has_source_appendix)
+        and not template_risk
+    )
+    if can_keep_formal:
+        return {
+            "mode": "limited_evidence_formal_report",
+            "replace_with_stub": False,
+            "report_status": "formal_scored",
+            "delivery_tier": "limited_evidence_formal_report",
+            "diagnostics": signal.get("diagnostics") or {},
+            "dense_chars": dense_chars,
+            "citation_count": len(citations),
+            "traceable_source_count": len(traceable_sources),
+        }
+    return {
+        "mode": "insufficient_analysis_stub",
+        "replace_with_stub": True,
+        "report_status": "insufficient_analysis_stub",
+        "delivery_tier": "insufficient_analysis_stub",
+        "diagnostics": signal.get("diagnostics") or {},
+        "dense_chars": dense_chars,
+        "citation_count": len(citations),
+        "traceable_source_count": len(traceable_sources),
+    }
+
+
 def _build_insufficient_stub_markdown(
     query: str,
     writer_report: Dict[str, Any],
@@ -3485,6 +3557,7 @@ HIGH_EVIDENCE_DEPTH_DEFAULTS = {
 
 HIGH_WRITING_QUALITY_DEFAULTS = {
     "BRAIN_ENABLE_LLM_EVIDENCE_ANALYSIS": "true",
+    "BRAIN_ENABLE_POST_QA_REPAIR": "true",
     "REPORT_ENABLE_LLM_BODY_REWRITE": "true",
     "REPORT_BODY_REWRITE_MAX_SECTIONS": "24",
     "REPORT_BODY_REWRITE_MAX_ELAPSED_SECONDS": "900",
@@ -4731,25 +4804,32 @@ def main() -> int:
 
     state_dict["writer_package_path"] = str(package_path)
     if formal_report_available:
-        _stub_signal = (
-            _insufficient_analysis_signal(writer_report)
+        _insufficient_action = (
+            _insufficient_analysis_delivery_action(report_markdown, writer_report)
             if env_flag("REPORT_INSUFFICIENT_STUB_ON_ZERO_CLAIMS", True)
-            else {"insufficient": False}
+            else {"mode": "normal", "replace_with_stub": False}
         )
-        if _stub_signal.get("insufficient"):
+        if _insufficient_action.get("replace_with_stub"):
             # P0 guardrail: analysis produced no usable LLM claims -> emit a short
             # honest stub instead of a fluent-but-vacuous deterministic long report.
             report_markdown = _build_insufficient_stub_markdown(
-                query, writer_report, as_dict(_stub_signal.get("diagnostics"))
+                query, writer_report, as_dict(_insufficient_action.get("diagnostics"))
             )
             writer_report["report_status"] = "insufficient_analysis_stub"
             writer_report["delivery_tier"] = "insufficient_analysis_stub"
             writer_report["insufficient_analysis_stub"] = True
+            writer_report["insufficient_analysis_delivery"] = _insufficient_action
             state_dict["answer_text"] = report_markdown
             write_markdown(formal_report_md_path, report_markdown)
             log("  [P0] 分析无有效 claim → 输出诚实短稿（非模板长文）", force=True)
         else:
             report_markdown, writer_report = finalize_formal_report_and_refresh_audit(report_markdown, writer_report)
+            if _insufficient_action.get("mode") == "limited_evidence_formal_report":
+                writer_report["report_status"] = "formal_scored"
+                writer_report["delivery_tier"] = "limited_evidence_formal_report"
+                writer_report["limited_evidence_formal_report"] = True
+                writer_report["insufficient_analysis_stub"] = False
+                writer_report["insufficient_analysis_delivery"] = _insufficient_action
             state_dict["answer_text"] = report_markdown
             write_formal_markdown(formal_report_md_path, report_markdown)
         writer_report["formal_report_path"] = str(formal_report_md_path)

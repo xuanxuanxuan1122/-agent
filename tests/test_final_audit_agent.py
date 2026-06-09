@@ -136,6 +136,42 @@ def test_final_audit_payload_includes_compact_repair_gap_context(monkeypatch):
     assert result["audit"]["critical_findings"][0]["gap_id"] == "GAP-metric"
 
 
+def test_final_audit_sets_large_default_output_budget(monkeypatch):
+    monkeypatch.setenv("RAG_MODEL_FINAL_AUDIT_PROFILE", "deepseek-v4-pro")
+    monkeypatch.setenv("RAG_LLM_PROFILE_DEEPSEEK_V4_PRO_PROVIDER", "openai_compatible")
+    monkeypatch.setenv("RAG_LLM_PROFILE_DEEPSEEK_V4_PRO_URL", "https://api.deepseek.example/chat/completions")
+    monkeypatch.setenv("RAG_LLM_PROFILE_DEEPSEEK_V4_PRO_API_KEY", "deepseek-test")
+    monkeypatch.setenv("RAG_LLM_PROFILE_DEEPSEEK_V4_PRO_MODEL", "deepseek-v4-pro")
+    monkeypatch.setenv("REPORT_ENABLE_FINAL_AUDIT", "true")
+    monkeypatch.setenv("REPORT_FINAL_AUDIT_BLOCKING", "false")
+    monkeypatch.delenv("RAG_LLM_PROFILE_DEEPSEEK_V4_PRO_MAX_OUTPUT_TOKENS", raising=False)
+    captured = {}
+
+    def fake_call_openai_compatible_json(*, config, system_prompt, user_payload):
+        captured["config"] = config
+        return {
+            "payload": {
+                "status": "pass",
+                "overall_score": 88,
+                "critical_findings": [],
+                "publish_recommendation": "publish_with_caveats",
+                "summary": "ok",
+            },
+            "usage": {"total_tokens": 10},
+            "llm_call": {"task": "final_audit", "model": "deepseek-v4-pro", "status": "success"},
+        }
+
+    monkeypatch.setattr(final_audit_agent, "call_openai_compatible_json", fake_call_openai_compatible_json)
+
+    result = final_audit_agent.run_final_audit(
+        report_markdown="# Report\n\nConclusion [1]\n\n## 来源附录\n- [1] Source | https://www.stats.gov.cn/source",
+        clean_evidence={"sources": [{"id": "1", "title": "Source", "url": "https://www.stats.gov.cn/source"}]},
+    )
+
+    assert result["success"] is True
+    assert int(captured["config"]["max_output_tokens"]) >= 8192
+
+
 def test_final_audit_drops_false_future_date_fatal_when_date_is_not_future(monkeypatch):
     _configure_deepseek_final_audit(monkeypatch)
     monkeypatch.setenv("REPORT_ENABLE_FINAL_AUDIT", "true")
