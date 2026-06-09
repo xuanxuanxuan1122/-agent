@@ -14,6 +14,7 @@ try:
     from rag_pipeline.contracts.ref_normalizer import normalize_claim_refs
     from rag_pipeline.contracts.research_reflection import build_research_reflection_memo
     from rag_pipeline.contracts.source_registry import pick_refs as _contract_pick_refs
+    from rag_pipeline.quality.conversion_summary import build_quality_conversion_summary
     from .analytics import run_analytics_agents
     from .chapter_evidence_builder import build_chapter_evidence_packages_from_evidence_package
     from .chapter_narrative_agent import run_chapter_narrative
@@ -42,6 +43,7 @@ except Exception:  # pragma: no cover - direct script mode fallback
         from rag_pipeline.contracts.ref_normalizer import normalize_claim_refs  # type: ignore
         from rag_pipeline.contracts.research_reflection import build_research_reflection_memo  # type: ignore
         from rag_pipeline.contracts.source_registry import pick_refs as _contract_pick_refs  # type: ignore
+        from rag_pipeline.quality.conversion_summary import build_quality_conversion_summary  # type: ignore
     except Exception:  # pragma: no cover
         apply_evidence_quality_contract = None  # type: ignore
         build_handoff_contract_summary = None  # type: ignore
@@ -49,6 +51,7 @@ except Exception:  # pragma: no cover - direct script mode fallback
         normalize_claim_refs = None  # type: ignore
         build_research_reflection_memo = None  # type: ignore
         _contract_pick_refs = None  # type: ignore
+        build_quality_conversion_summary = None  # type: ignore
     from analytics import run_analytics_agents  # type: ignore
     from chapter_evidence_builder import build_chapter_evidence_packages_from_evidence_package  # type: ignore
     from chapter_narrative_agent import run_chapter_narrative  # type: ignore
@@ -3802,6 +3805,27 @@ def build_writer_report(
                 "failed_contracts": ["handoff_contract_exception"],
                 "error": str(exc),
             }
+    quality_conversion_summary: Dict[str, Any] = {}
+    if build_quality_conversion_summary:
+        try:
+            quality_conversion_summary = build_quality_conversion_summary(
+                evidence_package=evidence_package,
+                structured_analysis=structured_analysis,
+                writer_report=writer_output,
+                writer_package={
+                    "argument_units": [item for item in list(argument_units or []) if isinstance(item, dict)],
+                    "chapter_packages": [item for item in list(chapter_packages or []) if isinstance(item, dict)],
+                    "table_packages": [item for item in list(table_packages or []) if isinstance(item, dict)],
+                    "source_registry": [item for item in list(rendered_source_registry or []) if isinstance(item, dict)],
+                },
+            )
+        except Exception as exc:  # pragma: no cover - conversion diagnostics must not block report rendering.
+            quality_conversion_summary = {
+                "schema_version": "quality_conversion_summary_v1",
+                "mode": "package",
+                "status": "error",
+                "error": str(exc),
+            }
     stage_quality_card = _stage_quality_card(
         chapter_evidence_packages=[item for item in list(chapter_evidence_packages or []) if isinstance(item, dict)],
         table_quality_summary=table_quality_summary,
@@ -3842,6 +3866,7 @@ def build_writer_report(
         "chapter_narrative": chapter_narrative_diagnostics,
         "stage_quality_card": stage_quality_card,
         "handoff_contract_summary": handoff_contract_summary,
+        "quality_conversion_summary": quality_conversion_summary,
     }
     return {
         **writer_output,
@@ -3885,6 +3910,7 @@ def build_writer_report(
         "table_gap_summary": table_gap_summary,
         "stage_quality_card": stage_quality_card,
         "handoff_contract_summary": handoff_contract_summary,
+        "quality_conversion_summary": quality_conversion_summary,
         "evidence_health_summary": evidence_health_summary,
         "research_reflection_memo": research_reflection_memo,
         "evidence_analysis_summary": evidence_analysis_summary,
@@ -3936,6 +3962,7 @@ def build_writer_report(
             "chapter_narrative": chapter_narrative_diagnostics,
             "stage_quality_card": stage_quality_card,
             "handoff_contract_summary": handoff_contract_summary,
+            "quality_conversion_summary": quality_conversion_summary,
         },
     }
 

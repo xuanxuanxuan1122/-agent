@@ -159,8 +159,11 @@ def test_repair_effectiveness_tracks_closed_gaps_not_just_task_count():
 
     assert summary["attempted_gap_count"] == 4
     assert summary["closed_gap_count"] == 2
+    assert summary["strict_closed_gap_count"] == 0
+    assert summary["signal_only_gap_count"] == 2
     assert summary["open_gap_count"] == 2
     assert summary["closure_rate"] == 0.5
+    assert summary["strict_closure_rate"] == 0
     assert summary["new_usable_evidence_count"] == 2
     assert summary["new_ab_source_count"] == 1
     assert summary["by_gap_status"]["still_insufficient"] == 1

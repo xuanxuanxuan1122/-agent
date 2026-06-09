@@ -102,10 +102,13 @@ def test_writer_report_exposes_stage_quality_card_in_all_debug_surfaces():
     assert report["stage_quality_card"]["schema_version"] == "stage_quality_card_v1"
     assert report["stage_quality_card"]["handoff"]["schema_version"] == "handoff_contract_summary_v1"
     assert report["handoff_contract_summary"]["schema_version"] == "handoff_contract_summary_v1"
+    assert report["quality_conversion_summary"]["schema_version"] == "quality_conversion_summary_v1"
     assert report["debug_snapshot"]["stage_quality_card"]["schema_version"] == "stage_quality_card_v1"
     assert report["render_artifacts"]["stage_quality_card"]["schema_version"] == "stage_quality_card_v1"
+    assert report["render_artifacts"]["quality_conversion_summary"]["schema_version"] == "quality_conversion_summary_v1"
     assert report["metadata"]["stage_quality_card"]["schema_version"] == "stage_quality_card_v1"
     assert report["metadata"]["handoff_contract_summary"]["schema_version"] == "handoff_contract_summary_v1"
+    assert report["metadata"]["quality_conversion_summary"]["schema_version"] == "quality_conversion_summary_v1"
 
 
 def test_writer_report_normalizes_argument_unit_refs_to_canonical_fields():

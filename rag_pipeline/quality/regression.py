@@ -7,9 +7,21 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from rag_pipeline.contracts.evidence_admission import summarize_evidence_admission
+from rag_pipeline.quality.conversion_summary import build_quality_conversion_summary
 
 
 CLOSED_GAP_STATUSES = {"closed", "resolved", "repaired", "evidence_found", "cache_satisfied"}
+STRICT_CLOSED_GAP_STATUSES = {
+    "closed",
+    "resolved",
+    "repaired",
+    "sufficiency_passed",
+    "claim_bound",
+    "section_rewritten",
+    "citation_resolved",
+    "metric_table_ready",
+}
+SIGNAL_ONLY_GAP_STATUSES = {"evidence_found", "cache_satisfied"}
 OPEN_GAP_STATUSES = {"open", "needs_repair", "insufficient", "still_insufficient", "live_search_required"}
 
 
@@ -202,6 +214,8 @@ def summarize_repair_effectiveness(
         gap_types[gap_type] += 1
 
     closed_count = sum(status_counts[status] for status in CLOSED_GAP_STATUSES)
+    strict_closed_count = sum(status_counts[status] for status in STRICT_CLOSED_GAP_STATUSES)
+    signal_only_count = sum(status_counts[status] for status in SIGNAL_ONLY_GAP_STATUSES)
     open_count = sum(status_counts[status] for status in OPEN_GAP_STATUSES)
     attempted_count = max(selected_count, len(gaps), closed_count + open_count)
 
@@ -225,8 +239,11 @@ def summarize_repair_effectiveness(
         "attempted_gap_count": attempted_count,
         "selected_repair_task_count": selected_count,
         "closed_gap_count": closed_count,
+        "strict_closed_gap_count": strict_closed_count,
+        "signal_only_gap_count": signal_only_count,
         "open_gap_count": open_count,
         "closure_rate": closure_rate,
+        "strict_closure_rate": strict_closed_count / attempted_count if attempted_count else 0.0,
         "new_usable_evidence_count": result_counter["new_usable_evidence_count"],
         "new_ab_source_count": result_counter["new_ab_source_count"],
         "signal_count": result_counter["signal_count"],
@@ -263,6 +280,15 @@ def build_run_quality_snapshot(
         or _as_list(package.get("fact_cards"))
     )
 
+    conversion_summary = _first_dict(package.get("quality_conversion_summary"), report.get("quality_conversion_summary"))
+    if not conversion_summary:
+        conversion_summary = build_quality_conversion_summary(
+            evidence_package=evidence_package,
+            structured_analysis=_as_dict(package.get("structured_analysis")) or _as_dict(report.get("structured_analysis")),
+            writer_report=report,
+            writer_package=package,
+        )
+
     return {
         "schema_version": "run_quality_snapshot_v1",
         "run_id": _text(metadata.get("run_id") or package.get("run_id") or report.get("run_id")),
@@ -290,6 +316,7 @@ def build_run_quality_snapshot(
         "cost_usd": run_metrics["cost_usd"],
         "repair_effectiveness": summarize_repair_effectiveness(writer_package=package, writer_report=report),
         "evidence_admission_summary": summarize_evidence_admission(fact_cards),
+        "quality_conversion_summary": conversion_summary,
         "handoff_contract_summary": handoff,
         "handoff_failed_contracts": handoff_failed_contracts,
         "handoff_failed_contract_count": len(handoff_failed_contracts),

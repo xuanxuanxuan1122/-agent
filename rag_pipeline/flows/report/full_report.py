@@ -4976,6 +4976,8 @@ def main() -> int:
         or as_dict(render_artifacts.get("handoff_contract_summary")),
         "package_normalization_summary": as_dict(writer_report.get("package_normalization_summary"))
         or as_dict(render_artifacts.get("package_normalization_summary")),
+        "quality_conversion_summary": as_dict(writer_report.get("quality_conversion_summary"))
+        or as_dict(render_artifacts.get("quality_conversion_summary")),
         "review_result": review_result,
         "reformatter_result": reformatter_result,
         **repair_trace_payload_from_state(
@@ -4993,6 +4995,29 @@ def main() -> int:
             "usable_for_skip_search": bool(topic_cache_preflight.get("usable_for_skip_search")),
         },
     }
+    if not as_dict(writer_package_payload.get("quality_conversion_summary")):
+        try:
+            from rag_pipeline.quality.conversion_summary import build_quality_conversion_summary
+
+            _quality_conversion_summary = build_quality_conversion_summary(
+                evidence_package=evidence_package_payload,
+                structured_analysis=as_dict(writer_package_payload.get("structured_analysis")),
+                writer_report=writer_report,
+                writer_package=writer_package_payload,
+            )
+            writer_package_payload["quality_conversion_summary"] = _quality_conversion_summary
+            writer_report["quality_conversion_summary"] = _quality_conversion_summary
+            state_dict["quality_conversion_summary"] = _quality_conversion_summary
+        except Exception as exc:
+            writer_package_payload["quality_conversion_summary"] = {
+                "schema_version": "quality_conversion_summary_v1",
+                "mode": "package",
+                "status": "error",
+                "error": str(exc),
+            }
+    if as_dict(writer_package_payload.get("quality_conversion_summary")):
+        writer_report["quality_conversion_summary"] = as_dict(writer_package_payload.get("quality_conversion_summary"))
+        state_dict["quality_conversion_summary"] = as_dict(writer_package_payload.get("quality_conversion_summary"))
     for stage_name, payload in (
         ("evidence_package", evidence_package_payload),
         ("chapter_evidence_packages", chapter_evidence_payload),
