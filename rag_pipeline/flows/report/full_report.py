@@ -4770,7 +4770,12 @@ def main() -> int:
     if as_dict(writer_report.get("live_timeout")) or as_dict(state_dict.get("live_timeout")) or as_dict(raw_output.get("live_timeout")):
         report_execution_mode = "timeout_fail_open"
     writer_report["report_execution_mode"] = writer_report.get("report_execution_mode") or report_execution_mode
-    writer_report["quality_mode"] = bool(writer_report.get("quality_mode") or report_execution_mode == "live_quality_full")
+    writer_quality_mode = str(writer_report.get("quality_mode") or report_quality_mode or "").strip()
+    if writer_quality_mode.lower() in {"true", "1", "yes"}:
+        writer_quality_mode = report_quality_mode or "high"
+    elif writer_quality_mode.lower() in {"false", "0", "no"}:
+        writer_quality_mode = report_quality_mode or "balanced"
+    writer_report["quality_mode"] = writer_quality_mode or ("high" if report_execution_mode == "live_quality_full" else "balanced")
     writer_report["quality_posture"] = writer_report.get("quality_posture") or quality_posture
     state_dict["writer_report"] = writer_report
     record_stage_snapshot(
@@ -4948,7 +4953,7 @@ def main() -> int:
     writer_package_payload = {
         "query": query,
         "report_execution_mode": writer_report.get("report_execution_mode") or report_execution_mode,
-        "quality_mode": bool(writer_report.get("quality_mode")),
+        "quality_mode": writer_report.get("quality_mode") or report_quality_mode,
         "quality_posture": quality_posture,
         "stage_status": stage_status(state_dict),
         "llm_runtime": llm_status,
@@ -4966,6 +4971,11 @@ def main() -> int:
         "chapter_packages": as_list(render_artifacts.get("chapter_packages")) or as_list(state_dict.get("chapter_packages")) or as_list(raw_output.get("chapter_packages")),
         "citation_manifest": as_dict(writer_report.get("citation_manifest")) or as_dict(render_artifacts.get("citation_manifest")),
         "writer_report": writer_report,
+        "stage_quality_card": as_dict(writer_report.get("stage_quality_card")) or as_dict(render_artifacts.get("stage_quality_card")),
+        "handoff_contract_summary": as_dict(writer_report.get("handoff_contract_summary"))
+        or as_dict(render_artifacts.get("handoff_contract_summary")),
+        "package_normalization_summary": as_dict(writer_report.get("package_normalization_summary"))
+        or as_dict(render_artifacts.get("package_normalization_summary")),
         "review_result": review_result,
         "reformatter_result": reformatter_result,
         **repair_trace_payload_from_state(

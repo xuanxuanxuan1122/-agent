@@ -33,6 +33,27 @@ def test_evidence_package_contract_reports_missing_ids_and_sources():
     assert result.summary["missing_evidence_id_count"] == 1
 
 
+def test_evidence_package_contract_treats_missing_allowed_use_as_warning_not_public_error():
+    result = validate_evidence_package_for_analysis(
+        {
+            "analysis_ready_evidence": [
+                {
+                    "evidence_id": "EV-unknown-use",
+                    "fact": "Potential evidence has not been tiered yet.",
+                    "source_id": "SRC-missing",
+                }
+            ],
+            "source_registry": [],
+        }
+    )
+
+    assert result.ok is True
+    assert "public_evidence_source_unresolved" not in result.errors
+    assert "evidence_allowed_use_missing" in result.warnings
+    assert result.summary["public_candidate_count"] == 0
+    assert result.summary["missing_allowed_use_count"] == 1
+
+
 def test_structured_analysis_contract_requires_claim_lineage_to_writer():
     result = validate_structured_analysis_for_writer(
         {
@@ -112,6 +133,19 @@ def test_writer_report_contract_blocks_factual_body_without_citation():
     result = validate_writer_report_for_final(
         {
             "report_markdown": "## Market\n\nThe market reached 100 billion yuan in 2025.\n\nSupported line [1].",
+            "source_registry": [{"ref": "[1]", "url": "https://example.com/report"}],
+        }
+    )
+
+    assert result.ok is False
+    assert "writer_factual_line_without_citation" in result.errors
+    assert result.summary["citationless_factual_line_count"] == 1
+
+
+def test_writer_report_contract_detects_chinese_factual_body_without_citation():
+    result = validate_writer_report_for_final(
+        {
+            "report_markdown": "## 市场\n\n2025年该市场规模达到100亿元，融资和采购活动继续增加。\n\n有引用的判断 [1]。",
             "source_registry": [{"ref": "[1]", "url": "https://example.com/report"}],
         }
     )

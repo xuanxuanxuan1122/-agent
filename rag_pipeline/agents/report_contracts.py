@@ -205,7 +205,9 @@ def filter_resolvable_evidence_refs(refs: Sequence[Any], source_registry: Sequen
 FACTUAL_CLAIM_RE = re.compile(
     r"(?:"
     r"\d{4}\s*年|"
+    r"\b(?:19|20)\d{2}\b|"
     r"\d+(?:\.\d+)?\s*(?:%|亿|万亿|万|条|家|美元|元|人民币|美元|CAGR)|"
+    r"\d+(?:\.\d+)?\s*(?:percent|billion|million|yuan|rmb|usd|x)|"
     r"CAGR|market\s+size|forecast|revenue|funding|"
     r"市场规模|融资|收入|营收|预测|白皮书|报告|发布|财报|公告|政策|补贴|"
     r"OpenAI|Microsoft|Google|Salesforce|AWS|Anthropic|Gartner|IDC|"

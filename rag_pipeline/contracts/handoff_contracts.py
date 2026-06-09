@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Sequence, Set
 
+from rag_pipeline.agents.report_contracts import text_has_factual_claim
 from rag_pipeline.contracts.evidence_identity import build_evidence_alias_map
 from rag_pipeline.contracts.ref_normalizer import normalize_claim_refs
 
@@ -11,11 +12,6 @@ from rag_pipeline.contracts.ref_normalizer import normalize_claim_refs
 HANDOFF_CONTRACT_VERSION = "handoff_contracts_v1"
 
 CITATION_RE = re.compile(r"\[(\d{1,5})\]")
-FACTUAL_LINE_RE = re.compile(
-    r"(?:\b(?:19|20)\d{2}\b|\b\d+(?:\.\d+)?\s*(?:%|percent|billion|million|yuan|rmb|usd|x)\b|"
-    r"\b(?:revenue|market|share|growth|funding|valuation|users|customers|cost|price|pricing)\b)",
-    re.IGNORECASE,
-)
 
 
 @dataclass(frozen=True)
@@ -221,13 +217,18 @@ def validate_evidence_package_for_analysis(evidence_package: Dict[str, Any]) -> 
     missing_id_count = 0
     unresolved_source_count = 0
     public_candidate_count = 0
+    missing_allowed_use_count = 0
 
     for item in evidence_items:
         if not _evidence_id(item):
             missing_id_count += 1
             errors.append("evidence_missing_evidence_id")
         allowed_use = _text(item.get("allowed_use") or item.get("usage") or item.get("analysis_role")).lower()
-        if allowed_use in {"public", "admissible", "publishable", "directional", "core", "supporting", ""}:
+        if not allowed_use:
+            missing_allowed_use_count += 1
+            warnings.append("evidence_allowed_use_missing")
+            continue
+        if allowed_use in {"public", "admissible", "publishable", "directional", "core", "supporting"}:
             public_candidate_count += 1
             if not _item_source_resolves(item, source_keys):
                 unresolved_source_count += 1
@@ -242,6 +243,7 @@ def validate_evidence_package_for_analysis(evidence_package: Dict[str, Any]) -> 
             "stage": "evidence_package_for_analysis",
             "analysis_candidate_count": len(evidence_items),
             "public_candidate_count": public_candidate_count,
+            "missing_allowed_use_count": missing_allowed_use_count,
             "missing_evidence_id_count": missing_id_count,
             "unresolved_public_source_count": unresolved_source_count,
             "source_registry_count": len(_source_registry(package)),
@@ -401,7 +403,7 @@ def validate_writer_report_for_final(writer_report: Dict[str, Any]) -> HandoffVa
     for line in _markdown_lines(markdown):
         if line.startswith(("#", "|", "```")):
             continue
-        if FACTUAL_LINE_RE.search(line) and not _line_has_citation(line):
+        if text_has_factual_claim(line) and not _line_has_citation(line):
             citationless_factual_lines.append(line[:180])
             errors.append("writer_factual_line_without_citation")
 

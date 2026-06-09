@@ -6,6 +6,7 @@ import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 
 from rag_pipeline.contracts.claim_roles import classify_claim_unit_roles
+from rag_pipeline.contracts.ref_normalizer import normalize_claim_refs
 from rag_pipeline.contracts.section_audit import audit_section_claim_roles
 from rag_pipeline.runtime_cache import json_safe_default
 
@@ -106,7 +107,7 @@ def _requirement_ids(payload: Dict[str, Any]) -> List[str]:
     )
 
 
-def _fact_refs(payload: Dict[str, Any]) -> List[str]:
+def _legacy_fact_refs(payload: Dict[str, Any]) -> List[str]:
     return _dedupe(
         [
             *_as_list(payload.get("fact_ids")),
@@ -119,6 +120,22 @@ def _fact_refs(payload: Dict[str, Any]) -> List[str]:
         ],
         limit=80,
     )
+
+
+def _normalized_ref_payload(payload: Dict[str, Any], fact_cards: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    if not fact_cards:
+        return {}
+    normalized = normalize_claim_refs(payload, fact_cards=fact_cards)
+    if _as_list(normalized.get("fact_ids")):
+        return normalized
+    return {}
+
+
+def _fact_refs(payload: Dict[str, Any], *, fact_cards: Sequence[Dict[str, Any]] | None = None) -> List[str]:
+    normalized = _normalized_ref_payload(payload, fact_cards or [])
+    if normalized:
+        return _dedupe(_as_list(normalized.get("fact_ids")), limit=80)
+    return _legacy_fact_refs(payload)
 
 
 def _source_ids(payload: Dict[str, Any]) -> List[str]:
@@ -649,6 +666,7 @@ def ingest_writer_package_artifacts(
             add_edge("search_task", search_task_id, "fact_card", fact_id, "found")
         summary["fact_card_count"] += 1
 
+    fact_cards_for_ref_normalization = list(fact_payload_map.values())
     seen_claims: Set[str] = set()
     claim_requirement_map: Dict[str, List[str]] = {}
     claim_payload_map: Dict[str, Dict[str, Any]] = {}
@@ -657,7 +675,7 @@ def ingest_writer_package_artifacts(
         if claim_id in seen_claims:
             continue
         seen_claims.add(claim_id)
-        fact_ids = _fact_refs(claim)
+        fact_ids = _fact_refs(claim, fact_cards=fact_cards_for_ref_normalization)
         req_ids = _infer_requirement_ids(
             claim,
             requirement_lookup=requirement_lookup,
@@ -712,7 +730,7 @@ def ingest_writer_package_artifacts(
             continue
         seen_sections.add(section_id)
         claim_ids = _dedupe([section.get("claim_id"), *_as_list(section.get("claim_ids"))], limit=40)
-        fact_ids = _fact_refs(section)
+        fact_ids = _fact_refs(section, fact_cards=fact_cards_for_ref_normalization)
         # P5: if the section did not carry claim_ids (the composer often fails to
         # propagate them — the "N claim_units but sections.claim_ids empty" gap),
         # recover the binding from fact overlap so the section is provably tied to

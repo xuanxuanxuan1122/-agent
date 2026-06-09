@@ -170,6 +170,66 @@ def test_bridge_backfills_claim_section_requirements_via_fact_layer(tmp_path, mo
     assert second["lineage_edge_total"] == summary["lineage_edge_total"]
 
 
+def test_bridge_canonicalizes_legacy_fact_refs_before_persisting_claims(tmp_path, monkeypatch):
+    monkeypatch.setenv("ARTIFACT_LEDGER_PATH", str(tmp_path / "artifact_ledger.sqlite"))
+    monkeypatch.setenv("ARTIFACT_OBJECT_ROOT", str(tmp_path / "objects"))
+    store = ArtifactStore()
+    store.upsert_run(run_id="run-alias", query="AI Agent", status="running")
+
+    writer_package = {
+        "evidence_package": {
+            "report_contract": {
+                "evidence_requirements": {
+                    "requirements": [
+                        {"requirement_id": "H1_metric", "chapter_id": "ch_01", "proof_role": "metric"}
+                    ]
+                }
+            },
+            "analysis_ready_evidence": [
+                {
+                    "evidence_id": "EV-canonical",
+                    "aliases": ["EV-legacy"],
+                    "requirement_id": "H1_metric",
+                    "source_id": "SRC-1",
+                    "fact": "A canonical fact carries a legacy evidence alias.",
+                    "source": {"id": "SRC-1", "url": "https://example.com/metric"},
+                }
+            ],
+        },
+        "source_registry": [{"id": "SRC-1", "url": "https://example.com/metric"}],
+        "argument_units": [
+            {
+                "claim_id": "CL-alias",
+                "claim": "The claim cites the legacy evidence id.",
+                "used_fact_refs": ["EV-legacy"],
+            }
+        ],
+        "chapter_packages": [
+            {
+                "chapter_id": "ch_01",
+                "sections": [
+                    {"section_id": "SEC-alias", "claim_id": "CL-alias", "used_fact_refs": ["EV-legacy"]}
+                ],
+            }
+        ],
+    }
+
+    ingest_writer_package_artifacts(store, run_id="run-alias", writer_package=writer_package, writer_report={})
+
+    claim = store.list_claim_units("run-alias", claim_ids=["CL-alias"])[0]
+    assert claim["fact_ids"] == ["EV-canonical"]
+    assert claim["requirement_ids"] == ["H1_metric"]
+    assert claim["source_ids"] == ["SRC-1"]
+    with store._connect() as conn:
+        row = conn.execute(
+            "SELECT used_fact_refs_json, requirement_ids_json FROM sections WHERE run_id=? AND section_id=?",
+            ("run-alias", "SEC-alias"),
+        ).fetchone()
+    assert "EV-canonical" in row[0]
+    assert "EV-legacy" not in row[0]
+    assert "H1_metric" in row[1]
+
+
 def test_bridge_persists_section_audit_score_gaps(tmp_path, monkeypatch):
     monkeypatch.setenv("ARTIFACT_LEDGER_PATH", str(tmp_path / "artifact_ledger.sqlite"))
     monkeypatch.setenv("ARTIFACT_OBJECT_ROOT", str(tmp_path / "objects"))
