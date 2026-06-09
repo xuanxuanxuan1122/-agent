@@ -1218,7 +1218,7 @@ def finalize_markdown_citations(
         min_value=0,
         max_value=1000,
     )
-    citation_rebind_required = bool(citationless_removed_count > rebind_threshold)
+    citation_rebind_required = bool(citationless_removed_count >= rebind_threshold)
     diagnostics = {
         "final_citation_reconciliation_status": reconciliation_status,
         "final_body_citation_refs": final_body_refs,
@@ -1232,6 +1232,8 @@ def finalize_markdown_citations(
         **sentence_drop_diagnostics,
         "citationless_factual_removed_count": citationless_removed_count,
         "citation_rebind_required": citation_rebind_required,
+        "citation_binding_quality_low": citation_rebind_required,
+        "repair_required": "citation_rebind" if citation_rebind_required else "",
         "citation_rebind_reason": (
             "citationless_factual_removal_exceeded_threshold" if citation_rebind_required else ""
         ),

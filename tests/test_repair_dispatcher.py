@@ -22,6 +22,8 @@ def test_dispatcher_routes_metric_missing_period_to_report_pdf_search():
     assert {"report", "survey", "pdf", "annual report"} <= set(seed["query_enhancers"])
     assert seed["avoid_queries"] == ["AI Agent market size"]
     assert "AI Agent market size" not in seed["query"]
+    assert {"研报", "调研", "统计", "测算口径"} & set(seed["query_enhancers"])
+    assert any(term in seed["query"] for term in ["研报", "调研", "统计", "测算口径"])
 
 
 def test_dispatcher_routes_counter_gap_to_negative_evidence():
@@ -39,6 +41,24 @@ def test_dispatcher_routes_counter_gap_to_negative_evidence():
     assert seed["required_field_focus"] == "counter_signal"
     assert seed["source_strategy"]["source_priority"][0] == "counter_evidence"
     assert {"failure", "cost", "ROI unclear", "compliance"} <= set(seed["query_enhancers"])
+    assert {"失败案例", "成本过高", "ROI不明", "合规"} & set(seed["query_enhancers"])
+    assert any(term in seed["query"] for term in ["失败案例", "成本过高", "ROI不明", "合规"])
+
+
+def test_dispatcher_routes_case_gap_with_chinese_case_enhancers():
+    seed = dispatch_repair_seed(
+        {
+            "gap_id": "GAP-case",
+            "requirement_id": "H1_case",
+            "gap_type": "customer_case_missing",
+            "proof_role": "case",
+            "query": "AI Agent enterprise workflow",
+        }
+    )
+
+    assert seed["repair_route"] == "case_source_search"
+    assert {"客户案例", "落地案例", "采购", "中标"} & set(seed["query_enhancers"])
+    assert any(term in seed["query"] for term in ["客户案例", "落地案例", "采购", "中标"])
 
 
 def test_rejected_span_summary_turns_missing_fields_into_repair_seed():

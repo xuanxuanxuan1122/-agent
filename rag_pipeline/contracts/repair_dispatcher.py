@@ -94,13 +94,13 @@ def dispatch_repair_seed(task: Dict[str, Any], *, failed_queries: Sequence[Any] 
     strategy = source_strategy_for_role(role, overrides=_as_dict(payload.get("source_strategy")))
     focus = str(payload.get("required_field_focus") or _field_focus(payload, missing_fields=payload.get("missing_fields") or payload.get("missing"))).strip()
     avoid_queries = _dedupe(failed_queries or payload.get("avoid_queries") or [], limit=12)
-    enhancers = _dedupe([*_as_list(payload.get("query_enhancers")), *strategy.get("query_enhancers", [])], limit=12)
+    enhancers = _dedupe([*_as_list(payload.get("query_enhancers")), *strategy.get("query_enhancers", [])], limit=20)
     query = _query_without_avoid(
         [
             payload.get("query") or payload.get("suggested_query") or payload.get("evidence_goal"),
             focus,
             *_as_list(payload.get("required_fields")),
-            *enhancers[:4],
+            *enhancers[:6],
         ],
         avoid_queries,
     )

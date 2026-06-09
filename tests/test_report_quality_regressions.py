@@ -1508,6 +1508,41 @@ def test_high_value_repair_selector_keeps_core_tasks_and_skips_length(monkeypatc
     assert all(item["search_task"].get("type") != "report_body_below_target_chars" for item in selected)
 
 
+def test_high_value_repair_selector_defaults_per_chapter_budget_by_quality_mode(monkeypatch):
+    monkeypatch.delenv("BRAIN_REPAIR_MAX_TASKS_PER_CHAPTER", raising=False)
+    monkeypatch.setenv("BRAIN_REPAIR_MAX_TASKS_PER_ROUND", "10")
+    monkeypatch.setenv("REPORT_QUALITY_MODE", "strict")
+    tasks = [
+        {
+            "query": f"query {index}",
+            "agent": "iqs_lane_1",
+            "search_task": {
+                "query": f"query {index}",
+                "gap_id": f"g{index}",
+                "chapter_id": "ch_01",
+                "blocking_gaps": ["metric_scope_period_unit_incomplete"],
+                "proof_role": role,
+            },
+        }
+        for index, role in enumerate(["metric", "source_check", "case", "counter", "support"], start=1)
+    ]
+
+    strict_state = {"metadata": {}}
+    strict_selected = _select_high_value_repair_tasks(tasks, state=strict_state, round_number=1)
+
+    assert len(strict_selected) == 4
+    assert strict_state["metadata"]["repair_task_selection_summary"]["max_tasks_per_chapter"] == 4
+    assert strict_state["metadata"]["repair_task_selection_summary"]["skipped_per_chapter_count"] == 1
+
+    monkeypatch.setenv("REPORT_QUALITY_MODE", "speed")
+    speed_state = {"metadata": {}}
+    speed_selected = _select_high_value_repair_tasks(tasks, state=speed_state, round_number=1)
+
+    assert len(speed_selected) == 1
+    assert speed_state["metadata"]["repair_task_selection_summary"]["max_tasks_per_chapter"] == 1
+    assert speed_state["metadata"]["repair_task_selection_summary"]["skipped_per_chapter_count"] == 4
+
+
 def test_lane_circuit_breaker_reroutes_core_and_skips_low_priority():
     state = {
         "iqs_lane_3_state": {

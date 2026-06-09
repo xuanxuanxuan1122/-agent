@@ -240,6 +240,28 @@ def test_final_citation_reconciliation_marks_rebind_required_when_many_facts_rem
     assert diagnostics["citation_rebind_reason"] == "citationless_factual_removal_exceeded_threshold"
 
 
+def test_final_citation_reconciliation_rebinds_when_removal_count_reaches_threshold(monkeypatch):
+    monkeypatch.setenv("REPORT_FINAL_CITATION_REBIND_REMOVAL_THRESHOLD", "5")
+    body = "\n".join(
+        [
+            "OpenAI revenue reached 20 billion in 2025.",
+            "Microsoft revenue reached 30 billion in 2025.",
+            "Google revenue reached 40 billion in 2025.",
+            "Salesforce revenue reached 50 billion in 2025.",
+            "Anthropic revenue reached 60 billion in 2025.",
+        ]
+    )
+
+    rewritten, _, diagnostics = finalize_markdown_citations(body, {"appendix_sources": []}, [])
+
+    assert rewritten == ""
+    assert diagnostics["citationless_factual_removed_count"] == 5
+    assert diagnostics["citation_rebind_required"] is True
+    assert diagnostics["citation_binding_quality_low"] is True
+    assert diagnostics["repair_required"] == "citation_rebind"
+    assert diagnostics["clean_report_eligible"] is False
+
+
 def test_manifest_maps_section_evidence_ref_to_public_citation():
     chapters = [
         {

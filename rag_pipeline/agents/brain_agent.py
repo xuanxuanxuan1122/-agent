@@ -8383,6 +8383,17 @@ def _task_chapter_key_for_budget(task: Dict[str, Any], index: int) -> str:
     ).strip().lower()
 
 
+def _repair_max_tasks_per_chapter() -> int:
+    if os.getenv("BRAIN_REPAIR_MAX_TASKS_PER_CHAPTER") is not None:
+        return _env_int("BRAIN_REPAIR_MAX_TASKS_PER_CHAPTER", 2, min_value=1, max_value=20)
+    mode = str(os.getenv("REPORT_QUALITY_MODE") or os.getenv("QUALITY_MODE") or "balanced").strip().lower()
+    if mode in {"speed", "fast", "loose", "draft", "quick_market_scan"}:
+        return 1
+    if mode in {"strict", "deep", "high", "deep_strict", "due_diligence", "investment_due_diligence"}:
+        return 4
+    return 2
+
+
 def _select_high_value_repair_tasks(
     tasks: Sequence[Dict[str, Any]],
     *,
@@ -8401,7 +8412,7 @@ def _select_high_value_repair_tasks(
         min_value=1,
         max_value=80,
     )
-    per_chapter = _env_int("BRAIN_REPAIR_MAX_TASKS_PER_CHAPTER", 2, min_value=1, max_value=20)
+    per_chapter = _repair_max_tasks_per_chapter()
     sorted_tasks = sorted(
         normalized,
         key=lambda task: (
