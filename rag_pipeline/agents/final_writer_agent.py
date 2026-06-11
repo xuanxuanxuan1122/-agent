@@ -1072,6 +1072,45 @@ def _citationless_factual_segments(markdown: str, *, limit: int = 8) -> List[str
     return examples
 
 
+def _diagnostic_only_review_payload(
+    *,
+    source_stage: str,
+    issue_type: str,
+    reason: str = "",
+    suggested_action: str = "",
+    **extra: Any,
+) -> Dict[str, Any]:
+    def compact_text(value: Any, limit: int) -> str:
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        return text if len(text) <= limit else text[: max(0, limit - 1)].rstrip() + "..."
+
+    payload = {
+        "schema_version": "diagnostic_review_suggestion_v1",
+        "source_stage": source_stage,
+        "issue_type": issue_type,
+        "reason": compact_text(reason, 260) if reason else "",
+        "suggested_action": compact_text(suggested_action, 260) if suggested_action else "",
+        "diagnostic_only": True,
+        "not_for_public_text": True,
+        "must_not_render": True,
+        "public_text_allowed": False,
+        "executor_should_decide": True,
+    }
+    payload.update({key: value for key, value in extra.items() if value not in (None, "")})
+    return payload
+
+
+def _citation_audit_mutation_mode() -> str:
+    value = str(os.environ.get("REPORT_CITATION_AUDIT_MUTATION_MODE") or "diagnostic_only").strip().lower()
+    if value in {"enforce", "strict", "repair_publication", "mutate", "clean"}:
+        return "enforce"
+    return "diagnostic_only"
+
+
+def _citation_audit_can_mutate() -> bool:
+    return _citation_audit_mutation_mode() == "enforce"
+
+
 def _drop_citationless_factual_bullets(markdown: str, *, limit: int = 12) -> tuple[str, Dict[str, Any]]:
     kept_lines: List[str] = []
     removed_examples: List[str] = []
@@ -1203,9 +1242,11 @@ def finalize_markdown_citations(
     """Make final body citations and appendix sources an atomic pair.
 
     The manifest is built before all renderer/sanitizer passes, while the final
-    body can still lose or gain numeric citation tokens. This step trusts the
-    final body as the public surface, removes citations that cannot resolve to
-    a traceable source, and renumbers the remaining body/appendix together.
+    body can still lose or gain numeric citation tokens. By default this step is
+    diagnostic-only: it reports unresolved or citationless facts, but it does
+    not delete public text. Set REPORT_CITATION_AUDIT_MUTATION_MODE=enforce to
+    use the legacy publication-repair behavior that removes unresolvable refs
+    and uncited factual statements.
 
     This step is only idempotent when re-entrant callers pass
     prefer_registry_refs=True: after the first pass the body numbering belongs
@@ -1213,6 +1254,8 @@ def finalize_markdown_citations(
     """
 
     original_body = str(body_markdown or "")
+    can_mutate = _citation_audit_can_mutate()
+    mutation_mode = _citation_audit_mutation_mode()
     lookup = _final_source_lookup(citation_manifest, source_registry, prefer_registry_refs=prefer_registry_refs)
     old_refs = _body_citation_refs(original_body)
     old_to_new: Dict[str, str] = {}
@@ -1249,13 +1292,27 @@ def finalize_markdown_citations(
 
     def replace(match: re.Match[str]) -> str:
         old_ref = f"[{match.group(1)}]"
-        return old_to_new.get(old_ref, "")
+        return old_to_new.get(old_ref, "" if can_mutate else old_ref)
 
     rewritten_body = re.sub(r"\[(\d{1,5})\]", replace, original_body)
     rewritten_body, duplicate_removed_count = _collapse_adjacent_duplicate_citations(rewritten_body)
-    rewritten_body, bullet_drop_diagnostics = _drop_citationless_factual_bullets(rewritten_body)
-    rewritten_body, short_line_drop_diagnostics = _drop_short_citationless_factual_lines(rewritten_body)
-    rewritten_body, sentence_drop_diagnostics = _drop_citationless_factual_sentences(rewritten_body)
+    if can_mutate:
+        rewritten_body, bullet_drop_diagnostics = _drop_citationless_factual_bullets(rewritten_body)
+        rewritten_body, short_line_drop_diagnostics = _drop_short_citationless_factual_lines(rewritten_body)
+        rewritten_body, sentence_drop_diagnostics = _drop_citationless_factual_sentences(rewritten_body)
+    else:
+        bullet_drop_diagnostics = {
+            "citationless_factual_bullet_removed_count": 0,
+            "citationless_factual_bullet_removed_examples": [],
+        }
+        short_line_drop_diagnostics = {
+            "citationless_short_factual_line_removed_count": 0,
+            "citationless_short_factual_line_removed_examples": [],
+        }
+        sentence_drop_diagnostics = {
+            "citationless_factual_sentence_removed_count": 0,
+            "citationless_factual_sentence_removed_examples": [],
+        }
     final_body_refs = _body_citation_refs(rewritten_body)
     final_appendix_refs = [str(source.get("ref") or "").strip() for source in appendix_sources if str(source.get("ref") or "").strip()]
     missing_appendix_refs = [ref for ref in final_body_refs if ref not in set(final_appendix_refs)]
@@ -1273,12 +1330,42 @@ def finalize_markdown_citations(
         max_value=1000,
     )
     citation_rebind_required = bool(citationless_removed_count >= rebind_threshold)
+    unresolved_count = len(unresolved) if can_mutate else 0
+    unresolved_observed_count = len(unresolved)
+    review_suggestions: List[Dict[str, Any]] = []
+    if unresolved:
+        review_suggestions.append(
+            _diagnostic_only_review_payload(
+                source_stage="final_citation_audit",
+                issue_type="unresolved_public_citation_refs",
+                reason="public body contains citation refs that do not resolve to the final source registry",
+                suggested_action="bind the missing refs to sources, rewrite the sentence with supported refs, or let the execution writer decide whether to soften it",
+                refs=unresolved,
+            )
+        )
+    if citationless_examples:
+        review_suggestions.append(
+            _diagnostic_only_review_payload(
+                source_stage="final_citation_audit",
+                issue_type="citationless_factual_public_text",
+                reason="public body contains factual-looking statements without terminal citations",
+                suggested_action="bind citations where evidence exists; otherwise let the execution writer decide whether to reframe or remove the unsupported hard facts",
+                examples=citationless_examples,
+            )
+        )
     diagnostics = {
         "final_citation_reconciliation_status": reconciliation_status,
+        "citation_audit_mutation_mode": mutation_mode,
+        "diagnostic_only": not can_mutate,
+        "not_for_public_text": True,
+        "must_not_render": True,
+        "public_text_allowed": False,
+        "executor_should_decide": True,
         "final_body_citation_refs": final_body_refs,
         "final_appendix_refs": final_appendix_refs,
         "final_missing_appendix_refs": missing_appendix_refs,
-        "final_unresolved_citation_removed_count": len(unresolved),
+        "final_unresolved_citation_removed_count": unresolved_count,
+        "final_unresolved_citation_observed_count": unresolved_observed_count,
         "final_unresolved_citation_refs": unresolved,
         "final_duplicate_citation_removed_count": duplicate_removed_count,
         **bullet_drop_diagnostics,
@@ -1294,6 +1381,7 @@ def finalize_markdown_citations(
         "clean_report_eligible": not citation_rebind_required and reconciliation_status == "ok",
         "factual_body_without_citations_count": len(citationless_examples),
         "citationless_fact_examples": citationless_examples,
+        "review_suggestions": review_suggestions,
     }
     return rewritten_body, appendix_sources, diagnostics
 
@@ -1373,6 +1461,16 @@ _BROAD_MARKET_CLAIM_RE = re.compile(
     re.I,
 )
 _SOFT_SOURCE_CLAIM_REASONS = {"weak_source_strong_claim", "entity_not_supported_by_evidence"}
+_SEVERE_SOURCE_CLAIM_REASONS = {"metric_claim_without_metric_fact", "metric_fact_ref_mismatch"}
+_SEVERE_UNRESOLVED_SOURCE_REASONS = {
+    "fake_or_placeholder_source",
+    "source_mismatch",
+    "low_quality_source_type",
+    "low_quality_title",
+    "low_quality_domain",
+    "source_level_d",
+    "dead_link",
+}
 _METRIC_VALUE_TOKEN_RE = re.compile(
     r"\d+(?:\.\d+)?\s*(?:%|亿|万|万元|亿元|亿美元|人民币|CNY|RMB|billion|million|trillion|yuan)",
     re.I,
@@ -1380,12 +1478,59 @@ _METRIC_VALUE_TOKEN_RE = re.compile(
 
 
 def _source_claim_gate_mode() -> str:
-    value = str(os.environ.get("REPORT_SOURCE_CLAIM_GATE_MODE") or "balanced").strip().lower()
+    value = str(os.environ.get("REPORT_SOURCE_CLAIM_GATE_MODE") or "permissive").strip().lower()
     if value in {"strict", "clean"}:
         return "strict"
     if value in {"relaxed", "balanced"}:
         return "balanced"
-    return "balanced"
+    if value in {"permissive", "recall", "loose", "draft", "complete"}:
+        return "permissive"
+    return "permissive"
+
+
+def _source_claim_gate_permissive() -> bool:
+    return _source_claim_gate_mode() == "permissive"
+
+
+def _section_gate_mutation_mode() -> str:
+    value = str(os.environ.get("REPORT_SECTION_GATE_MUTATION_MODE") or "diagnostic_only").strip().lower()
+    if value in {"enforce", "strict", "repair_publication", "mutate", "clean"}:
+        return "enforce"
+    return "diagnostic_only"
+
+
+def _section_gate_can_mutate() -> bool:
+    return _section_gate_mutation_mode() == "enforce" or _source_claim_gate_mode() == "strict"
+
+
+def _append_section_review_suggestion(
+    section: Dict[str, Any],
+    *,
+    source_stage: str,
+    issue_type: str,
+    reason: str,
+    suggested_action: str,
+    **extra: Any,
+) -> Dict[str, Any]:
+    retained = dict(section)
+    suggestions = [
+        item
+        for item in _as_list(retained.get("section_review_suggestions"))
+        if isinstance(item, dict)
+    ]
+    suggestions.append(
+        _diagnostic_only_review_payload(
+            source_stage=source_stage,
+            issue_type=issue_type,
+            reason=reason,
+            suggested_action=suggested_action,
+            **extra,
+        )
+    )
+    retained["section_review_suggestions"] = suggestions
+    retained["section_gate_mutation_mode"] = _section_gate_mutation_mode()
+    retained["diagnostic_only_review"] = True
+    return retained
 
 
 def _support_blob(section: Dict[str, Any]) -> str:
@@ -1833,6 +1978,12 @@ def _apply_source_claim_support_gate(
     diagnostics = {
         "source_claim_support_status": "ok",
         "source_gate_mode": _source_claim_gate_mode(),
+        "section_gate_mutation_mode": _section_gate_mutation_mode(),
+        "diagnostic_only": not _section_gate_can_mutate(),
+        "not_for_public_text": True,
+        "must_not_render": True,
+        "public_text_allowed": False,
+        "executor_should_decide": True,
         "section_dropped_due_to_source_claim_mismatch_count": 0,
         "section_dropped_due_to_unresolved_refs_count": 0,
         "factual_section_without_resolved_ref_count": 0,
@@ -1846,6 +1997,8 @@ def _apply_source_claim_support_gate(
         "soft_gate_rewritten_count": 0,
         "risk_section_demoted_count": 0,
         "relaxed_section_examples": [],
+        "permissive_retained_unresolved_section_count": 0,
+        "permissive_retained_manifest_citation_missing_count": 0,
     }
     has_section_refs = any(
         isinstance(section, dict)
@@ -1875,8 +2028,74 @@ def _apply_source_claim_support_gate(
             reason = ""
             if lineage.get("has_factual_claim") and not lineage.get("has_resolved_ref"):
                 reason = "factual_section_without_resolved_ref"
+            if not reason and diagnostics["source_gate_mode"] == "strict":
+                mismatch_reason = _section_source_claim_mismatch_reason(
+                    section,
+                    source_registry,
+                    topic_context=topic_context,
+                )
+                if mismatch_reason in _SEVERE_SOURCE_CLAIM_REASONS:
+                    reason = mismatch_reason
             if not reason:
                 kept_sections.append(section)
+                continue
+            can_mutate = _section_gate_can_mutate()
+            if not can_mutate:
+                retained = _append_section_review_suggestion(
+                    section,
+                    source_stage="source_claim_support_gate",
+                    issue_type=reason,
+                    reason=reason,
+                    suggested_action="keep the drafted analysis intact; let the execution writer decide whether to bind stronger citations, soften the wording, or schedule repair",
+                    chapter_id=chapter.get("chapter_id"),
+                    section_id=section.get("section_id"),
+                    block_type=section.get("block_type"),
+                )
+                retained["source_claim_gate_action"] = "retain_with_diagnostic"
+                retained["source_claim_gate_warning"] = reason
+                diagnostics["permissive_retained_unresolved_section_count"] += 1
+                if len(diagnostics["relaxed_section_examples"]) < 8:
+                    diagnostics["relaxed_section_examples"].append(
+                        {
+                            "chapter_id": chapter.get("chapter_id"),
+                            "section_id": section.get("section_id"),
+                            "block_type": section.get("block_type"),
+                            "reason": reason,
+                            "action": "retained_with_diagnostic",
+                            "diagnostic_only": True,
+                            "claim": str(section.get("claim") or "")[:220],
+                        }
+                    )
+                kept_sections.append(retained)
+                continue
+            if diagnostics["source_gate_mode"] == "permissive" and reason not in _SEVERE_SOURCE_CLAIM_REASONS:
+                retained = _append_section_review_suggestion(
+                    section,
+                    source_stage="source_claim_support_gate",
+                    issue_type=reason,
+                    reason=reason,
+                    suggested_action="legacy permissive mode retained this section; execution writer should verify citations before publication",
+                    chapter_id=chapter.get("chapter_id"),
+                    section_id=section.get("section_id"),
+                    block_type=section.get("block_type"),
+                )
+                retained["source_claim_gate_action"] = "retain_with_warning"
+                retained["source_claim_gate_warning"] = reason
+                if not str(retained.get("claim_strength") or "").strip():
+                    retained["claim_strength"] = "directional"
+                diagnostics["permissive_retained_unresolved_section_count"] += 1
+                if len(diagnostics["relaxed_section_examples"]) < 8:
+                    diagnostics["relaxed_section_examples"].append(
+                        {
+                            "chapter_id": chapter.get("chapter_id"),
+                            "section_id": section.get("section_id"),
+                            "block_type": section.get("block_type"),
+                            "reason": reason,
+                            "action": "retained_with_warning",
+                            "claim": str(section.get("claim") or "")[:220],
+                        }
+                    )
+                kept_sections.append(retained)
                 continue
             if (
                 reason == "factual_section_without_resolved_ref"
@@ -1998,16 +2217,50 @@ def _apply_source_claim_support_gate(
     return gated_chapters, diagnostics
 
 
+def _refs_for_public_section(section: Dict[str, Any]) -> List[str]:
+    refs: List[str] = []
+    for key in ("used_fact_refs", "evidence_refs", "citation_refs", "source_refs", "required_evidence_refs"):
+        refs.extend(str(ref or "").strip() for ref in _as_list(section.get(key)) if str(ref or "").strip())
+    return _dedupe_strings(refs)
+
+
+def _section_refs_failed_for_severe_source_reasons(
+    section: Dict[str, Any],
+    unresolved_ref_reasons: Sequence[Dict[str, Any]],
+) -> bool:
+    refs = set(_refs_for_public_section(section))
+    if not refs:
+        return False
+    reason_by_ref = {
+        str(item.get("ref") or "").strip(): str(item.get("reason") or "").strip()
+        for item in unresolved_ref_reasons
+        if isinstance(item, dict) and str(item.get("ref") or "").strip()
+    }
+    matching_reasons = [reason_by_ref.get(ref, "") for ref in refs if ref in reason_by_ref]
+    return bool(matching_reasons) and all(reason in _SEVERE_UNRESOLVED_SOURCE_REASONS for reason in matching_reasons)
+
+
 def _drop_factual_sections_without_manifest_citations(
     chapters: Sequence[Dict[str, Any]],
+    *,
+    unresolved_ref_reasons: Sequence[Dict[str, Any]] | None = None,
 ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
     diagnostics = {
+        "section_gate_mutation_mode": _section_gate_mutation_mode(),
+        "diagnostic_only": not _section_gate_can_mutate(),
+        "not_for_public_text": True,
+        "must_not_render": True,
+        "public_text_allowed": False,
+        "executor_should_decide": True,
         "section_dropped_due_to_source_claim_mismatch_count": 0,
         "section_dropped_due_to_unresolved_refs_count": 0,
         "factual_section_without_resolved_ref_count": 0,
         "source_claim_mismatch_examples": [],
         "citationless_fact_examples": [],
+        "permissive_retained_manifest_citation_missing_count": 0,
     }
+    permissive = _source_claim_gate_permissive()
+    unresolved_reason_items = [item for item in list(unresolved_ref_reasons or []) if isinstance(item, dict)]
     gated_chapters: List[Dict[str, Any]] = []
     for chapter in list(chapters or []):
         if not isinstance(chapter, dict):
@@ -2025,6 +2278,58 @@ def _drop_factual_sections_without_manifest_citations(
                 or _as_list(section.get("evidence_refs"))
             )
             if requires_citation and not _as_list(section.get("citation_refs")):
+                severe_source_failure = _section_refs_failed_for_severe_source_reasons(section, unresolved_reason_items)
+                if not _section_gate_can_mutate():
+                    retained = _append_section_review_suggestion(
+                        section,
+                        source_stage="manifest_citation_gate",
+                        issue_type="manifest_citation_missing",
+                        reason="section has factual content or evidence refs, but no public citation refs after manifest binding",
+                        suggested_action="keep the drafted section intact; let the execution writer bind citations, soften the claim, or schedule targeted repair",
+                        chapter_id=chapter.get("chapter_id"),
+                        section_id=section.get("section_id"),
+                    )
+                    retained["manifest_citation_gate_action"] = "retain_with_diagnostic"
+                    retained["manifest_citation_gate_warning"] = "manifest_citation_missing"
+                    diagnostics["permissive_retained_manifest_citation_missing_count"] += 1
+                    if len(diagnostics["citationless_fact_examples"]) < 8:
+                        diagnostics["citationless_fact_examples"].append(
+                            {
+                                "chapter_id": chapter.get("chapter_id"),
+                                "section_id": section.get("section_id"),
+                                "claim": str(section.get("claim") or section.get("reasoning") or "")[:220],
+                                "action": "retained_with_diagnostic",
+                                "diagnostic_only": True,
+                            }
+                        )
+                    kept_sections.append(retained)
+                    continue
+                if permissive and not severe_source_failure:
+                    retained = _append_section_review_suggestion(
+                        section,
+                        source_stage="manifest_citation_gate",
+                        issue_type="manifest_citation_missing",
+                        reason="section has factual content or evidence refs, but no public citation refs after manifest binding",
+                        suggested_action="legacy permissive mode retained this section; execution writer should verify citations before publication",
+                        chapter_id=chapter.get("chapter_id"),
+                        section_id=section.get("section_id"),
+                    )
+                    retained["manifest_citation_gate_action"] = "retain_with_warning"
+                    retained["manifest_citation_gate_warning"] = "manifest_citation_missing"
+                    if not str(retained.get("claim_strength") or "").strip():
+                        retained["claim_strength"] = "directional"
+                    diagnostics["permissive_retained_manifest_citation_missing_count"] += 1
+                    if len(diagnostics["citationless_fact_examples"]) < 8:
+                        diagnostics["citationless_fact_examples"].append(
+                            {
+                                "chapter_id": chapter.get("chapter_id"),
+                                "section_id": section.get("section_id"),
+                                "claim": str(section.get("claim") or section.get("reasoning") or "")[:220],
+                                "action": "retained_with_warning",
+                            }
+                        )
+                    kept_sections.append(retained)
+                    continue
                 diagnostics["section_dropped_due_to_source_claim_mismatch_count"] += 1
                 diagnostics["section_dropped_due_to_unresolved_refs_count"] += 1
                 diagnostics["factual_section_without_resolved_ref_count"] += 1
@@ -2065,6 +2370,8 @@ def _merge_source_claim_support_diagnostics(target: Dict[str, Any], extra: Dict[
         "demoted_section_count",
         "hard_dropped_section_count",
         "soft_gate_rewritten_count",
+        "permissive_retained_unresolved_section_count",
+        "permissive_retained_manifest_citation_missing_count",
     ):
         merged[key] = int(merged.get(key) or 0) + int(extra.get(key) or 0)
     for key in ("source_claim_mismatch_examples", "citationless_fact_examples", "relaxed_section_examples"):
@@ -2524,7 +2831,10 @@ def run_final_writer_agent(
             "rejected_reasons": {},
             "failure_reasons": {f"runtime_error:{type(exc).__name__}": 1},
         }
-    public_chapters, manifest_section_support = _drop_factual_sections_without_manifest_citations(public_chapters)
+    public_chapters, manifest_section_support = _drop_factual_sections_without_manifest_citations(
+        public_chapters,
+        unresolved_ref_reasons=_as_list(citation_manifest.get("filtered_unresolved_ref_reasons")),
+    )
     source_claim_support = _merge_source_claim_support_diagnostics(source_claim_support, manifest_section_support)
     before_chapter_count = len(public_chapters)
     public_chapters = [chapter for chapter in public_chapters if _chapter_has_public_body(chapter)]

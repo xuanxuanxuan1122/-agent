@@ -61,6 +61,19 @@ def _env_int(name: str, default: int, *, min_value: int = 0, max_value: int = 1_
     return min(max_value, max(min_value, value))
 
 
+def _final_audit_mode() -> str:
+    raw = str(
+        os.getenv("REPORT_FINAL_AUDIT_MODE")
+        or os.getenv("REPORT_DELIVERY_MODE")
+        or "draft_complete"
+    ).strip().lower()
+    if raw in {"strict", "publish", "publish_strict", "publication", "release"}:
+        return "publish_strict"
+    if raw in {"audit_only", "observe", "diagnostic", "diagnostic_only"}:
+        return "audit_only"
+    return "draft_complete"
+
+
 def _as_dict(value: Any) -> Dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
@@ -214,6 +227,54 @@ def _is_fatal_audit(payload: Dict[str, Any]) -> bool:
         if str(_as_dict(item).get("severity") or "").strip().lower() == "fatal":
             return True
     return False
+
+
+DELIVERY_BLOCKER_TYPES = {
+    "internal_evidence_cards",
+    "internal_round_trace",
+    "internal_draft_instruction",
+    "policy_profile_leak",
+    "internal_evidence_id",
+    "internal_chapter_id",
+    "empty_markdown_table",
+    "missing_sources_appendix",
+    "fake_or_placeholder_evidence",
+    "fake_or_placeholder_source",
+    "title_only_source",
+}
+
+
+def _delivery_blocker_findings(findings: Any) -> List[Dict[str, Any]]:
+    blockers: List[Dict[str, Any]] = []
+    for raw in _as_list(findings):
+        item = _as_dict(raw)
+        if not item:
+            continue
+        if str(item.get("type") or "").strip() in DELIVERY_BLOCKER_TYPES:
+            blockers.append(item)
+    return blockers
+
+
+def _deterministic_delivery_blockers(deterministic_audit: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return _delivery_blocker_findings(_as_list(_as_dict(deterministic_audit).get("findings")))
+
+
+def _draft_complete_status(
+    *,
+    audit_payload: Dict[str, Any],
+    deterministic_audit: Dict[str, Any],
+    delivery_blockers: Sequence[Dict[str, Any]],
+    isolated_gate: bool,
+) -> str:
+    if delivery_blockers:
+        return "fatal"
+    if isolated_gate:
+        if bool(deterministic_audit.get("fatal")):
+            return "fatal"
+        return str(audit_payload.get("status") or "warning").strip().lower()
+    if _is_fatal_audit(audit_payload) or bool(deterministic_audit.get("fatal")):
+        return "warning"
+    return str(audit_payload.get("status") or "warning").strip().lower()
 
 
 PUBLIC_EV_ID_RE = re.compile(r"(?<![A-Za-z0-9_])EV-\d+(?:-[A-Za-z0-9]+)?")
@@ -612,14 +673,20 @@ def run_final_audit(
         query=query,
     )
     isolated_gate = quality_gates_isolated()
-    blocking = _env_flag("REPORT_FINAL_AUDIT_BLOCKING", True) and not isolated_gate
-    if deterministic_audit.get("fatal") and blocking:
+    audit_mode = _final_audit_mode()
+    delivery_blockers = _deterministic_delivery_blockers(deterministic_audit)
+    blocking = _env_flag("REPORT_FINAL_AUDIT_BLOCKING", True) and not isolated_gate and audit_mode != "audit_only"
+    deterministic_blocks = bool(deterministic_audit.get("fatal")) if audit_mode == "publish_strict" else bool(delivery_blockers)
+    if deterministic_blocks and blocking:
         return {
             "enabled": True,
             "success": True,
             "status": "fatal",
             "blocked": True,
             "blocking": blocking,
+            "final_audit_mode": audit_mode,
+            "delivery_blockers": delivery_blockers or _as_list(deterministic_audit.get("findings")),
+            "quality_fatal_observed": bool(deterministic_audit.get("fatal")) and not bool(delivery_blockers),
             "quality_gate_mode": quality_gate_mode(),
             "deterministic_audit": deterministic_audit,
             "audit": {
@@ -647,25 +714,37 @@ def run_final_audit(
     normalized = normalize_llm_config(config)
     if not llm_config_is_ready(normalized):
         deterministic_fatal = bool(deterministic_audit.get("fatal"))
+        audit_payload = {
+            "status": "fatal" if deterministic_fatal else "skipped",
+            "overall_score": 0,
+            "critical_findings": _as_list(deterministic_audit.get("findings")),
+            "publish_recommendation": "hold",
+            "summary": deterministic_audit.get("summary"),
+        } if deterministic_fatal else {}
+        top_status = (
+            "fatal"
+            if audit_mode == "publish_strict" and deterministic_fatal
+            else _draft_complete_status(
+                audit_payload=audit_payload or {"status": "skipped"},
+                deterministic_audit=deterministic_audit,
+                delivery_blockers=delivery_blockers,
+                isolated_gate=isolated_gate,
+            )
+        )
         return {
             "enabled": True,
             "success": False,
-            "status": "fatal" if deterministic_fatal else "skipped",
-            "blocked": False,
+            "status": top_status,
+            "blocked": bool(blocking and delivery_blockers),
             "blocking": blocking,
+            "final_audit_mode": audit_mode,
+            "delivery_blockers": delivery_blockers,
+            "quality_fatal_observed": bool(deterministic_fatal and not delivery_blockers),
             "quality_gate_mode": quality_gate_mode(),
             "skipped_reason": "config_missing",
             "model": normalized.get("model") or "",
             "deterministic_audit": deterministic_audit,
-            "audit": {
-                "status": "fatal",
-                "overall_score": 0,
-                "critical_findings": _as_list(deterministic_audit.get("findings")),
-                "publish_recommendation": "hold",
-                "summary": deterministic_audit.get("summary"),
-            }
-            if deterministic_fatal
-            else {},
+            "audit": audit_payload,
         }
 
     max_chars = _env_int("REPORT_FINAL_AUDIT_MAX_CHARS", 200000, min_value=4000, max_value=1_000_000)
@@ -700,12 +779,26 @@ def run_final_audit(
             current_date=current_audit_date,
         )
         fatal = _is_fatal_audit(audit_payload) or bool(deterministic_audit.get("fatal"))
+        if audit_mode == "publish_strict":
+            top_status = "fatal" if deterministic_audit.get("fatal") else audit_payload["status"]
+            blocked = bool(blocking and fatal)
+        else:
+            top_status = _draft_complete_status(
+                audit_payload=audit_payload,
+                deterministic_audit=deterministic_audit,
+                delivery_blockers=delivery_blockers,
+                isolated_gate=isolated_gate,
+            )
+            blocked = bool(blocking and delivery_blockers)
         return {
             "enabled": True,
             "success": True,
-            "status": "fatal" if deterministic_audit.get("fatal") else audit_payload["status"],
-            "blocked": bool(blocking and fatal),
+            "status": top_status,
+            "blocked": blocked,
             "blocking": blocking,
+            "final_audit_mode": audit_mode,
+            "delivery_blockers": delivery_blockers,
+            "quality_fatal_observed": bool(fatal and not delivery_blockers),
             "quality_gate_mode": quality_gate_mode(),
             "model": normalized.get("model") or "",
             "reasoning_effort": normalized.get("reasoning_effort") or "",
@@ -722,8 +815,18 @@ def run_final_audit(
             "enabled": True,
             "success": False,
             "status": "failed",
-            "blocked": bool(blocking and deterministic_audit.get("fatal")),
+            "blocked": bool(
+                blocking
+                and (
+                    bool(deterministic_audit.get("fatal"))
+                    if audit_mode == "publish_strict"
+                    else bool(delivery_blockers)
+                )
+            ),
             "blocking": blocking,
+            "final_audit_mode": audit_mode,
+            "delivery_blockers": delivery_blockers,
+            "quality_fatal_observed": bool(deterministic_audit.get("fatal") and not delivery_blockers),
             "quality_gate_mode": quality_gate_mode(),
             "model": normalized.get("model") or "",
             "reasoning_effort": normalized.get("reasoning_effort") or "",

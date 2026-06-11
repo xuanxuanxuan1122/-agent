@@ -97,11 +97,20 @@ def test_internal_report_markers_are_fatal_or_flagged():
 def test_empty_markdown_table_is_removed_as_a_block():
     markdown = "正文。\n\n**空表**\n\n| 指标 | 数值 |\n| --- | --- |\n\n后文。"
 
-    cleaned = sanitize_public_markdown(markdown)
+    cleaned = sanitize_public_markdown(markdown, mode="enforce")
 
     assert "| 指标 | 数值 |" not in cleaned
     assert "**空表**" not in cleaned
     assert "后文" in cleaned
+
+
+def test_public_sanitizer_is_diagnostic_only_by_default(monkeypatch):
+    monkeypatch.delenv("REPORT_PUBLIC_SANITIZER_MUTATION_MODE", raising=False)
+    markdown = "Body.\n\n**Empty table**\n\n| Metric | Value |\n| --- | --- |\n\nTail."
+
+    cleaned = sanitize_public_markdown(markdown)
+
+    assert cleaned == markdown
 
 
 def test_deterministic_audit_blocks_missing_appendix_and_title_only_source():
@@ -160,7 +169,7 @@ def test_public_sanitizer_removes_soft_internal_narrative_language():
         "- [1] 来源 | https://example.com/source\n"
     )
 
-    cleaned = sanitize_public_markdown(markdown)
+    cleaned = sanitize_public_markdown(markdown, mode="enforce")
     body = cleaned.split("## 来源附录", 1)[0]
 
     for phrase in ["研究主线", "本节技术观察", "该证据来自", "该证据仅反映"]:

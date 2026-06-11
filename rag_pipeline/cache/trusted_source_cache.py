@@ -206,6 +206,47 @@ def _source_level(value: Any) -> str:
     return level if level in _SOURCE_LEVEL_RANK else ""
 
 
+_PLACEHOLDER_TITLES = {"official ai agent statistics"}
+_PLACEHOLDER_TEXT = "official data shows ai agent adoption reached 50% in 2025"
+
+
+def _scalar_text(value: Any) -> str:
+    if isinstance(value, (dict, list, tuple, set)):
+        return ""
+    return str(value or "").strip()
+
+
+def _looks_like_error_or_page_shell(text: Any, *, title: Any = "") -> bool:
+    body = re.sub(r"\s+", " ", _scalar_text(text)).strip()
+    header = re.sub(r"\s+", " ", _scalar_text(title)).strip()
+    lowered = f"{header} {body}".lower()
+    if not lowered.strip():
+        return False
+    if any(
+        marker in lowered
+        for marker in (
+            "403 forbidden",
+            "404 not found",
+            "页面未找到",
+            "页面找不到",
+            "访问的页面不存在",
+            "内容不存在或被删除",
+            "permission denied",
+            "access denied",
+        )
+    ):
+        return True
+    if re.match(r"^(url|source_url)\s*[:：]\s*https?://\S+\s*$", body, flags=re.I):
+        return True
+    if re.match(r"^(时间|date)\s*[:：]\s*[^。；;]{1,80}$", body, flags=re.I):
+        return True
+    if body.lower().startswith(("摘要：skip to main content", "skip to main content")):
+        return True
+    if "linkedin is better on the app" in lowered and len(body) < 600:
+        return True
+    return False
+
+
 def _is_fake_or_placeholder(source: Dict[str, Any], text: str = "") -> bool:
     joined = " ".join(
         str(item or "")
@@ -224,6 +265,8 @@ def _is_fake_or_placeholder(source: Dict[str, Any], text: str = "") -> bool:
         return True
     title = str(source.get("title") or "").strip().lower()
     publisher = str(source.get("publisher") or source.get("source") or "").strip()
+    if title in _PLACEHOLDER_TITLES:
+        return True
     return title == "official" and not publisher
 
 
@@ -266,9 +309,9 @@ def _iter_package_evidence(package: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
 
 def _entry_from_evidence(query: str, item: Dict[str, Any], *, report_id: str = "", run_id: str = "") -> Optional[Dict[str, Any]]:
     source = dict(_as_dict(item.get("source")))
-    source_url = str(source.get("url") or source.get("source_url") or item.get("source_url") or item.get("url") or "").strip()
-    source_title = str(source.get("title") or item.get("source_title") or item.get("title") or "").strip()
-    source_publisher = str(source.get("publisher") or source.get("source") or item.get("publisher") or "").strip()
+    source_url = _scalar_text(source.get("url") or source.get("source_url") or item.get("source_url") or item.get("url"))
+    source_title = _scalar_text(source.get("title") or item.get("source_title") or item.get("title"))
+    source_publisher = _scalar_text(source.get("publisher") or source.get("source") or item.get("publisher"))
     if source_url and not source.get("url"):
         source["url"] = source_url
     if source_title and not source.get("title"):
@@ -286,6 +329,8 @@ def _entry_from_evidence(query: str, item: Dict[str, Any], *, report_id: str = "
     if not _traceable(source):
         return None
     if _is_fake_or_placeholder(source, fact):
+        return None
+    if _looks_like_error_or_page_shell(fact, title=source_title):
         return None
     if not (fact or metric or value):
         return None
@@ -502,6 +547,8 @@ def lookup_trusted_sources(
             "date": entry.get("date"),
         }
         if _is_fake_or_placeholder(source, str(entry.get("fact_description") or "")):
+            continue
+        if _looks_like_error_or_page_shell(entry.get("fact_description"), title=entry.get("title")):
             continue
         if "source" in required and not str(entry.get("source_url") or "").strip():
             continue

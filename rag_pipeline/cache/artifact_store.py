@@ -61,6 +61,24 @@ def _compact_text(value: Any, max_chars: int = 1000) -> str:
     return text[:max_chars]
 
 
+def _source_scalar(value: Any) -> str:
+    if isinstance(value, (dict, list, tuple, set)):
+        return ""
+    text = str(value or "").strip()
+    if text.startswith("{") and any(
+        marker in text
+        for marker in (
+            "web_final_score",
+            "web_rerank_score",
+            "source_verification_status",
+            "traceability_status",
+            "fake_or_placeholder_source",
+        )
+    ):
+        return ""
+    return text
+
+
 def _enforced_claim_status(
     status: str,
     *,
@@ -512,17 +530,17 @@ class ArtifactStore:
                 """,
                 (
                     canonical_source_id,
-                    payload.get("canonical_url") or payload.get("url") or payload.get("source_url") or "",
-                    payload.get("title") or payload.get("source_title") or "",
-                    payload.get("publisher") or payload.get("source") or "",
-                    payload.get("published_at") or payload.get("date") or "",
-                    payload.get("fetched_at") or "",
-                    payload.get("source_type") or payload.get("type") or "",
-                    str(payload.get("source_level") or payload.get("credibility") or "").strip().upper(),
-                    payload.get("verification_status") or payload.get("source_verification_status") or "",
-                    payload.get("content_hash") or "",
-                    payload.get("storage_uri") or "",
-                    payload.get("status") or "validated",
+                    _source_scalar(payload.get("canonical_url") or payload.get("url") or payload.get("source_url")),
+                    _source_scalar(payload.get("title") or payload.get("source_title")),
+                    _source_scalar(payload.get("publisher") or payload.get("source")),
+                    _source_scalar(payload.get("published_at") or payload.get("date")),
+                    _source_scalar(payload.get("fetched_at")),
+                    _source_scalar(payload.get("source_type") or payload.get("type")),
+                    _source_scalar(payload.get("source_level") or payload.get("credibility")).upper(),
+                    _source_scalar(payload.get("verification_status") or payload.get("source_verification_status")),
+                    _source_scalar(payload.get("content_hash")),
+                    _source_scalar(payload.get("storage_uri")),
+                    _source_scalar(payload.get("status")) or "validated",
                     _json_dumps(payload),
                     now,
                     now,
@@ -537,7 +555,7 @@ class ArtifactStore:
                     status=excluded.status,
                     updated_at=excluded.updated_at
                 """,
-                (run_id, run_ref, canonical_source_id, payload.get("status") or "validated", now, now),
+                (run_id, run_ref, canonical_source_id, _source_scalar(payload.get("status")) or "validated", now, now),
             )
             conn.commit()
         return {"canonical_source_id": canonical_source_id, "run_source_id": run_ref}

@@ -3628,7 +3628,8 @@ def build_writer_report(
         analytics_outputs=analytics_outputs,
         evidence_health_summary=evidence_health_summary,
     )
-    if qa_result.get("rewrite_required"):
+    auto_rewrite_enabled = _env_flag("REPORT_QA_AUTO_REWRITE", False)
+    if qa_result.get("rewrite_required") and auto_rewrite_enabled:
         rewrite_instructions = [
             *[str(item) for item in _as_list(qa_result.get("rewrite_instructions")) if str(item).strip()],
             *[
@@ -3643,7 +3644,7 @@ def build_writer_report(
             rewrite_instructions=rewrite_instructions,
         )
         if rewritten.get("changed"):
-            candidate_markdown = sanitize_public_markdown(rewritten.get("report_markdown") or "")
+            candidate_markdown = sanitize_public_markdown(rewritten.get("report_markdown") or "", mode="enforce")
             candidate_output = {
                 **writer_output,
                 "report_markdown": candidate_markdown,
@@ -3694,6 +3695,25 @@ def build_writer_report(
                     if isinstance(source, dict) and str(source.get("ref") or "").strip()
                 ] or rendered_footnotes
                 qa_result = candidate_qa
+    elif qa_result.get("rewrite_required"):
+        qa_result = {
+            **_as_dict(qa_result),
+            "auto_rewrite_skipped_reason": "diagnostic_only_review",
+            "review_suggestions": [
+                *_as_list(_as_dict(qa_result).get("review_suggestions")),
+                {
+                    "schema_version": "qa_review_suggestion_v1",
+                    "source_stage": "qa_agent",
+                    "issue_type": "rewrite_required",
+                    "diagnostic_only": True,
+                    "not_for_public_text": True,
+                    "must_not_render": True,
+                    "public_text_allowed": False,
+                    "executor_should_decide": True,
+                    "suggested_action": "execution writer should decide whether to rewrite, repair evidence, or keep the draft with caveats",
+                },
+            ],
+        }
 
     layout = _as_dict(layout_plan) or _layout_plan_from_packages(report_blueprint, micro_layouts, chapter_evidence_packages)
     package_passed = bool(package_quality_report.get("passed"))
@@ -3810,7 +3830,23 @@ def build_writer_report(
             message = "报告已按证据强度降级生成，建议结合评分和缺陷清单人工复核。"
         if report_status == "formal_scored":
             delivery_tier = "scored_formal_report"
-            public_markdown = _downgrade_overconfident_language(public_markdown, claim_strength=claim_strength)
+            if _env_flag("REPORT_OVERCONFIDENCE_REWRITE_ENABLED", False):
+                public_markdown = _downgrade_overconfident_language(public_markdown, claim_strength=claim_strength)
+            else:
+                writer_output["overconfidence_review_suggestions"] = [
+                    {
+                        "schema_version": "overconfidence_review_suggestion_v1",
+                        "source_stage": "writer_quality_gate",
+                        "issue_type": "overconfident_language_possible",
+                        "diagnostic_only": True,
+                        "not_for_public_text": True,
+                        "must_not_render": True,
+                        "public_text_allowed": False,
+                        "executor_should_decide": True,
+                        "claim_strength": claim_strength,
+                        "suggested_action": "execution writer should decide whether wording needs softening based on available claim strength",
+                    }
+                ]
         scorecard = _render_quality_scorecard(
             query=query,
             quality_score=quality_score,

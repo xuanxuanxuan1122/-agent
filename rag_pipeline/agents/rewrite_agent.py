@@ -283,7 +283,7 @@ def run_rewrite_agent(
     )
     if llm_text:
         text = llm_text
-    text = sanitize_public_markdown(text)
+    text = sanitize_public_markdown(text, mode="enforce")
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     if text:
         text += "\n"

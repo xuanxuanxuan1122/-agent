@@ -146,7 +146,7 @@ def test_public_sanitizer_removes_internal_public_terms_and_connector_title():
         ]
     )
 
-    cleaned = sanitize_public_markdown(markdown)
+    cleaned = sanitize_public_markdown(markdown, mode="enforce")
 
     assert "market metric" not in cleaned
     assert "risk boundary" not in cleaned

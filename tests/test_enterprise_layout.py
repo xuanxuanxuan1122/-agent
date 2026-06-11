@@ -16,7 +16,7 @@ def test_enterprise_report_has_required_blocks():
     assert text.strip()
     assert "# 智能农业机器人" in text
     assert "核心观点" in text or "核心观察" in text
-    assert ("关键数据" in text or "关键事实" in text or "| 指标 |" in text)
+    assert ("## 1." in text or "## 一、" in text)
     assert "内容目录" not in text
     assert "图表目录" not in text
     assert "章节任务地图" not in text

@@ -26,6 +26,7 @@ def test_final_audit_fatal_blocks_when_blocking_enabled(monkeypatch):
     _configure_deepseek_final_audit(monkeypatch)
     monkeypatch.setenv("REPORT_ENABLE_FINAL_AUDIT", "true")
     monkeypatch.setenv("REPORT_FINAL_AUDIT_BLOCKING", "true")
+    monkeypatch.setenv("REPORT_FINAL_AUDIT_MODE", "publish_strict")
     captured = {}
 
     def fake_call_openai_compatible_json(*, config, system_prompt, user_payload):
@@ -65,6 +66,95 @@ def test_final_audit_fatal_blocks_when_blocking_enabled(monkeypatch):
     assert result["blocked"] is True
     assert result["audit"]["publish_recommendation"] == "hold"
     assert result["llm_call"]["model"] == "deepseek-v4-pro"
+
+
+def test_draft_complete_observes_llm_quality_fatal_without_blocking(monkeypatch):
+    _configure_deepseek_final_audit(monkeypatch)
+    monkeypatch.setenv("REPORT_ENABLE_FINAL_AUDIT", "true")
+    monkeypatch.setenv("REPORT_FINAL_AUDIT_BLOCKING", "true")
+    monkeypatch.delenv("REPORT_FINAL_AUDIT_MODE", raising=False)
+
+    def fake_call_openai_compatible_json(*, config, system_prompt, user_payload):
+        return {
+            "payload": {
+                "status": "fatal",
+                "overall_score": 35,
+                "critical_findings": [
+                    {"type": "unsupported_claim", "severity": "fatal", "message": "Weak citation support"}
+                ],
+                "publish_recommendation": "hold",
+                "summary": "Quality issue only.",
+            },
+            "usage": {"total_tokens": 10},
+            "llm_call": {"task": "final_audit", "model": "deepseek-v4-pro", "status": "success"},
+        }
+
+    monkeypatch.setattr(final_audit_agent, "call_openai_compatible_json", fake_call_openai_compatible_json)
+
+    result = final_audit_agent.run_final_audit(
+        report_markdown="# Report\n\nConclusion [1]\n\n## 来源附录\n- [1] Source | https://www.stats.gov.cn/source",
+        clean_evidence={"sources": [{"id": "1", "title": "Source", "url": "https://www.stats.gov.cn/source"}]},
+    )
+
+    assert result["final_audit_mode"] == "draft_complete"
+    assert result["status"] == "warning"
+    assert result["blocked"] is False
+    assert result["audit"]["status"] == "fatal"
+    assert result["audit"]["publish_recommendation"] == "hold"
+    assert result["quality_fatal_observed"] is True
+
+
+def test_draft_complete_demotes_deterministic_citationless_body_to_warning(monkeypatch):
+    monkeypatch.setenv("REPORT_ENABLE_FINAL_AUDIT", "true")
+    monkeypatch.setenv("REPORT_FINAL_AUDIT_BLOCKING", "true")
+    monkeypatch.delenv("REPORT_FINAL_AUDIT_MODE", raising=False)
+    monkeypatch.delenv("RAG_MODEL_FINAL_AUDIT_PROFILE", raising=False)
+    monkeypatch.setattr(final_audit_agent, "llm_config_is_ready", lambda _config: False)
+
+    result = final_audit_agent.run_final_audit(
+        report_markdown=(
+            "# Report\n\n"
+            "Official data shows enterprise adoption signals are rising. [1]\n\n"
+            "30 AI Agent enterprise landing cases.\n\n"
+            "## Sources\n- [1] Official | https://www.stats.gov.cn/source"
+        ),
+        clean_evidence={"sources": [{"id": "1", "title": "Official", "url": "https://www.stats.gov.cn/source"}]},
+        writer_package_payload={
+            "final_citation_audit": {
+                "final_citation_reconciliation_status": "blocked",
+                "final_body_citation_refs": ["1"],
+                "final_appendix_refs": ["1"],
+                "factual_body_without_citations_count": 1,
+                "citationless_fact_examples": ["30 AI Agent enterprise landing cases."],
+            }
+        },
+    )
+
+    assert result["final_audit_mode"] == "draft_complete"
+    assert result["status"] == "warning"
+    assert result["blocked"] is False
+    assert result["deterministic_audit"]["fatal"] is True
+    assert result["audit"]["critical_findings"][0]["type"] == "citationless_factual_body"
+
+
+def test_draft_complete_still_blocks_placeholder_sources(monkeypatch):
+    monkeypatch.setenv("REPORT_ENABLE_FINAL_AUDIT", "true")
+    monkeypatch.setenv("REPORT_FINAL_AUDIT_BLOCKING", "true")
+    monkeypatch.delenv("REPORT_FINAL_AUDIT_MODE", raising=False)
+
+    result = final_audit_agent.run_final_audit(
+        report_markdown=(
+            "# Report\n\n"
+            "Official data shows AI agent adoption reached 50% in 2025. [1]\n\n"
+            "## Sources\n- [1] Official | https://example.gov/ai-agent-statistics"
+        ),
+        clean_evidence={"sources": [{"id": "1", "title": "Official", "url": "https://example.gov/ai-agent-statistics"}]},
+    )
+
+    assert result["final_audit_mode"] == "draft_complete"
+    assert result["status"] == "fatal"
+    assert result["blocked"] is True
+    assert result["audit"]["publish_recommendation"] == "hold"
 
 
 def test_isolated_quality_gate_observes_fatal_audit_without_blocking(monkeypatch):

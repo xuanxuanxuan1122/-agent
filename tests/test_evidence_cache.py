@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import sqlite3
+
 from rag_pipeline.cache.evidence_cache import lookup_evidence, lookup_search, store_evidence_from_package, store_search
 from rag_pipeline.agents import brain_agent as brain_agent_module
 
@@ -264,8 +267,8 @@ def test_evidence_cache_rejects_generic_cross_topic_match(tmp_path, monkeypatch)
                     "proof_role": "source_check",
                     "confidence": 0.82,
                     "source": {
-                        "title": "Official AI Agent Statistics",
-                        "url": "https://example.gov/ai-agent-data",
+                        "title": "National enterprise AI adoption bulletin",
+                        "url": "https://data.beijing.gov.cn/reports/ai-agent-data",
                         "source_type": "official",
                     },
                 }
@@ -286,6 +289,107 @@ def test_evidence_cache_rejects_generic_cross_topic_match(tmp_path, monkeypatch)
 
     assert generic_only_hits == []
     assert exact_topic_hits
+
+
+def test_evidence_cache_rejects_placeholder_and_error_page_evidence(tmp_path, monkeypatch):
+    monkeypatch.setenv("EVIDENCE_CACHE_PATH", str(tmp_path / "evidence_cache.sqlite"))
+    monkeypatch.setenv("EVIDENCE_CACHE_SQLITE_JOURNAL_MODE", "MEMORY")
+    package = {
+        "analysis_ready_evidence": [
+            {
+                "fact": "Official data shows AI agent adoption reached 50% in 2025.",
+                "metric": "AI agent adoption",
+                "value": "50",
+                "unit": "%",
+                "period": "2025",
+                "source_level": "A",
+                "proof_role": "metric",
+                "source": {
+                    "title": "Official AI Agent Statistics",
+                    "url": "https://example.gov/ai-agent-statistics",
+                    "source_type": "official",
+                },
+            },
+            {
+                "fact": "403 Forbidden：403 Forbidden nginx；内容说明：该来源补充了 AI Agent 指标背景。",
+                "source_level": "C",
+                "proof_role": "source_check",
+                "source": {
+                    "title": "403 Forbidden",
+                    "url": "https://m.ofweek.com/ai/blocked.html",
+                    "source_type": "media",
+                },
+            },
+        ]
+    }
+
+    summary = store_evidence_from_package(query="ai agent official data", evidence_package=package)
+    hits = lookup_evidence(
+        {"query": "ai agent official data", "proof_role": "metric"},
+        min_source_level=["A", "B", "C"],
+        required_fields=["source"],
+    )
+
+    assert summary["stored_count"] == 0
+    assert summary["skipped_count"] == 2
+    assert hits == []
+
+
+def test_evidence_cache_lookup_filters_legacy_dirty_rows(tmp_path, monkeypatch):
+    db_path = tmp_path / "evidence_cache.sqlite"
+    monkeypatch.setenv("EVIDENCE_CACHE_PATH", str(db_path))
+    monkeypatch.setenv("EVIDENCE_CACHE_SQLITE_JOURNAL_MODE", "MEMORY")
+    query = "ai agent official data"
+    store_evidence_from_package(
+        query=query,
+        evidence_package={
+            "analysis_ready_evidence": [
+                {
+                    "fact": "Enterprise AI agent adoption reached 42% in 2025 according to a government dataset.",
+                    "metric": "enterprise AI agent adoption",
+                    "value": "42",
+                    "unit": "%",
+                    "period": "2025",
+                    "source_level": "A",
+                    "proof_role": "metric",
+                    "source": {
+                        "title": "National enterprise AI adoption bulletin",
+                        "url": "https://data.beijing.gov.cn/reports/ai-agent-data",
+                        "source_type": "official",
+                    },
+                }
+            ]
+        },
+    )
+    dirty_raw = {
+        "fact": "Official data shows AI agent adoption reached 50% in 2025.",
+        "source": {
+            "title": "Official AI Agent Statistics",
+            "url": "https://example.gov/ai-agent-statistics",
+            "source_type": "official",
+        },
+    }
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE evidence_cache
+            SET source_url=?, source_domain=?, fact_description=?, raw_json=?
+            """,
+            (
+                "https://example.gov/ai-agent-statistics",
+                "example.gov",
+                "Official data shows AI agent adoption reached 50% in 2025.",
+                json.dumps(dirty_raw),
+            ),
+        )
+
+    hits = lookup_evidence(
+        {"query": query, "proof_role": "metric", "lane_targets": ["official_data"]},
+        min_source_level=["A", "B", "C"],
+        required_fields=["source"],
+    )
+
+    assert hits == []
 
 
 def test_brain_core_cache_hit_becomes_seed_and_keeps_live_task(tmp_path, monkeypatch):

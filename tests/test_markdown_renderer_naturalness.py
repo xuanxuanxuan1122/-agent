@@ -630,7 +630,7 @@ def test_sanitize_public_markdown_removes_analysis_scaffold_language():
         "- [1] 来源A | https://example.org/a\n"
     )
 
-    cleaned = sanitize_public_markdown(markdown)
+    cleaned = sanitize_public_markdown(markdown, mode="enforce")
 
     for phrase in [
         "事实锚点",
@@ -665,7 +665,7 @@ def test_sanitize_public_markdown_removes_evidence_repair_signals_from_public_bo
         "- [1] 来源A | https://example.org/a\n"
     )
 
-    cleaned = sanitize_public_markdown(markdown)
+    cleaned = sanitize_public_markdown(markdown, mode="enforce")
 
     for phrase in [
         "商业化证据主要集中",

@@ -368,6 +368,14 @@ def test_llm_claim_with_valid_used_evidence_ids_is_accepted():
 
 
 def test_llm_claim_with_unsupported_entity_and_metric_is_deferred_for_repair():
+    os.environ["REPORT_CLAIM_RETENTION_MODE"] = "strict"
+    try:
+        _run_llm_claim_with_unsupported_entity_and_metric_is_deferred_for_repair()
+    finally:
+        os.environ.pop("REPORT_CLAIM_RETENTION_MODE", None)
+
+
+def _run_llm_claim_with_unsupported_entity_and_metric_is_deferred_for_repair():
     evidence_package = {
         "analysis_ready_evidence": [
             {
@@ -414,7 +422,7 @@ def test_llm_claim_with_unsupported_entity_and_metric_is_deferred_for_repair():
     assert validation["correctness_filter_summary"]["deferred_issue_counts"] == {"claim_support_needs_repair": 1}
 
 
-def test_llm_claim_with_anchor_mismatch_is_downgraded_directional_candidate():
+def test_llm_claim_with_anchor_mismatch_is_observed_without_mutating_by_default():
     claim_text = "\u4f01\u4e1a\u7ea7AI Agent\u7ade\u4e89\u683c\u5c40\u6b63\u5728\u5411\u573a\u666f\u843d\u5730\u548c\u6e20\u9053\u751f\u6001\u5206\u5316\u3002"
     evidence_text = "\u7edf\u8ba1\u90e8\u95e8\u901a\u8fc7\u5b98\u7f51\u548c\u7edf\u8ba1\u5e74\u9274\u53d1\u5e03AI Agent\u76f8\u5173\u7edf\u8ba1\u6570\u636e\u3002"
     evidence_package = {
@@ -451,15 +459,18 @@ def test_llm_claim_with_anchor_mismatch_is_downgraded_directional_candidate():
     assert validation["status"] == "valid"
     assert validation["usable_claim_count"] == 1
     assert validation["deferred_claim_count"] == 0
-    assert validation["llm_validation_issue_counts"]["claim_support_anchor_mismatch_downgraded"] == 1
-    assert unit["claim_strength"] == "directional"
-    assert unit["claim_status"] == "directional"
-    assert unit["claim_support_status"] == "anchor_mismatch_downgraded"
-    assert unit["writing_permission"] == "cautious_with_boundary"
-    assert unit["evidence_use_level"] == "directional_signal"
+    assert validation["llm_validation_issue_counts"]["claim_support_anchor_mismatch_observed"] == 1
+    assert unit["claim_strength"] == "moderate"
+    assert unit["claim_support_status"] == "anchor_mismatch_observed"
+    assert "writing_permission" not in unit
+    suggestions = unit["claim_review_suggestions"]
+    assert suggestions[0]["issue_type"] == "claim_support_anchor_mismatch"
+    assert suggestions[0]["suggested_claim_strength"] == "directional"
+    assert suggestions[0]["not_for_public_text"] is True
 
 
 def test_llm_semantic_judge_rejects_semantically_unsupported_claim(monkeypatch):
+    monkeypatch.setenv("REPORT_CLAIM_RETENTION_MODE", "strict")
     calls = []
 
     def fake_semantic_judge(*, claim_text, cited_cards, chapter_id, claim_id, llm_config):
@@ -523,7 +534,62 @@ def test_llm_semantic_judge_rejects_semantically_unsupported_claim(monkeypatch):
     }
 
 
+def test_llm_semantic_judge_permissive_retains_unsupported_claim(monkeypatch):
+    monkeypatch.delenv("REPORT_CLAIM_RETENTION_MODE", raising=False)
+    monkeypatch.setattr(
+        analysis_agent,
+        "_llm_semantic_claim_support_judge",
+        lambda **_kwargs: {
+            "status": "unsupported",
+            "reason": "Evidence is adjacent but not directly enough for a strong claim.",
+            "confidence": 0.78,
+        },
+    )
+    evidence_package = {
+        "analysis_ready_evidence": [
+            {
+                **_evidence("EV-agent", chapter_id="ch_02", level="B"),
+                "fact": "The report discusses AI Agent enterprise software trends.",
+                "distilled_fact": "The report discusses AI Agent enterprise software trends.",
+                "source_title": "AI Agent trends",
+            }
+        ]
+    }
+    payload = {
+        "chapter_synthesis": [
+            {
+                "chapter_id": "ch_02",
+                "claim_units": [
+                    {
+                        "claim_id": "semantic-mismatch",
+                        "claim": "AI Agent enterprise software trends are becoming a competitive differentiator.",
+                        "claim_strength": "moderate",
+                        "used_evidence_ids": ["EV-agent"],
+                        "evidence_basis": ["The report discusses AI Agent enterprise software trends."],
+                        "reasoning": "The cited evidence discusses the trend.",
+                    }
+                ],
+            }
+        ]
+    }
+
+    validation = validate_llm_analysis_output(payload, evidence_package, llm_config={"model": "judge"})
+
+    assert validation["usable_claim_count"] == 1
+    assert validation["deferred_claim_count"] == 1
+    assert validation["llm_validation_issue_counts"]["llm_claim_semantic_judge_unsupported_observed"] == 1
+    unit = validation["chapter_synthesis"][0]["claim_units"][0]
+    assert unit["claim_support_status"] == "semantic_unsupported_observed"
+    assert unit["claim_strength"] == "moderate"
+    assert "writing_permission" not in unit
+    suggestions = unit["claim_review_suggestions"]
+    assert suggestions[0]["issue_type"] == "llm_claim_semantic_judge_unsupported"
+    assert suggestions[0]["suggested_claim_strength"] == "directional"
+    assert suggestions[0]["not_for_public_text"] is True
+
+
 def test_llm_semantic_judge_partial_downgrades_claim(monkeypatch):
+    monkeypatch.setenv("REPORT_CLAIM_REVIEW_MUTATION_MODE", "enforce")
     monkeypatch.setattr(
         analysis_agent,
         "_llm_semantic_claim_support_judge",
@@ -625,6 +691,7 @@ def test_isolated_quality_gate_observes_semantic_judge_without_mutating_claim(mo
 
 
 def test_llm_semantic_judge_adjacent_downgrades_claim(monkeypatch):
+    monkeypatch.setenv("REPORT_CLAIM_REVIEW_MUTATION_MODE", "enforce")
     monkeypatch.setattr(
         analysis_agent,
         "_llm_semantic_claim_support_judge",
@@ -890,6 +957,7 @@ def test_llm_analysis_salvages_truncated_chapter_json(monkeypatch, tmp_path):
 
 
 def test_llm_claim_support_validator_unavailable_is_not_silent(monkeypatch):
+    monkeypatch.setenv("REPORT_CLAIM_RETENTION_MODE", "strict")
     monkeypatch.setattr(analysis_agent, "validate_claim_supported_by_facts", None)
     evidence_package = {
         "analysis_ready_evidence": [
@@ -926,7 +994,7 @@ def test_llm_claim_support_validator_unavailable_is_not_silent(monkeypatch):
     assert validation["llm_rejected_claim_examples"][0]["type"] == "claim_support_validator_unavailable"
 
 
-def test_llm_chinese_qualitative_claim_with_offtopic_fact_is_rejected():
+def test_llm_chinese_qualitative_claim_with_offtopic_fact_is_observed_without_mutation():
     evidence_package = {
         "analysis_ready_evidence": [
             {
@@ -962,13 +1030,14 @@ def test_llm_chinese_qualitative_claim_with_offtopic_fact_is_rejected():
     assert validation["usable_claim_count"] == 1
     assert validation["deferred_claim_count"] == 0
     assert validation["status"] == "valid"
-    assert validation["llm_validation_issue_counts"]["claim_support_anchor_mismatch_downgraded"] == 1
-    assert unit["claim_support_status"] == "anchor_mismatch_downgraded"
+    assert validation["llm_validation_issue_counts"]["claim_support_anchor_mismatch_observed"] == 1
+    assert unit["claim_support_status"] == "anchor_mismatch_observed"
     assert unit["claim_strength"] == "directional"
-    assert unit["writing_permission"] == "cautious_with_boundary"
+    assert "writing_permission" not in unit
+    assert unit["claim_review_suggestions"][0]["must_not_render"] is True
 
 
-def test_llm_numeric_claim_with_incomplete_metric_fact_is_downgraded():
+def test_llm_numeric_claim_with_incomplete_metric_fact_is_observed_without_mutation():
     evidence = _evidence("EV-METRIC", chapter_id="ch_02", level="B")
     evidence.update(
         {
@@ -1007,17 +1076,16 @@ def test_llm_numeric_claim_with_incomplete_metric_fact_is_downgraded():
 
     assert validation["status"] == "valid"
     assert validation["usable_claim_count"] == 1
-    assert validation["llm_validation_issue_counts"]["llm_numeric_claim_incomplete_metric_fact"] == 1
+    assert validation["llm_validation_issue_counts"]["llm_numeric_claim_incomplete_metric_fact_observed"] == 1
     assert unit["claim_strength"] == "directional"
-    assert unit["claim_status"] == "directional"
-    assert unit["evidence_use_level"] == "directional_signal"
-    assert unit["writing_permission"] == "cautious_with_boundary"
+    assert "claim_status" not in unit
+    assert "evidence_use_level" not in unit
+    assert "writing_permission" not in unit
     assert unit["metric_completeness_status"] == "incomplete"
     assert unit["metric_missing_fields"] == ["unit", "period"]
-    # The diagnostic note lives in the internal validation_notes field; the
-    # writer-facing limitation_boundary must stay free of pipeline English
-    # (it gets rendered into the public body via counter_evidence).
-    assert any("metric fields incomplete" in item for item in unit["validation_notes"])
+    assert unit["claim_review_suggestions"][0]["issue_type"] == "llm_numeric_claim_incomplete_metric_fact"
+    assert unit["claim_review_suggestions"][0]["not_for_public_text"] is True
+    assert "validation_notes" not in unit
     assert not any("metric fields incomplete" in str(item) for item in unit.get("limitation_boundary") or [])
 
     merged = merge_llm_analysis_with_fallback({}, payload, validation)
@@ -1026,13 +1094,20 @@ def test_llm_numeric_claim_with_incomplete_metric_fact_is_downgraded():
     judgment = merged["key_judgments"][0]
 
     for item in (merged_unit, key_claim, judgment):
-        assert item["evidence_use_level"] == "directional_signal"
-        assert item["writing_permission"] == "cautious_with_boundary"
         assert item["metric_completeness_status"] == "incomplete"
         assert item["metric_missing_fields"] == ["unit", "period"]
+        assert item["claim_review_suggestions"][0]["must_not_render"] is True
 
 
 def test_llm_claim_repair_priorities_are_promoted_to_evidence_gap_ledger():
+    os.environ["REPORT_CLAIM_RETENTION_MODE"] = "strict"
+    try:
+        _run_llm_claim_repair_priorities_are_promoted_to_evidence_gap_ledger()
+    finally:
+        os.environ.pop("REPORT_CLAIM_RETENTION_MODE", None)
+
+
+def _run_llm_claim_repair_priorities_are_promoted_to_evidence_gap_ledger():
     evidence_package = {
         "analysis_ready_evidence": [
             {
@@ -1922,6 +1997,7 @@ def test_quality_mode_marks_invalid_llm_analysis_as_degraded(monkeypatch):
 
 
 def test_invalid_llm_analysis_promotes_claim_repair_priorities_to_structured_output(monkeypatch, tmp_path):
+    monkeypatch.setenv("REPORT_CLAIM_RETENTION_MODE", "strict")
     evidence_package = {
         "query": "AI Agent",
         "analysis_ready_evidence": [
@@ -2449,7 +2525,7 @@ def test_anchor_mismatch_waived_when_semantic_judge_confirms_support(monkeypatch
     assert issue_counts["claim_support_anchor_mismatch_waived_by_semantic_judge"] == 1
 
 
-def test_anchor_mismatch_downgrades_when_semantic_judge_unavailable(monkeypatch):
+def test_anchor_mismatch_observes_when_semantic_judge_unavailable_by_default(monkeypatch):
     monkeypatch.setattr(
         analysis_agent,
         "_llm_semantic_claim_support_judge",
@@ -2461,12 +2537,15 @@ def test_anchor_mismatch_downgrades_when_semantic_judge_unavailable(monkeypatch)
 
     assert validation["usable_claim_count"] == 1
     unit = validation["chapter_synthesis"][0]["claim_units"][0]
-    # No semantic verdict: keep the conservative directional downgrade.
-    assert unit["claim_strength"] == "directional"
-    assert validation["llm_validation_issue_counts"]["claim_support_anchor_mismatch_downgraded"] == 1
+    # No semantic verdict: default review mode records a diagnostic suggestion
+    # and leaves the analysis unit for the execution writer to judge.
+    assert unit["claim_strength"] == "moderate"
+    assert validation["llm_validation_issue_counts"]["claim_support_anchor_mismatch_observed"] == 1
+    assert unit["claim_review_suggestions"][0]["issue_type"] == "claim_support_anchor_mismatch"
+    assert unit["claim_review_suggestions"][0]["not_for_public_text"] is True
 
 
-def test_anchor_mismatch_defers_to_judge_partial_downgrade(monkeypatch):
+def test_anchor_mismatch_defers_to_judge_partial_observation_by_default(monkeypatch):
     monkeypatch.setattr(
         analysis_agent,
         "_llm_semantic_claim_support_judge",
@@ -2478,9 +2557,10 @@ def test_anchor_mismatch_defers_to_judge_partial_downgrade(monkeypatch):
 
     assert validation["usable_claim_count"] == 1
     unit = validation["chapter_synthesis"][0]["claim_units"][0]
-    assert unit["claim_strength"] == "directional"
+    assert unit["claim_strength"] == "moderate"
     issue_counts = validation["llm_validation_issue_counts"]
-    # The judge's own downgrade is the verdict of record; the anchor miss is
+    # The judge's own observation is the verdict of record; the anchor miss is
     # not double-counted as a second downgrade issue.
-    assert issue_counts["llm_claim_semantic_judge_partial_downgraded"] == 1
+    assert issue_counts["llm_claim_semantic_judge_partial_observed"] == 1
     assert "claim_support_anchor_mismatch_downgraded" not in issue_counts
+    assert unit["claim_review_suggestions"][0]["issue_type"] == "llm_claim_semantic_judge_partial"

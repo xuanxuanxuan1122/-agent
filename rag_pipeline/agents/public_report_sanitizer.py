@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import os
 from typing import Dict, List
 
 
@@ -791,7 +792,17 @@ def _strip_diagnostic_tables(text: str) -> str:
     return "\n".join(out)
 
 
-def sanitize_public_markdown(markdown: str) -> str:
+def _public_sanitizer_mutation_mode() -> str:
+    value = str(os.environ.get("REPORT_PUBLIC_SANITIZER_MUTATION_MODE") or "diagnostic_only").strip().lower()
+    if value in {"enforce", "strict", "repair_publication", "mutate", "clean"}:
+        return "enforce"
+    return "diagnostic_only"
+
+
+def sanitize_public_markdown(markdown: str, *, mode: str | None = None) -> str:
+    effective_mode = str(mode or _public_sanitizer_mutation_mode()).strip().lower()
+    if effective_mode not in {"enforce", "strict", "repair_publication", "mutate", "clean"}:
+        return str(markdown or "")
     body, appendix = _split_source_appendix(str(markdown or ""))
     text = rewrite_internal_public_terms(normalize_public_text_artifacts(body))
     text = _strip_diagnostic_tables(text)

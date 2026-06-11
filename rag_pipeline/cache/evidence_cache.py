@@ -203,6 +203,89 @@ def _domain(url: Any) -> str:
         return ""
 
 
+_PLACEHOLDER_TITLES = {"official ai agent statistics"}
+_PLACEHOLDER_TEXT = "official data shows ai agent adoption reached 50% in 2025"
+
+
+def _scalar_text(value: Any) -> str:
+    if isinstance(value, (dict, list, tuple, set)):
+        return ""
+    return str(value or "").strip()
+
+
+def _official_domain_type(text: str) -> str:
+    lowered = str(text or "").lower()
+    if re.search(r"(sec\.gov|cninfo\.com\.cn|sse\.com\.cn|szse\.cn|hkexnews\.hk)", lowered):
+        return "financial_report"
+    if re.search(r"(\.gov(?:/|$)|gov\.cn|stats\.gov\.cn|miit\.gov\.cn|ndrc\.gov\.cn|mof\.gov\.cn|pbc\.gov\.cn|csrc\.gov\.cn|nist\.gov)", lowered):
+        return "official"
+    return ""
+
+
+def _is_fake_or_placeholder_source(source: Dict[str, Any], text: Any = "") -> bool:
+    url = _scalar_text(source.get("url") or source.get("source_url")).lower()
+    title = _scalar_text(source.get("title") or source.get("source_title")).lower()
+    publisher = _scalar_text(source.get("publisher") or source.get("source"))
+    joined = " ".join(
+        [
+            url,
+            title,
+            publisher.lower(),
+            _scalar_text(source.get("domain")).lower(),
+            _scalar_text(text).lower(),
+        ]
+    )
+    if "example.gov" in joined or "example.com" in joined:
+        return True
+    if _PLACEHOLDER_TEXT in joined:
+        return True
+    if title in _PLACEHOLDER_TITLES:
+        return True
+    if title == "official" and not publisher:
+        return True
+    return False
+
+
+def _looks_like_error_or_page_shell(text: Any, *, title: Any = "") -> bool:
+    body = re.sub(r"\s+", " ", _scalar_text(text)).strip()
+    header = re.sub(r"\s+", " ", _scalar_text(title)).strip()
+    lowered = f"{header} {body}".lower()
+    if not lowered.strip():
+        return False
+    if any(
+        marker in lowered
+        for marker in (
+            "403 forbidden",
+            "404 not found",
+            "页面未找到",
+            "页面找不到",
+            "访问的页面不存在",
+            "内容不存在或被删除",
+            "permission denied",
+            "access denied",
+        )
+    ):
+        return True
+    if re.match(r"^(url|source_url)\s*[:：]\s*https?://\S+\s*$", body, flags=re.I):
+        return True
+    if re.match(r"^(时间|date)\s*[:：]\s*[^。；;]{1,80}$", body, flags=re.I):
+        return True
+    if body.lower().startswith(("摘要：skip to main content", "skip to main content")):
+        return True
+    if "linkedin is better on the app" in lowered and len(body) < 600:
+        return True
+    return False
+
+
+def _record_is_polluted(row: sqlite3.Row, raw: Dict[str, Any]) -> bool:
+    source = dict(_as_dict(raw.get("source")))
+    source.setdefault("url", row["source_url"] or raw.get("source_url") or raw.get("url") or "")
+    source.setdefault("title", raw.get("source_title") or raw.get("title") or "")
+    source.setdefault("publisher", raw.get("publisher") or "")
+    fact = row["fact_description"] or raw.get("fact") or raw.get("clean_fact") or raw.get("content") or ""
+    return _is_fake_or_placeholder_source(source, fact) or _looks_like_error_or_page_shell(fact, title=source.get("title"))
+
+
 def _source_type_from_text(source: Dict[str, Any], fallback: str = "") -> str:
     text = " ".join(
         [
@@ -211,6 +294,9 @@ def _source_type_from_text(source: Dict[str, Any], fallback: str = "") -> str:
             str(source.get("url") or source.get("source_url") or ""),
         ]
     ).lower()
+    official_override = _official_domain_type(text)
+    if official_override:
+        return official_override
     if re.search(r"(caifuhao\.eastmoney|guba\.eastmoney|mguba\.eastmoney|baijiahao|toutiao|zhihu|xueqiu|weibo|sohu|book118|docin|doc88|renrendoc|wenku\.baidu)", text):
         return "self_media"
     if re.search(r"(view\.inews\.qq\.com|kuaixun|finance\.sina\.com\.cn|news\.10jqka\.com\.cn|news\.futunn\.com|eastmoney\.com)", text):
@@ -715,15 +801,17 @@ class EvidenceCache:
                 hits: List[Dict[str, Any]] = []
                 hit_ids: List[str] = []
                 for row in rows:
+                    raw = _json_loads(row["raw_json"], {})
+                    if not isinstance(raw, dict):
+                        continue
+                    if _record_is_polluted(row, raw):
+                        continue
                     if _SOURCE_LEVEL_RANK.get(str(row["source_level"] or "").upper(), 0) < minimum_rank:
                         continue
                     row_role = str(row["proof_role"] or "").strip().lower()
                     if proof_role and row_role and proof_role != row_role:
                         if not (proof_role == "source_check" and row_role in {"source_check", "metric", "filing", "official_data", "support"}):
                             continue
-                    raw = _json_loads(row["raw_json"], {})
-                    if not isinstance(raw, dict):
-                        continue
                     if not _row_matches_source_type(row, raw, required_source_types):
                         continue
                     if not self._required_fields_satisfied(row, raw, required):
@@ -972,9 +1060,9 @@ class EvidenceCache:
 
     def _record_from_evidence(self, query: str, item: Dict[str, Any]) -> Dict[str, Any]:
         source = dict(_as_dict(item.get("source")))
-        source_url = str(source.get("url") or item.get("source_url") or item.get("url") or "").strip()
-        source_title = str(source.get("title") or item.get("source_title") or item.get("title") or "").strip()
-        source_publisher = str(source.get("publisher") or item.get("publisher") or "").strip()
+        source_url = _scalar_text(source.get("url") or item.get("source_url") or item.get("url"))
+        source_title = _scalar_text(source.get("title") or item.get("source_title") or item.get("title"))
+        source_publisher = _scalar_text(source.get("publisher") or item.get("publisher"))
         if source_url and not source.get("url"):
             source["url"] = source_url
         if source_title and not source.get("title"):
@@ -993,6 +1081,8 @@ class EvidenceCache:
         fact = str(item.get("fact") or item.get("clean_fact") or item.get("content") or item.get("fact_description") or "").strip()
         metric = str(item.get("metric") or item.get("metric_name") or item.get("indicator") or "").strip()
         value = str(item.get("value") or item.get("numeric_value") or "").strip()
+        if _is_fake_or_placeholder_source(source, fact) or _looks_like_error_or_page_shell(fact, title=source_title):
+            return {}
         if not (source_url or source_title or source_publisher):
             return {}
         if not (fact or metric or value):

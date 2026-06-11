@@ -426,12 +426,35 @@ def _strict_quality_mode() -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on", "strict"}
 
 
+def _recall_first_evidence_mode() -> bool:
+    mode = str(
+        os.getenv("REPORT_EVIDENCE_RECALL_MODE")
+        or os.getenv("REPORT_COMPLETENESS_FIRST_MODE")
+        or "permissive"
+    ).strip().lower()
+    return mode in {"1", "true", "yes", "on", "recall", "permissive", "loose", "draft", "complete"}
+
+
+def _source_is_excluded_from_recall(evidence: Dict[str, Any]) -> bool:
+    source = _as_dict(evidence.get("source"))
+    source_level = str(evidence.get("source_level") or source.get("source_level") or "").strip().upper()
+    if source_level == "D":
+        return True
+    source_type = str(source.get("source_type") or evidence.get("source_type") or "").strip().lower()
+    if source_type in {"self_media", "social", "forum", "wiki", "seo", "search_page", "aggregator"}:
+        return True
+    url = str(source.get("url") or evidence.get("source_url") or "").lower()
+    title = str(source.get("title") or evidence.get("source_title") or "").lower()
+    identity = f"{source_type} {url} {title}"
+    return any(hint in identity for hint in SELF_MEDIA_DOMAIN_HINTS)
+
+
 def _directional_c_min_confidence() -> float:
-    raw = os.getenv("REPORT_DIRECTIONAL_C_MIN_CONFIDENCE", "0.55")
+    raw = os.getenv("REPORT_DIRECTIONAL_C_MIN_CONFIDENCE", "0.45")
     try:
         return max(0.0, min(1.0, float(raw)))
     except (TypeError, ValueError):
-        return 0.55
+        return 0.45
 
 
 def _source_family(evidence: Dict[str, Any]) -> str:
@@ -2598,18 +2621,22 @@ def _canonical_role(value: Any) -> str:
 
 
 def _isolate_evidence_quality_gate(evidence: Dict[str, Any]) -> Dict[str, Any]:
-    if not quality_gates_isolated():
+    recall_first = _recall_first_evidence_mode()
+    if not quality_gates_isolated() and not recall_first:
         return evidence
     role = _canonical_role(evidence.get("evidence_role"))
     if role == "rejected" or str(evidence.get("semantic_status") or "").strip().lower() in REJECTED_STATUSES:
         return evidence
     if not str(evidence.get("fact") or evidence.get("clean_fact") or evidence.get("content") or "").strip():
         return evidence
+    if recall_first and _source_is_excluded_from_recall(evidence):
+        return evidence
     observations = list(_as_list(evidence.get("quality_gate_observations")))
     if evidence.get("appendix_only") or role in {"clue", "appendix"}:
         observations.append(
             {
                 "type": "evidence_quality_gate_observed",
+                "mode": "recall_first" if recall_first and not quality_gates_isolated() else "isolated_quality_gate",
                 "previous_role": role,
                 "previous_appendix_only": bool(evidence.get("appendix_only")),
                 "reason": evidence.get("task_acceptance_reason") or evidence.get("semantic_reason") or evidence.get("usage_tier") or "",

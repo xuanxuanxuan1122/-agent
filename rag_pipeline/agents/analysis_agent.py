@@ -3085,6 +3085,72 @@ def _downgrade_claim_unit_to_directional(
         unit["validation_notes"] = _dedupe([*_as_list(unit.get("validation_notes")), boundary_note])
 
 
+def _claim_review_mutation_mode() -> str:
+    value = str(
+        os.getenv("REPORT_CLAIM_REVIEW_MUTATION_MODE")
+        or os.getenv("BRAIN_CLAIM_REVIEW_MUTATION_MODE")
+        or "diagnostic_only"
+    ).strip().lower()
+    if value in {"enforce", "strict", "mutate", "legacy", "blocking", "drop"}:
+        return "enforce"
+    return "diagnostic_only"
+
+
+def _claim_review_can_mutate() -> bool:
+    return _claim_review_mutation_mode() == "enforce" or _claim_retention_mode() == "strict"
+
+
+def _append_claim_review_suggestion(
+    unit: Dict[str, Any],
+    *,
+    source_stage: str,
+    issue_type: str,
+    reason: str = "",
+    suggested_claim_strength: str = "",
+    suggested_analysis_role: str = "",
+    suggested_evidence_use_level: str = "",
+    suggested_writing_permission: str = "",
+    repair_priority: Optional[Dict[str, Any]] = None,
+    semantic_judge: Optional[Dict[str, Any]] = None,
+) -> None:
+    suggestions = [
+        item
+        for item in _as_list(unit.get("claim_review_suggestions"))
+        if isinstance(item, dict)
+    ]
+    suggestion: Dict[str, Any] = {
+        "schema_version": "claim_review_suggestion_v1",
+        "source_stage": source_stage,
+        "issue_type": issue_type,
+        "reason": _compact(reason, 260) if reason else "",
+        "diagnostic_only": True,
+        "not_for_public_text": True,
+        "must_not_render": True,
+        "public_text_allowed": False,
+        "executor_should_decide": True,
+        "suggested_action": "execution writer should decide whether to keep, soften, repair evidence binding, or omit this claim",
+    }
+    if suggested_claim_strength:
+        suggestion["suggested_claim_strength"] = suggested_claim_strength
+    if suggested_analysis_role:
+        suggestion["suggested_analysis_role"] = suggested_analysis_role
+    if suggested_evidence_use_level:
+        suggestion["suggested_evidence_use_level"] = suggested_evidence_use_level
+    if suggested_writing_permission:
+        suggestion["suggested_writing_permission"] = suggested_writing_permission
+    if repair_priority:
+        suggestion["repair_priority"] = repair_priority
+    if semantic_judge:
+        suggestion["semantic_judge"] = {
+            key: value
+            for key, value in semantic_judge.items()
+            if key not in {"usage"}
+        }
+    suggestions.append(suggestion)
+    unit["claim_review_suggestions"] = suggestions
+    unit["claim_review_mutation_mode"] = _claim_review_mutation_mode()
+
+
 def _semantic_judge_status(value: Any) -> str:
     text = str(value or "").strip().lower()
     if text in {"yes", "true", "supported", "support", "pass", "passed"}:
@@ -3151,6 +3217,23 @@ def _semantic_judge_enabled(llm_config: Optional[Dict[str, Any]]) -> bool:
 
 def _semantic_judge_fail_closed() -> bool:
     return _env_flag("BRAIN_LLM_SEMANTIC_JUDGE_FAIL_CLOSED", False)
+
+
+def _claim_retention_mode() -> str:
+    value = str(
+        os.getenv("REPORT_CLAIM_RETENTION_MODE")
+        or os.getenv("BRAIN_CLAIM_RETENTION_MODE")
+        or "permissive"
+    ).strip().lower()
+    if value in {"strict", "blocking", "enforce", "drop"}:
+        return "strict"
+    if value in {"balanced", "normal"}:
+        return "balanced"
+    return "permissive"
+
+
+def _claim_retention_permissive() -> bool:
+    return _claim_retention_mode() == "permissive"
 
 
 SEMANTIC_JUDGE_PROMPT_VERSION = "semantic_claim_support_judge_v2_2026_06_tiered"
@@ -3419,6 +3502,8 @@ def validate_llm_analysis_output(
     semantic_judge_counts: Dict[str, int] = {}
     semantic_judge_usage: Dict[str, Any] = {}
     review_isolated = quality_gates_isolated()
+    claim_retention_permissive = _claim_retention_permissive()
+    claim_review_can_mutate = _claim_review_can_mutate()
     if not valid_refs:
         issue_counts = {"no_valid_input_evidence_refs": 1}
         return {
@@ -3646,7 +3731,7 @@ def validate_llm_analysis_output(
             anchor_mismatch_pending: Optional[Dict[str, Any]] = None
             if validate_claim_supported_by_facts is None:
                 issue = {
-                    "type": "claim_support_validator_unavailable_observed" if review_isolated else "claim_support_validator_unavailable",
+                    "type": "claim_support_validator_unavailable_observed" if (review_isolated or claim_retention_permissive) else "claim_support_validator_unavailable",
                     "chapter_id": chapter.get("chapter_id"),
                     "claim_id": unit.get("claim_id"),
                     "evidence_refs": refs,
@@ -3655,7 +3740,7 @@ def validate_llm_analysis_output(
                 issues.append(issue)
                 if len(rejected_examples) < 5:
                     rejected_examples.append({**issue, "claim": claim_text})
-                if not review_isolated:
+                if not review_isolated and not claim_retention_permissive:
                     continue
                 unit["claim_support_status"] = "validator_unavailable_observed"
             else:
@@ -3689,7 +3774,7 @@ def validate_llm_analysis_output(
                         unit["support_unsupported_terms"] = _as_list(support_payload.get("unsupported_terms"))
                     else:
                         issue = {
-                            "type": "claim_support_needs_repair_observed" if review_isolated else "claim_support_needs_repair",
+                            "type": "claim_support_needs_repair_observed" if (review_isolated or claim_retention_permissive) else "claim_support_needs_repair",
                             "chapter_id": chapter.get("chapter_id"),
                             "claim_id": unit.get("claim_id"),
                             "evidence_refs": refs,
@@ -3709,9 +3794,25 @@ def validate_llm_analysis_output(
                                     "evidence_use_level": "diagnostic_only",
                                 }
                             )
-                        if review_isolated:
+                        if review_isolated or claim_retention_permissive:
                             unit["claim_support_status"] = "needs_repair_observed"
                             unit["claim_support_repair_hint"] = repair_priority
+                            _append_claim_review_suggestion(
+                                unit,
+                                source_stage="claim_support_validator",
+                                issue_type="claim_support_needs_repair",
+                                reason="claim support validator found missing or mismatched evidence anchors",
+                                suggested_claim_strength="directional",
+                                suggested_evidence_use_level="diagnostic_only",
+                                suggested_writing_permission="not_allowed_until_repaired",
+                                repair_priority=repair_priority,
+                            )
+                            if claim_retention_permissive and not review_isolated and claim_review_can_mutate:
+                                _downgrade_claim_unit_to_directional(
+                                    unit,
+                                    status="needs_repair_observed",
+                                    boundary_note="claim support needs repair; keep only as cautious directional analysis until stronger evidence is bound",
+                                )
                         else:
                             continue
                 else:
@@ -3738,7 +3839,7 @@ def validate_llm_analysis_output(
             def _apply_pending_anchor_downgrade() -> None:
                 if not anchor_mismatch_pending:
                     return
-                if review_isolated:
+                if review_isolated or not claim_review_can_mutate:
                     issues.append(
                         {
                             "type": "claim_support_anchor_mismatch_observed",
@@ -3746,6 +3847,15 @@ def validate_llm_analysis_output(
                         }
                     )
                     unit["claim_support_status"] = "anchor_mismatch_observed"
+                    _append_claim_review_suggestion(
+                        unit,
+                        source_stage="claim_support_validator",
+                        issue_type="claim_support_anchor_mismatch",
+                        reason="lexical claim anchors did not fully match cited facts",
+                        suggested_claim_strength="directional",
+                        suggested_evidence_use_level="directional_signal",
+                        suggested_writing_permission="cautious_with_boundary",
+                    )
                     return
                 issues.append(
                     {
@@ -3789,17 +3899,17 @@ def validate_llm_analysis_output(
             elif semantic_status == "partial":
                 issue = {
                     "type": "llm_claim_semantic_judge_partial_observed"
-                    if review_isolated
+                    if (review_isolated or not claim_review_can_mutate)
                     else "llm_claim_semantic_judge_partial_downgraded",
                     "chapter_id": chapter.get("chapter_id"),
                     "claim_id": unit.get("claim_id"),
                     "evidence_refs": refs,
                     "semantic_judge": semantic_judge,
                 }
-                if not review_isolated:
+                if not review_isolated and claim_review_can_mutate:
                     issue["downgraded_to"] = "directional"
                 issues.append(issue)
-                if not review_isolated:
+                if not review_isolated and claim_review_can_mutate:
                     _downgrade_claim_unit_to_directional(
                         unit,
                         status="semantic_partial_downgraded",
@@ -3807,6 +3917,16 @@ def validate_llm_analysis_output(
                     )
                 else:
                     unit["claim_support_status"] = "semantic_partial_observed"
+                    _append_claim_review_suggestion(
+                        unit,
+                        source_stage="semantic_claim_support_judge",
+                        issue_type="llm_claim_semantic_judge_partial",
+                        reason=str(semantic_judge.get("reason") or "semantic judge found partial support"),
+                        suggested_claim_strength="directional",
+                        suggested_evidence_use_level="directional_signal",
+                        suggested_writing_permission="cautious_with_boundary",
+                        semantic_judge=semantic_judge,
+                    )
                 unit["semantic_judge"] = {
                     key: value
                     for key, value in semantic_judge.items()
@@ -3815,17 +3935,17 @@ def validate_llm_analysis_output(
             elif semantic_status == "adjacent":
                 issue = {
                     "type": "llm_claim_semantic_judge_adjacent_observed"
-                    if review_isolated
+                    if (review_isolated or not claim_review_can_mutate)
                     else "llm_claim_semantic_judge_adjacent_downgraded",
                     "chapter_id": chapter.get("chapter_id"),
                     "claim_id": unit.get("claim_id"),
                     "evidence_refs": refs,
                     "semantic_judge": semantic_judge,
                 }
-                if not review_isolated:
+                if not review_isolated and claim_review_can_mutate:
                     issue["downgraded_to"] = "contextual"
                 issues.append(issue)
-                if not review_isolated:
+                if not review_isolated and claim_review_can_mutate:
                     _downgrade_claim_unit_to_directional(
                         unit,
                         status="semantic_adjacent_downgraded",
@@ -3835,6 +3955,17 @@ def validate_llm_analysis_output(
                     unit["evidence_use_level"] = "background"
                 else:
                     unit["claim_support_status"] = "semantic_adjacent_observed"
+                    _append_claim_review_suggestion(
+                        unit,
+                        source_stage="semantic_claim_support_judge",
+                        issue_type="llm_claim_semantic_judge_adjacent",
+                        reason=str(semantic_judge.get("reason") or "semantic judge found adjacent/background support"),
+                        suggested_claim_strength="directional",
+                        suggested_analysis_role="contextual",
+                        suggested_evidence_use_level="background",
+                        suggested_writing_permission="cautious_with_boundary",
+                        semantic_judge=semantic_judge,
+                    )
                 unit["semantic_judge"] = {
                     key: value
                     for key, value in semantic_judge.items()
@@ -3843,7 +3974,7 @@ def validate_llm_analysis_output(
             elif not _semantic_judge_accepts(semantic_judge):
                 issue = {
                     "type": "llm_claim_semantic_judge_unsupported_observed"
-                    if review_isolated
+                    if (review_isolated or claim_retention_permissive or not claim_review_can_mutate)
                     else "llm_claim_semantic_judge_unsupported",
                     "chapter_id": chapter.get("chapter_id"),
                     "claim_id": unit.get("claim_id"),
@@ -3866,16 +3997,43 @@ def validate_llm_analysis_output(
                 semantic_repair_priority["gap_type"] = "claim_semantic_support_mismatch"
                 semantic_repair_priority["source_stage"] = "semantic_claim_support_judge"
                 claim_repair_priorities.append(semantic_repair_priority)
-                if len(rejected_examples) < 5:
-                    rejected_examples.append({**issue, "claim": claim_text})
-                if review_isolated:
+                if review_isolated or claim_retention_permissive or not claim_review_can_mutate:
                     unit["semantic_judge"] = {
                         key: value
                         for key, value in semantic_judge.items()
                         if key not in {"usage"}
                     }
                     unit["claim_support_status"] = "semantic_unsupported_observed"
+                    _append_claim_review_suggestion(
+                        unit,
+                        source_stage="semantic_claim_support_judge",
+                        issue_type="llm_claim_semantic_judge_unsupported",
+                        reason=str(semantic_judge.get("reason") or "semantic judge did not support the claim"),
+                        suggested_claim_strength="directional",
+                        suggested_evidence_use_level="diagnostic_only",
+                        suggested_writing_permission="repair_before_publication",
+                        repair_priority=semantic_repair_priority,
+                        semantic_judge=semantic_judge,
+                    )
+                    if claim_retention_permissive and not review_isolated and claim_review_can_mutate:
+                        _downgrade_claim_unit_to_directional(
+                            unit,
+                            status="semantic_unsupported_observed",
+                            boundary_note="semantic judge did not find direct support; keep only as cautious directional analysis and repair the evidence binding",
+                        )
+                    if len(deferred_examples) < 8:
+                        deferred_examples.append(
+                            {
+                                **issue,
+                                "claim": claim_text,
+                                "repair_priority": semantic_repair_priority,
+                                "claim_status": unit.get("claim_status") or unit.get("claim_support_status"),
+                                "evidence_use_level": unit.get("evidence_use_level"),
+                            }
+                        )
                 else:
+                    if len(rejected_examples) < 5:
+                        rejected_examples.append({**issue, "claim": claim_text})
                     continue
             else:
                 unit["semantic_judge"] = {
@@ -3907,19 +4065,19 @@ def validate_llm_analysis_output(
                     )
                     issue = {
                         "type": "llm_numeric_claim_incomplete_metric_fact_observed"
-                        if review_isolated
+                        if (review_isolated or not claim_review_can_mutate)
                         else "llm_numeric_claim_incomplete_metric_fact",
                         "chapter_id": chapter.get("chapter_id"),
                         "claim_id": unit.get("claim_id"),
                         "evidence_refs": refs,
                         "metric_gaps": metric_gaps,
                     }
-                    if not review_isolated:
+                    if not review_isolated and claim_review_can_mutate:
                         issue["downgraded_to"] = "directional"
                     issues.append(issue)
                     unit["metric_completeness_status"] = "incomplete"
                     unit["metric_missing_fields"] = missing_fields
-                    if not review_isolated:
+                    if not review_isolated and claim_review_can_mutate:
                         unit["claim_status"] = "directional"
                         unit["claim_strength"] = "directional"
                         unit["claim_strength_ceiling"] = "directional"
@@ -3934,6 +4092,16 @@ def validate_llm_analysis_output(
                             + "; use only as a directional signal until repaired"
                         )
                         unit["validation_notes"] = _dedupe([*_as_list(unit.get("validation_notes")), boundary_note])
+                    else:
+                        _append_claim_review_suggestion(
+                            unit,
+                            source_stage="metric_completeness_gate",
+                            issue_type="llm_numeric_claim_incomplete_metric_fact",
+                            reason="numeric claim cites metric facts with missing value/unit/period/source fields",
+                            suggested_claim_strength="directional",
+                            suggested_evidence_use_level="directional_signal",
+                            suggested_writing_permission="cautious_with_boundary",
+                        )
             inferred_requirement_ids = _dedupe(
                 [
                     *[
@@ -4263,6 +4431,7 @@ def merge_llm_analysis_with_fallback(
                 "writing_permission": unit.get("writing_permission"),
                 "metric_completeness_status": unit.get("metric_completeness_status"),
                 "metric_missing_fields": _as_list(unit.get("metric_missing_fields")),
+                "claim_review_suggestions": _as_list(unit.get("claim_review_suggestions")),
                 "requirement_ids": _as_list(unit.get("requirement_ids")),
                 "fact_ids": _as_list(unit.get("fact_ids")) or refs,
                 "source_ids": _as_list(unit.get("source_ids")),
@@ -4304,6 +4473,7 @@ def merge_llm_analysis_with_fallback(
                     "writing_permission": claim_payload["writing_permission"],
                     "metric_completeness_status": claim_payload["metric_completeness_status"],
                     "metric_missing_fields": claim_payload["metric_missing_fields"],
+                    "claim_review_suggestions": claim_payload["claim_review_suggestions"],
                     "requirement_ids": claim_payload["requirement_ids"],
                     "fact_ids": claim_payload["fact_ids"],
                     "source_ids": claim_payload["source_ids"],
@@ -4338,6 +4508,7 @@ def merge_llm_analysis_with_fallback(
                         "writing_permission": claim_payload["writing_permission"],
                         "metric_completeness_status": claim_payload["metric_completeness_status"],
                         "metric_missing_fields": claim_payload["metric_missing_fields"],
+                        "claim_review_suggestions": claim_payload["claim_review_suggestions"],
                         "confidence": claim_payload["confidence"],
                         "decision_implication": claim_payload["decision_implication"],
                     }

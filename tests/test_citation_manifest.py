@@ -91,7 +91,28 @@ def test_finalize_is_idempotent_for_reentrant_passes_with_registry_priority():
     assert [s["title"] for s in third_sources] == [s["title"] for s in second_sources]
 
 
-def test_final_citation_reconciliation_removes_unresolved_final_body_refs():
+def test_final_citation_reconciliation_observes_unresolved_final_body_refs_without_deleting_by_default():
+    body = "The report cites a valid source [7], a missing source [8], and another valid source [9]."
+    sources = [
+        {"ref": "[7]", "title": "Valid source A", "url": "https://example.org/a"},
+        {"ref": "[9]", "title": "Valid source B", "url": "https://example.org/b"},
+    ]
+
+    rewritten, appendix_sources, diagnostics = finalize_markdown_citations(body, {"appendix_sources": sources}, sources)
+
+    assert "[8]" in rewritten
+    assert "[1]" in rewritten and "[2]" in rewritten
+    assert [source["ref"] for source in appendix_sources] == ["[1]", "[2]"]
+    assert diagnostics["diagnostic_only"] is True
+    assert diagnostics["not_for_public_text"] is True
+    assert diagnostics["final_unresolved_citation_removed_count"] == 0
+    assert diagnostics["final_unresolved_citation_observed_count"] == 1
+    assert diagnostics["final_unresolved_citation_refs"] == ["[8]"]
+    assert diagnostics["review_suggestions"][0]["must_not_render"] is True
+
+
+def test_final_citation_reconciliation_removes_unresolved_final_body_refs_in_enforce_mode(monkeypatch):
+    monkeypatch.setenv("REPORT_CITATION_AUDIT_MUTATION_MODE", "enforce")
     body = "The report cites a valid source [7], a missing source [8], and another valid source [9]."
     sources = [
         {"ref": "[7]", "title": "Valid source A", "url": "https://example.org/a"},
@@ -200,7 +221,8 @@ def test_final_citation_reconciliation_manifest_public_refs_override_manifest_al
     assert diagnostics["final_citation_reconciliation_status"] == "ok"
 
 
-def test_final_citation_reconciliation_drops_long_factual_body_without_citations():
+def test_final_citation_reconciliation_drops_long_factual_body_without_citations(monkeypatch):
+    monkeypatch.setenv("REPORT_CITATION_AUDIT_MUTATION_MODE", "enforce")
     body = (
         "2025年 AI 生成视音频内容超过 20 亿条，企业级 Agent 市场规模继续扩张，"
         "并且该判断同时涉及市场规模、企业采购、产业政策和收入预测等多个可核验事实，"
@@ -218,7 +240,8 @@ def test_final_citation_reconciliation_drops_long_factual_body_without_citations
     assert diagnostics["citationless_fact_examples"] == []
 
 
-def test_final_citation_reconciliation_drops_trailing_uncited_factual_sentence_in_cited_paragraph():
+def test_final_citation_reconciliation_drops_trailing_uncited_factual_sentence_in_cited_paragraph(monkeypatch):
+    monkeypatch.setenv("REPORT_CITATION_AUDIT_MUTATION_MODE", "enforce")
     body = (
         "Enterprise AI Agent adoption is moving from pilots into workflow automation [1]. "
         "OpenAI revenue reached 20 billion in 2025."
@@ -239,7 +262,25 @@ def test_final_citation_reconciliation_drops_trailing_uncited_factual_sentence_i
     assert diagnostics["factual_body_without_citations_count"] == 0
 
 
-def test_final_citation_reconciliation_drops_citationless_factual_bullets():
+def test_final_citation_reconciliation_keeps_uncited_factual_sentence_as_diagnostic_by_default():
+    body = "OpenAI revenue reached 20 billion in 2025."
+
+    rewritten, appendix_sources, diagnostics = finalize_markdown_citations(body, {"appendix_sources": []}, [])
+
+    assert rewritten == body
+    assert appendix_sources == []
+    assert diagnostics["diagnostic_only"] is True
+    assert diagnostics["final_citation_reconciliation_status"] == "blocked"
+    assert diagnostics["citationless_factual_sentence_removed_count"] == 0
+    assert diagnostics["citationless_factual_removed_count"] == 0
+    assert diagnostics["factual_body_without_citations_count"] == 1
+    assert diagnostics["citationless_fact_examples"] == [body]
+    assert diagnostics["review_suggestions"][0]["issue_type"] == "citationless_factual_public_text"
+    assert diagnostics["review_suggestions"][0]["not_for_public_text"] is True
+
+
+def test_final_citation_reconciliation_drops_citationless_factual_bullets(monkeypatch):
+    monkeypatch.setenv("REPORT_CITATION_AUDIT_MUTATION_MODE", "enforce")
     body = "\n".join(
         [
             "- \u673a\u4f1a\u5224\u65ad\uff1aOpenAI \u4e0e Microsoft \u7684\u6280\u672f\u548c\u76d1\u7ba1\u7ea6\u675f\u4f1a\u5982\u4f55\u6539\u53d8\u673a\u4f1a\u6392\u5e8f",
@@ -259,7 +300,8 @@ def test_final_citation_reconciliation_drops_citationless_factual_bullets():
     assert diagnostics["factual_body_without_citations_count"] == 0
 
 
-def test_final_citation_reconciliation_drops_short_citationless_factual_lines():
+def test_final_citation_reconciliation_drops_short_citationless_factual_lines(monkeypatch):
+    monkeypatch.setenv("REPORT_CITATION_AUDIT_MUTATION_MODE", "enforce")
     body = "\n".join(
         [
             "\u6e17\u900f\u7387\u4e3a10%\uff0c\u671f\u95f4\u4e3a2011\u5e74",
@@ -278,6 +320,7 @@ def test_final_citation_reconciliation_drops_short_citationless_factual_lines():
 
 
 def test_final_citation_reconciliation_marks_rebind_required_when_many_facts_removed(monkeypatch):
+    monkeypatch.setenv("REPORT_CITATION_AUDIT_MUTATION_MODE", "enforce")
     monkeypatch.setenv("REPORT_FINAL_CITATION_REBIND_REMOVAL_THRESHOLD", "3")
     body = "\n".join(
         [
@@ -299,6 +342,7 @@ def test_final_citation_reconciliation_marks_rebind_required_when_many_facts_rem
 
 
 def test_final_citation_reconciliation_rebinds_when_removal_count_reaches_threshold(monkeypatch):
+    monkeypatch.setenv("REPORT_CITATION_AUDIT_MUTATION_MODE", "enforce")
     monkeypatch.setenv("REPORT_FINAL_CITATION_REBIND_REMOVAL_THRESHOLD", "5")
     body = "\n".join(
         [
@@ -794,6 +838,7 @@ def test_final_writer_filters_unresolved_refs_before_rendered_manifest(monkeypat
 
 def test_final_writer_drops_factual_section_when_all_refs_unresolved(monkeypatch):
     monkeypatch.setenv("REPORT_FINAL_WRITER_SOURCE_APPENDIX", "true")
+    monkeypatch.setenv("REPORT_SOURCE_CLAIM_GATE_MODE", "strict")
 
     output = run_final_writer_agent(
         query="AI Agent",
@@ -835,6 +880,7 @@ def test_final_writer_drops_factual_section_when_all_refs_unresolved(monkeypatch
 
 def test_final_writer_drops_metric_claim_when_metric_fact_is_not_structured(monkeypatch):
     monkeypatch.setenv("REPORT_FINAL_WRITER_SOURCE_APPENDIX", "true")
+    monkeypatch.setenv("REPORT_SOURCE_CLAIM_GATE_MODE", "strict")
 
     output = run_final_writer_agent(
         query="AI Agent",
@@ -1014,6 +1060,7 @@ def test_final_writer_removes_unresolved_final_body_citation_before_appendix(mon
 
 def test_final_writer_drops_factual_section_when_manifest_filters_its_only_source(monkeypatch):
     monkeypatch.setenv("REPORT_FINAL_WRITER_SOURCE_APPENDIX", "true")
+    monkeypatch.setenv("REPORT_SOURCE_CLAIM_GATE_MODE", "strict")
 
     output = run_final_writer_agent(
         query="AI Agent",
@@ -1065,6 +1112,7 @@ def test_final_writer_drops_factual_section_when_manifest_filters_its_only_sourc
 
 def test_final_writer_drops_evidence_backed_section_without_manifest_citation(monkeypatch):
     monkeypatch.setenv("REPORT_FINAL_WRITER_SOURCE_APPENDIX", "true")
+    monkeypatch.setenv("REPORT_SOURCE_CLAIM_GATE_MODE", "strict")
 
     output = run_final_writer_agent(
         query="AI Agent",
@@ -1377,7 +1425,7 @@ def test_final_writer_counts_analysis_transfer_by_refs_when_section_loses_claim_
 
 def test_final_writer_balanced_gate_preserves_weak_source_claim_after_analysis(monkeypatch):
     monkeypatch.setenv("REPORT_FINAL_WRITER_SOURCE_APPENDIX", "true")
-    monkeypatch.delenv("REPORT_SOURCE_CLAIM_GATE_MODE", raising=False)
+    monkeypatch.setenv("REPORT_SOURCE_CLAIM_GATE_MODE", "balanced")
 
     output = run_final_writer_agent(
         query="AI Agent",
@@ -1614,6 +1662,7 @@ def test_final_writer_recovers_citation_from_supporting_fact_source_url(monkeypa
 
 def test_final_writer_omits_chapter_when_all_sections_dropped_after_citation_gate(monkeypatch):
     monkeypatch.setenv("REPORT_FINAL_WRITER_SOURCE_APPENDIX", "true")
+    monkeypatch.setenv("REPORT_SOURCE_CLAIM_GATE_MODE", "strict")
 
     output = run_final_writer_agent(
         query="AI Agent",
@@ -1647,6 +1696,49 @@ def test_final_writer_omits_chapter_when_all_sections_dropped_after_citation_gat
     assert "## 1. Technology maturity" not in markdown
     assert "Technology maturity should be judged" not in markdown
     assert output["source_claim_support"]["empty_chapter_omitted_after_source_gate_count"] == 1
+
+
+def test_final_writer_permissive_gate_keeps_unresolved_factual_section(monkeypatch):
+    monkeypatch.setenv("REPORT_FINAL_WRITER_SOURCE_APPENDIX", "true")
+    monkeypatch.delenv("REPORT_SOURCE_CLAIM_GATE_MODE", raising=False)
+
+    output = run_final_writer_agent(
+        query="AI Agent",
+        report_blueprint={
+            "report_shell": {"front_blocks": [], "back_blocks": ["appendix"]},
+            "chapters": [{"chapter_id": "ch_01", "chapter_title": "Technology maturity"}],
+        },
+        chapter_packages=[
+            {
+                "chapter_id": "ch_01",
+                "chapter_title": "Technology maturity",
+                "sections": [
+                    {
+                        "section_id": "s_tech",
+                        "section_title": "Technology constraint",
+                        "block_type": "technology_maturity",
+                        "claim": "Technology maturity constrains production deployment.",
+                        "reasoning": "Tool calls and permission control determine whether the workflow can enter production.",
+                        "render_blocks": [{"type": "paragraph", "text": "Technology maturity constrains production deployment."}],
+                        "supporting_facts": ["A technical maturity observation without a resolvable citation."],
+                        "evidence_backed": True,
+                    }
+                ],
+            }
+        ],
+        source_registry=[],
+    )
+
+    markdown = output["report_markdown"]
+    assert "## 1. Technology maturity" in markdown
+    assert "Technology maturity constrains production deployment" in markdown
+    support = output["source_claim_support"]
+    assert support["source_gate_mode"] == "permissive"
+    assert support["diagnostic_only"] is True
+    assert support["not_for_public_text"] is True
+    assert support["section_dropped_due_to_source_claim_mismatch_count"] == 0
+    assert support["permissive_retained_manifest_citation_missing_count"] == 1
+    assert support["citationless_fact_examples"][0]["action"] == "retained_with_diagnostic"
 
 
 def test_final_writer_explains_unresolved_ref_when_source_was_excluded(monkeypatch):
@@ -1932,6 +2024,7 @@ def test_final_writer_preserves_metric_claim_after_analysis_topic_checks_are_ups
 
 def test_final_writer_drops_metric_claim_when_source_is_placeholder_even_after_analysis(monkeypatch):
     monkeypatch.setenv("REPORT_FINAL_WRITER_SOURCE_APPENDIX", "true")
+    monkeypatch.setenv("REPORT_SOURCE_CLAIM_GATE_MODE", "strict")
 
     output = run_final_writer_agent(
         query="AI Agent生态发展报告",

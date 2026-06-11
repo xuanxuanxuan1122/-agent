@@ -78,6 +78,35 @@ def test_run_source_ids_are_local_and_map_to_canonical_sources(tmp_path):
     assert store.resolve_run_source("run-b", "SRC-001")["canonical_url"] == "https://example.com/b"
 
 
+def test_source_upsert_drops_nested_dict_publisher_metadata(tmp_path):
+    store = _store(tmp_path)
+    store.upsert_run(run_id="run-a", query="q", status="running")
+    nested_source = {
+        "title": "IDC source that should not become publisher",
+        "url": "https://mfe-prod.idc.com/getdoc.jsp?containerId=prCHC53669525",
+        "source_type": "research",
+        "web_final_score": 0.68,
+    }
+
+    store.upsert_source(
+        run_id="run-a",
+        run_source_id="SRC-001",
+        source={
+            "canonical_url": "https://www.stats.gov.cn/example",
+            "title": "Government statistics page",
+            "publisher": nested_source,
+            "source": nested_source,
+            "source_level": "A",
+            "status": "validated",
+        },
+    )
+
+    resolved = store.resolve_run_source("run-a", "SRC-001")
+
+    assert resolved["publisher"] == ""
+    assert "web_final_score" not in resolved["publisher"]
+
+
 def test_artifact_payloads_inline_small_json_and_spill_large_payloads_to_files(tmp_path):
     store = _store(tmp_path)
     store.upsert_run(run_id="run-a", query="q", status="running")

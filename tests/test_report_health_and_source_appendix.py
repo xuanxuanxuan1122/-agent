@@ -497,7 +497,7 @@ def test_score_markdown_counts_global_cached_body_rewrites_as_successes():
 def test_public_sanitizer_normalizes_ocr_artifacts_and_empty_punctuation():
     markdown = "## 章节\n\n中⼼心发布报告（）。管理理团队提到⼤大模型应⽤用落地.。"
 
-    cleaned = sanitize_public_markdown(markdown)
+    cleaned = sanitize_public_markdown(markdown, mode="enforce")
 
     assert "中⼼心" not in cleaned
     assert "管理理" not in cleaned

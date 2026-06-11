@@ -207,6 +207,49 @@ def test_isolated_quality_gate_keeps_appendix_clues_analysis_ready(monkeypatch):
     assert by_id["EV-CLUE"]["analysis_input"]["quality_gate_observations"]
 
 
+def test_recall_first_mode_promotes_traceable_media_clue_analysis_ready(monkeypatch):
+    monkeypatch.delenv("REPORT_QUALITY_GATE_MODE", raising=False)
+    monkeypatch.delenv("REPORT_EVIDENCE_RECALL_MODE", raising=False)
+    package = build_evidence_package(
+        evidence_items=[
+            {
+                "evidence_id": "EV-MEDIA-CLUE",
+                "dimension": "market signal",
+                "fact": "A 2026 business media article reports that enterprises are testing AI Agent workflow assistants.",
+                "clean_fact": "A 2026 business media article reports that enterprises are testing AI Agent workflow assistants.",
+                "metric": "deployment signal",
+                "value": "2026",
+                "period": "2026",
+                "source": {
+                    "title": "Business media AI Agent workflow report",
+                    "url": "https://www.yicai.com/news/ai-agent-workflow",
+                    "source_type": "media",
+                    "publisher": "Yicai",
+                },
+                "source_level": "C",
+                "source_verification_status": "search_result_only",
+                "source_verified": False,
+                "confidence": 0.32,
+                "evidence_role": "clue",
+                "allowed_use": "appendix_only",
+                "appendix_only": True,
+                "semantic_status": "weak_relevance",
+                "proof_role": "case",
+                "evidence_type": "media_signal",
+            }
+        ],
+        top_k=4,
+    )
+
+    by_id = {item["evidence_id"]: item for item in package["analysis_ready_evidence"]}
+    assert "EV-MEDIA-CLUE" in by_id
+    item = by_id["EV-MEDIA-CLUE"]
+    assert item["allowed_use"] == "supporting_context"
+    assert item["appendix_only"] is False
+    assert item["evidence_role"] == "supporting"
+    assert item["quality_gate_observations"]
+
+
 def test_ab_policy_evidence_uses_chapter_relevance_when_metric_query_is_too_narrow():
     evidence_pool = [
         {

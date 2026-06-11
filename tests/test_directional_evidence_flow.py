@@ -36,7 +36,7 @@ def test_missing_proof_standards_downgrade_to_public_directional_claim():
 def test_sanitizer_rewrites_internal_gap_language_instead_of_dropping_block():
     markdown = "## 1. 行情判断\n证据不足，不能作为确定性结论，但价格和库存已经出现方向性变化。"
 
-    cleaned = sanitize_public_markdown(markdown)
+    cleaned = sanitize_public_markdown(markdown, mode="enforce")
 
     assert "## 1. 行情判断" in cleaned
     assert "价格和库存已经出现方向性变化" in cleaned
