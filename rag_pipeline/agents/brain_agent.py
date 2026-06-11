@@ -1129,7 +1129,7 @@ def _search_query_contract_terms(
             _append_unique_text(source_terms, term, max_items=4)
 
     query_terms: List[str] = []
-    for term in [*role_terms, *field_terms, *source_terms]:
+    for term in [*role_terms, *source_terms, *field_terms]:
         _append_unique_text(query_terms, term, max_items=max_terms)
 
     return {
@@ -1305,7 +1305,7 @@ def build_search_tasks_for_goal(
         source_priority=source_priority,
     )
     query_focus = _compact_iqs_terms([research_object, *global_required_terms, *terms], max_terms=2, max_chars=16)
-    base_query = _compose_iqs_query([topic_terms[:1], query_contract["query_terms"], query_focus, query_hint])
+    base_query = _compose_iqs_query([topic_terms[:3], query_contract["query_terms"], query_focus, query_hint])
     task = {
         "task_id": f"{chapter_id}_{str(goal.get('goal_id') or proof_role).replace(' ', '_')}_{proof_role}",
         "agent": "iqs",
@@ -3305,6 +3305,21 @@ def _deadline_remaining_seconds(state: Dict[str, Any]) -> float:
 def _deadline_exceeded(state: Dict[str, Any], *, min_remaining: float = 0.0) -> bool:
     remaining = _deadline_remaining_seconds(state)
     return remaining != float("inf") and remaining <= float(min_remaining or 0.0)
+
+
+def _analysis_deadline_ts_for_state(state: Dict[str, Any]) -> Optional[float]:
+    """Deadline handed to run_analysis_agent: the report deadline minus a writer
+    reserve, so the renderer/body-rewrite stages still fit before the wall clock
+    runs out instead of discovering the timeout only after analysis returns."""
+    deadline_ts = _deadline_ts_from_state(state)
+    if deadline_ts <= 0:
+        return None
+    reserve = 0.0
+    try:
+        reserve = float(os.getenv("BRAIN_ANALYSIS_WRITER_RESERVE_SECONDS", "240") or 240)
+    except (TypeError, ValueError):
+        reserve = 240.0
+    return deadline_ts - max(0.0, reserve)
 
 
 def _deadline_timeout_payload(state: Dict[str, Any], *, stage: str) -> Dict[str, Any]:
@@ -12691,7 +12706,12 @@ def merge_outputs_node(state: BrainAgentState) -> BrainAgentState:
         evidence_package["report_plan"] = report_plan
         evidence_package.setdefault("metadata", {})
         evidence_package["metadata"]["report_plan"] = report_plan
-    analysis_state = run_analysis_agent(evidence_package, query=str(state.get("query") or ""), llm_config=build_llm_config("decision"))
+    analysis_state = run_analysis_agent(
+        evidence_package,
+        query=str(state.get("query") or ""),
+        llm_config=build_llm_config("decision"),
+        deadline_ts=_analysis_deadline_ts_for_state(state),
+    )
     structured_analysis = _as_dict(analysis_state.get("structured_analysis"))
     if report_plan:
         structured_analysis["report_plan"] = report_plan

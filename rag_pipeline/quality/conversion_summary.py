@@ -264,7 +264,11 @@ def _claim_funnel(
         source_ids = _as_list(normalized.get("source_ids"))
         requirement_ids = _as_list(normalized.get("requirement_ids"))
         chapter_id = _text(claim.get("chapter_id"))
-        bound = bool(fact_ids and source_ids and requirement_ids)
+        evidence_bound = bool(fact_ids)
+        source_bound = bool(source_ids)
+        requirement_bound = bool(requirement_ids)
+        fully_bound = bool(evidence_bound and source_bound and requirement_bound)
+        bound = bool(evidence_bound and source_bound)
         renderable = bool(bound and not _claim_forbidden({**claim, **normalized}))
         section_bound = bool(
             renderable
@@ -274,6 +278,10 @@ def _claim_funnel(
             )
         )
         counts["total_claim_count"] += 1
+        counts["evidence_bound_claim_count"] += int(evidence_bound)
+        counts["source_bound_claim_count"] += int(source_bound)
+        counts["requirement_bound_claim_count"] += int(requirement_bound)
+        counts["fully_bound_claim_count"] += int(fully_bound)
         counts["bound_claim_count"] += int(bound)
         counts["unbound_claim_count"] += int(not bound)
         counts["renderable_claim_count"] += int(renderable)
@@ -294,6 +302,10 @@ def _claim_funnel(
                 _increment_slice(by_chapter, chapter_id, "renderable_claim_count")
     total = counts["total_claim_count"]
     counts["bound_claim_rate"] = _ratio(counts["bound_claim_count"], total)
+    counts["evidence_bound_claim_rate"] = _ratio(counts["evidence_bound_claim_count"], total)
+    counts["source_bound_claim_rate"] = _ratio(counts["source_bound_claim_count"], total)
+    counts["requirement_bound_claim_rate"] = _ratio(counts["requirement_bound_claim_count"], total)
+    counts["fully_bound_claim_rate"] = _ratio(counts["fully_bound_claim_count"], total)
     counts["renderable_claim_rate"] = _ratio(counts["renderable_claim_count"], total)
     counts["section_bound_claim_rate"] = _ratio(counts["section_bound_claim_count"], counts["renderable_claim_count"])
     return {"schema_version": "claim_conversion_funnel_v1", **dict(counts)}
@@ -307,12 +319,16 @@ def _metric_funnel(
 ) -> Dict[str, Any]:
     assets = build_metric_assets(fact_cards, source_registry)
     missing_counts: Counter[str] = Counter()
+    reject_counts: Counter[str] = Counter()
     complete = 0
+    semantic_complete = 0
     table_ready = 0
     for asset in assets:
         missing = _as_list(asset.get("missing_fields"))
         missing_counts.update(missing)
+        reject_counts.update(_as_list(asset.get("reject_reasons")))
         complete += int(bool(asset.get("complete")))
+        semantic_complete += int(bool(asset.get("semantic_complete")))
         table_ready += int(bool(asset.get("table_ready")))
         req_id = _text(asset.get("requirement_id"))
         chapter_id = _text(asset.get("chapter_id"))
@@ -320,22 +336,29 @@ def _metric_funnel(
             _increment_slice(by_requirement, req_id, "metric_candidate_count")
             if asset.get("complete"):
                 _increment_slice(by_requirement, req_id, "complete_metric_count")
+            if asset.get("semantic_complete"):
+                _increment_slice(by_requirement, req_id, "semantic_complete_metric_count")
             if asset.get("table_ready"):
                 _increment_slice(by_requirement, req_id, "table_ready_metric_count")
         if chapter_id:
             _increment_slice(by_chapter, chapter_id, "metric_candidate_count")
             if asset.get("complete"):
                 _increment_slice(by_chapter, chapter_id, "complete_metric_count")
+            if asset.get("semantic_complete"):
+                _increment_slice(by_chapter, chapter_id, "semantic_complete_metric_count")
             if asset.get("table_ready"):
                 _increment_slice(by_chapter, chapter_id, "table_ready_metric_count")
     return {
         "schema_version": "metric_conversion_funnel_v1",
         "metric_candidate_count": len(assets),
         "complete_metric_count": complete,
+        "semantic_complete_metric_count": semantic_complete,
         "table_ready_metric_count": table_ready,
         "metric_completion_rate": _ratio(complete, len(assets)),
+        "metric_semantic_completion_rate": _ratio(semantic_complete, len(assets)),
         "metric_to_table_ready_rate": _ratio(table_ready, len(assets)),
         "metric_missing_field_counts": dict(missing_counts),
+        "metric_reject_reason_counts": dict(reject_counts),
         "metric_assets": assets[:50],
     }
 
@@ -453,7 +476,7 @@ def _recommendations(
                 ][:20],
             }
         )
-    if _safe_int(metric_funnel.get("complete_metric_count")) < 8 and _safe_int(metric_funnel.get("metric_candidate_count")):
+    if _safe_int(metric_funnel.get("semantic_complete_metric_count") or metric_funnel.get("complete_metric_count")) < 8 and _safe_int(metric_funnel.get("metric_candidate_count")):
         recommendations.append(
             {
                 "type": "low_complete_metric_count",

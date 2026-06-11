@@ -14,9 +14,12 @@ from rag_pipeline.cache.trusted_source_cache import store_trusted_sources_from_p
 
 try:
     from rag_pipeline.contracts.evidence_quality import apply_evidence_quality_contract, infer_claim_type
+    from rag_pipeline.contracts.quality_gate_policy import quality_gates_isolated
 except Exception:  # pragma: no cover - direct script mode fallback
     apply_evidence_quality_contract = None  # type: ignore
     infer_claim_type = None  # type: ignore
+    def quality_gates_isolated(default: bool = False) -> bool:  # type: ignore
+        return default
 
 
 MERGER_NAME = "evidence_merger"
@@ -351,6 +354,7 @@ def _analysis_input_for_evidence(evidence: Dict[str, Any], *, fact_text: Any = "
         "source_level": str(evidence.get("source_level") or "").strip(),
         "evidence_role": str(evidence.get("evidence_role") or "").strip(),
         "allowed_use": str(evidence.get("allowed_use") or "").strip(),
+        "quality_gate_observations": _as_list(evidence.get("quality_gate_observations")),
         "evidence_card": _as_dict(evidence.get("evidence_card")),
         "semantic_status": str(evidence.get("semantic_status") or "").strip(),
         "semantic_reason": str(evidence.get("semantic_reason") or "").strip(),
@@ -384,6 +388,30 @@ def _as_dict(value: Any) -> Dict[str, Any]:
 
 def _as_list(value: Any) -> List[Any]:
     return list(value) if isinstance(value, list) else []
+
+
+def _source_scalar(value: Any) -> str:
+    if value is None or isinstance(value, (dict, list, tuple, set)):
+        return ""
+    text = str(value).strip()
+    if not text or text.lower() in {"none", "null", "nan"}:
+        return ""
+    compact = text.replace(" ", "")
+    if compact.startswith(("{", "[")) and any(token in compact for token in ("'title'", '"title"', "'url'", '"url"')):
+        return ""
+    return text
+
+
+def _first_source_scalar(*values: Any) -> str:
+    for value in values:
+        text = _source_scalar(value)
+        if text:
+            return text
+    return ""
+
+
+def _source_mapping(value: Any) -> Dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
 
 
 def _strict_quality_mode() -> bool:
@@ -695,6 +723,142 @@ def _source_type(source: Dict[str, Any]) -> str:
     return "unknown"
 
 
+_ROLE_REFINEMENT_BY_EVIDENCE_TYPE = {
+    "official_data": "source_check",
+    "source_check": "source_check",
+    "filing": "filing",
+    "financial_report": "filing",
+    "annual_report": "filing",
+    "prospectus": "filing",
+    "case": "case",
+    "customer_case": "case",
+    "counter": "counter",
+    "risk": "counter",
+    "technology_product": "technology_product",
+}
+
+_POLICY_ROLE_TERMS = (
+    "policy",
+    "regulat",
+    "compliance",
+    "guideline",
+    "standard",
+    "\u653f\u7b56",
+    "\u76d1\u7ba1",
+    "\u5408\u89c4",
+    "\u6307\u5357",
+    "\u6307\u5f15",
+    "\u6761\u4f8b",
+    "\u884c\u52a8\u8ba1\u5212",
+    "\u5b9e\u65bd\u65b9\u6848",
+)
+
+_FILING_ROLE_TERMS = (
+    "annual report",
+    "financial report",
+    "prospectus",
+    "investor relations",
+    "sec filing",
+    "\u5e74\u62a5",
+    "\u8d22\u62a5",
+    "\u62db\u80a1\u4e66",
+    "\u6295\u8d44\u8005\u5173\u7cfb",
+)
+
+_CASE_ROLE_TERMS = (
+    "case",
+    "customer",
+    "deployment",
+    "implemented",
+    "procurement",
+    "tender",
+    "\u6848\u4f8b",
+    "\u5ba2\u6237",
+    "\u843d\u5730",
+    "\u90e8\u7f72",
+    "\u9879\u76ee",
+    "\u91c7\u8d2d",
+    "\u4e2d\u6807",
+)
+
+_COUNTER_ROLE_TERMS = (
+    "risk",
+    "failure",
+    "security",
+    "privacy",
+    "delay",
+    "cancel",
+    "roi unclear",
+    "\u98ce\u9669",
+    "\u5931\u8d25",
+    "\u5b89\u5168",
+    "\u9690\u79c1",
+    "\u5ef6\u8fdf",
+    "\u53d6\u6d88",
+)
+
+
+def _text_has_any(text: str, terms: Sequence[str]) -> bool:
+    lowered = str(text or "").lower()
+    return any(term and term.lower() in lowered for term in terms)
+
+
+def _has_metric_unit_signal(value: Any, unit: Any, content: Any = "") -> bool:
+    unit_text = str(unit or "").strip().lower()
+    value_text = str(value or "").strip()
+    haystack = f"{value_text} {unit_text} {content}".lower()
+    if unit_text and unit_text not in {"unknown", "none", "n/a", "na"}:
+        return True
+    return bool(
+        re.search(
+            r"\d+(?:\.\d+)?\s*(?:%|percent|percentage|cagr|bps|x|倍|亿元|亿美元|万元|美元|元|家|个|套|人|次|million|billion)",
+            haystack,
+            re.I,
+        )
+    )
+
+
+def _refine_proof_role_for_evidence(
+    *,
+    proof_role: Any,
+    evidence_type: Any,
+    claim_type: Any,
+    source_type: str,
+    metric: Any,
+    value: Any,
+    unit: Any,
+    content: Any,
+    source: Dict[str, Any],
+) -> str:
+    role = str(proof_role or "").strip().lower()
+    evidence_type_text = str(evidence_type or "").strip().lower()
+    if role and role != "metric":
+        return role
+    mapped = _ROLE_REFINEMENT_BY_EVIDENCE_TYPE.get(evidence_type_text)
+    text = " ".join(
+        [
+            str(content or ""),
+            str(metric or ""),
+            str(value or ""),
+            str(claim_type or ""),
+            str(source.get("title") or ""),
+            str(source.get("url") or ""),
+            str(source_type or ""),
+        ]
+    )
+    if mapped and (mapped != "source_check" or _text_has_any(text, _POLICY_ROLE_TERMS) or source_type in {"official", "government"}):
+        return mapped
+    if source_type in {"financial_report", "annual_report", "prospectus", "company_announcement"} and _text_has_any(text, _FILING_ROLE_TERMS):
+        return "filing"
+    if source_type in {"official", "government"} and _text_has_any(text, _POLICY_ROLE_TERMS) and not _has_metric_unit_signal(value, unit, content):
+        return "source_check"
+    if _text_has_any(text, _COUNTER_ROLE_TERMS) and not _has_metric_unit_signal(value, unit, content):
+        return "counter"
+    if _text_has_any(text, _CASE_ROLE_TERMS) and not _has_metric_unit_signal(value, unit, content):
+        return "case"
+    return role or mapped or "support"
+
+
 def _source_rank(source_type: str) -> int:
     return {
         "official": 5,
@@ -803,8 +967,39 @@ def _timeliness_rank(value: str) -> int:
     return {"fresh": 3, "recent": 2, "unknown": 1, "dated": 0}.get(value, 1)
 
 
+def _numeric_match_is_artifact(text: str, match: re.Match[str]) -> bool:
+    unit = str(match.group("unit") or "")
+    number_text = str(match.group("number") or "")
+    if unit:
+        return False
+    start, end = match.span()
+    before = text[max(0, start - 80):start].lower()
+    after = text[end:min(len(text), end + 80)].lower()
+    context = f"{before}{number_text}{after}"
+    if re.search(r"https?://|www\.|/detail/|/report/|[?&](?:id|docid|page)=", context):
+        return True
+    if re.search(r"\b(?:source_check|http_status|response_code|status_code)\s*(?:=|:|\u4e3a)?\s*$", before):
+        return True
+    try:
+        number = float(number_text.replace(",", ""))
+    except (TypeError, ValueError):
+        return False
+    if number.is_integer() and 1 <= number <= 31:
+        if re.search(
+            r"\b(?:jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december)\b",
+            before,
+        ):
+            return True
+        if re.search(r"\b(?:on|as of|dated|published|released)\s+(?:[a-z]+\s+)?$", before):
+            return True
+    if len(number_text.replace(",", "")) >= 6 and re.search(r"\b(?:id|detail|doc|report|article|page)\b", context):
+        return True
+    return False
+
+
 def _has_number(text: Any) -> bool:
-    return any(_valid_numeric_match(match) for match in NUMERIC_RE.finditer(str(text or "")))
+    raw = str(text or "")
+    return any(_valid_numeric_match(match) and not _numeric_match_is_artifact(raw, match) for match in NUMERIC_RE.finditer(raw))
 
 
 def _valid_numeric_match(match: re.Match[str]) -> bool:
@@ -817,8 +1012,9 @@ def _valid_numeric_match(match: re.Match[str]) -> bool:
 
 def _extract_numeric_values(text: Any) -> List[str]:
     values: List[str] = []
-    for match in NUMERIC_RE.finditer(str(text or "")):
-        if not _valid_numeric_match(match):
+    raw = str(text or "")
+    for match in NUMERIC_RE.finditer(raw):
+        if not _valid_numeric_match(match) or _numeric_match_is_artifact(raw, match):
             continue
         value = f"{match.group('number')}{match.group('unit') or ''}"
         if value not in values:
@@ -831,7 +1027,7 @@ def _extract_numeric_values(text: Any) -> List[str]:
 def _numeric_norm(value: Any) -> Tuple[Optional[float], str]:
     text = str(value or "")
     match = NUMERIC_RE.search(text)
-    if not match or not _valid_numeric_match(match):
+    if not match or not _valid_numeric_match(match) or _numeric_match_is_artifact(text, match):
         return None, ""
     number = float(str(match.group("number") or "0").replace(",", ""))
     unit = str(match.group("unit") or "").lower()
@@ -982,19 +1178,30 @@ def _infer_metric(text: Any, fallback: str = "") -> str:
 
 
 def _source_from_raw_point(point: Dict[str, Any], fallback_source: Dict[str, Any]) -> Dict[str, Any]:
-    source_url = str(point.get("source_url") or point.get("url") or point.get("source") or fallback_source.get("url") or "").strip()
-    title = str(point.get("source_title") or point.get("source_name") or fallback_source.get("title") or point.get("source") or "").strip()
+    point_source = _source_mapping(point.get("source"))
+    fallback_source = _source_mapping(fallback_source)
+    source_url = _first_source_scalar(point.get("source_url"), point.get("url"), point_source.get("url"), point.get("source"), fallback_source.get("url"), fallback_source.get("source_url"))
+    title = _first_source_scalar(point.get("source_title"), point.get("source_name"), point_source.get("title"), fallback_source.get("title"), point.get("source"))
+    publisher = _first_source_scalar(
+        point.get("publisher"),
+        point.get("source_publisher"),
+        point_source.get("publisher"),
+        point_source.get("organization"),
+        fallback_source.get("publisher"),
+        fallback_source.get("organization"),
+        fallback_source.get("source"),
+    )
     return {
         "title": title or "未命名来源",
         "url": source_url,
-        "date": str(point.get("date") or point.get("period") or fallback_source.get("date") or "").strip(),
+        "date": _first_source_scalar(point.get("date"), point.get("period"), point_source.get("date"), fallback_source.get("date")),
         "quote": _compact_text(point.get("evidence") or fallback_source.get("quote") or "", max_chars=420),
-        "source_type": str(point.get("source_type") or point.get("type") or fallback_source.get("source_type") or fallback_source.get("type") or "").strip(),
-        "publisher": str(point.get("publisher") or point.get("source_publisher") or fallback_source.get("publisher") or fallback_source.get("source") or "").strip(),
-        "source": str(point.get("publisher") or point.get("source_publisher") or fallback_source.get("publisher") or fallback_source.get("source") or "").strip(),
-        "document_id": str(point.get("document_id") or point.get("doc_id") or fallback_source.get("document_id") or fallback_source.get("doc_id") or "").strip(),
-        "page_ref": str(point.get("page_ref") or fallback_source.get("page_ref") or "").strip(),
-        "source_verification_status": str(point.get("source_verification_status") or fallback_source.get("source_verification_status") or "").strip(),
+        "source_type": _first_source_scalar(point.get("source_type"), point.get("type"), point_source.get("source_type"), fallback_source.get("source_type"), fallback_source.get("type")),
+        "publisher": publisher,
+        "source": publisher,
+        "document_id": _first_source_scalar(point.get("document_id"), point.get("doc_id"), point_source.get("document_id"), fallback_source.get("document_id"), fallback_source.get("doc_id")),
+        "page_ref": _first_source_scalar(point.get("page_ref"), point_source.get("page_ref"), fallback_source.get("page_ref")),
+        "source_verification_status": _first_source_scalar(point.get("source_verification_status"), point_source.get("source_verification_status"), fallback_source.get("source_verification_status")),
         "source_verified": bool(point.get("source_verified") or fallback_source.get("source_verified")),
     }
 
@@ -1105,8 +1312,8 @@ def _is_placeholder_source_url(value: Any) -> bool:
 
 def _is_generic_official_source(source: Dict[str, Any]) -> bool:
     title = str(source.get("title") or source.get("name") or "").strip().lower()
-    publisher = str(source.get("publisher") or source.get("source") or source.get("organization") or "").strip()
-    url = str(source.get("url") or source.get("source_url") or "").strip()
+    publisher = _first_source_scalar(source.get("publisher"), source.get("source"), source.get("organization"))
+    url = _first_source_scalar(source.get("url"), source.get("source_url"))
     return title == "official" and not publisher and not url
 
 
@@ -1268,6 +1475,123 @@ def _missing_topic_anchor_groups(task: Dict[str, Any], evidence_text: str) -> Li
     return missing
 
 
+SOURCE_PRIORITY_FAMILIES = {
+    "official_data": {"official", "government", "technical_standard"},
+    "official": {"official", "government", "technical_standard"},
+    "government": {"official", "government"},
+    "filing": {"filing", "financial_report", "annual_report", "prospectus", "exchange", "company_announcement"},
+    "financial_report": {"filing", "financial_report", "annual_report", "prospectus", "exchange", "company_announcement"},
+    "annual_report": {"annual_report", "financial_report", "filing"},
+    "prospectus": {"prospectus", "filing"},
+    "market_research": {"research", "industry_report", "association", "consulting", "market_research", "brokerage", "whitepaper"},
+    "research": {"research", "industry_report", "association", "consulting", "market_research", "brokerage", "whitepaper"},
+    "whitepaper": {"whitepaper", "research", "industry_report"},
+    "case": {"company_official", "product_doc", "media", "news", "official"},
+    "customer_case": {"company_official", "product_doc", "media", "news", "official"},
+    "counter": {"official", "government", "research", "industry_report", "association", "consulting", "market_research", "brokerage", "media", "news"},
+    "risk": {"official", "government", "research", "industry_report", "association", "consulting", "market_research", "brokerage", "media", "news"},
+}
+
+
+def _source_priority_matches(source_priority: Sequence[str], source: Dict[str, Any], source_level: Any = "") -> bool:
+    source_type = _source_type(source)
+    source_text = " ".join(
+        [
+            str(source.get("title") or ""),
+            str(source.get("url") or source.get("source_url") or ""),
+            str(source.get("source_type") or source.get("type") or ""),
+            str(source_level or ""),
+        ]
+    ).lower()
+    compact_source_text = re.sub(r"[\s_\-]+", "", source_text)
+    for raw_priority in source_priority:
+        priority = str(raw_priority or "").strip().lower()
+        if not priority:
+            continue
+        priority_compact = re.sub(r"[\s_\-]+", "", priority)
+        if priority in source_text or priority_compact in compact_source_text:
+            return True
+        if source_type in SOURCE_PRIORITY_FAMILIES.get(priority, set()):
+            return True
+        if priority in {"a", "level_a", "source_level_a"} and str(source_level or "").strip().upper() == "A":
+            return True
+        if priority in {"b", "level_b", "source_level_b"} and str(source_level or "").strip().upper() == "B":
+            return True
+    return False
+
+
+def _report_topic_hit(task: Dict[str, Any], readable_text: str) -> bool:
+    text = str(readable_text or "").lower()
+    compact_text = re.sub(r"\s+", "", text)
+    topic_terms: List[str] = []
+    topic_terms.extend(str(item or "") for item in _as_list(task.get("global_required_terms")))
+    topic_terms.extend(
+        str(task.get(key) or "")
+        for key in ["research_object", "plan_query", "report_query"]
+        if str(task.get(key) or "").strip()
+    )
+    for raw_term in topic_terms:
+        term = str(raw_term or "").strip().lower()
+        if not term:
+            continue
+        term_compact = re.sub(r"\s+", "", term)
+        if term_compact and term_compact in compact_text:
+            return True
+        tokens = [token for token in re.split(r"[\s,;:/()]+", term) if len(token) >= 3]
+        if len(tokens) >= 2 and sum(1 for token in tokens if _term_in_text(token, text)) >= 2:
+            return True
+        if len(tokens) == 1 and _term_in_text(tokens[0], text):
+            return True
+    return False
+
+
+def _role_source_fit(proof_role: Any, evidence_type: Any, source: Dict[str, Any]) -> bool:
+    role = str(proof_role or "").strip().lower()
+    evidence_type_text = str(evidence_type or "").strip().lower()
+    mapped_role = _ROLE_REFINEMENT_BY_EVIDENCE_TYPE.get(evidence_type_text, evidence_type_text)
+    source_type = _source_type(source)
+    role = role or mapped_role
+    if role in {"source_check", "official_data"}:
+        return source_type in {"official", "government", "technical_standard", "association"}
+    if role == "filing":
+        return source_type in {"filing", "financial_report", "annual_report", "prospectus", "exchange", "company_announcement"}
+    if role == "case":
+        return source_type in {"company_official", "product_doc", "media", "news", "official"}
+    if role == "counter":
+        return source_type in {
+            "official",
+            "government",
+            "research",
+            "industry_report",
+            "association",
+            "consulting",
+            "market_research",
+            "brokerage",
+            "media",
+            "news",
+        }
+    if role == "technology_product":
+        return source_type in {"company_official", "product_doc", "technical_standard", "official", "research", "whitepaper"}
+    return False
+
+
+def _can_use_chapter_or_report_relevance(evidence: Dict[str, Any], task: Dict[str, Any], source: Dict[str, Any]) -> bool:
+    source_level = str(evidence.get("source_level") or "").strip().upper()
+    if source_level not in {"A", "B"}:
+        return False
+    role = str(evidence.get("proof_role") or task.get("proof_role") or "").strip().lower()
+    evidence_type = str(evidence.get("evidence_type") or task.get("evidence_type") or "").strip().lower()
+    mapped_role = _ROLE_REFINEMENT_BY_EVIDENCE_TYPE.get(evidence_type, evidence_type)
+    return (role or mapped_role) in {
+        "source_check",
+        "official_data",
+        "filing",
+        "case",
+        "counter",
+        "technology_product",
+    } and _role_source_fit(role or mapped_role, evidence_type, source)
+
+
 def task_acceptance_filter(evidence: Dict[str, Any], task: Dict[str, Any]) -> Dict[str, Any]:
     if not task:
         return {
@@ -1327,16 +1651,9 @@ def task_acceptance_filter(evidence: Dict[str, Any], task: Dict[str, Any]) -> Di
     goal_hit = any(token in evidence_text for token in goal_tokens[:12])
 
     has_number = bool(re.search(r"\d", str(evidence.get("content") or evidence.get("value") or "")))
-    source_text = " ".join(
-        [
-            str(source.get("title") or ""),
-            str(source.get("url") or ""),
-            str(source.get("source_type") or ""),
-            str(evidence.get("source_level") or ""),
-        ]
-    ).lower()
-    source_priority_hit = any(term and term in source_text for term in source_priority)
+    source_priority_hit = _source_priority_matches(source_priority, source, evidence.get("source_level"))
     missing_topic_groups = _missing_topic_anchor_groups(task, readable_text)
+    report_topic_hit = _report_topic_hit(task, readable_text)
 
     score = 0.0
     score += 0.40 * must_ratio
@@ -1364,6 +1681,18 @@ def task_acceptance_filter(evidence: Dict[str, Any], task: Dict[str, Any]) -> Di
             "relevance_score": round(score, 4),
             "role_hint": "rejected",
             "reason": "forbidden_terms_hit",
+            "matched_terms": matched_must,
+        }
+    if (
+        _can_use_chapter_or_report_relevance(evidence, task, source)
+        and report_topic_hit
+        and (source_priority_hit or _role_source_fit(evidence.get("proof_role"), evidence.get("evidence_type"), source))
+    ):
+        return {
+            "accepted": True,
+            "relevance_score": round(max(score, 0.43), 4),
+            "role_hint": "bounded_context",
+            "reason": "chapter_or_report_relevance_pass",
             "matched_terms": matched_must,
         }
     threshold = 0.42
@@ -1427,14 +1756,14 @@ def _build_evidence(
         "unit": item.get("unit") or item.get("numeric_unit") or unit_key,
         "source": {
             "title": str(source.get("title") or "未命名来源").strip(),
-            "url": str(source.get("url") or source.get("source_url") or "").strip(),
-            "date": str(source.get("date") or "").strip(),
+            "url": _first_source_scalar(source.get("url"), source.get("source_url")),
+            "date": _first_source_scalar(source.get("date")),
             "quote": _compact_text(source.get("quote") or "", max_chars=420),
             "source_type": source_type,
-            "publisher": str(source.get("publisher") or source.get("source") or "").strip(),
-            "source": str(source.get("source") or source.get("publisher") or "").strip(),
-            "document_id": str(source.get("document_id") or source.get("doc_id") or "").strip(),
-            "page_ref": str(source.get("page_ref") or "").strip(),
+            "publisher": _first_source_scalar(source.get("publisher"), source.get("organization"), source.get("source")),
+            "source": _first_source_scalar(source.get("source"), source.get("publisher"), source.get("organization")),
+            "document_id": _first_source_scalar(source.get("document_id"), source.get("doc_id")),
+            "page_ref": _first_source_scalar(source.get("page_ref")),
         },
         "timeliness": time_bucket,
         "confidence": confidence,
@@ -1505,6 +1834,31 @@ def _build_evidence(
     evidence["source_verified"] = verification_status in VERIFIED_SOURCE_STATUSES
     evidence["source"]["source_verification_status"] = verification_status
     evidence["source"]["source_verified"] = evidence["source_verified"]
+    original_proof_role = str(evidence.get("proof_role") or "").strip().lower()
+    refined_proof_role = _refine_proof_role_for_evidence(
+        proof_role=original_proof_role,
+        evidence_type=evidence.get("evidence_type"),
+        claim_type=evidence.get("claim_type"),
+        source_type=source_type,
+        metric=evidence.get("metric"),
+        value=evidence.get("value"),
+        unit=evidence.get("unit"),
+        content=evidence.get("content"),
+        source=evidence.get("source"),
+    )
+    if original_proof_role and refined_proof_role != original_proof_role:
+        evidence["original_proof_role"] = original_proof_role
+    evidence["proof_role"] = refined_proof_role
+    if evidence.get("search_task"):
+        task_copy = _as_dict(evidence.get("search_task"))
+        evidence["search_task"] = {
+            **task_copy,
+            "original_proof_role": task_copy.get("original_proof_role") or original_proof_role,
+            "proof_role": refined_proof_role,
+            "resolved_proof_role": refined_proof_role,
+        }
+    if original_proof_role and refined_proof_role != original_proof_role and refined_proof_role in {"source_check", "filing", "case", "counter", "technology_product"}:
+        evidence["claim_type"] = refined_proof_role
     task_acceptance = task_acceptance_filter(evidence, task_payload)
     evidence["task_relevance_score"] = task_acceptance.get("relevance_score")
     evidence["task_accepted"] = bool(task_acceptance.get("accepted"))
@@ -1579,6 +1933,17 @@ def _build_evidence(
             strict_quality=_strict_quality_mode(),
             directional_c_min_confidence=_directional_c_min_confidence(),
         )
+    if original_proof_role and refined_proof_role != original_proof_role:
+        evidence["original_proof_role"] = original_proof_role
+        evidence["proof_role"] = refined_proof_role
+        if str(evidence.get("claim_type") or "").strip().lower() == "hard_metric":
+            evidence["claim_type"] = refined_proof_role
+        card = dict(_as_dict(evidence.get("evidence_card")))
+        card["proof_role"] = refined_proof_role
+        if str(card.get("claim_type") or "").strip().lower() == "hard_metric":
+            card["claim_type"] = refined_proof_role
+        evidence["evidence_card"] = card
+    evidence = _isolate_evidence_quality_gate(evidence)
     evidence["analysis_input"] = _analysis_input_for_evidence(evidence, fact_text=evidence["clean_fact"])
     return evidence
 
@@ -1912,13 +2277,13 @@ def build_clean_facts(evidence_items: Sequence[Dict[str, Any]]) -> Tuple[List[Di
         source = _as_dict(item.get("source"))
         clean_source = {
             "title": str(source.get("title") or "未命名来源").strip(),
-            "url": str(source.get("url") or source.get("source_url") or "").strip(),
-            "date": str(source.get("date") or "").strip(),
+            "url": _first_source_scalar(source.get("url"), source.get("source_url")),
+            "date": _first_source_scalar(source.get("date")),
             "source_type": str(source.get("source_type") or "").strip(),
-            "publisher": str(source.get("publisher") or source.get("source") or "").strip(),
-            "source": str(source.get("source") or source.get("publisher") or "").strip(),
-            "document_id": str(source.get("document_id") or source.get("doc_id") or "").strip(),
-            "page_ref": str(source.get("page_ref") or "").strip(),
+            "publisher": _first_source_scalar(source.get("publisher"), source.get("organization"), source.get("source")),
+            "source": _first_source_scalar(source.get("source"), source.get("publisher"), source.get("organization")),
+            "document_id": _first_source_scalar(source.get("document_id"), source.get("doc_id")),
+            "page_ref": _first_source_scalar(source.get("page_ref")),
         }
         _copy_retrieval_score_fields(clean_source, source, item)
         fact = {
@@ -1968,6 +2333,7 @@ def build_clean_facts(evidence_items: Sequence[Dict[str, Any]]) -> Tuple[List[Di
             "source_subtier": str(item.get("source_subtier") or "").strip(),
             "evidence_grade_note": str(item.get("evidence_grade_note") or "").strip(),
             "usage_tier": str(item.get("usage_tier") or "").strip(),
+            "quality_gate_observations": _as_list(item.get("quality_gate_observations")),
         }
         fact["analysis_input"] = _analysis_input_for_evidence({**item, **fact}, fact_text=fact_text)
         if should_discard_evidence(fact):
@@ -2028,13 +2394,13 @@ def _clean_chapter_fact(fact: Dict[str, Any]) -> Dict[str, Any]:
     source = _as_dict(fact.get("source"))
     clean_source = {
         "title": str(source.get("title") or "未命名来源").strip(),
-        "url": str(source.get("url") or source.get("source_url") or "").strip(),
-        "date": str(source.get("date") or "").strip(),
+        "url": _first_source_scalar(source.get("url"), source.get("source_url")),
+        "date": _first_source_scalar(source.get("date")),
         "source_type": str(source.get("source_type") or "").strip(),
-        "publisher": str(source.get("publisher") or source.get("source") or "").strip(),
-        "source": str(source.get("source") or source.get("publisher") or "").strip(),
-        "document_id": str(source.get("document_id") or source.get("doc_id") or "").strip(),
-        "page_ref": str(source.get("page_ref") or "").strip(),
+        "publisher": _first_source_scalar(source.get("publisher"), source.get("organization"), source.get("source")),
+        "source": _first_source_scalar(source.get("source"), source.get("publisher"), source.get("organization")),
+        "document_id": _first_source_scalar(source.get("document_id"), source.get("doc_id")),
+        "page_ref": _first_source_scalar(source.get("page_ref")),
     }
     _copy_retrieval_score_fields(clean_source, source, fact)
     cleaned = {
@@ -2184,6 +2550,39 @@ def _canonical_role(value: Any) -> str:
     if role == "exclude":
         return "rejected"
     return role or "appendix"
+
+
+def _isolate_evidence_quality_gate(evidence: Dict[str, Any]) -> Dict[str, Any]:
+    if not quality_gates_isolated():
+        return evidence
+    role = _canonical_role(evidence.get("evidence_role"))
+    if role == "rejected" or str(evidence.get("semantic_status") or "").strip().lower() in REJECTED_STATUSES:
+        return evidence
+    if not str(evidence.get("fact") or evidence.get("clean_fact") or evidence.get("content") or "").strip():
+        return evidence
+    observations = list(_as_list(evidence.get("quality_gate_observations")))
+    if evidence.get("appendix_only") or role in {"clue", "appendix"}:
+        observations.append(
+            {
+                "type": "evidence_quality_gate_observed",
+                "previous_role": role,
+                "previous_appendix_only": bool(evidence.get("appendix_only")),
+                "reason": evidence.get("task_acceptance_reason") or evidence.get("semantic_reason") or evidence.get("usage_tier") or "",
+            }
+        )
+    evidence["quality_gate_observations"] = observations
+    evidence["appendix_only"] = False
+    evidence["enterprise_usable"] = True
+    evidence["evidence_role"] = "supporting" if role in {"clue", "appendix", ""} else role
+    evidence["usage_tier"] = evidence.get("usage_tier") or "analysis_ready_observed"
+    allowed_use = str(evidence.get("allowed_use") or _as_dict(evidence.get("evidence_card")).get("allowed_use") or "").strip()
+    if allowed_use in {"", "appendix_only", "clue", "rejected"}:
+        evidence["allowed_use"] = "supporting_context"
+        card = dict(_as_dict(evidence.get("evidence_card")))
+        card["allowed_use"] = "supporting_context"
+        card["analysis_eligible"] = True
+        evidence["evidence_card"] = card
+    return evidence
 
 
 def _new_filter_funnel(metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -2533,9 +2932,9 @@ def _source_key_for_fact(fact: Dict[str, Any], traceability: Optional[Dict[str, 
 
 def _source_traceability_payload(fact: Dict[str, Any]) -> Dict[str, Any]:
     source = _as_dict(fact.get("source"))
-    url = str(source.get("url") or source.get("source_url") or fact.get("source_url") or "").strip()
-    title = str(source.get("title") or source.get("name") or fact.get("source_title") or "").strip()
-    publisher = str(source.get("publisher") or source.get("source") or fact.get("source_text") or "").strip()
+    url = _first_source_scalar(source.get("url"), source.get("source_url"), fact.get("source_url"))
+    title = _first_source_scalar(source.get("title"), source.get("name"), fact.get("source_title"))
+    publisher = _first_source_scalar(source.get("publisher"), source.get("organization"), source.get("source"), fact.get("source_text"))
     source_ref = str(fact.get("source_ref") or source.get("ref") or source.get("id") or "").strip()
     document_ref = str(
         source.get("document_id")
@@ -2592,8 +2991,8 @@ def _source_registry_key(source: Dict[str, Any], traceability: Dict[str, Any]) -
     if document_ref:
         return f"doc:{document_ref}"
     title = re.sub(r"\s+", "", str(source.get("title") or traceability.get("source_title") or "").strip().lower())
-    publisher = re.sub(r"\s+", "", str(source.get("publisher") or source.get("source") or traceability.get("publisher") or "").strip().lower())
-    date = re.sub(r"\s+", "", str(source.get("date") or "").strip().lower())
+    publisher = re.sub(r"\s+", "", _first_source_scalar(source.get("publisher"), source.get("source"), traceability.get("publisher")).lower())
+    date = re.sub(r"\s+", "", _first_source_scalar(source.get("date")).lower())
     return f"title:{title}|{publisher}|{date}" if title else ""
 
 
@@ -2618,14 +3017,14 @@ def _build_source_registry(clean_evidence_list: Sequence[Dict[str, Any]]) -> Lis
                 "ref": ref or f"[{len(registry) + 1}]",
                 "id": str(source.get("id") or fact.get("source_id") or len(registry) + 1),
                 "title": str(source.get("title") or traceability.get("source_title") or "").strip(),
-                "url": str(source.get("url") or source.get("source_url") or traceability.get("source_url") or "").strip(),
-                "publisher": str(source.get("publisher") or source.get("source") or traceability.get("publisher") or "").strip(),
-                "source": str(source.get("source") or source.get("publisher") or traceability.get("publisher") or "").strip(),
-                "date": str(source.get("date") or "").strip(),
+                "url": _first_source_scalar(source.get("url"), source.get("source_url"), traceability.get("source_url")),
+                "publisher": _first_source_scalar(source.get("publisher"), source.get("organization"), source.get("source"), traceability.get("publisher")),
+                "source": _first_source_scalar(source.get("source"), source.get("publisher"), source.get("organization"), traceability.get("publisher")),
+                "date": _first_source_scalar(source.get("date")),
                 "source_type": str(source.get("source_type") or "").strip(),
                 "source_level": "D" if fake_source else str(fact.get("source_level") or source.get("source_level") or "").strip().upper(),
-                "document_id": str(source.get("document_id") or source.get("doc_id") or "").strip(),
-                "page_ref": str(source.get("page_ref") or "").strip(),
+                "document_id": _first_source_scalar(source.get("document_id"), source.get("doc_id")),
+                "page_ref": _first_source_scalar(source.get("page_ref")),
                 "traceability_status": _source_traceability_status(traceability),
                 "source_verification_status": str(traceability.get("source_verification_status") or "").strip(),
                 "source_verified": bool(traceability.get("source_verified")),
@@ -2933,14 +3332,18 @@ def _evidence_analysis_contract_for(fact: Dict[str, Any]) -> Dict[str, Any]:
     else:
         cannot_support.extend(["core_claim", "clean_report_claim"])
 
-    if metric_completeness.get("complete") and source_level in {"A", "B"} and source_verified:
-        can_support.append("quantified_table")
-    elif metric_completeness.get("has_metric_signal") and not metric_completeness.get("complete"):
+    metric_gate_required = claim_type == "hard_metric" or proof_role in {"metric", "market_data", "quant_metric"}
+    if metric_gate_required:
+        if metric_completeness.get("complete") and source_level in {"A", "B"} and source_verified:
+            can_support.append("quantified_table")
+        elif metric_completeness.get("has_metric_signal") and not metric_completeness.get("complete"):
+            cannot_support.append("quantified_table")
+            repair_need.append("metric_scope_period_unit_incomplete")
+        elif metric_completeness.get("complete") and source_level in {"A", "B"} and not source_verified:
+            cannot_support.append("quantified_table")
+            repair_need.append("source_not_verified")
+    elif metric_completeness.get("has_metric_signal"):
         cannot_support.append("quantified_table")
-        repair_need.append("metric_scope_period_unit_incomplete")
-    elif metric_completeness.get("complete") and source_level in {"A", "B"} and not source_verified:
-        cannot_support.append("quantified_table")
-        repair_need.append("source_not_verified")
     if claim_type == "hard_metric" and metric_proof_gaps:
         can_support = [item for item in can_support if item not in {"core_claim", "decision_implication", "quantified_table"}]
         if source_level in {"A", "B"} and source_trace.get("has_source_ref"):
@@ -3006,6 +3409,11 @@ def _public_fact_payload(fact: Dict[str, Any]) -> Dict[str, Any]:
         "source_tier": str(fact.get("source_tier") or _as_dict(fact.get("evidence_card")).get("source_tier") or "").strip(),
         "evidence_role": _canonical_role(fact.get("evidence_role")),
         "allowed_use": str(fact.get("allowed_use") or _as_dict(fact.get("evidence_card")).get("allowed_use") or "").strip(),
+        "proof_role": str(fact.get("proof_role") or _as_dict(fact.get("evidence_card")).get("proof_role") or _as_dict(fact.get("search_task")).get("proof_role") or "").strip().lower(),
+        "evidence_type": str(fact.get("evidence_type") or _as_dict(fact.get("evidence_card")).get("evidence_type") or _as_dict(fact.get("search_task")).get("evidence_type") or "").strip(),
+        "claim_type": str(fact.get("claim_type") or fact.get("conclusion_type") or _as_dict(fact.get("evidence_card")).get("claim_type") or "").strip(),
+        "conclusion_type": str(fact.get("conclusion_type") or fact.get("claim_type") or _as_dict(fact.get("evidence_card")).get("conclusion_type") or "").strip(),
+        "proof_standard": str(fact.get("proof_standard") or _as_dict(fact.get("search_task")).get("proof_standard") or "").strip(),
         "evidence_fit_score": fact.get("evidence_fit_score") or _as_dict(fact.get("evidence_card")).get("evidence_fit_score"),
         "metric_proof_gaps": _as_list(fact.get("metric_proof_gaps") or _as_dict(fact.get("evidence_card")).get("metric_proof_gaps")),
         "analysis_readiness": str(fact.get("analysis_readiness") or _as_dict(fact.get("evidence_card")).get("analysis_readiness") or "").strip(),
@@ -3030,6 +3438,7 @@ def _public_fact_payload(fact: Dict[str, Any]) -> Dict[str, Any]:
         "followup_seed": bool(fact.get("followup_seed")),
         "can_support_claim_if_corrobated": bool(fact.get("can_support_claim_if_corrobated")),
         "usage_tier": str(fact.get("usage_tier") or "").strip(),
+        "quality_gate_observations": _as_list(fact.get("quality_gate_observations")),
         **analysis_contract,
         "analysis_input": _as_dict(fact.get("analysis_input")) or _analysis_input_for_evidence(fact, fact_text=fact.get("fact")),
     }
@@ -4035,6 +4444,7 @@ def build_evidence_package(
             dimensions.append(dimension)
         copied = dict(item)
         copied["dimension"] = dimension
+        copied = _isolate_evidence_quality_gate(copied)
         evidence_by_dimension[dimension].append(copied)
 
     conflicts = detect_conflicts([item for items in evidence_by_dimension.values() for item in items])
@@ -4074,13 +4484,24 @@ def build_evidence_package(
     promoted_context_count = promote_corroborated_context_facts(clean_evidence_list)
     source_registry = _build_source_registry(clean_evidence_list)
     chapter_evidence = build_chapter_evidence(clean_evidence_list, chapter_dim_mapping=chapter_dim_mapping)
+    analysis_ready_observe_only = quality_gates_isolated()
     analysis_ready_evidence = [
         _public_fact_payload(fact)
         for fact in clean_evidence_list
         if str(fact.get("fact") or "").strip()
-        and _canonical_role(fact.get("evidence_role")) in {"core", "supporting"}
-        and not fact.get("appendix_only")
-        and str(fact.get("allowed_use") or _as_dict(fact.get("evidence_card")).get("allowed_use") or "") in {"core_claim", "supporting", "supporting_context", ""}
+        and (
+            (
+                _canonical_role(fact.get("evidence_role")) != "rejected"
+                and str(fact.get("semantic_status") or "").strip().lower() not in REJECTED_STATUSES
+            )
+            if analysis_ready_observe_only
+            else (
+                _canonical_role(fact.get("evidence_role")) in {"core", "supporting"}
+                and not fact.get("appendix_only")
+                and str(fact.get("allowed_use") or _as_dict(fact.get("evidence_card")).get("allowed_use") or "")
+                in {"core_claim", "supporting", "supporting_context", ""}
+            )
+        )
     ]
     rerank_diagnostics = build_rerank_diagnostics(
         _as_dict(metadata),

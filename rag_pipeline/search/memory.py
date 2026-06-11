@@ -625,7 +625,14 @@ def _call_openai_compatible_json_once(
     try:
         payload = json.loads(content)
     except json.JSONDecodeError as exc:
-        diagnostic = {**llm_call, "status": "failed", "error": f"LLM response is not valid JSON: {content[:400]}"}
+        diagnostic = {
+            **llm_call,
+            "status": "failed",
+            "error": f"LLM response is not valid JSON: {content[:400]}",
+            "raw_content": content,
+            "raw_content_chars": len(content),
+            "finish_reason": choice.get("finish_reason"),
+        }
         raise LLMCallError(diagnostic["error"], diagnostic=diagnostic) from exc
     if not isinstance(payload, dict):
         diagnostic = {**llm_call, "status": "failed", "error": "LLM response JSON root must be an object."}

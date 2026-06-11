@@ -67,6 +67,59 @@ def test_final_audit_fatal_blocks_when_blocking_enabled(monkeypatch):
     assert result["llm_call"]["model"] == "deepseek-v4-pro"
 
 
+def test_isolated_quality_gate_observes_fatal_audit_without_blocking(monkeypatch):
+    _configure_deepseek_final_audit(monkeypatch)
+    monkeypatch.setenv("REPORT_ENABLE_FINAL_AUDIT", "true")
+    monkeypatch.setenv("REPORT_FINAL_AUDIT_BLOCKING", "true")
+    monkeypatch.setenv("REPORT_QUALITY_GATE_MODE", "isolated")
+
+    def fake_call_openai_compatible_json(*, config, system_prompt, user_payload):
+        return {
+            "payload": {
+                "status": "fatal",
+                "overall_score": 35,
+                "critical_findings": [{"severity": "fatal", "message": "Unsupported citation"}],
+                "publish_recommendation": "hold",
+                "summary": "Observe only in isolated mode.",
+            },
+            "usage": {"total_tokens": 10},
+            "llm_call": {"task": "final_audit", "model": "deepseek-v4-pro", "status": "success"},
+        }
+
+    monkeypatch.setattr(final_audit_agent, "call_openai_compatible_json", fake_call_openai_compatible_json)
+
+    result = final_audit_agent.run_final_audit(
+        report_markdown="# Report\n\nConclusion [1]\n\n## 来源附录\n- [1] Source | https://example.org/source",
+        validation={"passed": True, "quality_score": 90},
+        clean_evidence={"sources": [{"id": "1", "title": "Source", "url": "https://example.org/source"}]},
+    )
+
+    assert result["status"] == "fatal"
+    assert result["blocked"] is False
+    assert result["blocking"] is False
+    assert result["quality_gate_mode"] == "isolated"
+    assert result["audit"]["publish_recommendation"] == "hold"
+
+
+def test_isolated_quality_gate_preserves_deterministic_fatal_when_llm_config_missing(monkeypatch):
+    monkeypatch.setenv("REPORT_ENABLE_FINAL_AUDIT", "true")
+    monkeypatch.setenv("REPORT_FINAL_AUDIT_BLOCKING", "true")
+    monkeypatch.setenv("REPORT_QUALITY_GATE_MODE", "isolated")
+    monkeypatch.delenv("RAG_MODEL_FINAL_AUDIT_PROFILE", raising=False)
+    monkeypatch.setattr(final_audit_agent, "llm_config_is_ready", lambda _config: False)
+
+    result = final_audit_agent.run_final_audit(
+        report_markdown="# Report\n\nUnsupported conclusion [1].",
+        clean_evidence={"sources": []},
+    )
+
+    assert result["status"] == "fatal"
+    assert result["blocked"] is False
+    assert result["blocking"] is False
+    assert result["audit"]["publish_recommendation"] == "hold"
+    assert result["skipped_reason"] == "config_missing"
+
+
 def test_final_audit_payload_includes_compact_repair_gap_context(monkeypatch):
     _configure_deepseek_final_audit(monkeypatch)
     monkeypatch.setenv("REPORT_ENABLE_FINAL_AUDIT", "true")

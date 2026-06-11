@@ -7,6 +7,7 @@ from typing import Any, Dict, Iterable, List, Sequence
 from .public_report_sanitizer import has_internal_gap_language, rewrite_internal_gap_language
 from .report_contracts import normalize_evidence_refs
 from .summary_quality import sanitize_summary_judgments
+from rag_pipeline.contracts.public_text_guard import public_text_quality
 
 
 INTERNAL_LAYOUT_PHRASES = [
@@ -209,7 +210,12 @@ def _public_text(value: Any, max_chars: int = 500) -> str:
     text = re.sub(r"\s{2,}", " ", text)
     text = re.sub(r"([。；]){2,}", r"\1", text)
     text = text.strip(" \t\r\n，；")
-    return "" if has_internal_gap_language(text) else text
+    if has_internal_gap_language(text):
+        return ""
+    guard = public_text_quality(text)
+    if guard.get("severity") == "reject":
+        return ""
+    return str(guard.get("cleaned") or text).strip()
 
 
 def _metric_sentence_from_block(block: Dict[str, Any], text: str) -> str:

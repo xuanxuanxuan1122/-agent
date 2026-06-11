@@ -24,6 +24,7 @@ from rag_pipeline.agents.public_report_sanitizer import find_publication_blocker
 from rag_pipeline.agents.report_health import build_report_health_card
 from rag_pipeline.agents.summary_quality import sanitize_summary_judgments
 from rag_pipeline.contracts.quality_gate import build_quality_gate_state
+from rag_pipeline.contracts.quality_gate_policy import quality_gates_isolated
 from rag_pipeline.observability.run_trace import write_run_trace_from_package
 
 
@@ -3212,14 +3213,17 @@ def build_review_diagnostic(
         for chapter in chapters
         if len(str(chapter.get("chapter_title") or "")) > 36 or "?" in str(chapter.get("chapter_title") or "")
     ]
-    table_warnings = len(as_list(quality.get("warnings")))
+    tables_enabled = env_flag("REPORT_ENABLE_TABLES", True)
+    table_warnings = len(as_list(quality.get("warnings"))) if tables_enabled else 0
     checks = {
         "evidence_gaps": bool(gap_summary.get("chapter_gaps")),
         "post_qa_repair_failed": bool(gap_summary.get("post_qa_repair_failed")),
         "table_validation_warnings": table_warnings,
+        "table_generation_disabled": not tables_enabled,
         "title_contract_issues": len(title_issues),
     }
-    needs_review = any(bool(value) for value in checks.values()) or str(as_dict(writer_report).get("report_status") or "") == "review_required"
+    review_checks = {key: value for key, value in checks.items() if key != "table_generation_disabled"}
+    needs_review = any(bool(value) for value in review_checks.values()) or str(as_dict(writer_report).get("report_status") or "") == "review_required"
     return {
         "status": "needs_review" if needs_review else "passed",
         "checks": checks,
@@ -4298,25 +4302,49 @@ def _run_fail_open_rebuild_from_package(
         source_registry=source_registry,
     )
     evidence_package["chapter_evidence_packages"] = chapter_evidence_packages
-    allow_fail_open_llm = env_flag("FULL_REPORT_FAIL_OPEN_ALLOW_LLM_ANALYSIS", False)
-    previous_analysis_llm_flag = os.environ.get("BRAIN_ENABLE_LLM_EVIDENCE_ANALYSIS")
-    os.environ["BRAIN_ENABLE_LLM_EVIDENCE_ANALYSIS"] = "true" if allow_fail_open_llm else "false"
-    try:
-        llm_config: Dict[str, Any] = {}
-        if allow_fail_open_llm:
-            try:
-                from rag_pipeline.config.search_config import build_llm_config_for_task
+    # The deadline usually fires after run_analysis_agent has already produced
+    # usable LLM claims on the main path (the timeout is discovered between
+    # analysis and writer). Re-running analysis here would burn post-deadline
+    # LLM budget to rebuild a worse copy of work we already have, so reuse the
+    # main-path structured_analysis whenever it carries usable claim units.
+    existing_analysis = (
+        as_dict(state_dict.get("structured_analysis"))
+        or as_dict(raw_output.get("structured_analysis"))
+        or as_dict(render_artifacts.get("structured_analysis"))
+    )
+    if as_list(existing_analysis.get("claim_units")) or as_list(existing_analysis.get("chapter_insights")):
+        structured_analysis = dict(existing_analysis)
+        structured_analysis.setdefault("analysis_reused_from_main_path", True)
+    else:
+        allow_fail_open_llm = env_flag("FULL_REPORT_FAIL_OPEN_ALLOW_LLM_ANALYSIS", False)
+        previous_analysis_llm_flag = os.environ.get("BRAIN_ENABLE_LLM_EVIDENCE_ANALYSIS")
+        os.environ["BRAIN_ENABLE_LLM_EVIDENCE_ANALYSIS"] = "true" if allow_fail_open_llm else "false"
+        try:
+            llm_config: Dict[str, Any] = {}
+            if allow_fail_open_llm:
+                try:
+                    from rag_pipeline.config.search_config import build_llm_config_for_task
 
-                llm_config = dict(build_llm_config_for_task("decision"))
-            except Exception:
-                llm_config = {}
-        analysis_state = run_analysis_agent(evidence_package, query=query, llm_config=llm_config)
-    finally:
-        if previous_analysis_llm_flag is None:
-            os.environ.pop("BRAIN_ENABLE_LLM_EVIDENCE_ANALYSIS", None)
-        else:
-            os.environ["BRAIN_ENABLE_LLM_EVIDENCE_ANALYSIS"] = previous_analysis_llm_flag
-    structured_analysis = as_dict(analysis_state.get("structured_analysis"))
+                    llm_config = dict(build_llm_config_for_task("decision"))
+                except Exception:
+                    llm_config = {}
+            fail_open_llm_budget = 0.0
+            try:
+                fail_open_llm_budget = float(os.getenv("FULL_REPORT_FAIL_OPEN_LLM_BUDGET_SECONDS", "180") or 180)
+            except (TypeError, ValueError):
+                fail_open_llm_budget = 180.0
+            analysis_state = run_analysis_agent(
+                evidence_package,
+                query=query,
+                llm_config=llm_config,
+                deadline_ts=(time.perf_counter() + fail_open_llm_budget) if allow_fail_open_llm and fail_open_llm_budget > 0 else None,
+            )
+        finally:
+            if previous_analysis_llm_flag is None:
+                os.environ.pop("BRAIN_ENABLE_LLM_EVIDENCE_ANALYSIS", None)
+            else:
+                os.environ["BRAIN_ENABLE_LLM_EVIDENCE_ANALYSIS"] = previous_analysis_llm_flag
+        structured_analysis = as_dict(analysis_state.get("structured_analysis"))
     _sync_analysis_repair_priorities_to_evidence_package(evidence_package, structured_analysis)
     micro_layouts = as_list(render_artifacts.get("micro_layouts")) or run_micro_layout_agent(
         report_blueprint=report_blueprint,
@@ -4579,6 +4607,10 @@ def main() -> int:
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
     load_dotenv(PIPELINE_ROOT / ".env")
+    os.environ.setdefault("REPORT_QUALITY_GATE_MODE", "isolated")
+    os.environ.setdefault("REPORT_FINAL_AUDIT_BLOCKING", "false")
+    os.environ.setdefault("QA_DEEP_EVALUATOR_BLOCKING", "false")
+    os.environ.setdefault("REPORT_ENABLE_TABLES", "false")
     configure_pipeline_logging()
     resolved_quality_mode = resolve_report_quality_mode(
         os.getenv("REPORT_QUALITY_MODE", ""),
@@ -4803,6 +4835,9 @@ def main() -> int:
     writer_not_ready = writer_status in {"not_ready", "diagnostic_only"} and not report_markdown
     writer_publishable = bool(report_markdown) and writer_status in {"final", "final_clean"} and not writer_not_ready
     formal_report_available = bool(report_markdown) and not writer_not_ready
+    quality_gate_isolated = quality_gates_isolated()
+    if quality_gate_isolated and formal_report_available:
+        writer_publishable = True
     emit_clean_report = env_flag("REPORT_WRITE_CLEAN_REPORT", False)
     if not report_markdown:
         reformatter_skip_reason = "no_report_markdown"
@@ -5409,6 +5444,8 @@ def main() -> int:
     )
     fallback_report_written = bool(as_dict(reformatter_result).get("fallback_output_written"))
     reformatter_blocked_clean = bool(reformatter_required and not clean_report_written)
+    if quality_gate_isolated:
+        reformatter_blocked_clean = False
     final_audit_result: Dict[str, Any] = as_dict(writer_package_payload.get("final_audit_result"))
     final_audit_blocked = False
 

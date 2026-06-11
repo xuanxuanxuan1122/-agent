@@ -46,6 +46,14 @@ _INTERNAL_ANALYSIS_TOKENS = frozenset(
         "observation_only",
         "directional_ready",
         "decision_ready",
+        "source_check",
+        "http_status",
+        "response_code",
+        "status_code",
+        "currency_usd",
+        "currency_cny",
+        "money",
+        "unknown",
     }
 )
 
@@ -55,6 +63,20 @@ def _public_variable_text(*values: Any) -> str:
     labels (e.g. ``counter``) never get rendered as a public subject."""
     text = _first_text(*values)
     if text.strip().lower() in _INTERNAL_ANALYSIS_TOKENS:
+        return ""
+    return text
+
+
+def _public_unit_text(*values: Any) -> str:
+    """First public-safe unit text; internal normalized unit enums stay private."""
+
+    text = _first_text(*values)
+    if not text:
+        return ""
+    normalized = text.strip().lower()
+    if normalized in _INTERNAL_ANALYSIS_TOKENS:
+        return ""
+    if normalized.startswith("currency_"):
         return ""
     return text
 
@@ -445,7 +467,7 @@ class EvidenceFactCard:
             action_or_signal=_first_text(merged.get("action_or_signal"), merged.get("action"), merged.get("signal")),
             variable=_public_variable_text(merged.get("variable"), merged.get("analysis_variable"), merged.get("metric"), merged.get("indicator")),
             value=_first_text(merged.get("value"), merged.get("display_value"), merged.get("numeric_value")),
-            unit=_first_text(merged.get("unit"), merged.get("numeric_unit")),
+            unit=_public_unit_text(merged.get("unit"), merged.get("numeric_unit")),
             time_or_scope=_first_text(merged.get("time_or_scope"), merged.get("period"), merged.get("scope"), merged.get("date")),
             distilled_fact=_first_text(
                 merged.get("distilled_fact"),

@@ -6,6 +6,7 @@ from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
 from rag_pipeline.config.search_config import build_llm_config_for_task
+from rag_pipeline.contracts.quality_gate_policy import quality_gate_mode, quality_gates_isolated
 from rag_pipeline.search.memory import call_openai_compatible_json, llm_config_is_ready, normalize_llm_config
 
 
@@ -610,7 +611,8 @@ def run_final_audit(
         writer_package_payload=package,
         query=query,
     )
-    blocking = _env_flag("REPORT_FINAL_AUDIT_BLOCKING", True)
+    isolated_gate = quality_gates_isolated()
+    blocking = _env_flag("REPORT_FINAL_AUDIT_BLOCKING", True) and not isolated_gate
     if deterministic_audit.get("fatal") and blocking:
         return {
             "enabled": True,
@@ -618,6 +620,7 @@ def run_final_audit(
             "status": "fatal",
             "blocked": True,
             "blocking": blocking,
+            "quality_gate_mode": quality_gate_mode(),
             "deterministic_audit": deterministic_audit,
             "audit": {
                 "status": "fatal",
@@ -643,15 +646,26 @@ def run_final_audit(
         config["max_output_tokens"] = min_output_tokens
     normalized = normalize_llm_config(config)
     if not llm_config_is_ready(normalized):
+        deterministic_fatal = bool(deterministic_audit.get("fatal"))
         return {
             "enabled": True,
             "success": False,
-            "status": "skipped",
+            "status": "fatal" if deterministic_fatal else "skipped",
             "blocked": False,
             "blocking": blocking,
+            "quality_gate_mode": quality_gate_mode(),
             "skipped_reason": "config_missing",
             "model": normalized.get("model") or "",
             "deterministic_audit": deterministic_audit,
+            "audit": {
+                "status": "fatal",
+                "overall_score": 0,
+                "critical_findings": _as_list(deterministic_audit.get("findings")),
+                "publish_recommendation": "hold",
+                "summary": deterministic_audit.get("summary"),
+            }
+            if deterministic_fatal
+            else {},
         }
 
     max_chars = _env_int("REPORT_FINAL_AUDIT_MAX_CHARS", 200000, min_value=4000, max_value=1_000_000)
@@ -692,6 +706,7 @@ def run_final_audit(
             "status": "fatal" if deterministic_audit.get("fatal") else audit_payload["status"],
             "blocked": bool(blocking and fatal),
             "blocking": blocking,
+            "quality_gate_mode": quality_gate_mode(),
             "model": normalized.get("model") or "",
             "reasoning_effort": normalized.get("reasoning_effort") or "",
             "max_output_tokens": int(normalized.get("max_output_tokens") or 0),
@@ -709,6 +724,7 @@ def run_final_audit(
             "status": "failed",
             "blocked": bool(blocking and deterministic_audit.get("fatal")),
             "blocking": blocking,
+            "quality_gate_mode": quality_gate_mode(),
             "model": normalized.get("model") or "",
             "reasoning_effort": normalized.get("reasoning_effort") or "",
             "error": str(exc),

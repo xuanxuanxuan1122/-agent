@@ -39,6 +39,63 @@ def test_metric_assets_classify_complete_and_missing_fields():
     assert assets[1]["missing_fields"] == ["period"]
 
 
+def test_metric_assets_require_semantic_table_ready_fields():
+    assets = build_metric_assets(
+        [
+            {
+                "evidence_id": "EV-DIRTY",
+                "proof_role": "metric",
+                "metric": "deployment signal",
+                "value": "!(/_next/static/media/logo.png) 产品 ! 产品 ADP 知识引擎",
+                "unit": "摘要：产品 导航 资源 登录",
+                "period": "2025-12-29T00:00:00+08:00",
+                "source_id": "SRC-DIRTY",
+                "source_level": "B",
+            },
+            {
+                "evidence_id": "EV-GOOD",
+                "proof_role": "metric",
+                "metric": "中标项目数量",
+                "value": "223",
+                "unit": "个",
+                "period": "2025年Q3",
+                "source_id": "SRC-GOOD",
+                "source_level": "B",
+            },
+        ]
+    )
+
+    dirty = next(item for item in assets if item["evidence_id"] == "EV-DIRTY")
+    good = next(item for item in assets if item["evidence_id"] == "EV-GOOD")
+    assert dirty["complete"] is True
+    assert dirty["semantic_complete"] is False
+    assert dirty["table_ready"] is False
+    assert "invalid_value" in dirty["reject_reasons"]
+    assert "invalid_unit" in dirty["reject_reasons"]
+    assert "published_at_as_period" in dirty["reject_reasons"]
+    assert good["semantic_complete"] is True
+    assert good["table_ready"] is True
+
+
+def test_metric_assets_do_not_treat_policy_year_as_metric_candidate():
+    assets = build_metric_assets(
+        [
+            {
+                "evidence_id": "EV-POLICY",
+                "proof_role": "source_check",
+                "evidence_type": "official_data",
+                "metric": "policy signal",
+                "value": "2026",
+                "period": "2026",
+                "source_id": "SRC-POLICY",
+                "source_level": "A",
+            }
+        ]
+    )
+
+    assert assets == []
+
+
 def test_quality_conversion_summary_builds_canonical_funnels_and_recommendations():
     evidence_package = {
         "normalized_evidence": [
@@ -132,11 +189,16 @@ def test_quality_conversion_summary_builds_canonical_funnels_and_recommendations
     assert summary["evidence_funnel"]["analysis_ready_count"] == 2
     assert summary["claim_funnel"]["total_claim_count"] == 3
     assert summary["claim_funnel"]["bound_claim_count"] == 2
+    assert summary["claim_funnel"]["evidence_bound_claim_count"] == 2
+    assert summary["claim_funnel"]["source_bound_claim_count"] == 2
+    assert summary["claim_funnel"]["requirement_bound_claim_count"] == 2
+    assert summary["claim_funnel"]["fully_bound_claim_count"] == 2
     assert summary["claim_funnel"]["renderable_claim_count"] == 1
     assert summary["claim_funnel"]["section_bound_claim_count"] == 1
     assert summary["claim_funnel"]["diagnostic_only_claim_count"] == 1
     assert summary["metric_funnel"]["metric_candidate_count"] == 2
     assert summary["metric_funnel"]["complete_metric_count"] == 1
+    assert summary["metric_funnel"]["semantic_complete_metric_count"] == 1
     assert summary["metric_funnel"]["metric_missing_field_counts"]["period"] == 1
     assert summary["citation_funnel"]["final_deleted_fact_count"] == 3
     assert summary["citation_funnel"]["citation_rebind_required"] is True
@@ -147,6 +209,48 @@ def test_quality_conversion_summary_builds_canonical_funnels_and_recommendations
     actions = {item["action"] for item in summary["recommendations"]}
     assert "metric_repair_search" in actions
     assert "citation_rebind_or_section_rewrite" in actions
+
+
+def test_quality_conversion_summary_keeps_source_bound_directional_claim_renderable():
+    evidence_package = {
+        "clean_evidence_list": [{"evidence_id": "EV-1", "source_id": "SRC-1"}],
+        "analysis_ready_evidence": [
+            {
+                "evidence_id": "EV-1",
+                "source_id": "SRC-1",
+                "chapter_id": "ch_01",
+                "fact": "AI Agent deployments are moving into enterprise workflows.",
+                "source_level": "B",
+            }
+        ],
+    }
+    structured_analysis = {
+        "claim_units": [
+            {
+                "claim_id": "CL-1",
+                "claim": "AI Agent deployments are moving into enterprise workflows.",
+                "used_evidence_ids": ["EV-1"],
+                "claim_strength": "directional",
+            }
+        ]
+    }
+    writer_package = {
+        "chapter_packages": [{"chapter_id": "ch_01", "sections": [{"section_id": "SEC-1", "claim_id": "CL-1"}]}]
+    }
+
+    summary = build_quality_conversion_summary(
+        evidence_package=evidence_package,
+        structured_analysis=structured_analysis,
+        writer_package=writer_package,
+    )
+
+    funnel = summary["claim_funnel"]
+    assert funnel["evidence_bound_claim_count"] == 1
+    assert funnel["source_bound_claim_count"] == 1
+    assert funnel["requirement_bound_claim_count"] == 0
+    assert funnel["fully_bound_claim_count"] == 0
+    assert funnel["bound_claim_count"] == 1
+    assert funnel["renderable_claim_count"] == 1
 
 
 def test_quality_snapshot_exposes_conversion_summary():

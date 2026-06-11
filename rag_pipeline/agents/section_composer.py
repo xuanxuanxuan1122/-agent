@@ -15,6 +15,13 @@ def _env_int(name: str, default: int, *, min_value: int = 0, max_value: int = 10
     return max(min_value, min(max_value, value))
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = str(os.getenv(name, "")).strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
 def _text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
@@ -149,6 +156,14 @@ def _clean_analysis_basis_text(value: Any, *, max_chars: int = 260) -> str:
     text = _text(value)
     if not text:
         return ""
+    if re.search(
+        r"\b(?:semantic\s+judge|metric\s+fields\s+incomplete|not_allowed_until_repaired|currency_(?:usd|cny))\b",
+        text,
+        flags=re.I,
+    ):
+        return ""
+    if re.search(r"\b(?:source_check|http_status|response_code|status_code)\s*(?:=|:|\u4e3a)", text, flags=re.I):
+        return ""
     text = re.sub(r"<[^>]+>", "", text)
     text = re.sub(r"https?://\S+", "", text)
     text = re.sub(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:[+-]\d{2}:\d{2})?", "", text)
@@ -206,8 +221,9 @@ def _metric_sentence(card: EvidenceFactCard) -> str:
     subject = _public_subject(card.subject, "相关主体")
     variable = card.variable or "关键指标"
     value = card.value
-    if value and card.unit and card.unit not in value:
-        value = f"{value}{card.unit}"
+    unit = "" if str(card.unit or "").strip().lower() in {"currency_usd", "currency_cny", "money", "unknown"} else card.unit
+    if value and unit and unit not in value:
+        value = f"{value}{unit}"
     period = card.time_or_scope
     fact = card.distilled_fact.rstrip("。.")
     if value:
@@ -272,7 +288,7 @@ def _variable_explanation(lens: str, card: EvidenceFactCard) -> str:
         return f"这说明{variable}会影响可靠性、权限、安全和集成成本，进而决定能否进入生产流程。"
     if lens == "risk":
         return f"这说明{variable}是推翻或削弱本章判断的触发条件。"
-    return f"这说明{variable}已经成为影响本章判断的核心变量。"
+    return f"{variable}需要结合来源范围、场景深度和时间窗口一起判断，避免把背景信息直接外推为结论。"
 
 
 def _general_sentence(card: EvidenceFactCard, lens: str) -> str:
@@ -286,7 +302,7 @@ def _general_sentence(card: EvidenceFactCard, lens: str) -> str:
         return _risk_sentence(card)
     fact = card.distilled_fact.rstrip("。.")
     variable = card.variable or "章节判断"
-    return f"{fact}。这一事实用于判断{variable}是否具备持续性。"
+    return f"{fact}。该信息只能在已引用来源覆盖的范围内支撑对{variable}的方向性判断。"
 
 
 def _claim_analysis_parts(claim_unit: ClaimUnit, *, known_facts: Sequence[str] = ()) -> List[str]:
@@ -367,15 +383,15 @@ def _expansion_sentences(
         mechanism = f"从竞争结构看，{variable}会影响玩家分化、渠道控制、生态入口和客户迁移成本；同一事实在不同玩家手中可能代表不同的壁垒。"
         implication = f"因此，本节关注的不只是参与者数量，而是哪些能力真正沉淀为客户入口、交付能力和可持续优势。"
     else:
-        mechanism = f"从本章问题看，{variable}是把事实转成判断的核心连接点；它决定这些证据究竟只是背景信息，还是已经能支撑方向性分析。"
-        implication = f"因此，本节会把事实、机制和边界放在同一个判断框架中，而不是只复述来源材料。"
+        mechanism = f"从本章证据看，{variable}需要与来源范围、场景深度和时间窗口一起判断，避免把背景信息直接外推为结论。"
+        implication = f"因此，本节只在已引用事实覆盖的范围内说明判断边界，不把单一材料扩展成强结论。"
     boundary = _clean_analysis_basis_text(claim_unit.limitation_boundary) if claim_unit.limitation_boundary else ""
     if not boundary:
         if strength in {"strong", "moderate", "decision_ready", "core_claim"}:
             boundary = f"边界在于这些事实仍需要与更多来源中的同类变量相互印证，尤其要观察{variable}是否能持续出现在不同客户、不同场景或不同时间窗口。"
         else:
             boundary = f"由于该判断属于方向性分析，结论应限定在已引用事实能够覆盖的场景内，重点看{variable}后续是否重复出现并形成更稳定的证据链。"
-    question_sentence = f"放回章节问题看，{chapter_question} 的回答不能只依赖单点事实，而要看上述机制能否连续支撑需求、商业化或风险判断。" if chapter_question else ""
+    question_sentence = f"围绕章节问题“{chapter_question}”，本节只保留能被已引用事实支撑的判断，并说明其适用边界。" if chapter_question else ""
     fact_sentence = f"已有事实链显示：{facts_text}。" if facts_text else ""
     depth_sentence = f"进一步看，{variable}需要同时接受场景深度、组织采纳、交付成本和持续使用的检验；这些条件越完整，相关事实越能从单点样本转化为可解释的行业信号。"
     return [fact_sentence, mechanism, implication, boundary, question_sentence, depth_sentence]
@@ -394,6 +410,11 @@ def _expand_to_target(
     parts = [part for part in base_parts if _text(part)]
     known_facts = [card.distilled_fact for card in selected if _text(card.distilled_fact)]
     status = "base"
+    if not _env_flag("REPORT_COMPOSER_EXPAND_TO_TARGET", False):
+        paragraph = _join_public_sentences(parts)
+        if _compact_len(paragraph) < target:
+            status = "base_no_expand" if paragraph else "insufficient_facts"
+        return paragraph, status
     if _compact_len(_join_public_sentences(parts)) < target:
         for sentence in _expansion_sentences(
             lens=lens,

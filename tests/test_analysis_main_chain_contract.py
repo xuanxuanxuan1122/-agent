@@ -4,6 +4,7 @@ import os
 import rag_pipeline.agents.analysis_agent as analysis_agent
 import rag_pipeline.agents.analysis_agent as analysis_agent
 from rag_pipeline.flows.report import full_report
+from rag_pipeline.search.memory import LLMCallError
 
 from rag_pipeline.agents.analysis_agent import (
     _chapter_evidence_diagnostics,
@@ -563,8 +564,64 @@ def test_llm_semantic_judge_partial_downgrades_claim(monkeypatch):
     assert validation["llm_validation_issue_counts"]["llm_claim_semantic_judge_partial_downgraded"] == 1
     assert validation["llm_semantic_judge_counts"]["partial"] == 1
     assert unit["semantic_judge_status"] == "partial"
-    assert unit["claim_strength"] == "directional"
-    assert unit["writing_permission"] == "cautious_with_boundary"
+
+
+def test_isolated_quality_gate_observes_semantic_judge_without_mutating_claim(monkeypatch):
+    monkeypatch.setenv("REPORT_QUALITY_GATE_MODE", "isolated")
+    monkeypatch.setattr(
+        analysis_agent,
+        "_llm_semantic_claim_support_judge",
+        lambda **_kwargs: {
+            "status": "partial",
+            "reason": "The evidence only partially supports the scope.",
+            "confidence": 0.8,
+        },
+    )
+    evidence_package = {
+        "analysis_ready_evidence": [
+            _evidence(
+                "EV-SAFE",
+                chapter_id="ch_01",
+                allowed_use="supporting",
+                proof_role="support",
+            )
+        ]
+    }
+    payload = {
+        "chapter_synthesis": [
+            {
+                "chapter_id": "ch_01",
+                "claim_units": [
+                    {
+                        "claim_id": "claim-1",
+                        "claim": "Enterprise agent deployments are moving from pilots into workflow automation.",
+                        "used_evidence_ids": ["EV-SAFE"],
+                        "evidence_basis": [
+                            "Enterprise agent deployments are moving from pilots into workflow automation."
+                        ],
+                        "reasoning_chain": [
+                            "The cited deployment signal directly supports a workflow automation discussion."
+                        ],
+                        "limitation_boundary": ["Keep scope bounded to workflow automation."],
+                        "claim_strength": "moderate",
+                        "claim_strength_ceiling": "moderate",
+                    }
+                ],
+            }
+        ]
+    }
+
+    validation = validate_llm_analysis_output(payload, evidence_package, llm_config={"model": "judge"})
+
+    assert validation["usable_claim_count"] == 1
+    issue_counts = validation["llm_validation_issue_counts"]
+    assert issue_counts["llm_claim_semantic_judge_partial_observed"] == 1
+    assert "llm_claim_semantic_judge_partial_downgraded" not in issue_counts
+    unit = validation["chapter_synthesis"][0]["claim_units"][0]
+    assert unit["claim_strength"] == "moderate"
+    assert unit["semantic_judge_status"] == "partial"
+    assert "semantic judge" not in str(unit.get("counter_boundary") or "").lower()
+    assert "semantic judge" not in str(unit.get("limitation_boundary") or "").lower()
 
 
 def test_llm_semantic_judge_adjacent_downgrades_claim(monkeypatch):
@@ -785,6 +842,51 @@ def test_llm_analysis_prompts_request_typed_claims_without_two_to_three_cap(monk
     assert "claim_type" in global_prompt
     assert "contextual" in global_prompt
     assert "2-3 claim_units" not in global_prompt
+
+
+def test_llm_analysis_salvages_truncated_chapter_json(monkeypatch, tmp_path):
+    raw = (
+        '{"chapter_synthesis":[{"chapter_id":"ch_01","claim_units":[{'
+        '"claim_id":"CL-SALVAGE",'
+        '"claim":"AI Agent deployments are moving into enterprise workflow automation.",'
+        '"claim_type":"directional_claim",'
+        '"used_evidence_ids":["EV-1"],'
+        '"claim_strength":"directional",'
+        '"one_sentence_reason":"The cited source describes enterprise workflow automation."'
+        '}]}'
+    )
+
+    def fake_llm(*, config, system_prompt, user_payload):
+        raise LLMCallError(
+            "LLM response is not valid JSON: truncated",
+            diagnostic={"raw_content": raw, "error": "LLM response is not valid JSON: truncated"},
+        )
+
+    monkeypatch.setattr(analysis_agent, "call_openai_compatible_json", fake_llm)
+    monkeypatch.setattr(analysis_agent, "llm_config_is_ready", lambda cfg: True)
+    monkeypatch.setattr(analysis_agent, "normalize_llm_config", lambda cfg: {"model": cfg.get("model", "fake")})
+    monkeypatch.setenv("BRAIN_LLM_ANALYSIS_CACHE_PATH", str(tmp_path))
+
+    result = analysis_agent.synthesize_with_llm_analysis_v2(
+        evidence_package={
+            "query": "AI Agent enterprise deployment",
+            "analysis_ready_evidence": [
+                {
+                    **_evidence("EV-1", chapter_id="ch_01", level="B"),
+                    "distilled_fact": "AI Agent deployments are moving into enterprise workflow automation.",
+                    "fact": "AI Agent deployments are moving into enterprise workflow automation.",
+                }
+            ],
+        },
+        fallback={"query": "AI Agent enterprise deployment"},
+        llm_config={"provider": "fake", "model": "fake"},
+    )
+
+    assert result["_llm_failed_chapter_count"] == 0
+    assert result["_llm_json_salvage_attempted_count"] == 1
+    assert result["_llm_json_salvage_success_count"] == 1
+    assert result["chapter_synthesis"][0]["claim_units"][0]["claim_id"] == "CL-SALVAGE"
+    assert result["_llm_chapter_results"][0]["status"] == "json_salvaged"
 
 
 def test_llm_claim_support_validator_unavailable_is_not_silent(monkeypatch):
@@ -2288,3 +2390,93 @@ def test_load_stage_snapshot_returns_corrupt_on_bad_manifest(tmp_path, monkeypat
     result = stage_snapshot_cache.load_stage_snapshot("run-1", "evidence_package")
     assert result["status"] == "corrupt"
     assert "error" in result
+
+
+def _anchor_mismatch_fixture():
+    """Claim paraphrases the evidence so lexical n-gram anchors miss while the
+    semantics genuinely support it (the live-run 19/19 false-downgrade shape)."""
+
+    evidence_package = {
+        "analysis_ready_evidence": [
+            {
+                **_evidence("EV-prop", chapter_id="ch_03", level="B"),
+                "fact": "广州市典型案例集显示，AI物业经理智能体已落地300多个项目，管理超2000万平米，助客户降低管理成本60-70%。",
+                "distilled_fact": "广州市典型案例集显示，AI物业经理智能体已落地300多个项目，管理超2000万平米，助客户降低管理成本60-70%。",
+                "source_title": "广州案例集",
+            }
+        ]
+    }
+    payload = {
+        "chapter_synthesis": [
+            {
+                "chapter_id": "ch_03",
+                "claim_units": [
+                    {
+                        "claim_id": "anchor-paraphrase",
+                        "claim": "AI Agent在物业管理环节已实现规模化商业落地，并通过典型案例证明了显著降本增效成果。",
+                        "claim_strength": "moderate",
+                        "used_evidence_ids": ["EV-prop"],
+                        "evidence_basis": ["广州市典型案例集显示AI物业经理智能体已落地300多个项目。"],
+                        "reasoning": "案例集中的落地规模与降本数据支持该判断。",
+                    }
+                ],
+            }
+        ]
+    }
+    return evidence_package, payload
+
+
+def test_anchor_mismatch_waived_when_semantic_judge_confirms_support(monkeypatch):
+    monkeypatch.setattr(
+        analysis_agent,
+        "_llm_semantic_claim_support_judge",
+        lambda **_kwargs: {"status": "supported", "reason": "facts directly support the claim", "confidence": 0.9},
+    )
+    evidence_package, payload = _anchor_mismatch_fixture()
+
+    validation = validate_llm_analysis_output(payload, evidence_package, llm_config={"model": "judge"})
+
+    assert validation["usable_claim_count"] == 1
+    unit = validation["chapter_synthesis"][0]["claim_units"][0]
+    # The judge's verdict outranks the lexical anchor miss: no downgrade.
+    assert unit["claim_strength"] == "moderate"
+    issue_counts = validation["llm_validation_issue_counts"]
+    assert "claim_support_anchor_mismatch_downgraded" not in issue_counts
+    assert issue_counts["claim_support_anchor_mismatch_waived_by_semantic_judge"] == 1
+
+
+def test_anchor_mismatch_downgrades_when_semantic_judge_unavailable(monkeypatch):
+    monkeypatch.setattr(
+        analysis_agent,
+        "_llm_semantic_claim_support_judge",
+        lambda **_kwargs: {"status": "skipped_disabled_or_missing_config"},
+    )
+    evidence_package, payload = _anchor_mismatch_fixture()
+
+    validation = validate_llm_analysis_output(payload, evidence_package, llm_config={"model": "judge"})
+
+    assert validation["usable_claim_count"] == 1
+    unit = validation["chapter_synthesis"][0]["claim_units"][0]
+    # No semantic verdict: keep the conservative directional downgrade.
+    assert unit["claim_strength"] == "directional"
+    assert validation["llm_validation_issue_counts"]["claim_support_anchor_mismatch_downgraded"] == 1
+
+
+def test_anchor_mismatch_defers_to_judge_partial_downgrade(monkeypatch):
+    monkeypatch.setattr(
+        analysis_agent,
+        "_llm_semantic_claim_support_judge",
+        lambda **_kwargs: {"status": "partial", "reason": "direction supported, strength not", "confidence": 0.7},
+    )
+    evidence_package, payload = _anchor_mismatch_fixture()
+
+    validation = validate_llm_analysis_output(payload, evidence_package, llm_config={"model": "judge"})
+
+    assert validation["usable_claim_count"] == 1
+    unit = validation["chapter_synthesis"][0]["claim_units"][0]
+    assert unit["claim_strength"] == "directional"
+    issue_counts = validation["llm_validation_issue_counts"]
+    # The judge's own downgrade is the verdict of record; the anchor miss is
+    # not double-counted as a second downgrade issue.
+    assert issue_counts["llm_claim_semantic_judge_partial_downgraded"] == 1
+    assert "claim_support_anchor_mismatch_downgraded" not in issue_counts

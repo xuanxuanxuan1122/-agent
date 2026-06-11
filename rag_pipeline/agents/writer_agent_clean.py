@@ -12,6 +12,7 @@ try:
     from rag_pipeline.contracts.handoff_contracts import build_handoff_contract_summary
     from rag_pipeline.contracts.evidence_identity import build_evidence_alias_map
     from rag_pipeline.contracts.ref_normalizer import normalize_claim_refs
+    from rag_pipeline.contracts.quality_gate_policy import quality_gate_mode, quality_gates_isolated
     from rag_pipeline.contracts.research_reflection import build_research_reflection_memo
     from rag_pipeline.contracts.source_registry import pick_refs as _contract_pick_refs
     from rag_pipeline.quality.conversion_summary import build_quality_conversion_summary
@@ -41,6 +42,7 @@ except Exception:  # pragma: no cover - direct script mode fallback
         from rag_pipeline.contracts.handoff_contracts import build_handoff_contract_summary  # type: ignore
         from rag_pipeline.contracts.evidence_identity import build_evidence_alias_map  # type: ignore
         from rag_pipeline.contracts.ref_normalizer import normalize_claim_refs  # type: ignore
+        from rag_pipeline.contracts.quality_gate_policy import quality_gate_mode, quality_gates_isolated  # type: ignore
         from rag_pipeline.contracts.research_reflection import build_research_reflection_memo  # type: ignore
         from rag_pipeline.contracts.source_registry import pick_refs as _contract_pick_refs  # type: ignore
         from rag_pipeline.quality.conversion_summary import build_quality_conversion_summary  # type: ignore
@@ -49,6 +51,12 @@ except Exception:  # pragma: no cover - direct script mode fallback
         build_handoff_contract_summary = None  # type: ignore
         build_evidence_alias_map = None  # type: ignore
         normalize_claim_refs = None  # type: ignore
+        def quality_gate_mode(default: str = "blocking") -> str:  # type: ignore
+            return default
+
+        def quality_gates_isolated(default: bool = False) -> bool:  # type: ignore
+            return default
+
         build_research_reflection_memo = None  # type: ignore
         _contract_pick_refs = None  # type: ignore
         build_quality_conversion_summary = None  # type: ignore
@@ -72,6 +80,11 @@ except Exception:  # pragma: no cover - direct script mode fallback
     from risk_agent import run_risk_agent  # type: ignore
     from table_agent import run_table_agent  # type: ignore
     from table_validator import validate_table_package  # type: ignore
+
+try:
+    from rag_pipeline.contracts.public_text_guard import public_text_quality
+except Exception:  # pragma: no cover
+    public_text_quality = None  # type: ignore
 
 
 AGENT_NAME = "writer_agent"
@@ -284,6 +297,8 @@ def _writer_ready_for_final(
     package_passed: bool,
     package_warning_blocked: bool,
 ) -> bool:
+    if quality_gates_isolated():
+        return bool(str(markdown or "").strip()) and not has_internal_gap_language(str(markdown or ""))
     return (
         bool(_as_dict(qa_result).get("passed"))
         and not _qa_has_pending_repair(qa_result)
@@ -336,6 +351,10 @@ def _body_table_budget() -> int:
 
 def _per_chapter_table_budget() -> int:
     return _env_int("REPORT_MAX_BODY_TABLES_PER_CHAPTER", 1, min_value=0, max_value=6)
+
+
+def _tables_enabled() -> bool:
+    return str(os.getenv("REPORT_ENABLE_TABLES", "true")).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _refs_from_evidence_package(package: Dict[str, Any], *, limit: int = 8) -> List[str]:
@@ -625,6 +644,11 @@ def _sanitize_public_table_cell(value: Any, *, max_chars: int = 180) -> str:
     text = re.sub(r"\s+", " ", str(value or "")).strip()
     if not text:
         return ""
+    if public_text_quality is not None:
+        guard = public_text_quality(text)
+        if guard.get("severity") == "reject":
+            return ""
+        text = str(guard.get("cleaned") or text).strip()
     text = re.sub(r"第\s*\d+\s*轮\s*[｜|:：]\s*", "", text)
     text = re.sub(r"^[^：:]{0,120}(?:报告|研究|query|查询|检索)[^：:]{0,120}[：:]\s*", "", text, flags=re.I)
     text = re.sub(r"(?:竞争对比|政策监管|技术产业链|市场规模|成本|金额)\s*=\s*(?=；|;|$)", "", text)
@@ -1233,6 +1257,25 @@ def _table_planning_summary(micro_layouts: Sequence[Dict[str, Any]]) -> Dict[str
 
 
 def _table_quality_summary(table_packages: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    raw_candidate_count = len([table for table in list(table_packages or []) if isinstance(table, dict)])
+    if not _tables_enabled():
+        return {
+            "enabled": False,
+            "status": "disabled_by_config",
+            "candidate_count": 0,
+            "raw_candidate_count": raw_candidate_count,
+            "validated_count": 0,
+            "rendered_count": 0,
+            "repaired_count": 0,
+            "demoted_count": 0,
+            "drop_count": 0,
+            "calculation_error_count": 0,
+            "missing_claim_binding_count": 0,
+            "table_type_distribution": {},
+            "render_tier_distribution": {},
+            "reject_reason_distribution": {},
+            "demoted_samples": [],
+        }
     candidate_count = 0
     validated_count = 0
     rendered_count = 0
@@ -1287,7 +1330,10 @@ def _table_quality_summary(table_packages: Sequence[Dict[str, Any]]) -> Dict[str
         if any(_as_dict(item).get("type") == "missing_table_anchor" for item in [*errors, *warnings]):
             missing_claim_binding_count += 1
     return {
+        "enabled": True,
+        "status": "enabled",
         "candidate_count": candidate_count,
+        "raw_candidate_count": candidate_count,
         "validated_count": validated_count,
         "rendered_count": rendered_count,
         "repaired_count": repaired_count,
@@ -1337,6 +1383,18 @@ def _table_placement_summary(table_packages: Sequence[Dict[str, Any]]) -> Dict[s
 
 
 def _table_gap_summary(table_packages: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    raw_candidate_count = len([table for table in list(table_packages or []) if isinstance(table, dict)])
+    if not _tables_enabled():
+        return {
+            "enabled": False,
+            "status": "disabled_by_config",
+            "raw_candidate_count": raw_candidate_count,
+            "table_evidence_requirement_count": 0,
+            "table_follow_up_count": 0,
+            "rendered_high_value_table_count": 0,
+            "missing_field_distribution": {},
+            "samples": [],
+        }
     requirement_count = 0
     follow_up_count = 0
     missing_fields: Dict[str, int] = {}
@@ -1367,6 +1425,9 @@ def _table_gap_summary(table_packages: Sequence[Dict[str, Any]]) -> Dict[str, An
                     }
                 )
     return {
+        "enabled": True,
+        "status": "enabled",
+        "raw_candidate_count": len([table for table in list(table_packages or []) if isinstance(table, dict)]),
         "table_evidence_requirement_count": requirement_count,
         "table_follow_up_count": follow_up_count,
         "rendered_high_value_table_count": rendered_high_value_table_count,
@@ -1441,6 +1502,7 @@ def _stage_quality_card(
 
     table_summary = _as_dict(table_quality_summary)
     table_gap = _as_dict(table_gap_summary)
+    table_enabled = bool(table_summary.get("enabled", True)) and bool(table_gap.get("enabled", True))
     analysis = _as_dict(analysis_stage_diagnostics)
     citation = _as_dict(final_citation_audit)
     handoff = _as_dict(handoff_contract_summary)
@@ -1457,9 +1519,9 @@ def _stage_quality_card(
         top_blockers.append("unresolved_evidence_refs")
     if evidence_totals["relevance_rejected_count"]:
         top_blockers.append("chapter_relevance_rejections")
-    if _count_value(table_summary.get("drop_count")):
+    if table_enabled and _count_value(table_summary.get("drop_count")):
         top_blockers.append("table_drop")
-    if _as_dict(table_gap.get("missing_field_distribution")):
+    if table_enabled and _as_dict(table_gap.get("missing_field_distribution")):
         top_blockers.append("table_metric_fields_missing")
     if _count_value(analysis.get("llm_failed_chapter_count") or analysis.get("failed_chapter_count")):
         top_blockers.append("analysis_partial_failure")
@@ -1485,7 +1547,10 @@ def _stage_quality_card(
             "weakest_chapters": weakest_chapters,
         },
         "table": {
+            "enabled": table_enabled,
+            "status": table_summary.get("status") or table_gap.get("status") or ("enabled" if table_enabled else "disabled_by_config"),
             "candidate_count": _count_value(table_summary.get("candidate_count")),
+            "raw_candidate_count": _count_value(table_summary.get("raw_candidate_count") or table_gap.get("raw_candidate_count")),
             "rendered_count": _count_value(table_summary.get("rendered_count")),
             "rendered_high_value_table_count": _count_value(table_gap.get("rendered_high_value_table_count")),
             "drop_count": _count_value(table_summary.get("drop_count")),
@@ -1518,6 +1583,8 @@ def _stage_quality_card(
 
 
 def _table_follow_up_queries(table_packages: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not _tables_enabled():
+        return []
     followups: List[Dict[str, Any]] = []
     seen = set()
     for table in table_packages:
@@ -2007,6 +2074,20 @@ def _chapter_facts(chapter: Dict[str, Any], *, limit: int = 12) -> List[str]:
     return _dedupe(facts, limit=limit)
 
 
+def _has_bounded_supporting_ab_evidence(chapter: Dict[str, Any], quality: Dict[str, Any]) -> bool:
+    supporting_count = int(quality.get("supporting_evidence_count") or 0)
+    table_count = int(quality.get("table_evidence_count") or 0)
+    sample_count = len(_as_list(chapter.get("sample_evidence")))
+    level_distribution = _as_dict(quality.get("source_level_distribution"))
+    ab_count = 0
+    for level in ("A", "B"):
+        try:
+            ab_count += int(level_distribution.get(level) or 0)
+        except (TypeError, ValueError):
+            continue
+    return ab_count >= 1 and (supporting_count + table_count + sample_count) >= 2
+
+
 def _expansion_section(chapter: Dict[str, Any], *, kind: str, index: int) -> Dict[str, Any]:
     title = _compact(chapter.get("chapter_title") or "本章", 120)
     facts = _chapter_facts(chapter, limit=12)
@@ -2125,7 +2206,11 @@ def _chapter_expandable(chapter: Dict[str, Any]) -> bool:
         for item in _as_list(chapter.get("evidence_gaps"))
         if isinstance(item, dict)
     }
-    if "insufficient_core_evidence" in missing_types and not quality.get("core_ab_source_count"):
+    if (
+        "insufficient_core_evidence" in missing_types
+        and not quality.get("core_ab_source_count")
+        and not _has_bounded_supporting_ab_evidence(chapter, quality)
+    ):
         return False
     return True
 
@@ -2153,7 +2238,10 @@ def _hard_delivery_blockers(
     package_quality_report: Dict[str, Any],
     coverage_matrix: Sequence[Dict[str, Any]],
     delivery_gate: Optional[Dict[str, Any]] = None,
+    enforce_quality_gate: bool = True,
 ) -> List[Dict[str, Any]]:
+    if enforce_quality_gate and quality_gates_isolated():
+        return []
     blockers: List[Dict[str, Any]] = []
     text = str(markdown or "")
     strict_gate = _strict_delivery_gate()
@@ -3310,12 +3398,17 @@ def build_writer_report(
         structured_analysis=structured_analysis,
         llm_client=llm_client,
     ))
-    table_packages = copy.deepcopy(list(table_packages or run_table_agent(
-        chapter_evidence_packages=chapter_evidence_packages,
-        micro_layouts=micro_layouts,
-        analytics_outputs=analytics_outputs,
-        llm_client=llm_client,
-    )))
+    tables_enabled = _tables_enabled()
+    raw_table_package_count = len([item for item in list(table_packages or []) if isinstance(item, dict)])
+    if tables_enabled:
+        table_packages = copy.deepcopy(list(table_packages or run_table_agent(
+            chapter_evidence_packages=chapter_evidence_packages,
+            micro_layouts=micro_layouts,
+            analytics_outputs=analytics_outputs,
+            llm_client=llm_client,
+        )))
+    else:
+        table_packages = []
     body_table_budget = _body_table_budget()
     per_chapter_table_budget = _per_chapter_table_budget()
     rendered_tables = 0
@@ -3400,11 +3493,10 @@ def build_writer_report(
         for unit in argument_units
         if isinstance(unit, dict) and unit.get("public_render") is True and not unit.get("omit_from_report")
     ]
-    tables_enabled = str(os.getenv("REPORT_ENABLE_TABLES", "true")).strip().lower() in {"1", "true", "yes", "on"}
     public_table_packages = [
         table
         for table in table_packages
-        if tables_enabled and isinstance(table, dict) and table.get("should_render") and not table.get("appendix_only")
+        if isinstance(table, dict) and table.get("should_render") and not table.get("appendix_only")
     ]
     target_body_chars = _env_int("REPORT_TARGET_BODY_CHARS", 0, min_value=0, max_value=100000)
     public_chapter_packages = _expand_chapter_packages_for_body_target(public_chapter_packages, target_chars=target_body_chars)
@@ -3614,25 +3706,28 @@ def build_writer_report(
         and "low_ab_core_coverage" in package_warning_types
     )
     table_gap_summary = _table_gap_summary(table_packages)
-    delivery_blockers = _hard_delivery_blockers(
+    observed_delivery_blockers = _hard_delivery_blockers(
         markdown=public_markdown,
         qa_result=qa_result,
         package_quality_report=package_quality_report,
         coverage_matrix=coverage_matrix,
         delivery_gate=delivery_gate,
+        enforce_quality_gate=False,
     )
-    delivery_blockers.extend(_layout_delivery_blockers(report_blueprint))
-    delivery_blockers.extend(
+    observed_delivery_blockers.extend(_layout_delivery_blockers(report_blueprint))
+    observed_delivery_blockers.extend(
         _report_family_delivery_blockers(
             research_plan=research_plan,
             report_blueprint=report_blueprint,
             report_plan=report_plan,
         )
     )
+    isolated_quality_gate = quality_gates_isolated()
+    delivery_blockers = [] if isolated_quality_gate else list(observed_delivery_blockers)
     qa_pending_repair_reasons = _qa_pending_repair_reasons(qa_result)
     qa_pending_repair = bool(qa_pending_repair_reasons)
     quality_findings = _quality_findings_from_review(
-        delivery_blockers=delivery_blockers,
+        delivery_blockers=observed_delivery_blockers if isolated_quality_gate else delivery_blockers,
         qa_result=qa_result,
         package_quality_report=package_quality_report,
         delivery_gate=delivery_gate,
@@ -3681,7 +3776,7 @@ def build_writer_report(
             qa_result=qa_result,
             package_passed=package_passed,
             package_warning_blocked=package_warning_blocked,
-        ) and delivery_tier == "publishable_clean"
+        ) and (delivery_tier == "publishable_clean" or isolated_quality_gate)
         clean_standard = _clean_standard()
         strict_clean_content_eligible = bool(report_ready and not delivery_blockers)
         render_gate = _as_dict(_as_dict(qa_result).get("render_gate"))
@@ -3689,7 +3784,7 @@ def build_writer_report(
             clean_candidate_eligible
             and public_markdown.strip()
             and not bool(render_gate.get("blocked"))
-            and not bool(_as_dict(delivery_gate).get("diagnostic_only"))
+            and (isolated_quality_gate or not bool(_as_dict(delivery_gate).get("diagnostic_only")))
             and str(delivery_tier or "").strip() != "diagnostic_only"
             and not has_internal_gap_language(public_markdown)
         )
@@ -3699,7 +3794,7 @@ def build_writer_report(
             clean_content_eligible = bool(
                 public_markdown.strip()
                 and not bool(render_gate.get("blocked"))
-                and not bool(_as_dict(delivery_gate).get("diagnostic_only"))
+                and (isolated_quality_gate or not bool(_as_dict(delivery_gate).get("diagnostic_only")))
                 and not has_internal_gap_language(public_markdown)
             )
         else:
@@ -3880,6 +3975,7 @@ def build_writer_report(
         "message": message,
         "config_warnings": config_warnings,
         "delivery_blockers": delivery_blockers,
+        "observed_delivery_blockers": observed_delivery_blockers,
         "fatal_delivery_blockers": fatal_delivery_blockers,
         "quality_findings": quality_findings,
         "quality_score": quality_score,

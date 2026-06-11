@@ -8,7 +8,7 @@ from rag_pipeline.agents.report_contracts import (
 )
 from rag_pipeline.agents.chapter_argument_agent import run_chapter_argument_agent
 from rag_pipeline.agents.section_composer import compose_section_paragraph
-from rag_pipeline.agents.writer_agent_clean import _expand_chapter_packages_for_body_target
+from rag_pipeline.agents.writer_agent_clean import _chapter_expandable, _expand_chapter_packages_for_body_target
 from rag_pipeline.contracts.report_contract import build_report_contract_from_package
 
 
@@ -303,6 +303,38 @@ def test_composer_turns_metric_fact_card_into_natural_paragraph():
     assert result["composer_variable_explanation_count"] == 1
 
 
+def test_internal_metric_unit_enum_does_not_leak_into_fact_card_or_paragraph():
+    card = EvidenceFactCard.from_legacy_dict(
+        {
+            "evidence_id": "EV-USD",
+            "chapter_id": "ch_01",
+            "public_fact_card": {
+                "subject": "AI Agent market",
+                "variable": "market size",
+                "value": "471亿美元",
+                "unit": "currency_usd",
+                "time_or_scope": "2025",
+                "distilled_fact": "AI Agent market reached 471亿美元 in 2025.",
+                "fact_type": "metric",
+                "block_affinity": ["metric_reconciliation"],
+            },
+            "source_level": "B",
+            "source_ref": "[2]",
+            "source_verification_status": "document_verified",
+        }
+    )
+
+    result = compose_section_paragraph(
+        fact_cards=[card],
+        claim_unit=ClaimUnit(chapter_id="ch_01", claim_strength="moderate"),
+        block_type="metric_reconciliation",
+        chapter_question="Is market space real?",
+    )
+
+    assert card.unit == ""
+    assert "currency_usd" not in str(result)
+
+
 def test_ref_lineage_resolves_source_alias_and_filters_orphan_refs():
     source_registry = [
         {
@@ -451,6 +483,7 @@ def test_composer_uses_claim_unit_analysis_fields_for_richer_paragraph():
 
 def test_composer_expands_valid_claim_to_research_paragraph(monkeypatch):
     monkeypatch.setenv("REPORT_COMPOSER_TARGET_SECTION_CHARS", "420")
+    monkeypatch.setenv("REPORT_COMPOSER_EXPAND_TO_TARGET", "true")
     card = EvidenceFactCard(
         evidence_id="EV-LONG",
         chapter_id="ch_01",
@@ -496,6 +529,7 @@ def test_composer_expands_valid_claim_to_research_paragraph(monkeypatch):
 
 def test_composer_longform_does_not_repeat_same_fact_sentence(monkeypatch):
     monkeypatch.setenv("REPORT_COMPOSER_TARGET_SECTION_CHARS", "850")
+    monkeypatch.setenv("REPORT_COMPOSER_EXPAND_TO_TARGET", "true")
     fact = "AI Agent commercialization landed, and the 3.3 trillion yuan track is accelerating."
     card = EvidenceFactCard(
         evidence_id="EV-REPEAT",
@@ -531,6 +565,44 @@ def test_composer_longform_does_not_repeat_same_fact_sentence(monkeypatch):
     assert result["composition_status"] in {"composed", "composed_directional"}
     assert result["composer_expansion_status"] == "expanded"
     assert result["paragraph"].count(fact.rstrip(".")) <= 1
+
+
+def test_composer_default_does_not_generate_generic_template_filler(monkeypatch):
+    monkeypatch.delenv("REPORT_COMPOSER_EXPAND_TO_TARGET", raising=False)
+    monkeypatch.setenv("REPORT_COMPOSER_TARGET_SECTION_CHARS", "850")
+    card = EvidenceFactCard(
+        evidence_id="EV-GENERIC",
+        chapter_id="ch_01",
+        subject="AI Agent deployment",
+        variable="章节信号",
+        action_or_signal="entered workflow",
+        distilled_fact="AI Agent deployment entered customer workflow in the cited source.",
+        fact_type="case",
+        block_affinity=["integrated_signal"],
+        source_ref="[2]",
+        source_level="B",
+    )
+    claim = ClaimUnit(
+        claim_id="CL-GENERIC",
+        chapter_id="ch_01",
+        claim="AI Agent deployment shows a directional workflow signal.",
+        evidence_refs=["EV-GENERIC"],
+        evidence_basis=["The cited source says AI Agent deployment entered customer workflow."],
+        claim_strength="directional",
+    )
+
+    result = compose_section_paragraph(
+        fact_cards=[card],
+        claim_unit=claim,
+        block_type="integrated_signal",
+        chapter_question="How should enterprise AI Agent deployment be judged?",
+    )
+
+    paragraph = result["paragraph"]
+    assert result["composer_expansion_status"] == "base_no_expand"
+    assert "事实转成判断" not in paragraph
+    assert "核心连接点" not in paragraph
+    assert "这一事实用于判断" not in paragraph
 
 
 def test_composer_does_not_promote_raw_evidence_basis_snippets():
@@ -1307,3 +1379,33 @@ def test_chapter_argument_body_rewrite_off_even_when_chapter_narrative_enabled(m
     section = packages[0]["sections"][0]
     assert section["body_composition_status"] == "composed"
     assert "body_rewrite_status" not in section
+
+
+def test_chapter_expandable_allows_bounded_supporting_ab_evidence():
+    chapter = {
+        "chapter_id": "ch_supporting",
+        "chapter_title": "Enterprise AI Agent adoption boundaries",
+        "chapter_fact_digest": [
+            "Official policy defines governance boundaries for enterprise AI Agent adoption.",
+            "Research evidence records deployment friction and ROI uncertainty.",
+        ],
+        "sections": [
+            {
+                "evidence_refs": ["EV-POLICY", "EV-COUNTER"],
+                "supporting_facts": [
+                    "Official policy defines governance boundaries.",
+                    "Research records ROI uncertainty.",
+                ],
+            }
+        ],
+        "evidence_quality_summary": {
+            "core_evidence_count": 0,
+            "core_ab_source_count": 0,
+            "supporting_evidence_count": 3,
+            "table_evidence_count": 0,
+            "source_level_distribution": {"A": 1, "B": 2},
+        },
+        "evidence_gaps": [{"type": "insufficient_core_evidence"}],
+    }
+
+    assert _chapter_expandable(chapter) is True

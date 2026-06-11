@@ -247,7 +247,13 @@ def _report_fact_sentence(item: Dict[str, Any], text: str, *, max_chars: int = 1
         }.get(unit.lower(), unit)
         suffix = normalized_unit if normalized_unit and normalized_unit not in metric_value else ""
         tail = f"（{scope}）" if scope else ""
-        return _compact(f"{prefix}{metric}为{metric_value}{suffix}{tail}", max_chars)
+        metric_sentence = _compact(f"{prefix}{metric}为{metric_value}{suffix}{tail}", max_chars)
+        # Extraction noise often leaves stub metric fields (metric="成本",
+        # value="5") on facts whose prose is the real payload. Only replace the
+        # prose when the metric sentence is substantial enough to survive the
+        # downstream fact-card length gate; otherwise fall through to prose.
+        if len(metric_sentence) >= 18:
+            return metric_sentence
     for separator in ("：", ":"):
         if separator not in value:
             continue
@@ -469,6 +475,15 @@ def _public_fact_card(item: Dict[str, Any], distilled: str) -> Dict[str, Any]:
 
 
 def _public_fact_quality(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Two-tier quality verdict for the public fact pool.
+
+    Hard rejections are reserved for facts that can never be written (garbage
+    text, untraceable, blocked hosts). Weak-but-real facts (suspicious metric
+    fields, aggregator sources, identity doubts) are kept as directional-only
+    cards instead of being discarded: dropping them is what previously starved
+    6/8 chapters down to zero fact cards in fail-open rebuilds.
+    """
+
     fact = _fact_text(item)
     distilled = _distill_fact(item)
     level = _source_level(item)
@@ -476,23 +491,32 @@ def _public_fact_quality(item: Dict[str, Any]) -> Dict[str, Any]:
     host = _source_host(url)
     traceable = _traceable(item)
     rejection: List[str] = []
+    downgrade: List[str] = []
     if not distilled:
         rejection.append("empty_or_bad_fact")
     if _invalid_metric(item):
-        rejection.append("invalid_metric")
+        # The metric fields are extraction garbage, but the fact text itself
+        # may still be a usable qualitative signal; demote instead of drop.
+        downgrade.append("invalid_metric")
     if _fact_type(item) == "metric" and (
         not str(item.get("subject") or item.get("company") or item.get("entity") or "").strip()
         or not (str(item.get("scope") or item.get("market_scope") or "").strip() or _time_or_scope(distilled))
     ):
-        rejection.append("no_subject_or_scope")
+        if len(distilled) >= 40:
+            # The prose carries the fact and the metric fields are extraction
+            # residue: keep the prose as a directional card.
+            downgrade.append("no_subject_or_scope")
+        else:
+            # A bare metric fragment with no subject or scope is unusable.
+            rejection.append("no_subject_or_scope")
     if _navigation_or_search_text(fact):
         rejection.append("navigation_text")
     if _bad_fact_text(fact):
         rejection.append("bad_fact_pattern")
     if _source_identity_bad(item):
-        rejection.append("source_identity_bad")
+        downgrade.append("source_identity_bad")
     if _low_quality_source(item):
-        rejection.append("low_quality_source")
+        downgrade.append("low_quality_source")
     if _topic_relevance(item) == "weak":
         rejection.append("weak_topic_relevance")
     if level == "D":
@@ -502,6 +526,14 @@ def _public_fact_quality(item: Dict[str, Any]) -> Dict[str, Any]:
     if host and re.search(r"(?:twitter|x|instagram|facebook|baike|baijiahao|csdn|cnblogs|juejin)\.", host, flags=re.I):
         rejection.append("blocked_host")
     fact_card = _public_fact_card(item, distilled) if not rejection else {}
+    if fact_card and downgrade:
+        if "invalid_metric" in downgrade or "no_subject_or_scope" in downgrade:
+            # Never let an unverifiable metric masquerade as one downstream.
+            if fact_card.get("fact_type") == "metric":
+                fact_card["fact_type"] = "directional"
+        fact_card["directional_only"] = True
+        fact_card["claim_strength_hint"] = "directional"
+        fact_card["downgrade_reasons"] = list(downgrade)
     if fact_card:
         required_missing = [
             key
@@ -522,6 +554,7 @@ def _public_fact_quality(item: Dict[str, Any]) -> Dict[str, Any]:
         "fact_type": _fact_type(item),
         "topic_relevance": _topic_relevance(item),
         "rejection_reason": rejection,
+        "downgrade_reason": downgrade,
         "distilled_fact": distilled,
         "public_fact_card": fact_card,
     }
@@ -600,7 +633,10 @@ def _invalid_metric(item: Dict[str, Any]) -> bool:
     metric_lower = metric.lower()
     if str(item.get("metric_validation_status") or "").strip().lower() == "invalid":
         return True
-    if unit == "unknown":
+    if unit == "unknown" and (metric or value):
+        # An unknown unit only invalidates an actual metric claim; plain text
+        # facts routinely carry unit="unknown" from upstream normalization and
+        # must not be culled wholesale for it.
         return True
     if metric_lower in {"source_check", "status", "http_status", "response_code"} and re.fullmatch(r"[1-5]\d{2}", value):
         return True
@@ -774,7 +810,9 @@ def _public_filter_summary(candidates: Sequence[Dict[str, Any]]) -> Dict[str, An
     citation_eligible = 0
     fact_cards = 0
     invalid_metric = 0
+    downgraded = 0
     reasons: Dict[str, int] = {}
+    downgrade_reasons: Dict[str, int] = {}
     fact_types: Dict[str, int] = {}
     for item in candidates:
         if not isinstance(item, dict):
@@ -787,13 +825,18 @@ def _public_filter_summary(candidates: Sequence[Dict[str, Any]]) -> Dict[str, An
             citation_eligible += 1
         if _as_dict(quality.get("public_fact_card")):
             fact_cards += 1
-        if "invalid_metric" in _as_list(quality.get("rejection_reason")):
+        if "invalid_metric" in _as_list(quality.get("rejection_reason")) or "invalid_metric" in _as_list(quality.get("downgrade_reason")):
             invalid_metric += 1
+        if _as_list(quality.get("downgrade_reason")):
+            downgraded += 1
         fact_type = str(quality.get("fact_type") or "unknown")
         fact_types[fact_type] = fact_types.get(fact_type, 0) + 1
         for reason in _as_list(quality.get("rejection_reason")):
             reason_text = str(reason or "").strip() or "unknown"
             reasons[reason_text] = reasons.get(reason_text, 0) + 1
+        for reason in _as_list(quality.get("downgrade_reason")):
+            reason_text = str(reason or "").strip() or "unknown"
+            downgrade_reasons[reason_text] = downgrade_reasons.get(reason_text, 0) + 1
     return {
         "candidate_fact_count": total,
         "eligible_fact_count": eligible,
@@ -801,7 +844,9 @@ def _public_filter_summary(candidates: Sequence[Dict[str, Any]]) -> Dict[str, An
         "fact_card_count": fact_cards,
         "filtered_fact_count": max(0, total - eligible),
         "invalid_metric_filtered_count": invalid_metric,
+        "downgraded_fact_count": downgraded,
         "rejection_reasons": reasons,
+        "downgrade_reasons": downgrade_reasons,
         "fact_type_distribution": fact_types,
     }
 

@@ -43,6 +43,7 @@ from .report_contracts import (
     resolve_section_source_refs,
     text_has_factual_claim,
 )
+from rag_pipeline.contracts.public_text_guard import public_text_quality
 
 
 AGENT_NAME = "final_writer_agent"
@@ -151,6 +152,7 @@ GLOBAL_BLOCK_TITLES = {
 PUBLIC_SUMMARY_BLOCKS = {
     "executive_summary",
     "key_judgments",
+    "key_data",
     "deal_snapshot",
     "investment_conclusion",
     "impact_judgment",
@@ -201,6 +203,13 @@ def _public_global_block_allowed(block_key: str, report_blueprint: Optional[Dict
         return _public_policy_summary_allowed(report_blueprint)
     if key in PUBLIC_SUMMARY_BLOCKS:
         return True
+    if key == "risk_triggers":
+        # Risk/counter-signal content is part of the title's promise for
+        # research reports; render_risk_package emits nothing when the risk
+        # package is empty, so allowing it never produces an empty shell.
+        # Skipping it (the old behavior) let FinalAudit flag "risk assessment
+        # missing" as fatal even when risk items existed.
+        return _env_flag("REPORT_PUBLIC_RISK_TRIGGERS_BLOCK", True)
     return False
 
 
@@ -228,7 +237,12 @@ def _dedupe_strings(values: Sequence[Any], *, limit: int = 200) -> List[str]:
 
 def _public_text(value: Any) -> str:
     text = rewrite_internal_gap_language(str(value or "").strip())
-    return "" if has_internal_gap_language(text) else text
+    if has_internal_gap_language(text):
+        return ""
+    guard = public_text_quality(text)
+    if guard.get("severity") == "reject":
+        return ""
+    return str(guard.get("cleaned") or text).strip()
 
 
 def _source_host(source: Dict[str, Any]) -> str:
@@ -869,33 +883,67 @@ def _final_source_aliases(source: Dict[str, Any]) -> set[str]:
 def _final_source_lookup(
     citation_manifest: Dict[str, Any],
     source_registry: Sequence[Dict[str, Any]],
+    *,
+    prefer_registry_refs: bool = False,
 ) -> Dict[str, Dict[str, Any]]:
+    """Resolve body citation tokens like [8] to their sources.
+
+    On the first finalize pass the body still carries manifest numbering, so
+    the manifest owns the public [N] keys. After that pass the body numbering
+    is defined by the renumbered registry returned from finalize; re-resolving
+    such a body against the stale manifest numbering silently shifts every
+    citation that follows a multi-ref section (the off-by-one source mismatch
+    flagged as fatal by FinalAudit). Re-entrant callers must therefore pass
+    prefer_registry_refs=True so the latest registry owns the [N] keys and the
+    manifest only fills gaps.
+    """
+
     lookup: Dict[str, Dict[str, Any]] = {}
     manifest_sources = [
         item for item in _as_list(_as_dict(citation_manifest).get("appendix_sources")) if isinstance(item, dict)
     ]
-    manifest_public_ref_owner: Dict[str, int] = {}
-    for source in manifest_sources:
-        public_ref = _normalize_citation_ref(source.get("ref"))
-        if not public_ref:
-            continue
-        lookup[public_ref] = source
-        manifest_public_ref_owner[public_ref] = id(source)
-    sources = [
-        *manifest_sources,
-        *[item for item in list(source_registry or []) if isinstance(item, dict)],
-    ]
-    for source in sources:
+    registry_sources = [item for item in list(source_registry or []) if isinstance(item, dict)]
+    public_ref_owner: Dict[str, int] = {}
+
+    def claim_public_refs(sources: Sequence[Dict[str, Any]], *, overwrite: bool) -> None:
+        for source in sources:
+            public_ref = _normalize_citation_ref(source.get("ref"))
+            if not public_ref:
+                continue
+            if overwrite or public_ref not in lookup:
+                lookup[public_ref] = source
+                public_ref_owner[public_ref] = id(source)
+
+    if prefer_registry_refs:
+        claim_public_refs(registry_sources, overwrite=True)
+        claim_public_refs(manifest_sources, overwrite=False)
+        alias_ordered_sources = [*registry_sources, *manifest_sources]
+    else:
+        claim_public_refs(manifest_sources, overwrite=True)
+        alias_ordered_sources = [*manifest_sources, *registry_sources]
+    for source in alias_ordered_sources:
         for alias in _final_source_aliases(source):
             normalized_alias = _normalize_citation_ref(alias)
             if (
-                normalized_alias in manifest_public_ref_owner
-                and manifest_public_ref_owner[normalized_alias] != id(source)
+                normalized_alias in public_ref_owner
+                and public_ref_owner[normalized_alias] != id(source)
             ):
                 continue
             lookup.setdefault(alias, source)
+    # Evidence refs (EV-xx) were assigned against manifest-era numbering, so
+    # resolve them through the manifest's own appendix sources regardless of
+    # which side owns the public [N] keys.
+    manifest_by_ref: Dict[str, Dict[str, Any]] = {}
+    for source in manifest_sources:
+        public_ref = _normalize_citation_ref(source.get("ref"))
+        if public_ref:
+            manifest_by_ref.setdefault(public_ref, source)
     for evidence_ref, citation_ref in _as_dict(_as_dict(citation_manifest).get("evidence_to_citation")).items():
-        source = lookup.get(str(citation_ref or "").strip()) or lookup.get(_normalize_citation_ref(citation_ref))
+        source = (
+            manifest_by_ref.get(_normalize_citation_ref(citation_ref))
+            or lookup.get(str(citation_ref or "").strip())
+            or lookup.get(_normalize_citation_ref(citation_ref))
+        )
         if source:
             lookup.setdefault(str(evidence_ref or "").strip(), source)
             lookup.setdefault(_normalize_citation_ref(evidence_ref), source)
@@ -1149,6 +1197,8 @@ def finalize_markdown_citations(
     body_markdown: str,
     citation_manifest: Dict[str, Any],
     source_registry: Sequence[Dict[str, Any]],
+    *,
+    prefer_registry_refs: bool = False,
 ) -> tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
     """Make final body citations and appendix sources an atomic pair.
 
@@ -1156,10 +1206,14 @@ def finalize_markdown_citations(
     body can still lose or gain numeric citation tokens. This step trusts the
     final body as the public surface, removes citations that cannot resolve to
     a traceable source, and renumbers the remaining body/appendix together.
+
+    This step is only idempotent when re-entrant callers pass
+    prefer_registry_refs=True: after the first pass the body numbering belongs
+    to the renumbered registry, not to the manifest.
     """
 
     original_body = str(body_markdown or "")
-    lookup = _final_source_lookup(citation_manifest, source_registry)
+    lookup = _final_source_lookup(citation_manifest, source_registry, prefer_registry_refs=prefer_registry_refs)
     old_refs = _body_citation_refs(original_body)
     old_to_new: Dict[str, str] = {}
     appendix_sources: List[Dict[str, Any]] = []
@@ -1266,7 +1320,15 @@ def _rewrite_final_markdown_with_reconciled_appendix(
     appendix_package: Dict[str, Any],
 ) -> tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
     body, _old_appendix = _split_rendered_source_appendix(markdown)
-    body, reconciled_sources, diagnostics = finalize_markdown_citations(body, citation_manifest, source_registry)
+    # The incoming body has already been finalized once, so its numbering is
+    # defined by source_registry (the previous reconciled appendix), not by the
+    # manifest-era numbering.
+    body, reconciled_sources, diagnostics = finalize_markdown_citations(
+        body,
+        citation_manifest,
+        source_registry,
+        prefer_registry_refs=True,
+    )
     parts = [body]
     if CITATION_RE.search(body) and reconciled_sources:
         rendered = _render_appendix_block(
@@ -1618,6 +1680,68 @@ def _narrow_single_company_overbroad_section(section: Dict[str, Any]) -> Dict[st
     return updated
 
 
+_RISK_SECTION_HINT_RE = re.compile(r"risk|counter", re.I)
+_RISK_SECTION_TEXT_RE = re.compile(r"风险|反向样本|反向信号|反证|推翻或削弱|触发条件")
+_SOURCE_ATTRIBUTION_SENTENCE_RE = re.compile(
+    r"[^。；;！？\n]*(?:《[^》\n]{2,80}》|研究指出|研究显示|报告指出|报告显示|指南指出|白皮书|案例集|数据显示|调查显示)[^。；;！？\n]*[。；;！？]?"
+)
+
+
+def _is_risk_or_counter_section(section: Dict[str, Any]) -> bool:
+    role_blob = " ".join(
+        str(section.get(key) or "")
+        for key in ("block_type", "analysis_role", "proof_role", "section_role", "evidence_role")
+    )
+    if _RISK_SECTION_HINT_RE.search(role_blob):
+        return True
+    text_blob = " ".join(str(section.get(key) or "") for key in ("section_title", "claim"))
+    return bool(_RISK_SECTION_TEXT_RE.search(text_blob))
+
+
+def _narrow_unreferenced_risk_section(section: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Keep a risk/counter section whose refs failed to resolve, as a directional caution.
+
+    Risk and counter-evidence claims systematically cite aggregator-style
+    industry reports, which the citation manifest filters as low quality. Hard
+    dropping these sections strips every risk discussion from the report and
+    breaks the title's promise (a FinalAudit fatal). Instead, strip the
+    source-attribution sentences (the unverifiable part) and keep the risk
+    reasoning itself as an uncited directional caution. Returns None when too
+    little text survives, in which case the caller falls back to dropping.
+    """
+
+    def strip_attribution(text: Any) -> str:
+        cleaned = _SOURCE_ATTRIBUTION_SENTENCE_RE.sub("", str(text or ""))
+        return re.sub(r"\s+", " ", cleaned).strip()
+
+    claim = strip_attribution(section.get("claim"))
+    if len(claim) < 30:
+        return None
+    updated = dict(section)
+    updated["claim"] = claim
+    updated["reasoning"] = strip_attribution(section.get("reasoning"))
+    updated["claim_strength"] = "directional"
+    updated["source_claim_demoted_from"] = "factual_section_without_resolved_ref"
+    updated["source_claim_gate_action"] = "demote_risk_unreferenced"
+    for key in ("evidence_refs", "used_fact_refs", "citation_refs", "supporting_facts", "evidence_basis"):
+        if key in updated:
+            updated[key] = []
+    render_blocks: List[Dict[str, Any]] = []
+    for block in _as_list(section.get("render_blocks")):
+        if not isinstance(block, dict):
+            continue
+        copied_block = dict(block)
+        if str(copied_block.get("type") or "paragraph").lower() == "paragraph":
+            block_text = strip_attribution(copied_block.get("text"))
+            if not block_text:
+                continue
+            copied_block["text"] = block_text
+        render_blocks.append(copied_block)
+    if render_blocks:
+        updated["render_blocks"] = render_blocks
+    return updated
+
+
 def _narrow_soft_source_claim_section(section: Dict[str, Any], reason: str) -> Dict[str, Any]:
     support_text = _supporting_fact_text(section)
     use_chinese = bool(re.search(r"[\u4e00-\u9fff]", support_text))
@@ -1720,6 +1844,7 @@ def _apply_source_claim_support_gate(
         "demoted_section_count": 0,
         "hard_dropped_section_count": 0,
         "soft_gate_rewritten_count": 0,
+        "risk_section_demoted_count": 0,
         "relaxed_section_examples": [],
     }
     has_section_refs = any(
@@ -1753,6 +1878,29 @@ def _apply_source_claim_support_gate(
             if not reason:
                 kept_sections.append(section)
                 continue
+            if (
+                reason == "factual_section_without_resolved_ref"
+                and diagnostics["source_gate_mode"] != "strict"
+                and _is_risk_or_counter_section(section)
+            ):
+                narrowed = _narrow_unreferenced_risk_section(section)
+                if narrowed is not None:
+                    kept_sections.append(narrowed)
+                    diagnostics["demoted_section_count"] += 1
+                    diagnostics["soft_gate_rewritten_count"] += 1
+                    diagnostics["risk_section_demoted_count"] += 1
+                    if len(diagnostics["relaxed_section_examples"]) < 8:
+                        diagnostics["relaxed_section_examples"].append(
+                            {
+                                "chapter_id": chapter.get("chapter_id"),
+                                "section_id": section.get("section_id"),
+                                "block_type": section.get("block_type"),
+                                "reason": reason,
+                                "action": "demoted_risk_unreferenced",
+                                "claim": str(section.get("claim") or "")[:220],
+                            }
+                        )
+                    continue
             if reason == "single_company_source_overbroad_claim":
                 kept_sections.append(_narrow_single_company_overbroad_section(section))
                 diagnostics["weak_source_strong_claim_demoted_count"] += 1
@@ -2137,7 +2285,7 @@ def _render_key_data_block(title: str, decision_package: Dict[str, Any], table_p
 
     def row_citation_suffix(row: Dict[str, Any]) -> str:
         refs: List[str] = []
-        for key in ("citation_refs", "source_refs"):
+        for key in ("citation_refs", "source_refs", "evidence_refs"):
             refs.extend(_as_list(row.get(key)))
         for key in ("source_ref", "citation_ref", "ref"):
             value = str(row.get(key) or "").strip()
@@ -2155,10 +2303,11 @@ def _render_key_data_block(title: str, decision_package: Dict[str, Any], table_p
         table = _as_dict(table)
         if not _table_passed_for_public(table):
             continue
+        table_suffix = row_citation_suffix(table)
         headers = _as_list(table.get("headers"))
         for row in _as_list(table.get("rows"))[:3]:
             row = _as_dict(row)
-            suffix = row_citation_suffix(row)
+            suffix = row_citation_suffix(row) or table_suffix
             if not suffix:
                 continue
             text = _key_data_bullet_from_table_row(headers, row)
@@ -2204,8 +2353,6 @@ def _render_global_block(
             return ""
         rendered_groups.add("summary")
         rendered = _rename_first_h2(render_executive_summary(decision_package, table_packages), title)
-        if re.search(r"(?m)^##\s*关键数据(?:\s|$)", rendered):
-            rendered_groups.add("key_data")
         return rendered
     if key == "key_data":
         if "key_data" in rendered_groups:

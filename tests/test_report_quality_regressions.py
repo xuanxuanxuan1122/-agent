@@ -2175,7 +2175,8 @@ def test_table_rows_use_source_ref_and_drop_blank_subject_rows():
     assert _row_has_valid_leading_cell(["\u5bf9\u8c61/\u573a\u666f", "\u5173\u952e\u4e8b\u5b9e"], row) is False
 
 
-def test_body_table_quality_count_uses_retained_rows_only():
+def test_body_table_quality_count_uses_retained_rows_only(monkeypatch):
+    monkeypatch.setenv("REPORT_ENABLE_TABLES", "true")
     packages = run_table_agent(
         chapter_evidence_packages=[
             {
@@ -2327,6 +2328,7 @@ def test_market_analytics_keeps_refs_and_excludes_extreme_cagr_rows():
 
 
 def test_market_analytics_table_packages_validate_after_field_normalization(monkeypatch):
+    monkeypatch.setenv("REPORT_ENABLE_TABLES", "true")
     monkeypatch.setenv("REPORT_MAX_BODY_TABLES_PER_CHAPTER", "2")
     monkeypatch.setenv("REPORT_MAX_BODY_TABLES", "6")
     analytics = run_market_analytics_agent(
@@ -2368,7 +2370,8 @@ def test_market_analytics_table_packages_validate_after_field_normalization(monk
     assert by_type["market_metric_table"]["rows"][0]["source"]
 
 
-def test_table_agent_emits_requirements_and_followups_when_metric_fields_missing():
+def test_table_agent_emits_requirements_and_followups_when_metric_fields_missing(monkeypatch):
+    monkeypatch.setenv("REPORT_ENABLE_TABLES", "true")
     packages = run_table_agent(
         chapter_evidence_packages=[
             {
@@ -2426,7 +2429,8 @@ def test_render_table_package_hides_internal_columns_and_uses_chinese_labels():
     assert "[1][2]" in markdown
 
 
-def test_per_chapter_table_budget_keeps_highest_value_table_only():
+def test_per_chapter_table_budget_keeps_highest_value_table_only(monkeypatch):
+    monkeypatch.setenv("REPORT_ENABLE_TABLES", "true")
     packages = run_table_agent(
         chapter_evidence_packages=[
             {
@@ -2826,6 +2830,39 @@ def test_full_report_blocker_summary_keeps_advisories_nonblocking():
         )
         == ""
     )
+
+
+def test_full_report_ignores_table_review_warnings_when_tables_disabled(monkeypatch):
+    monkeypatch.setenv("REPORT_ENABLE_TABLES", "false")
+    writer_report = {
+        "report_status": "final",
+        "qa_result": {
+            "passed": True,
+            "repair_required": False,
+            "blocking_followups": [],
+            "advisory_followups": [],
+        },
+    }
+
+    diagnostic = full_report.build_review_diagnostic(
+        writer_report=writer_report,
+        report_blueprint={"chapters": [{"chapter_title": "正常章节标题"}]},
+        package_quality_report={"warnings": [{"type": "table_validation_error"}]},
+        evidence_gap_summary={"status": "ok", "chapter_gaps": []},
+    )
+    blocker_summary = full_report.build_qa_blocker_summary(
+        writer_report=writer_report,
+        evidence_gap_summary={"status": "ok", "chapter_gaps": []},
+        review_diagnostic=diagnostic,
+        reformatter_result={"status": "skipped"},
+        writer_pending_repair_reasons=[],
+    )
+
+    assert diagnostic["checks"]["table_generation_disabled"] is True
+    assert diagnostic["checks"]["table_validation_warnings"] == 0
+    assert diagnostic["status"] == "passed"
+    assert blocker_summary["status"] == "passed"
+    assert "table_validation_warnings" not in blocker_summary["advisory_types"]
 
 
 def test_full_report_publish_gate_blocks_hard_qa_repair():

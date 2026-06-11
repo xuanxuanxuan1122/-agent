@@ -1,8 +1,15 @@
-from rag_pipeline.agents.writer_agent_clean import build_writer_report, _stage_quality_card, _table_quality_summary
+from rag_pipeline.agents.writer_agent_clean import (
+    build_writer_report,
+    _stage_quality_card,
+    _table_follow_up_queries,
+    _table_gap_summary,
+    _table_quality_summary,
+)
 from tests.helpers import sample_evidence_package, sample_structured_analysis
 
 
-def test_table_quality_summary_exposes_render_tiers_and_reject_reasons():
+def test_table_quality_summary_exposes_render_tiers_and_reject_reasons(monkeypatch):
+    monkeypatch.setenv("REPORT_ENABLE_TABLES", "true")
     summary = _table_quality_summary(
         [
             {"table_id": "body", "should_render": True, "table_value_tier": "high"},
@@ -18,7 +25,8 @@ def test_table_quality_summary_exposes_render_tiers_and_reject_reasons():
     assert summary["drop_count"] == 1
 
 
-def test_stage_quality_card_aggregates_binding_table_and_citation_signals():
+def test_stage_quality_card_aggregates_binding_table_and_citation_signals(monkeypatch):
+    monkeypatch.setenv("REPORT_ENABLE_TABLES", "true")
     table_summary = _table_quality_summary(
         [
             {"table_id": "body", "should_render": True, "table_value_tier": "high"},
@@ -90,6 +98,56 @@ def test_stage_quality_card_aggregates_binding_table_and_citation_signals():
     assert card["handoff"]["results"]["analysis_to_writer"]["summary"]["missing_fact_or_evidence_refs_count"] == 1
     assert "handoff_contract_failed" in card["top_blockers"]
     assert "citation_rebind_required" in card["top_blockers"]
+
+
+def test_disabled_tables_do_not_create_quality_blockers_or_followups(monkeypatch):
+    monkeypatch.setenv("REPORT_ENABLE_TABLES", "false")
+    table_packages = [
+        {
+            "table_id": "t_missing",
+            "chapter_id": "ch_01",
+            "should_render": False,
+            "reject_reasons": ["body_rows_lt_2"],
+            "table_evidence_requirements": [
+                {
+                    "table_id": "t_missing",
+                    "chapter_id": "ch_01",
+                    "missing_fields": ["unit"],
+                    "query": "find market size unit",
+                }
+            ],
+            "table_follow_up_queries": [
+                {
+                    "table_id": "t_missing",
+                    "chapter_id": "ch_01",
+                    "query": "find market size unit",
+                }
+            ],
+        }
+    ]
+
+    table_summary = _table_quality_summary(table_packages)
+    gap_summary = _table_gap_summary(table_packages)
+    card = _stage_quality_card(
+        chapter_evidence_packages=[],
+        table_quality_summary=table_summary,
+        table_gap_summary=gap_summary,
+        analysis_stage_diagnostics={},
+        final_citation_audit={},
+    )
+
+    assert table_summary["enabled"] is False
+    assert table_summary["status"] == "disabled_by_config"
+    assert table_summary["candidate_count"] == 0
+    assert table_summary["raw_candidate_count"] == 1
+    assert gap_summary["enabled"] is False
+    assert gap_summary["table_follow_up_count"] == 0
+    assert _table_follow_up_queries(table_packages) == []
+    assert card["table"]["enabled"] is False
+    assert card["table"]["drop_count"] == 0
+    assert card["table"]["table_follow_up_count"] == 0
+    assert "table_drop" not in card["top_blockers"]
+    assert "table_metric_fields_missing" not in card["top_blockers"]
 
 
 def test_writer_report_exposes_stage_quality_card_in_all_debug_surfaces():

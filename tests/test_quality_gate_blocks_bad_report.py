@@ -92,6 +92,66 @@ def test_balanced_delivery_gate_keeps_directional_draft(monkeypatch):
     assert blockers == []
 
 
+def test_isolated_quality_gate_turns_delivery_blockers_into_diagnostics(monkeypatch):
+    monkeypatch.setenv("REPORT_QUALITY_GATE_MODE", "isolated")
+    blockers = _hard_delivery_blockers(
+        markdown="draft still mentions insufficient_ab_sources and internal gap markers",
+        qa_result={
+            "passed": False,
+            "errors": [{"type": "report_markdown_empty"}],
+            "render_gate": {"blockers": [{"type": "render_failed"}]},
+        },
+        package_quality_report={"blocking_errors": [{"package": "chapter_packages", "type": "sections_empty"}]},
+        coverage_matrix=[
+            {
+                "decision_ready": False,
+                "claim_status": "directional",
+                "blocking_gaps": ["metric_evidence_missing"],
+                "evidence_refs": ["EV-1"],
+            }
+        ],
+        delivery_gate={
+            "tier": "diagnostic_only",
+            "diagnostic_only": True,
+            "blocking_reasons": [{"type": "evidence_health_summary_inconsistent"}],
+        },
+    )
+
+    assert blockers == []
+
+
+def test_isolated_quality_gate_can_collect_observed_delivery_diagnostics(monkeypatch):
+    monkeypatch.setenv("REPORT_QUALITY_GATE_MODE", "isolated")
+    diagnostics = _hard_delivery_blockers(
+        markdown="draft still mentions insufficient_ab_sources and internal gap markers",
+        qa_result={
+            "passed": False,
+            "errors": [{"type": "report_markdown_empty"}],
+            "render_gate": {"blockers": [{"type": "render_failed"}]},
+        },
+        package_quality_report={"blocking_errors": [{"package": "chapter_packages", "type": "sections_empty"}]},
+        coverage_matrix=[
+            {
+                "decision_ready": False,
+                "claim_status": "directional",
+                "blocking_gaps": ["metric_evidence_missing"],
+                "evidence_refs": ["EV-1"],
+            }
+        ],
+        delivery_gate={
+            "tier": "diagnostic_only",
+            "diagnostic_only": True,
+            "blocking_reasons": [{"type": "evidence_health_summary_inconsistent"}],
+        },
+        enforce_quality_gate=False,
+    )
+
+    diagnostic_types = {item["type"] for item in diagnostics}
+    assert "diagnostic_only" in diagnostic_types
+    assert "pipeline_empty_package" in diagnostic_types
+    assert "render_failed" in diagnostic_types
+
+
 def test_strict_delivery_gate_blocks_proof_and_qa_failures(monkeypatch):
     monkeypatch.setenv("REPORT_DELIVERY_GATE_MODE", "strict")
     qa_result = {

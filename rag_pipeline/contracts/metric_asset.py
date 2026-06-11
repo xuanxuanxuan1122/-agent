@@ -5,11 +5,28 @@ import json
 import re
 from typing import Any, Dict, Iterable, List, Sequence
 
+from rag_pipeline.contracts.public_text_guard import public_text_quality
 from rag_pipeline.runtime_cache import json_safe_default
 
 
 METRIC_ASSET_VERSION = "metric_asset_v1"
 _PERCENT_RE = re.compile(r"\d+(?:\.\d+)?\s*%")
+_VALUE_RE = re.compile(
+    r"^\s*(?:约|超过|达到|大于|小于|不少于|不低于)?\s*"
+    r"\d+(?:\.\d+)?\s*(?:[-~至]\s*\d+(?:\.\d+)?\s*)?"
+    r"(?:%|pct|个百分点|亿美元|亿元|万亿元|美元|元|个|家|人|次|项|项目|平方米|万平方米|亿平方米|GB|TB|tokens?|CAGR)?\s*$",
+    re.I,
+)
+_UNIT_RE = re.compile(
+    r"^(?:%|pct|百分点|亿美元|亿元|万亿元|美元|元|个|家|人|次|项|项目|平方米|万平方米|亿平方米|CAGR|GB|TB|token|tokens)$",
+    re.I,
+)
+_PERIOD_RE = re.compile(
+    r"^(?:截至)?\s*\d{4}\s*(?:年)?(?:\s*(?:Q[1-4]|第[一二三四1234]季度|上半年|下半年))?"
+    r"(?:\s*[-至到]\s*(?:\d{4}\s*(?:年)?(?:\s*(?:Q[1-4]|第[一二三四1234]季度|上半年|下半年))?))?\s*$",
+    re.I,
+)
+_PUBLISHED_AT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", re.I)
 
 
 def _as_dict(value: Any) -> Dict[str, Any]:
@@ -75,8 +92,22 @@ def _unit_from_value(value: str) -> str:
 
 def _metric_candidate(card: Dict[str, Any]) -> bool:
     proof_role = _text(card.get("proof_role") or card.get("analysis_role")).lower()
+    explicit_non_metric_roles = {
+        "source_check",
+        "official_data",
+        "filing",
+        "case",
+        "counter",
+        "risk",
+        "technology_product",
+        "boundary",
+        "context",
+        "support",
+    }
+    if proof_role in explicit_non_metric_roles and not _as_list(card.get("metric_missing_fields")):
+        return False
     return bool(
-        proof_role == "metric"
+        proof_role in {"metric", "market_data", "quantitative", "quant_metric"}
         or card.get("metric")
         or card.get("indicator")
         or card.get("value")
@@ -95,6 +126,63 @@ def _missing_fields(asset: Dict[str, Any]) -> List[str]:
 
 def metric_is_complete(metric_asset: Dict[str, Any]) -> bool:
     return not _missing_fields(_as_dict(metric_asset))
+
+
+def _hard_public_reject(text: str) -> bool:
+    guard = public_text_quality(text)
+    reasons = set(_as_list(guard.get("reasons")))
+    return bool(guard.get("severity") == "reject" and reasons - {"too_short_after_cleaning"})
+
+
+def _valid_metric_value(value: str) -> bool:
+    text = _text(value)
+    if not text or len(text) > 60:
+        return False
+    if _hard_public_reject(text):
+        return False
+    if not re.search(r"\d", text):
+        return False
+    return bool(_VALUE_RE.match(text))
+
+
+def _valid_metric_unit(unit: str, value: str = "") -> bool:
+    text = _text(unit)
+    if not text:
+        return bool(_unit_from_value(value))
+    if len(text) > 24:
+        return False
+    if _hard_public_reject(text):
+        return False
+    return bool(_UNIT_RE.match(text))
+
+
+def _valid_metric_period(period: str) -> tuple[bool, str]:
+    text = _text(period)
+    if not text:
+        return False, "missing_period"
+    if _PUBLISHED_AT_RE.match(text):
+        return False, "published_at_as_period"
+    if len(text) > 40:
+        return False, "invalid_period"
+    if _hard_public_reject(text):
+        return False, "dirty_period"
+    return bool(_PERIOD_RE.match(text)), "invalid_period"
+
+
+def _semantic_reject_reasons(asset: Dict[str, Any]) -> List[str]:
+    reasons: List[str] = []
+    if not _valid_metric_value(_text(asset.get("value"))):
+        reasons.append("invalid_value")
+    if not _valid_metric_unit(_text(asset.get("unit")), _text(asset.get("value"))):
+        reasons.append("invalid_unit")
+    period_ok, period_reason = _valid_metric_period(_text(asset.get("period")))
+    if not period_ok:
+        reasons.append(period_reason)
+    combined = " ".join(_text(asset.get(key)) for key in ("metric", "value", "unit", "period", "scope"))
+    guard = public_text_quality(combined)
+    if guard.get("severity") == "reject":
+        reasons.extend(f"dirty_{reason}" for reason in _as_list(guard.get("reasons")))
+    return _dedupe(reasons)
 
 
 def _table_allowed(asset: Dict[str, Any]) -> bool:
@@ -151,7 +239,11 @@ def build_metric_assets(
         asset["metric_id"] = _metric_id(asset)
         asset["missing_fields"] = _dedupe([*_as_list(card.get("metric_missing_fields")), *_missing_fields(asset)])
         asset["complete"] = not asset["missing_fields"]
-        asset["table_ready"] = bool(asset["complete"] and _table_allowed(asset))
+        asset["syntactic_complete"] = bool(asset["complete"])
+        semantic_reject_reasons = _semantic_reject_reasons(asset) if asset["complete"] else []
+        asset["semantic_complete"] = bool(asset["complete"] and not semantic_reject_reasons)
+        asset["reject_reasons"] = semantic_reject_reasons
+        asset["table_ready"] = bool(asset["semantic_complete"] and _table_allowed(asset))
         if asset["metric_id"] in seen:
             continue
         seen.add(asset["metric_id"])

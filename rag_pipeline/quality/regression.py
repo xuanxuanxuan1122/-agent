@@ -10,7 +10,7 @@ from rag_pipeline.contracts.evidence_admission import summarize_evidence_admissi
 from rag_pipeline.quality.conversion_summary import build_quality_conversion_summary
 
 
-CLOSED_GAP_STATUSES = {"closed", "resolved", "repaired", "evidence_found", "cache_satisfied"}
+CLOSED_GAP_STATUSES = {"closed", "resolved", "repaired", "sufficiency_passed", "claim_bound", "section_rewritten", "citation_resolved", "metric_table_ready"}
 STRICT_CLOSED_GAP_STATUSES = {
     "closed",
     "resolved",

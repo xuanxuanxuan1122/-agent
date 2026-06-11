@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import threading
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple, TypedDict
 
@@ -19,6 +20,8 @@ try:
     )
     from rag_pipeline.contracts.research_reflection import build_research_reflection_memo
     from rag_pipeline.contracts.evidence_quality import classify_evidence
+    from rag_pipeline.contracts.json_salvage import salvage_chapter_json
+    from rag_pipeline.contracts.quality_gate_policy import quality_gate_mode, quality_gates_isolated
     from rag_pipeline.contracts.ref_normalizer import normalize_claim_refs
     from rag_pipeline.search.memory import call_openai_compatible_json, llm_config_is_ready, normalize_llm_config
     from .evidence_merger import get_dynamic_dimensions
@@ -36,6 +39,18 @@ except Exception:  # pragma: no cover - script mode fallback
         from rag_pipeline.contracts.evidence_quality import classify_evidence  # type: ignore
     except Exception:  # pragma: no cover
         classify_evidence = None  # type: ignore
+    try:
+        from rag_pipeline.contracts.json_salvage import salvage_chapter_json  # type: ignore
+    except Exception:  # pragma: no cover
+        salvage_chapter_json = None  # type: ignore
+    try:
+        from rag_pipeline.contracts.quality_gate_policy import quality_gate_mode, quality_gates_isolated  # type: ignore
+    except Exception:  # pragma: no cover
+        def quality_gate_mode(default: str = "blocking") -> str:  # type: ignore
+            return default
+
+        def quality_gates_isolated(default: bool = False) -> bool:  # type: ignore
+            return default
     try:
         from rag_pipeline.contracts.evidence_support_validation import (  # type: ignore
             incomplete_metric_cards_for_numeric_claim,
@@ -92,6 +107,13 @@ PUBLIC_ANALYSIS_TEXT_KEYS = {
 }
 PUBLIC_ANALYSIS_FORBIDDEN_PATTERNS = [
     r"\bevidence_cards?\b",
+    r"\bsemantic\s+judge\b",
+    r"\bmetric\s+fields\s+incomplete\b",
+    r"\bnot_allowed_until_repaired\b",
+    r"\bcurrency_(?:usd|cny)\b",
+    r"\bsource_check\s*(?:=|:|\u4e3a)\b",
+    r"\bhttp_status\s*(?:=|:|\u4e3a)\b",
+    r"\bresponse_code\s*(?:=|:|\u4e3a)\b",
     r"(?<![A-Za-z0-9_])EV-\d+(?:-[A-Za-z0-9]+)?",
     r"(?<![A-Za-z0-9_])ch_\d{1,3}(?![A-Za-z0-9_])",
     r"第\s*\d+\s*轮",
@@ -809,6 +831,34 @@ def _select_analysis_items_for_dimension(items: Sequence[Dict[str, Any]], *, max
             added += 1
 
     item_list = [item for item in list(items or []) if isinstance(item, dict)]
+    diversity_limit = 1 if max_items <= 8 else 3
+    add(
+        [
+            item
+            for item in item_list
+            if str(item.get("proof_role") or "").strip().lower() in {"source_check", "filing", "official_data"}
+        ],
+        diversity_limit,
+    )
+    add(
+        [
+            item
+            for item in item_list
+            if str(item.get("proof_role") or "").strip().lower() == "counter"
+            or bool(item.get("counter_evidence"))
+            or re.search(r"(counter|risk|failure|downside|鍙嶈瘉|椋庨櫓|澶辫触|涓嬫粦|鍙栨秷)", _fact_text(item), re.I)
+        ],
+        diversity_limit,
+    )
+    add(
+        [
+            item
+            for item in item_list
+            if str(item.get("proof_role") or "").strip().lower() in {"case", "boundary"}
+            or str(item.get("source_family") or "").strip().lower() == "company/case"
+        ],
+        diversity_limit,
+    )
     add(
         [
             item
@@ -2513,6 +2563,22 @@ def synthesize_chapter_with_llm_analysis(
         raise RuntimeError("LLM analysis dependencies are unavailable.")
     config = dict(llm_config or {})
     config["timeout"] = float(os.getenv("BRAIN_LLM_ANALYSIS_TIMEOUT_SECONDS", config.get("timeout") or 120) or 120)
+    try:
+        analysis_max_tokens = int(os.getenv("BRAIN_LLM_ANALYSIS_MAX_OUTPUT_TOKENS", "8192") or 8192)
+    except ValueError:
+        analysis_max_tokens = 8192
+    try:
+        configured_max_tokens = int(config.get("max_output_tokens") or 0)
+    except (TypeError, ValueError):
+        configured_max_tokens = 0
+    config["max_output_tokens"] = max(configured_max_tokens, analysis_max_tokens)
+    if "disable_thinking" not in config:
+        config["disable_thinking"] = str(os.getenv("BRAIN_LLM_ANALYSIS_DISABLE_THINKING", "true")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
     chapter_id = str(chapter_payload.get("chapter_id") or "chapter")
     user_payload = {
         "query": _compact(evidence_package.get("query"), 180),
@@ -2597,6 +2663,42 @@ def _is_transient_llm_error(exc: Exception) -> bool:
     return any(marker in text for marker in transient_markers)
 
 
+def _raw_json_from_exception(exc: Exception) -> str:
+    diagnostic = getattr(exc, "diagnostic", None)
+    if isinstance(diagnostic, dict):
+        raw = str(diagnostic.get("raw_content") or "").strip()
+        if raw:
+            return raw
+        error = str(diagnostic.get("error") or "")
+        marker = "LLM response is not valid JSON:"
+        if marker in error:
+            return error.split(marker, 1)[1].strip()
+    text = str(exc or "")
+    marker = "LLM response is not valid JSON:"
+    return text.split(marker, 1)[1].strip() if marker in text else ""
+
+
+def _salvage_llm_chapter_payload(exc: Exception, chapter_payload: Dict[str, Any]) -> Dict[str, Any]:
+    if salvage_chapter_json is None:
+        return {}
+    raw = _raw_json_from_exception(exc)
+    if not raw:
+        return {}
+    payload = salvage_chapter_json(
+        raw,
+        chapter_id=str(chapter_payload.get("chapter_id") or "chapter"),
+        chapter_title=str(chapter_payload.get("chapter_title") or ""),
+    )
+    if not isinstance(payload, dict) or not payload:
+        return {}
+    payload["_llm_json_salvaged"] = True
+    payload["_llm_json_salvage_raw_chars"] = len(raw)
+    payload["_llm_cache_hit"] = False
+    payload["_llm_cache_path"] = ""
+    payload.setdefault("_llm_usage", {})
+    return payload
+
+
 def synthesize_with_llm_analysis_v2(
     *,
     evidence_package: Dict[str, Any],
@@ -2618,25 +2720,58 @@ def synthesize_with_llm_analysis_v2(
     cache_hits = 0
     failed = 0
     retry_total = 0
+    json_salvage_attempted = 0
+    json_salvage_success = 0
     max_retries = _env_int("BRAIN_LLM_ANALYSIS_MAX_RETRIES", 2, min_value=0, max_value=5)
     retry_base_seconds = float(os.getenv("BRAIN_LLM_ANALYSIS_RETRY_BASE_SECONDS", "0.5") or 0.5)
+
+    deadline_min_remaining = float(os.getenv("BRAIN_LLM_ANALYSIS_DEADLINE_MIN_SECONDS", "30") or 30)
 
     def worker(chapter_payload: Dict[str, Any]) -> Dict[str, Any]:
         last_error = ""
         for attempt in range(max_retries + 1):
+            if _analysis_deadline_reached(min_remaining=deadline_min_remaining):
+                return {
+                    "chapter_id": chapter_payload.get("chapter_id"),
+                    "payload": {},
+                    "error": "skipped_deadline: report deadline left no budget for this chapter analysis call",
+                    "attempts": attempt,
+                    "skipped_deadline": True,
+                }
+            attempt_config = {**config, "timeout": _deadline_capped_timeout(config["timeout"])}
             try:
                 return {
                     "chapter_id": chapter_payload.get("chapter_id"),
                     "payload": synthesize_chapter_with_llm_analysis(
                         evidence_package=evidence_package,
                         chapter_payload=chapter_payload,
-                        llm_config=config,
+                        llm_config=attempt_config,
                     ),
                     "error": "",
                     "attempts": attempt + 1,
                 }
             except Exception as exc:
                 last_error = str(exc)
+                if not _is_transient_llm_error(exc):
+                    salvaged = _salvage_llm_chapter_payload(exc, chapter_payload)
+                    if salvaged:
+                        return {
+                            "chapter_id": chapter_payload.get("chapter_id"),
+                            "payload": salvaged,
+                            "error": "",
+                            "attempts": attempt + 1,
+                            "json_salvage_attempted": True,
+                            "json_salvage_success": True,
+                        }
+                    if _raw_json_from_exception(exc):
+                        return {
+                            "chapter_id": chapter_payload.get("chapter_id"),
+                            "payload": {},
+                            "error": last_error,
+                            "attempts": attempt + 1,
+                            "json_salvage_attempted": True,
+                            "json_salvage_success": False,
+                        }
                 if attempt < max_retries and _is_transient_llm_error(exc):
                     time.sleep(retry_base_seconds * (2 ** attempt))
                     continue
@@ -2648,16 +2783,26 @@ def synthesize_with_llm_analysis_v2(
                 }
         return {"chapter_id": chapter_payload.get("chapter_id"), "payload": {}, "error": last_error, "attempts": max_retries + 1}
 
+    deadline_skipped = 0
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         future_map = {executor.submit(worker, chapter): chapter for chapter in chapters}
         for future in as_completed(future_map):
             result = future.result()
             retry_total += max(0, int(result.get("attempts") or 1) - 1)
+            json_salvage_attempted += int(bool(result.get("json_salvage_attempted")))
+            json_salvage_success += int(bool(result.get("json_salvage_success")))
             payload = _as_dict(result.get("payload"))
             error = str(result.get("error") or "")
             if error:
                 failed += 1
-                chapter_results.append({"chapter_id": result.get("chapter_id"), "status": "error", "error": error})
+                deadline_skipped += int(bool(result.get("skipped_deadline")))
+                chapter_results.append(
+                    {
+                        "chapter_id": result.get("chapter_id"),
+                        "status": "skipped_deadline" if result.get("skipped_deadline") else "error",
+                        "error": error,
+                    }
+                )
                 continue
             if payload.get("_llm_cache_hit"):
                 cache_hits += 1
@@ -2671,7 +2816,11 @@ def synthesize_with_llm_analysis_v2(
             chapter_results.append(
                 {
                     "chapter_id": result.get("chapter_id"),
-                    "status": "cached" if payload.get("_llm_cache_hit") else "called",
+                    "status": (
+                        "json_salvaged"
+                        if payload.get("_llm_json_salvaged")
+                        else ("cached" if payload.get("_llm_cache_hit") else "called")
+                    ),
                     "claim_count": sum(len(_as_list(ch.get("claim_units"))) for ch in _as_list(payload.get("chapter_synthesis")) if isinstance(ch, dict)),
                     "cache_path": payload.get("_llm_cache_path"),
                 }
@@ -2690,6 +2839,9 @@ def synthesize_with_llm_analysis_v2(
         "_llm_failed_chapter_count": failed,
         "_llm_submitted_chapter_count": len(chapters),
         "_llm_retry_count": retry_total,
+        "_llm_deadline_skipped_chapter_count": deadline_skipped,
+        "_llm_json_salvage_attempted_count": json_salvage_attempted,
+        "_llm_json_salvage_success_count": json_salvage_success,
     }
 
 
@@ -2748,15 +2900,23 @@ NON_DROPPING_CLAIM_ISSUES = {
     "claim_support_anchor_mismatch_downgraded",
     "decision_claim_downgraded_no_valid_ref",
     "llm_claim_semantic_judge_partial_downgraded",
+    "llm_claim_semantic_judge_partial_observed",
     "llm_claim_semantic_judge_adjacent_downgraded",
+    "llm_claim_semantic_judge_adjacent_observed",
     "llm_claim_semantic_judge_error",
     "llm_claim_semantic_judge_unsupported",
+    "llm_claim_semantic_judge_unsupported_observed",
     "llm_numeric_claim_incomplete_metric_fact",
+    "llm_numeric_claim_incomplete_metric_fact_observed",
+    "claim_support_needs_repair_observed",
+    "claim_support_anchor_mismatch_observed",
 }
 
 REPAIRABLE_CLAIM_ISSUES = {
     "claim_support_needs_repair",
+    "claim_support_needs_repair_observed",
     "llm_claim_semantic_judge_unsupported",
+    "llm_claim_semantic_judge_unsupported_observed",
 }
 
 
@@ -2945,6 +3105,44 @@ def _semantic_judge_accepts(result: Dict[str, Any]) -> bool:
     return status == "supported"
 
 
+# Wall-clock deadline shared by the chapter-analysis workers and the semantic
+# judge. The brain owns the report deadline; analysis must stop submitting new
+# LLM work when the remaining budget cannot fit another call, otherwise the
+# timeout is only discovered after run_analysis_agent returns and the whole
+# main writer path is lost to fail-open.
+_ANALYSIS_DEADLINE_TS: Optional[float] = None
+_SEMANTIC_JUDGE_CALL_COUNT: int = 0
+_SEMANTIC_JUDGE_COUNT_LOCK = threading.Lock()
+
+
+def _set_analysis_deadline(deadline_ts: Optional[float]) -> None:
+    global _ANALYSIS_DEADLINE_TS, _SEMANTIC_JUDGE_CALL_COUNT
+    try:
+        value = float(deadline_ts or 0.0)
+    except (TypeError, ValueError):
+        value = 0.0
+    _ANALYSIS_DEADLINE_TS = value if value > 0 else None
+    _SEMANTIC_JUDGE_CALL_COUNT = 0
+
+
+def _analysis_deadline_remaining() -> float:
+    if not _ANALYSIS_DEADLINE_TS:
+        return float("inf")
+    return _ANALYSIS_DEADLINE_TS - time.perf_counter()
+
+
+def _analysis_deadline_reached(min_remaining: float = 0.0) -> bool:
+    remaining = _analysis_deadline_remaining()
+    return remaining != float("inf") and remaining <= float(min_remaining or 0.0)
+
+
+def _deadline_capped_timeout(configured_timeout: float, *, floor: float = 10.0) -> float:
+    remaining = _analysis_deadline_remaining()
+    if remaining == float("inf"):
+        return configured_timeout
+    return max(floor, min(configured_timeout, remaining - 5.0))
+
+
 def _semantic_judge_enabled(llm_config: Optional[Dict[str, Any]]) -> bool:
     return bool(llm_config) and _env_flag("BRAIN_ENABLE_LLM_SEMANTIC_JUDGE", True)
 
@@ -3066,6 +3264,15 @@ def _llm_semantic_claim_support_judge(
         result["cache_hit"] = True
         result["cache_path"] = str(cache_path)
         return result
+    if _analysis_deadline_reached(min_remaining=float(os.getenv("BRAIN_SEMANTIC_JUDGE_DEADLINE_MIN_SECONDS", "20") or 20)):
+        return {"status": "skipped_deadline"}
+    max_calls = _env_int("BRAIN_SEMANTIC_JUDGE_MAX_CALLS", 0, min_value=0, max_value=10_000)
+    global _SEMANTIC_JUDGE_CALL_COUNT
+    with _SEMANTIC_JUDGE_COUNT_LOCK:
+        if max_calls and _SEMANTIC_JUDGE_CALL_COUNT >= max_calls:
+            return {"status": "skipped_budget"}
+        _SEMANTIC_JUDGE_CALL_COUNT += 1
+    config["timeout"] = _deadline_capped_timeout(config["timeout"])
     try:
         response = call_openai_compatible_json(
             config=config,
@@ -3105,6 +3312,75 @@ def _llm_semantic_claim_support_judge(
     return output
 
 
+def _prewarm_semantic_judge_cache(
+    chapter_iterable: Sequence[Any],
+    *,
+    card_by_ref: Dict[str, Dict[str, Any]],
+    valid_refs: set,
+    evidence_alias_map: Dict[str, Any],
+    input_cards: Sequence[Dict[str, Any]],
+    llm_config: Optional[Dict[str, Any]],
+) -> None:
+    """Run semantic judge calls concurrently before the sequential validation loop.
+
+    The judge result cache is keyed on (claim, cited cards), so warming it here
+    turns the per-claim judge calls inside the validation loop into cache hits.
+    Failures are ignored: the loop will simply call the judge itself.
+    """
+
+    if not _semantic_judge_enabled(llm_config):
+        return
+    concurrency = _env_int("BRAIN_SEMANTIC_JUDGE_CONCURRENCY", 4, min_value=1, max_value=8)
+    if concurrency <= 1:
+        return
+    jobs: List[Tuple[str, List[Dict[str, Any]], Any, Any]] = []
+    for raw_chapter in chapter_iterable:
+        if not isinstance(raw_chapter, dict):
+            continue
+        for unit in _as_list(raw_chapter.get("claim_units")):
+            if not isinstance(unit, dict):
+                continue
+            claim_text = _compact(unit.get("claim"), 360)
+            if not claim_text:
+                continue
+            raw_refs = [str(ref or "").strip() for ref in _as_list(unit.get("used_evidence_ids")) if str(ref or "").strip()]
+            if not raw_refs:
+                continue
+            if normalize_claim_refs is not None:
+                normalized_refs = normalize_claim_refs(
+                    {**unit, "used_evidence_ids": raw_refs},
+                    alias_map=evidence_alias_map,
+                    fact_cards=input_cards,
+                )
+                refs = [str(ref or "").strip() for ref in _as_list(normalized_refs.get("fact_ids")) if str(ref or "").strip()]
+            else:
+                refs = raw_refs
+            refs = [ref for ref in refs if not valid_refs or ref in valid_refs]
+            cited_cards = [_as_dict(card_by_ref.get(ref)) for ref in refs if _as_dict(card_by_ref.get(ref))]
+            if not cited_cards:
+                continue
+            jobs.append((claim_text, cited_cards, raw_chapter.get("chapter_id"), unit.get("claim_id")))
+    if not jobs:
+        return
+
+    def prewarm(job: Tuple[str, List[Dict[str, Any]], Any, Any]) -> None:
+        claim_text, cited_cards, chapter_id, claim_id = job
+        try:
+            _llm_semantic_claim_support_judge(
+                claim_text=claim_text,
+                cited_cards=cited_cards,
+                chapter_id=chapter_id,
+                claim_id=claim_id,
+                llm_config=llm_config,
+            )
+        except Exception:
+            return
+
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        for future in as_completed({executor.submit(prewarm, job) for job in jobs}):
+            future.result()
+
+
 def validate_llm_analysis_output(
     payload: Dict[str, Any],
     evidence_package: Dict[str, Any],
@@ -3140,6 +3416,7 @@ def validate_llm_analysis_output(
     claim_repair_priorities: List[Dict[str, Any]] = []
     semantic_judge_counts: Dict[str, int] = {}
     semantic_judge_usage: Dict[str, Any] = {}
+    review_isolated = quality_gates_isolated()
     if not valid_refs:
         issue_counts = {"no_valid_input_evidence_refs": 1}
         return {
@@ -3185,6 +3462,14 @@ def validate_llm_analysis_output(
         len(_as_list(_as_dict(item).get("claim_units")))
         for item in chapter_iterable
         if isinstance(item, dict)
+    )
+    _prewarm_semantic_judge_cache(
+        chapter_iterable,
+        card_by_ref=card_by_ref,
+        valid_refs=valid_refs,
+        evidence_alias_map=evidence_alias_map,
+        input_cards=input_cards,
+        llm_config=llm_config,
     )
     for raw_chapter in chapter_iterable:
         if not isinstance(raw_chapter, dict):
@@ -3356,9 +3641,10 @@ def validate_llm_analysis_output(
                 unit["missing_binding_reason"] = unit.get("missing_binding_reason") or "decision_ready claim lacked valid evidence refs"
                 issues.append({"type": "decision_claim_downgraded_no_valid_ref", "chapter_id": chapter.get("chapter_id")})
             cited_cards = [_as_dict(card_by_ref.get(ref)) for ref in refs if _as_dict(card_by_ref.get(ref))]
+            anchor_mismatch_pending: Optional[Dict[str, Any]] = None
             if validate_claim_supported_by_facts is None:
                 issue = {
-                    "type": "claim_support_validator_unavailable",
+                    "type": "claim_support_validator_unavailable_observed" if review_isolated else "claim_support_validator_unavailable",
                     "chapter_id": chapter.get("chapter_id"),
                     "claim_id": unit.get("claim_id"),
                     "evidence_refs": refs,
@@ -3367,7 +3653,9 @@ def validate_llm_analysis_output(
                 issues.append(issue)
                 if len(rejected_examples) < 5:
                     rejected_examples.append({**issue, "claim": claim_text})
-                continue
+                if not review_isolated:
+                    continue
+                unit["claim_support_status"] = "validator_unavailable_observed"
             else:
                 support_result = validate_claim_supported_by_facts(claim_text, cited_cards)
                 if not getattr(support_result, "supported", False):
@@ -3382,26 +3670,24 @@ def validate_llm_analysis_output(
                     )
                     gap_type = str(repair_priority.get("gap_type") or "")
                     if gap_type == "claim_support_anchor_mismatch":
-                        issue = {
-                            "type": "claim_support_anchor_mismatch_downgraded",
+                        # Lexical n-gram anchors systematically miss paraphrased
+                        # LLM claims (live run: 19/19 usable claims downgraded
+                        # this way), so defer the verdict to the semantic judge
+                        # below: it confirms direct support, downgrades, or
+                        # rejects. Only when the judge cannot run do we fall
+                        # back to the conservative directional downgrade.
+                        anchor_mismatch_pending = {
                             "chapter_id": chapter.get("chapter_id"),
                             "claim_id": unit.get("claim_id"),
                             "evidence_refs": refs,
                             "gap_type": gap_type,
-                            "downgraded_to": "directional",
                             **support_payload,
                         }
-                        issues.append(issue)
-                        _downgrade_claim_unit_to_directional(
-                            unit,
-                            status="anchor_mismatch_downgraded",
-                            boundary_note="claim support is adjacent rather than direct; use only as a directional signal until stronger evidence is repaired",
-                        )
                         unit["support_gap_type"] = gap_type
                         unit["support_unsupported_terms"] = _as_list(support_payload.get("unsupported_terms"))
                     else:
                         issue = {
-                            "type": "claim_support_needs_repair",
+                            "type": "claim_support_needs_repair_observed" if review_isolated else "claim_support_needs_repair",
                             "chapter_id": chapter.get("chapter_id"),
                             "claim_id": unit.get("claim_id"),
                             "evidence_refs": refs,
@@ -3421,7 +3707,11 @@ def validate_llm_analysis_output(
                                     "evidence_use_level": "diagnostic_only",
                                 }
                             )
-                        continue
+                        if review_isolated:
+                            unit["claim_support_status"] = "needs_repair_observed"
+                            unit["claim_support_repair_hint"] = repair_priority
+                        else:
+                            continue
                 else:
                     unit["claim_support_status"] = support_result.status
             semantic_judge = _llm_semantic_claim_support_judge(
@@ -3442,10 +3732,39 @@ def validate_llm_analysis_output(
                     if isinstance(value, (int, float)):
                         semantic_judge_usage[key] = semantic_judge_usage.get(key, 0) + value
             unit["semantic_judge_status"] = semantic_status
+
+            def _apply_pending_anchor_downgrade() -> None:
+                if not anchor_mismatch_pending:
+                    return
+                if review_isolated:
+                    issues.append(
+                        {
+                            "type": "claim_support_anchor_mismatch_observed",
+                            **anchor_mismatch_pending,
+                        }
+                    )
+                    unit["claim_support_status"] = "anchor_mismatch_observed"
+                    return
+                issues.append(
+                    {
+                        "type": "claim_support_anchor_mismatch_downgraded",
+                        "downgraded_to": "directional",
+                        **anchor_mismatch_pending,
+                    }
+                )
+                _downgrade_claim_unit_to_directional(
+                    unit,
+                    status="anchor_mismatch_downgraded",
+                    boundary_note="claim support is adjacent rather than direct; use only as a directional signal until stronger evidence is repaired",
+                )
+
             if semantic_status.startswith("skipped"):
                 unit["semantic_judge_skipped_reason"] = semantic_status
+                # No semantic verdict available: keep the conservative lexical
+                # downgrade rather than shipping an unverified strong claim.
+                _apply_pending_anchor_downgrade()
             elif semantic_status == "error":
-                fail_closed = _semantic_judge_fail_closed()
+                fail_closed = _semantic_judge_fail_closed() and not review_isolated
                 issue = {
                     "type": "llm_claim_semantic_judge_error_blocked" if fail_closed else "llm_claim_semantic_judge_error",
                     "chapter_id": chapter.get("chapter_id"),
@@ -3464,21 +3783,28 @@ def validate_llm_analysis_output(
                     if key not in {"usage"}
                 }
                 unit["semantic_judge_risk"] = "judge_error_rule_fallback"
+                _apply_pending_anchor_downgrade()
             elif semantic_status == "partial":
                 issue = {
-                    "type": "llm_claim_semantic_judge_partial_downgraded",
+                    "type": "llm_claim_semantic_judge_partial_observed"
+                    if review_isolated
+                    else "llm_claim_semantic_judge_partial_downgraded",
                     "chapter_id": chapter.get("chapter_id"),
                     "claim_id": unit.get("claim_id"),
                     "evidence_refs": refs,
                     "semantic_judge": semantic_judge,
-                    "downgraded_to": "directional",
                 }
+                if not review_isolated:
+                    issue["downgraded_to"] = "directional"
                 issues.append(issue)
-                _downgrade_claim_unit_to_directional(
-                    unit,
-                    status="semantic_partial_downgraded",
-                    boundary_note="semantic judge found only partial support; keep as cautious directional analysis until stronger evidence is bound",
-                )
+                if not review_isolated:
+                    _downgrade_claim_unit_to_directional(
+                        unit,
+                        status="semantic_partial_downgraded",
+                        boundary_note="semantic judge found only partial support; keep as cautious directional analysis until stronger evidence is bound",
+                    )
+                else:
+                    unit["claim_support_status"] = "semantic_partial_observed"
                 unit["semantic_judge"] = {
                     key: value
                     for key, value in semantic_judge.items()
@@ -3486,21 +3812,27 @@ def validate_llm_analysis_output(
                 }
             elif semantic_status == "adjacent":
                 issue = {
-                    "type": "llm_claim_semantic_judge_adjacent_downgraded",
+                    "type": "llm_claim_semantic_judge_adjacent_observed"
+                    if review_isolated
+                    else "llm_claim_semantic_judge_adjacent_downgraded",
                     "chapter_id": chapter.get("chapter_id"),
                     "claim_id": unit.get("claim_id"),
                     "evidence_refs": refs,
                     "semantic_judge": semantic_judge,
-                    "downgraded_to": "contextual",
                 }
+                if not review_isolated:
+                    issue["downgraded_to"] = "contextual"
                 issues.append(issue)
-                _downgrade_claim_unit_to_directional(
-                    unit,
-                    status="semantic_adjacent_downgraded",
-                    boundary_note="semantic judge found adjacent background rather than direct support; use only as contextual framing until stronger evidence is bound",
-                )
-                unit["analysis_role"] = "contextual"
-                unit["evidence_use_level"] = "background"
+                if not review_isolated:
+                    _downgrade_claim_unit_to_directional(
+                        unit,
+                        status="semantic_adjacent_downgraded",
+                        boundary_note="semantic judge found adjacent background rather than direct support; use only as contextual framing until stronger evidence is bound",
+                    )
+                    unit["analysis_role"] = "contextual"
+                    unit["evidence_use_level"] = "background"
+                else:
+                    unit["claim_support_status"] = "semantic_adjacent_observed"
                 unit["semantic_judge"] = {
                     key: value
                     for key, value in semantic_judge.items()
@@ -3508,7 +3840,9 @@ def validate_llm_analysis_output(
                 }
             elif not _semantic_judge_accepts(semantic_judge):
                 issue = {
-                    "type": "llm_claim_semantic_judge_unsupported",
+                    "type": "llm_claim_semantic_judge_unsupported_observed"
+                    if review_isolated
+                    else "llm_claim_semantic_judge_unsupported",
                     "chapter_id": chapter.get("chapter_id"),
                     "claim_id": unit.get("claim_id"),
                     "evidence_refs": refs,
@@ -3532,13 +3866,32 @@ def validate_llm_analysis_output(
                 claim_repair_priorities.append(semantic_repair_priority)
                 if len(rejected_examples) < 5:
                     rejected_examples.append({**issue, "claim": claim_text})
-                continue
+                if review_isolated:
+                    unit["semantic_judge"] = {
+                        key: value
+                        for key, value in semantic_judge.items()
+                        if key not in {"usage"}
+                    }
+                    unit["claim_support_status"] = "semantic_unsupported_observed"
+                else:
+                    continue
             else:
                 unit["semantic_judge"] = {
                     key: value
                     for key, value in semantic_judge.items()
                     if key not in {"usage"}
                 }
+                if anchor_mismatch_pending:
+                    # The semantic judge confirmed direct support, so the
+                    # lexical anchor miss was a paraphrase false positive; keep
+                    # the claim at its original strength and record the waiver.
+                    issues.append(
+                        {
+                            "type": "claim_support_anchor_mismatch_waived_by_semantic_judge",
+                            **anchor_mismatch_pending,
+                        }
+                    )
+                    unit["support_gap_type"] = ""
             if incomplete_metric_cards_for_numeric_claim is not None:
                 metric_gaps = incomplete_metric_cards_for_numeric_claim(claim_text, cited_cards)
                 if metric_gaps:
@@ -3551,30 +3904,34 @@ def validate_llm_analysis_output(
                         ]
                     )
                     issue = {
-                        "type": "llm_numeric_claim_incomplete_metric_fact",
+                        "type": "llm_numeric_claim_incomplete_metric_fact_observed"
+                        if review_isolated
+                        else "llm_numeric_claim_incomplete_metric_fact",
                         "chapter_id": chapter.get("chapter_id"),
                         "claim_id": unit.get("claim_id"),
                         "evidence_refs": refs,
                         "metric_gaps": metric_gaps,
-                        "downgraded_to": "directional",
                     }
+                    if not review_isolated:
+                        issue["downgraded_to"] = "directional"
                     issues.append(issue)
-                    unit["claim_status"] = "directional"
-                    unit["claim_strength"] = "directional"
-                    unit["claim_strength_ceiling"] = "directional"
-                    unit["analysis_role"] = "directional"
-                    unit["evidence_use_level"] = "directional_signal"
-                    unit["writing_permission"] = "cautious_with_boundary"
                     unit["metric_completeness_status"] = "incomplete"
                     unit["metric_missing_fields"] = missing_fields
-                    boundary_note = (
-                        "metric fields incomplete: "
-                        + (", ".join(missing_fields) if missing_fields else "unknown")
-                        + "; use only as a directional signal until repaired"
-                    )
-                    limitation_boundary = _dedupe([*limitation_boundary, boundary_note])
-                    unit["limitation_boundary"] = limitation_boundary
-                    unit["counter_boundary"] = "\n".join(limitation_boundary)
+                    if not review_isolated:
+                        unit["claim_status"] = "directional"
+                        unit["claim_strength"] = "directional"
+                        unit["claim_strength_ceiling"] = "directional"
+                        unit["analysis_role"] = "directional"
+                        unit["evidence_use_level"] = "directional_signal"
+                        unit["writing_permission"] = "cautious_with_boundary"
+                        boundary_note = (
+                            "metric fields incomplete: "
+                            + (", ".join(missing_fields) if missing_fields else "unknown")
+                            + "; use only as a directional signal until repaired"
+                        )
+                        limitation_boundary = _dedupe([*limitation_boundary, boundary_note])
+                        unit["limitation_boundary"] = limitation_boundary
+                        unit["counter_boundary"] = "\n".join(limitation_boundary)
             inferred_requirement_ids = _dedupe(
                 [
                     *[
@@ -4514,7 +4871,9 @@ def run_analysis_agent(
     *,
     query: str = "",
     llm_config: Optional[Dict[str, Any]] = None,
+    deadline_ts: Optional[float] = None,
 ) -> AnalysisAgentState:
+    _set_analysis_deadline(deadline_ts)
     try:
         package = _as_dict(evidence_package)
         if query and not package.get("query"):
@@ -4713,6 +5072,8 @@ def run_analysis_agent(
                 "handoff_ready": False,
             },
         }
+    finally:
+        _set_analysis_deadline(None)
 
 
 def analysis_agent_tool(evidence_package: Dict[str, Any]) -> Dict[str, Any]:

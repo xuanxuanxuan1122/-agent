@@ -168,3 +168,55 @@ def test_fallback_analysis_stratified_selection_keeps_counter_and_metric():
 
     assert "EV-METRIC" in selected_ids
     assert "EV-COUNTER" in selected_ids
+
+
+def test_fallback_analysis_stratified_selection_reserves_role_diversity():
+    metrics = [
+        {
+            "evidence_id": f"EV-METRIC-{i}",
+            "fact": f"Official metric {i} shows adoption reached {40 + i}% in 2025.",
+            "proof_role": "metric",
+            "metric": "adoption",
+            "value": f"{40 + i}%",
+            "period": "2025",
+            "source_level": "A",
+            "allowed_use": "core_claim",
+            "confidence": 0.9 - i * 0.01,
+            "source": {"title": f"Official metric {i}", "url": f"https://www.stats.gov.cn/metric/{i}"},
+        }
+        for i in range(8)
+    ]
+    role_items = [
+        {
+            "evidence_id": "EV-POLICY",
+            "fact": "Official policy sets enterprise AI Agent governance boundaries.",
+            "proof_role": "source_check",
+            "source_level": "A",
+            "allowed_use": "supporting",
+            "confidence": 0.72,
+            "source": {"title": "Policy", "url": "https://gov.example/policy"},
+        },
+        {
+            "evidence_id": "EV-COUNTER",
+            "fact": "Research records deployment failures and ROI uncertainty.",
+            "proof_role": "counter",
+            "source_level": "B",
+            "allowed_use": "supporting",
+            "confidence": 0.68,
+            "source": {"title": "Research counter", "url": "https://research.example/counter"},
+        },
+        {
+            "evidence_id": "EV-CASE",
+            "fact": "A customer case shows workflow deployment in production.",
+            "proof_role": "case",
+            "source_level": "B",
+            "allowed_use": "supporting",
+            "confidence": 0.66,
+            "source": {"title": "Customer case", "url": "https://company.example/case"},
+        },
+    ]
+
+    selected = _select_analysis_items_for_dimension([*metrics, *role_items], max_items=6)
+    selected_ids = {item["evidence_id"] for item in selected}
+
+    assert {"EV-POLICY", "EV-COUNTER", "EV-CASE"}.issubset(selected_ids)

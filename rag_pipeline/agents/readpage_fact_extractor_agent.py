@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 
 from ..config.search_config import build_llm_config_for_task, build_llm_config_from_profile
 from ..search.memory import call_openai_compatible_json, llm_config_is_ready, normalize_llm_config
+from rag_pipeline.contracts.public_text_guard import public_text_quality
 from rag_pipeline.contracts.repair_dispatcher import rejected_span_repair_summary
 
 
@@ -592,6 +593,9 @@ def _validated_card(
             rejected.append(_rejection("low_quality_source", card))
         if re.search(r"example\.(?:com|gov|org)", card_source_url, flags=re.I):
             rejected.append(_rejection("fake_or_placeholder_source", card))
+    guard = public_text_quality(distilled)
+    if guard.get("severity") == "reject":
+        rejected.append({**_rejection("dirty_public_text", card), "guard_reasons": guard.get("reasons", [])})
     if _looks_bad_text(distilled):
         reason = "internal_or_claim_like_text" if INTERNAL_OR_CLAIM_PATTERNS.search(distilled) else "navigation_or_low_quality_text"
         rejected.append(_rejection(reason, card))

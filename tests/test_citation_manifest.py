@@ -33,6 +33,64 @@ def test_final_citation_reconciliation_renumbers_body_and_appendix_by_final_body
     assert diagnostics["final_missing_appendix_refs"] == []
 
 
+def test_finalize_is_idempotent_for_reentrant_passes_with_registry_priority():
+    """Regression for the live off-by-one source mismatch (FinalAudit fatal).
+
+    The first finalize renumbers the body by first-citation order. A second
+    pass (run after sanitizers/gates) must resolve that body against the
+    renumbered registry, not the stale manifest numbering, otherwise every
+    citation after the first multi-ref section shifts by one and the appendix
+    points at the wrong sources while the audit still reports "ok".
+    """
+
+    # Mirrors the live failure: the property-case section cites [6]+[13]
+    # (main + supplementary ref), so manifest numbering and body-order
+    # numbering diverge from [7] onward.
+    manifest_sources = [
+        {"ref": "[6]", "title": "Guangzhou property case", "url": "https://example.org/gz"},
+        {"ref": "[7]", "title": "Sichuan gov policy", "url": "https://example.org/sc"},
+        {"ref": "[8]", "title": "Jingdigital B2B scenarios", "url": "https://example.org/jing"},
+        {"ref": "[13]", "title": "Cybersecurity market report", "url": "https://example.org/sec"},
+    ]
+    manifest = {
+        "appendix_sources": manifest_sources,
+        "evidence_to_citation": {"EV-A": "[6]", "EV-B": "[7]", "EV-C": "[8]", "EV-D": "[13]"},
+    }
+    body = "物业案例已验证 [6][13]。政策环境提供支撑 [7]。径硕梳理六大场景 [8]。"
+
+    first_body, first_sources, first_diag = finalize_markdown_citations(body, manifest, manifest_sources)
+    assert first_body == "物业案例已验证 [1][2]。政策环境提供支撑 [3]。径硕梳理六大场景 [4]。"
+    assert [s["title"] for s in first_sources] == [
+        "Guangzhou property case",
+        "Cybersecurity market report",
+        "Sichuan gov policy",
+        "Jingdigital B2B scenarios",
+    ]
+    assert first_diag["final_citation_reconciliation_status"] == "ok"
+
+    # Re-entrant pass, as performed by _rewrite_final_markdown_with_reconciled_appendix.
+    second_body, second_sources, second_diag = finalize_markdown_citations(
+        first_body,
+        manifest,
+        first_sources,
+        prefer_registry_refs=True,
+    )
+    assert second_body == first_body
+    assert [s["title"] for s in second_sources] == [s["title"] for s in first_sources]
+    assert second_diag["final_citation_reconciliation_status"] == "ok"
+
+    # Third pass stays stable too (the writer flow reconciles twice after the
+    # initial finalize).
+    third_body, third_sources, _ = finalize_markdown_citations(
+        second_body,
+        manifest,
+        second_sources,
+        prefer_registry_refs=True,
+    )
+    assert third_body == second_body
+    assert [s["title"] for s in third_sources] == [s["title"] for s in second_sources]
+
+
 def test_final_citation_reconciliation_removes_unresolved_final_body_refs():
     body = "The report cites a valid source [7], a missing source [8], and another valid source [9]."
     sources = [
