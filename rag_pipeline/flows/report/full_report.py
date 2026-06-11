@@ -4610,7 +4610,10 @@ def main() -> int:
     os.environ.setdefault("REPORT_QUALITY_GATE_MODE", "isolated")
     os.environ.setdefault("REPORT_FINAL_AUDIT_BLOCKING", "false")
     os.environ.setdefault("QA_DEEP_EVALUATOR_BLOCKING", "false")
-    os.environ.setdefault("REPORT_ENABLE_TABLES", "false")
+    # Tables stay enabled: the metric-asset contract already filters
+    # incomplete metrics, and with the fake-metric extraction fixed upstream
+    # the table lane only sees real indicators. Disabling tables wholesale
+    # cost the structural completeness score.
     configure_pipeline_logging()
     resolved_quality_mode = resolve_report_quality_mode(
         os.getenv("REPORT_QUALITY_MODE", ""),
@@ -5505,7 +5508,15 @@ def main() -> int:
         if "clean_content_eligible" in writer_report
         else writer_report.get("clean_report_eligible")
     )
-    clean_content_eligible_final = bool(writer_clean_content_eligible and not final_audit_blocked)
+    # Honest status is decoupled from flow blocking: a non-blocking audit
+    # (isolated mode) must still strip the clean label from a fatal report,
+    # otherwise a 31-point report ships marked "final_clean".
+    final_audit_fatal = str(as_dict(writer_report.get("final_audit_result")).get("status") or "").strip().lower() == "fatal"
+    if final_audit_fatal and not final_audit_blocked:
+        if str(writer_report.get("report_status") or "").strip() == "final_clean":
+            writer_report["report_status"] = "formal_scored"
+        writer_report.setdefault("clean_report_blocked_reason", "final_audit_fatal")
+    clean_content_eligible_final = bool(writer_clean_content_eligible and not final_audit_blocked and not final_audit_fatal)
     clean_output_enabled = bool(emit_clean_report)
     clean_report_eligible_final = bool(clean_content_eligible_final and clean_output_enabled)
     writer_report["writer_clean_report_eligible"] = writer_clean_content_eligible

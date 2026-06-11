@@ -3076,11 +3076,13 @@ def _downgrade_claim_unit_to_directional(
     unit["writing_permission"] = "cautious_with_boundary"
     if status:
         unit["claim_support_status"] = status
-    limitation_boundary = _as_list(unit.get("limitation_boundary"))
     if boundary_note:
-        limitation_boundary = _dedupe([*limitation_boundary, boundary_note])
-        unit["limitation_boundary"] = limitation_boundary
-        unit["counter_boundary"] = "\n".join(str(item) for item in limitation_boundary if str(item or "").strip())
+        # Review verdicts only adjust structural fields. The note is pipeline
+        # diagnostics in English; limitation_boundary/counter_boundary are
+        # writer-facing fields that get rendered into the public body, and
+        # writing the note there is how "semantic judge found only partial
+        # support..." ended up verbatim in a published report.
+        unit["validation_notes"] = _dedupe([*_as_list(unit.get("validation_notes")), boundary_note])
 
 
 def _semantic_judge_status(value: Any) -> str:
@@ -3924,14 +3926,14 @@ def validate_llm_analysis_output(
                         unit["analysis_role"] = "directional"
                         unit["evidence_use_level"] = "directional_signal"
                         unit["writing_permission"] = "cautious_with_boundary"
+                        # Diagnostics stay out of writer-facing boundary fields
+                        # (they get rendered into the public body verbatim).
                         boundary_note = (
                             "metric fields incomplete: "
                             + (", ".join(missing_fields) if missing_fields else "unknown")
                             + "; use only as a directional signal until repaired"
                         )
-                        limitation_boundary = _dedupe([*limitation_boundary, boundary_note])
-                        unit["limitation_boundary"] = limitation_boundary
-                        unit["counter_boundary"] = "\n".join(limitation_boundary)
+                        unit["validation_notes"] = _dedupe([*_as_list(unit.get("validation_notes")), boundary_note])
             inferred_requirement_ids = _dedupe(
                 [
                     *[

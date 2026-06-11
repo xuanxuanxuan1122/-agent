@@ -4259,7 +4259,13 @@ def _source_by_text(sources: Sequence[Dict[str, Any]], evidence_text: str) -> Di
         key=lambda item: item[1],
         reverse=True,
     )
-    if ranked and ranked[0][1] >= 5:
+    # Token co-occurrence is a weak signal: at the old threshold of 5 (two
+    # shared numbers were enough) evidence lines were routinely stitched onto
+    # the wrong source, producing citations whose prose names one publication
+    # while the appendix resolves to another. Prefer leaving a line unbound
+    # over fabricating its provenance.
+    threshold = _env_int("BRAIN_SOURCE_TEXT_MATCH_MIN_SCORE", 8, min_value=1, max_value=100)
+    if ranked and ranked[0][1] >= threshold:
         return ranked[0][0]
     return {}
 
@@ -4299,7 +4305,11 @@ def _structured_evidence_to_raw_points(
             continue
         tag_match = re.search(r"【([^】]+)】", clean)
         tag = tag_match.group(1).strip() if tag_match else ""
-        source = _source_for_evidence_line(sources, citation_ids, clean)
+        source = _source_by_citation_id(sources, citation_ids)
+        source_binding = "citation_id" if source else ""
+        if not source:
+            source = _source_by_text(sources, clean)
+            source_binding = "fuzzy_text" if source else "unbound"
         line_period = _extract_period(clean)
         value_matches = list(_IQS_EVIDENCE_VALUE_RE.finditer(clean))
         if not value_matches:
@@ -4310,7 +4320,12 @@ def _structured_evidence_to_raw_points(
             prefix_context = clean[max(0, value_match.start() - 16) : value_match.start()] if value_match else ""
             prefix_years = re.findall(r"20\d{2}年?", prefix_context)
             period = (prefix_years[-1] if prefix_years else "") or _extract_period(local_context) or line_period
-            metric = _infer_metric_from_context(clean, value) if value else (tag or role or "qualitative_fact")
+            # Qualitative lines must not masquerade as metrics: tags like
+            # 【竞争对比】and lane roles like technology_product used to be
+            # written into the metric field and later rendered as fake
+            # indicator sentences ("technology_product为20"). The tag and the
+            # proof role keep their own fields below.
+            metric = _infer_metric_from_context(clean, value) if value else ""
             key = (dimension, metric, value, clean[:100], str(source.get("url") or ""))
             if key in seen:
                 continue
@@ -4330,6 +4345,8 @@ def _structured_evidence_to_raw_points(
                     "confidence": confidence,
                     "citation_ids": citation_ids,
                     "proof_role": role,
+                    "source_binding": source_binding,
+                    "source_binding_fuzzy": source_binding == "fuzzy_text",
                     "source_verification_status": str(source.get("source_verification_status") or ("readpage_verified" if source.get("readpage_verified") else "search_result_only")).strip(),
                     "source_verified": bool(source.get("source_verified") or str(source.get("source_verification_status") or "").strip() in {"readpage_verified", "document_verified"}),
                 }

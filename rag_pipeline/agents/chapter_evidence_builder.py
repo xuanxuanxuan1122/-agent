@@ -203,7 +203,13 @@ def _distill_fact(item: Dict[str, Any], *, max_chars: int = 220) -> str:
     if not fact or _bad_fact_text(fact):
         metric = _compact(item.get("metric") or item.get("indicator"), 80)
         value = _compact(item.get("value") or item.get("display_value") or item.get("numeric_value"), 80)
-        if metric and value and not _invalid_metric(item):
+        if (
+            metric
+            and value
+            and not _invalid_metric(item)
+            and not _internal_metric_name(metric)
+            and _metric_value_carries_meaning(value, str(item.get("unit") or item.get("numeric_unit") or ""))
+        ):
             fact = f"{metric}: {value}"
         else:
             return ""
@@ -225,6 +231,47 @@ def _distill_fact(item: Dict[str, Any], *, max_chars: int = 220) -> str:
     return "；".join(parts)[:max_chars].rstrip("；;，,。")
 
 
+_UNIT_DISPLAY_MAP = {
+    "percent": "%",
+    "ratio": "",
+    "count": "",
+    "currency_cny": "",
+    "currency_usd": "",
+    "unknown": "",
+    "": "",
+}
+
+# Pipeline role names, evidence tags, and validation fields that upstream
+# extraction used to write into the metric slot. None of these are real
+# indicators; rendering them produced body text like "technology_product为20"
+# and "source_check为26（2025）".
+_INTERNAL_METRIC_NAME_RE = re.compile(
+    r"^(?:source_check|status|http_status|response_code|qualitative_fact|"
+    r"technology_product|official_data|customer_case|filing|case|counter|support|metric|"
+    r"事实|关键事实|竞争对比|政策目标|政策监管|技术产业链|数字数据|发展趋势|资本事件|数据点)$",
+    re.I,
+)
+
+
+def _internal_metric_name(metric: str) -> bool:
+    return bool(_INTERNAL_METRIC_NAME_RE.fullmatch(str(metric or "").strip()))
+
+
+def _metric_value_carries_meaning(value: str, unit: str) -> bool:
+    """A metric sentence is only renderable when the value reads as a real
+    quantity: either the value text carries its own unit, or the unit field
+    maps to a known display unit. Bare numbers (dates, ids, file suffixes)
+    must fall through to prose."""
+
+    text = str(value or "").strip()
+    if not re.search(r"\d", text):
+        return False
+    if re.search(r"\d\s*(?:%|亿|万|千|元|美元|台|套|件|家|倍|人|个|吨|GWh|MWh|kWh|GW|MW|KW)", text, re.I):
+        return True
+    mapped = _UNIT_DISPLAY_MAP.get(str(unit or "").lower())
+    return bool(mapped)
+
+
 def _report_fact_sentence(item: Dict[str, Any], text: str, *, max_chars: int = 150) -> str:
     value = re.sub(r"\s+", " ", str(text or "")).strip()
     value = re.sub(r"https?://\S+", "", value)
@@ -236,15 +283,19 @@ def _report_fact_sentence(item: Dict[str, Any], text: str, *, max_chars: int = 1
     unit = _compact(item.get("unit") or item.get("numeric_unit"), 20)
     scope = _compact(item.get("scope") or item.get("market_scope") or _time_or_scope(value), 40)
     subject = _compact(item.get("subject") or item.get("company") or item.get("entity"), 60)
-    if metric and metric_value and not _invalid_metric(item):
+    if (
+        metric
+        and metric_value
+        and not _invalid_metric(item)
+        and not _internal_metric_name(metric)
+        and _metric_value_carries_meaning(metric_value, unit)
+    ):
         prefix = f"{subject}的" if subject else ""
-        normalized_unit = {
-            "percent": "%",
-            "ratio": "",
-            "count": "",
-            "currency_cny": "",
-            "unknown": "",
-        }.get(unit.lower(), unit)
+        normalized_unit = _UNIT_DISPLAY_MAP.get(unit.lower())
+        if normalized_unit is None:
+            # Unknown unit labels are internal enums (currency_usd leaked into
+            # a published body as "471亿美元currency_usd"); never render them.
+            normalized_unit = "" if re.fullmatch(r"[a-z0-9_]+", unit.lower() or "") else unit
         suffix = normalized_unit if normalized_unit and normalized_unit not in metric_value else ""
         tail = f"（{scope}）" if scope else ""
         metric_sentence = _compact(f"{prefix}{metric}为{metric_value}{suffix}{tail}", max_chars)

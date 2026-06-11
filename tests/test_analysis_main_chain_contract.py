@@ -1014,7 +1014,11 @@ def test_llm_numeric_claim_with_incomplete_metric_fact_is_downgraded():
     assert unit["writing_permission"] == "cautious_with_boundary"
     assert unit["metric_completeness_status"] == "incomplete"
     assert unit["metric_missing_fields"] == ["unit", "period"]
-    assert any("metric fields incomplete" in item for item in unit["limitation_boundary"])
+    # The diagnostic note lives in the internal validation_notes field; the
+    # writer-facing limitation_boundary must stay free of pipeline English
+    # (it gets rendered into the public body via counter_evidence).
+    assert any("metric fields incomplete" in item for item in unit["validation_notes"])
+    assert not any("metric fields incomplete" in str(item) for item in unit.get("limitation_boundary") or [])
 
     merged = merge_llm_analysis_with_fallback({}, payload, validation)
     merged_unit = merged["claim_units"][0]

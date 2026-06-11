@@ -1164,6 +1164,51 @@ def _public_verification_focus(package: Dict[str, Any], refs: Sequence[str]) -> 
     return _dedupe([*base, *extras], limit=8)
 
 
+_BOUNDARY_DIAGNOSTIC_RE = re.compile(
+    r"semantic judge|anchor mismatch|metric fields incomplete|until stronger evidence|"
+    r"until repaired|directional signal|cautious directional|rule fallback",
+    re.I,
+)
+
+
+def _section_title_from_claim(claim: Any) -> str:
+    """Derive a short, complete heading from the claim's first clause.
+
+    Cutting mid-clause produced truncated headings like
+    "技术成熟度是影响AI Agent进入生产流程的..."; stop at a natural break and
+    only keep results that read as a full phrase.
+    """
+
+    text = re.sub(r"\s+", " ", str(claim or "")).strip()
+    if not text:
+        return ""
+    first = re.split(r"[，,。；;！？!?]", text, maxsplit=1)[0].strip()
+    if 6 <= len(first) <= 30:
+        return first
+    return ""
+
+
+def _writer_safe_boundary_items(items: Sequence[Any]) -> List[str]:
+    """Drop pipeline diagnostics from limitation_boundary before it can reach
+    writer-facing fields (counter_evidence). Review verdicts used to append
+    English judge notes here, and cached claim units may still carry them."""
+
+    safe: List[str] = []
+    for item in items:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        if _BOUNDARY_DIAGNOSTIC_RE.search(text):
+            continue
+        letters = sum(1 for ch in text if ch.isascii() and ch.isalpha())
+        if letters > max(12, len(text) * 0.6):
+            # Mostly-English prose in a boundary field is pipeline language,
+            # not reader-facing analysis for these Chinese reports.
+            continue
+        safe.append(text)
+    return safe
+
+
 def _unit_from_structured(unit: Dict[str, Any], package: Dict[str, Any], section_id: str, fallback_refs: Sequence[str]) -> Dict[str, Any]:
     raw_refs = (
         _as_list(unit.get("used_evidence_ids"))
@@ -1180,7 +1225,7 @@ def _unit_from_structured(unit: Dict[str, Any], package: Dict[str, Any], section
         or _as_list(unit.get("fact_chain"))
     )
     reasoning_chain = _as_list(unit.get("reasoning_chain"))
-    boundary_chain = _as_list(unit.get("limitation_boundary"))
+    boundary_chain = _writer_safe_boundary_items(_as_list(unit.get("limitation_boundary")))
     fallback_fact = _compact(
         unit.get("fact")
         or unit.get("supporting_fact")
@@ -1226,7 +1271,10 @@ def _unit_from_structured(unit: Dict[str, Any], package: Dict[str, Any], section
         "chapter_id": package.get("chapter_id"),
         "section_id": section_id,
         "question": question,
-        "section_title": _compact(unit.get("section_title") or question, 160),
+        # Falling back to the chapter question produced up to 9 identical H3
+        # headings in one report; prefer a claim-derived title so every
+        # section announces its own point.
+        "section_title": _compact(unit.get("section_title") or _section_title_from_claim(claim) or question, 160),
         "claim": claim,
         "reasoning": _ensure_reasoning(
             unit.get("reasoning")

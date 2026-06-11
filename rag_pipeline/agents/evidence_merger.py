@@ -976,6 +976,14 @@ def _numeric_match_is_artifact(text: str, match: re.Match[str]) -> bool:
     before = text[max(0, start - 80):start].lower()
     after = text[end:min(len(text), end + 80)].lower()
     context = f"{before}{number_text}{after}"
+    if number_text.startswith("-") and start > 0 and not text[start - 1].isspace():
+        # "…实施明路-240825" style filename/date suffixes: the hyphen is a
+        # separator glued to the preceding word, not a minus sign.
+        return True
+    if "." not in number_text and len(number_text.lstrip("-").replace(",", "")) >= 6:
+        # Unit-less integers of 6+ digits are date stamps, document ids, or
+        # filename suffixes, never real report metrics.
+        return True
     if re.search(r"https?://|www\.|/detail/|/report/|[?&](?:id|docid|page)=", context):
         return True
     if re.search(r"\b(?:source_check|http_status|response_code|status_code)\s*(?:=|:|\u4e3a)?\s*$", before):
@@ -1024,6 +1032,31 @@ def _extract_numeric_values(text: Any) -> List[str]:
     return values
 
 
+def _clean_unit_text(value: Any) -> str:
+    text = str(value or "").strip()
+    if text.lower() in {"unknown", "none", "n/a", "na", "null"}:
+        return ""
+    return text
+
+
+_DOC_NOISE_RES = (
+    # Analyst credential blocks leaked from PDF report mastheads.
+    re.compile(r"(?:SAC\s*)?执业证书编号[:：]?\s*[A-Za-z0-9]+"),
+    re.compile(r"电话[:：]\s*[\d\-—()（）\s]{7,20}"),
+    re.compile(r"邮箱[:：]?\s*[\w.+-]+@[\w-]+(?:\.[\w-]+)+"),
+    re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+"),
+    # Inline markdown heading markers carried over from PDF-to-text layout.
+    re.compile(r"\s#{1,6}\s"),
+)
+
+
+def _strip_document_noise(text: Any) -> str:
+    value = str(text or "")
+    for pattern in _DOC_NOISE_RES:
+        value = pattern.sub(" ", value)
+    return re.sub(r"\s{2,}", " ", value).strip()
+
+
 def _numeric_norm(value: Any) -> Tuple[Optional[float], str]:
     text = str(value or "")
     match = NUMERIC_RE.search(text)
@@ -1031,6 +1064,12 @@ def _numeric_norm(value: Any) -> Tuple[Optional[float], str]:
         return None, ""
     number = float(str(match.group("number") or "0").replace(",", ""))
     unit = str(match.group("unit") or "").lower()
+    if not unit.strip():
+        # A bare number without a recognizable unit is not a usable metric
+        # value: filenames, dates, and IDs all match the numeric pattern.
+        # Returning "unknown" here used to brand thousands of plain-text
+        # facts as broken metrics downstream; leave the unit empty instead.
+        return number, ""
     if unit in {"%", "pct", "个百分点"}:
         return number, "percent"
     if "美元" in unit:
@@ -1053,7 +1092,10 @@ def _numeric_norm(value: Any) -> Tuple[Optional[float], str]:
         return number, "currency_cny" if "元" in unit or "亿" in unit or "万" in unit else "count"
     if unit == "倍":
         return number, "ratio"
-    return number, "unknown"
+    # Unrecognized unit: keep the number but do not brand the whole fact with
+    # a pseudo-unit. "unknown" used to trip the invalid-metric filters for
+    # ~80% of plain-text facts.
+    return number, ""
 
 
 PERCENT_KEYS = {"percent", "percentage", "ratio_percent"}
@@ -1741,19 +1783,22 @@ def _build_evidence(
     )
     evidence_id = f"EV-{raw_id}"
     s_grade = bool(has_numeric and source_type in {"official", "financial_report", "research", "media"} and confidence >= 0.55)
-    normalized_value, unit_key = _numeric_norm(value or (numeric_values[0] if numeric_values else ""))
+    # Only normalize an explicitly provided value. Backfilling from the first
+    # number found in the content turned dates, filename suffixes, and ids
+    # into fake metric values attached to otherwise good qualitative facts.
+    normalized_value, unit_key = _numeric_norm(value)
     task_payload = _task_payload_from_item(item, research_plan)
     evidence = {
         "evidence_id": evidence_id,
         "dimension": dimension,
-        "content": _compact_text(content, max_chars=900),
+        "content": _compact_text(_strip_document_noise(content), max_chars=900),
         "metric": metric,
         "metric_key": _metric_key(metric),
-        "value": value or (numeric_values[0] if numeric_values else ""),
+        "value": value,
         "numeric_values": numeric_values,
         "numeric_value": normalized_value,
         "numeric_unit": unit_key,
-        "unit": item.get("unit") or item.get("numeric_unit") or unit_key,
+        "unit": _clean_unit_text(item.get("unit") or item.get("numeric_unit") or unit_key),
         "source": {
             "title": str(source.get("title") or "未命名来源").strip(),
             "url": _first_source_scalar(source.get("url"), source.get("source_url")),
