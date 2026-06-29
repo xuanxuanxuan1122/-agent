@@ -211,15 +211,17 @@ def run_smoke(output_dir: Path) -> Dict[str, Any]:
             report_plan={"report_family": sample["report_family"], "research_object": sample["query"]},
             search_task_schedule=search_task_schedule,
         )
+        render_artifacts = writer_report.get("render_artifacts") or {}
         artifacts = {
             "01_research_plan.json": research_plan,
             "02_report_blueprint.json": writer_report.get("report_blueprint"),
             "03_search_task_schedule.json": writer_report.get("search_task_schedule"),
-            "04_chapter_evidence_packages.json": writer_report.get("chapter_evidence_packages"),
-            "05_micro_layouts.json": writer_report.get("micro_layouts"),
-            "06_table_packages.json": writer_report.get("table_packages"),
-            "07_argument_units.json": writer_report.get("argument_units"),
-            "08_chapter_packages.json": writer_report.get("chapter_packages"),
+            "04_chapter_evidence_packages.json": render_artifacts.get("chapter_evidence_packages")
+            or writer_report.get("chapter_evidence_packages"),
+            "05_micro_layouts.json": render_artifacts.get("micro_layouts") or writer_report.get("micro_layouts"),
+            "06_table_packages.json": render_artifacts.get("table_packages") or writer_report.get("table_packages"),
+            "07_argument_units.json": render_artifacts.get("argument_units") or writer_report.get("argument_units"),
+            "08_chapter_packages.json": render_artifacts.get("chapter_packages") or writer_report.get("chapter_packages"),
             "09_package_quality_report.json": writer_report.get("package_quality_report"),
             "11_qa_result.json": writer_report.get("qa_result"),
             "12_pipeline_debug.json": writer_report.get("debug_snapshot"),

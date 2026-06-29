@@ -27,6 +27,12 @@ from ..search.engine import build_arg_parser as build_rag_arg_parser
 from ..search.memory import call_openai_compatible_json, llm_config_is_ready, normalize_llm_config
 from rag_pipeline.cache.evidence_cache import lookup_evidence as lookup_cached_evidence
 from rag_pipeline.cache.evidence_cache import record_cache_activity
+from rag_pipeline.cache.stage_execution_guard import (
+    get_cached_stage_output as _stage_guard_get_cached_output,
+    stable_stage_hash as _stage_guard_hash,
+    stage_cache_enabled as _stage_guard_cache_enabled,
+    store_stage_output as _stage_guard_store_output,
+)
 from rag_pipeline.cache.trusted_source_cache import lookup_trusted_sources
 from rag_pipeline.contracts.query_builder import build_query_package
 from rag_pipeline.contracts.repair_dispatcher import dispatch_repair_seed
@@ -432,9 +438,13 @@ def _topic_seed_terms(query: str, chapter: Optional[Dict[str, Any]] = None, goal
         add("AI芯片", "AI", "人工智能", "GPU", "ASIC")
     elif not AI_AGENT_TOPIC_RE.search(text):
         add("人工智能", "AI", "人工智能")
-    add("供应链", "供应链", "产业链")
+    if "供应链" in text or "supply chain" in lower_text:
+        add("供应链", "供应链", "supply chain")
     add("中美科技" if chip_context else "中美政策", "中美", "美国", "出口管制")
-    add("中国芯片" if chip_context else "中国市场", "中国", "国产")
+    if chip_context:
+        add("中国芯片", "中国", "国产")
+    elif any(needle in text for needle in ["中国市场", "国产替代"]):
+        add("中国市场", "中国市场", "国产替代")
     add("先进制程", "先进制程", "制程")
     add("EDA", "EDA")
     add("光刻设备", "光刻", "ASML")
@@ -954,6 +964,12 @@ def _intent_for_proof_role(proof_role: str) -> str:
 
 
 _SEARCH_TERM_HINTS = (
+    "低空经济",
+    "eVTOL",
+    "无人机",
+    "通航",
+    "AI Agent",
+    "Agentic AI",
     "新能源汽车",
     "新能源车",
     "新型材料",
@@ -1006,17 +1022,19 @@ def _append_unique_text(items: List[str], value: Any, *, max_items: int = 12) ->
 
 
 def _anchor_terms_from_text(value: Any, *, max_terms: int = 10) -> List[str]:
-    text = re.sub(r"\s+", "", str(value or "")).strip()
+    raw = re.sub(r"\s+", " ", str(value or "")).strip()
+    text = re.sub(r"\s+", "", raw).strip()
     if not text:
         return []
     terms: List[str] = []
     for phrase in _SEARCH_TERM_HINTS:
-        if phrase in text:
+        compact_phrase = re.sub(r"\s+", "", phrase)
+        if phrase in raw or (compact_phrase and compact_phrase in text):
             _append_unique_text(terms, phrase, max_items=max_terms)
     parts = re.split(
         r"[\s,;:!?，。；：！？、/\\|()\[\]{}（）【】《》\"']+|"
         r"(?:是否|哪些|怎么|如何|当前|现在|其中|对于|关于|以及|或者|并且|同时|只有|判断为|"
-        r"本章|核心|问题|回答|中|里|的|与|和|及|比|更|才|可|向好|确定性|短期|放量)",
+        r"本章|核心|问题|回答|里|的|与|和|及|比|更|才|可|向好|确定性|短期|放量)",
         text,
     )
     for part in parts:
@@ -1047,6 +1065,216 @@ def _terms_for_chapter(chapter: Dict[str, Any], goal: Dict[str, Any]) -> List[st
             if text and text not in terms:
                 terms.append(text)
     return terms[:8]
+
+
+_GENERIC_TOPIC_ANCHOR_TERMS = {
+    "产业链",
+    "供应链",
+    "中国市场",
+    "市场",
+    "商业化",
+    "政策",
+    "应用场景",
+    "投资判断",
+    "风险",
+    "机会",
+    "研究",
+    "分析",
+    "判断",
+    "市场规模",
+    "需求",
+    "数据",
+    "统计",
+    "口径",
+    "来源",
+}
+
+_NAMED_TOPIC_SEED_TERMS = {"马斯克", "库克", "黄仁勋", "特斯拉", "苹果", "英伟达"}
+
+
+def _is_generic_topic_anchor_term(term: Any) -> bool:
+    text = re.sub(r"\s+", "", str(term or "")).strip()
+    if not text:
+        return True
+    if text in _GENERIC_TOPIC_ANCHOR_TERMS or text in _SEARCH_TERM_STOPWORDS:
+        return True
+    if re.fullmatch(r"(20\d{2}|19\d{2}|q[1-4]|h[12])", text, re.I):
+        return True
+    return False
+
+
+def _topic_anchor_terms_for_search(
+    *,
+    research_plan: Dict[str, Any],
+    chapter: Dict[str, Any],
+    goal: Dict[str, Any],
+    max_terms: int = 4,
+) -> List[str]:
+    terms: List[str] = []
+    seed_terms = _topic_seed_terms(str(research_plan.get("query") or ""), chapter, goal)
+    named_seed_terms = [term for term in seed_terms if term in _NAMED_TOPIC_SEED_TERMS]
+    if named_seed_terms:
+        for term in named_seed_terms:
+            _append_unique_text(terms, term, max_items=max_terms)
+            if len(terms) >= max_terms:
+                return terms
+        return terms[:max_terms]
+    primary_candidates: List[Any] = [
+        research_plan.get("research_object"),
+        *_as_list(research_plan.get("global_required_terms")),
+        *_as_list(goal.get("topic_anchor_terms")),
+    ]
+    fallback_candidates: List[Any] = [
+        *_as_list(goal.get("must_have_terms")),
+        goal.get("dimension_name"),
+        chapter.get("chapter_title"),
+        chapter.get("core_question"),
+        chapter.get("chapter_question"),
+        research_plan.get("query"),
+    ]
+    for value in primary_candidates:
+        if AI_AGENT_TOPIC_RE.search(str(value or "")):
+            _append_unique_text(terms, "AI Agent", max_items=max_terms)
+            if len(terms) >= max_terms:
+                return terms
+        for term in _search_terms_from_value(value, max_terms=6):
+            if _is_generic_topic_anchor_term(term):
+                continue
+            _append_unique_text(terms, term, max_items=max_terms)
+            if len(terms) >= max_terms:
+                return terms
+    if terms:
+        return terms[:max_terms]
+    for value in fallback_candidates:
+        if AI_AGENT_TOPIC_RE.search(str(value or "")):
+            _append_unique_text(terms, "AI Agent", max_items=max_terms)
+            if len(terms) >= max_terms:
+                return terms
+        for term in _search_terms_from_value(value, max_terms=6):
+            if _is_generic_topic_anchor_term(term):
+                continue
+            _append_unique_text(terms, term, max_items=max_terms)
+            if len(terms) >= max_terms:
+                return terms
+    return terms[:max_terms]
+
+
+def _chapter_focus_terms_for_search(
+    *,
+    research_plan: Dict[str, Any],
+    chapter: Dict[str, Any],
+    goal: Dict[str, Any],
+    topic_anchor_terms: Optional[Sequence[Any]] = None,
+    max_terms: int = 4,
+) -> List[str]:
+    """Return chapter-specific query terms without reusing the global topic anchor."""
+
+    topic_keys = {
+        re.sub(r"\s+", "", str(term or "").lower())
+        for term in list(topic_anchor_terms or [])
+        + _as_list(research_plan.get("global_required_terms"))
+        + [research_plan.get("research_object")]
+        if str(term or "").strip()
+    }
+    terms: List[str] = []
+    candidates: List[Any] = [
+        *_as_list(goal.get("must_have_terms")),
+        *_as_list(goal.get("expected_metrics")),
+        goal.get("question"),
+        goal.get("evidence_goal"),
+        goal.get("dimension_name"),
+        chapter.get("chapter_title"),
+        chapter.get("core_question"),
+        chapter.get("chapter_question"),
+    ]
+    for value in candidates:
+        for term in _search_terms_from_value(value, max_terms=8):
+            cleaned = str(term or "").strip()
+            key = re.sub(r"\s+", "", cleaned.lower())
+            if not key or key in topic_keys:
+                continue
+            if key in _SEARCH_TERM_STOPWORDS:
+                continue
+            if re.fullmatch(r"(20\d{2}|19\d{2}|q[1-4]|h[12])", key, re.I):
+                continue
+            _append_unique_text(terms, cleaned, max_items=max_terms)
+            if len(terms) >= max_terms:
+                return terms
+    return terms[:max_terms]
+
+
+def _query_has_topic_anchor(query: Any, anchors: Sequence[Any]) -> bool:
+    query_key = re.sub(r"\s+", "", str(query or "").lower())
+    if not query_key:
+        return False
+    for anchor in anchors:
+        anchor_key = re.sub(r"\s+", "", str(anchor or "").lower())
+        if anchor_key and anchor_key in query_key:
+            return True
+    return False
+
+
+def _ensure_search_query_topic_anchor(task: Dict[str, Any], anchors: Sequence[Any]) -> Dict[str, Any]:
+    copied = dict(task)
+    anchor_terms: List[str] = []
+    for anchor in anchors:
+        if _is_generic_topic_anchor_term(anchor):
+            continue
+        _append_unique_text(anchor_terms, anchor, max_items=6)
+    copied["topic_anchor_terms"] = anchor_terms
+    if not anchor_terms:
+        copied["topic_anchor_status"] = "no_anchor_available"
+        copied["topic_anchor_repaired"] = False
+        copied["topic_anchor_missing_before_repair"] = False
+        return copied
+    query = str(copied.get("query") or "").strip()
+    if _query_has_topic_anchor(query, anchor_terms):
+        copied["topic_anchor_status"] = "ok"
+        copied["topic_anchor_repaired"] = False
+        copied["topic_anchor_missing_before_repair"] = False
+    else:
+        copied["query"] = _compose_iqs_query([anchor_terms[:2], query])
+        copied["topic_anchor_status"] = "repaired" if _query_has_topic_anchor(copied.get("query"), anchor_terms) else "missing"
+        copied["topic_anchor_repaired"] = copied["topic_anchor_status"] == "repaired"
+        copied["topic_anchor_missing_before_repair"] = True
+    query_contract = dict(_as_dict(copied.get("query_contract")))
+    query_contract["topic_anchor_terms"] = anchor_terms
+    query_contract["topic_anchor_status"] = copied["topic_anchor_status"]
+    query_contract["topic_anchor_required"] = bool(anchor_terms)
+    copied["query_contract"] = query_contract
+    return copied
+
+
+def _ensure_search_query_chapter_focus(task: Dict[str, Any], focus_terms: Sequence[Any]) -> Dict[str, Any]:
+    copied = dict(task)
+    terms: List[str] = []
+    for term in focus_terms:
+        text = str(term or "").strip()
+        if not text:
+            continue
+        _append_unique_text(terms, text, max_items=6)
+    copied["chapter_focus_terms"] = terms
+    query = str(copied.get("query") or "").strip()
+    if not terms:
+        copied["chapter_focus_status"] = "no_focus_available"
+        copied["chapter_focus_repaired"] = False
+        copied["chapter_focus_missing_before_repair"] = False
+    elif _query_has_topic_anchor(query, terms):
+        copied["chapter_focus_status"] = "ok"
+        copied["chapter_focus_repaired"] = False
+        copied["chapter_focus_missing_before_repair"] = False
+    else:
+        anchors = _as_list(copied.get("topic_anchor_terms"))[:1]
+        copied["query"] = _compose_iqs_query([anchors, terms[:2], query])
+        copied["chapter_focus_status"] = "repaired" if _query_has_topic_anchor(copied.get("query"), terms) else "missing"
+        copied["chapter_focus_repaired"] = copied["chapter_focus_status"] == "repaired"
+        copied["chapter_focus_missing_before_repair"] = True
+    query_contract = dict(_as_dict(copied.get("query_contract")))
+    query_contract["chapter_focus_terms"] = terms
+    query_contract["chapter_focus_status"] = copied["chapter_focus_status"]
+    query_contract["chapter_focus_required"] = bool(terms)
+    copied["query_contract"] = query_contract
+    return copied
 
 
 _SEARCH_REQUIRED_FIELDS_BY_ROLE: Dict[str, List[str]] = {
@@ -1084,6 +1312,24 @@ _SEARCH_FIELD_QUERY_TERMS: Dict[str, str] = {
 }
 
 
+_SEARCH_FIELD_QUERY_TERMS_CN: Dict[str, str] = {
+    "metric": "指标",
+    "value": "数值",
+    "unit": "单位",
+    "period": "时间",
+    "scope": "范围",
+    "source": "来源",
+    "source_ref": "来源",
+    "source_url": "来源",
+    "source_title": "来源",
+    "company": "公司",
+    "use_case": "应用案例",
+    "deployment_scope": "落地范围",
+    "counter_signal": "风险",
+    "filing_type": "公告",
+}
+
+
 _SEARCH_LANE_QUERY_TERMS: Dict[str, str] = {
     "official_data": "official",
     "market_research": "research report",
@@ -1097,34 +1343,145 @@ _SEARCH_LANE_QUERY_TERMS: Dict[str, str] = {
 }
 
 
+_SEARCH_LANE_QUERY_TERMS_CN: Dict[str, str] = {
+    "official_data": "官方数据",
+    "market_research": "研究报告",
+    "customer_case": "客户案例",
+    "counter_evidence": "风险",
+    "filing_company": "公告",
+    "filing": "公告",
+    "association": "协会",
+    "technology_product": "产品标准",
+    "technical_standard": "技术标准",
+}
+
+
+_SEARCH_ROLE_QUERY_TERMS_CN: Dict[str, List[str]] = {
+    "metric": ["指标"],
+    "source_check": ["来源"],
+    "counter": ["风险"],
+    "case": ["客户案例"],
+    "filing": ["公告"],
+    "technology_product": ["产品", "标准"],
+    "support": ["证据"],
+}
+
+
+_ACADEMIC_ROLE_QUERY_TERMS_CN: Dict[str, List[str]] = {
+    "metric": ["指标", "就业", "岗位", "证书"],
+    "source_check": ["来源", "官方", "原文"],
+    "counter": ["风险", "替代", "错配"],
+    "case": ["案例", "培养方案", "招聘岗位"],
+    "filing": ["政策", "专业目录", "教学标准"],
+    "support": ["证据", "课程", "职业"],
+}
+
+
+_ACADEMIC_LANE_TARGETS_BY_ROLE: Dict[str, List[str]] = {
+    "metric": ["official_data", "market_research"],
+    "support": ["market_research", "official_data"],
+    "source_check": ["official_data", "market_research"],
+    "case": ["market_research", "news_event", "official_data"],
+    "counter": ["news_event", "market_research"],
+    "filing": ["official_data", "market_research"],
+}
+
+
+_ACADEMIC_SOURCE_PRIORITY_BY_ROLE: Dict[str, List[str]] = {
+    "metric": ["统计", "就业数据", "招生数据", "证书数据", "高校", "协会"],
+    "support": ["官方", "教育部", "人社部", "财政部", "高校", "协会", "研究报告"],
+    "source_check": ["官方", "原文", "政策文件", "协会", "高校", "研究报告"],
+    "case": ["培养方案", "招聘岗位", "职业案例", "高校案例", "监管案例"],
+    "counter": ["就业风险", "自动化替代", "岗位饱和", "技能错配", "监管风险"],
+    "filing": ["政策文件", "专业目录", "教学标准", "职业资格公告", "监管公告"],
+}
+
+
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+_SEARCH_PLACEHOLDER_TOKEN_RE = re.compile(
+    r"\b(product|source|official|metric|value|unit|period|research report|customer case|filing|risk|evidence)\b",
+    re.I,
+)
+
+
+def _contains_cjk(*values: Any) -> bool:
+    return any(_CJK_RE.search(str(value or "")) for value in values)
+
+
+def _is_academic_or_professional_research_plan(research_plan: Dict[str, Any]) -> bool:
+    framing = _as_dict(research_plan.get("problem_framing"))
+    quality_rules = _as_dict(research_plan.get("quality_rules"))
+    domain = str(
+        research_plan.get("research_domain")
+        or framing.get("research_domain")
+        or quality_rules.get("research_domain")
+        or ""
+    ).strip()
+    if domain == "academic_or_professional_field":
+        return True
+    subject = re.sub(r"\s+", "", str(research_plan.get("research_object") or research_plan.get("query") or "")).strip()
+    if not subject:
+        return False
+    if re.search(r"行业|产业|市场|公司|产品|商业化|投资|供应链|机会|风险|竞争格局|客户|订单|采购", subject):
+        return False
+    return bool(len(subject) <= 16 and re.search(r"(?:学|学科|专业)$|课程|就业|职业|证书", subject))
+
+
+def _academic_lane_targets_for_role(proof_role: str) -> List[str]:
+    return list(_ACADEMIC_LANE_TARGETS_BY_ROLE.get(str(proof_role or "").strip().lower()) or ["market_research", "official_data"])
+
+
+def _academic_source_priority_for_role(proof_role: str) -> List[str]:
+    return list(_ACADEMIC_SOURCE_PRIORITY_BY_ROLE.get(str(proof_role or "").strip().lower()) or ["官方", "高校", "协会", "研究报告"])
+
+
+def _academic_query_terms_for_role(proof_role: str, existing_terms: Sequence[Any]) -> List[str]:
+    terms: List[str] = []
+    for term in _ACADEMIC_ROLE_QUERY_TERMS_CN.get(str(proof_role or "").strip().lower(), ["证据"]):
+        _append_unique_text(terms, term, max_items=7)
+    for term in existing_terms:
+        cleaned = str(term or "").strip()
+        if cleaned and cleaned not in {"客户案例", "财报", "招股书", "投资者关系", "产品标准"}:
+            _append_unique_text(terms, cleaned, max_items=7)
+    return terms[:7]
+
+
 def _search_query_contract_terms(
     *,
     proof_role: str,
     required_fields: Sequence[Any],
     lane_targets: Sequence[Any],
     source_priority: Sequence[Any],
+    localized: bool = False,
     max_terms: int = 7,
 ) -> Dict[str, Any]:
     field_terms: List[str] = []
     source_terms: List[str] = []
 
-    role_terms = {
-        "metric": ["metric"],
-        "source_check": ["source"],
-        "counter": ["risk"],
-        "case": ["customer case"],
-        "filing": ["filing"],
-        "technology_product": ["product"],
-        "support": ["evidence"],
-    }.get(proof_role, ["evidence"])
+    if localized:
+        role_terms = _SEARCH_ROLE_QUERY_TERMS_CN.get(proof_role, ["证据"])
+        field_term_map = _SEARCH_FIELD_QUERY_TERMS_CN
+        lane_term_map = _SEARCH_LANE_QUERY_TERMS_CN
+    else:
+        role_terms = {
+            "metric": ["metric"],
+            "source_check": ["source"],
+            "counter": ["risk"],
+            "case": ["customer case"],
+            "filing": ["filing"],
+            "technology_product": ["product"],
+            "support": ["evidence"],
+        }.get(proof_role, ["evidence"])
+        field_term_map = _SEARCH_FIELD_QUERY_TERMS
+        lane_term_map = _SEARCH_LANE_QUERY_TERMS
 
     for field in required_fields:
-        term = _SEARCH_FIELD_QUERY_TERMS.get(str(field or "").strip().lower())
+        term = field_term_map.get(str(field or "").strip().lower())
         if term:
             _append_unique_text(field_terms, term, max_items=5)
 
     for lane in list(lane_targets or []) + list(source_priority or []):
-        term = _SEARCH_LANE_QUERY_TERMS.get(str(lane or "").strip().lower())
+        term = lane_term_map.get(str(lane or "").strip().lower())
         if term:
             _append_unique_text(source_terms, term, max_items=4)
 
@@ -1135,10 +1492,49 @@ def _search_query_contract_terms(
     return {
         "schema_version": "search_query_contract_v2",
         "proof_role": proof_role,
+        "localized": localized,
         "required_fields": [str(item) for item in required_fields if str(item or "").strip()],
         "field_query_terms": field_terms,
         "source_query_terms": source_terms,
         "query_terms": query_terms,
+    }
+
+
+def _search_task_query_quality(task: Dict[str, Any]) -> Dict[str, Any]:
+    query = str(task.get("query") or "")
+    contract = _as_dict(task.get("query_contract"))
+    anchors = [str(item).strip() for item in _as_list(task.get("topic_anchor_terms") or contract.get("topic_anchor_terms")) if str(item).strip()]
+    contract_terms = [
+        str(item).strip()
+        for item in _as_list(contract.get("query_terms"))
+        if str(item).strip()
+    ]
+    localized = bool(contract.get("localized")) or _contains_cjk(query)
+    placeholder_terms = sorted({match.group(1).lower() for match in _SEARCH_PLACEHOLDER_TOKEN_RE.finditer(query)}) if localized else []
+    has_topic_anchor = not anchors or _query_has_topic_anchor(query, anchors)
+    has_source_intent = bool(contract_terms and any(str(term).lower() in query.lower() for term in contract_terms))
+    has_time_or_scope = bool(
+        re.search(r"\b20\d{2}\b", query)
+        or any(needle in query for needle in ["中国", "全球", "行业", "产业", "市场", "范围", "时间", "年度"])
+    )
+    score = 1.0
+    if not has_topic_anchor:
+        score -= 0.35
+    if not has_source_intent:
+        score -= 0.2
+    if placeholder_terms:
+        score -= min(0.4, 0.15 * len(placeholder_terms))
+    if not has_time_or_scope:
+        score -= 0.1
+    score = round(max(0.0, min(1.0, score)), 4)
+    return {
+        "schema_version": "search_task_query_quality_v1",
+        "score": score,
+        "has_topic_anchor": has_topic_anchor,
+        "has_source_intent": has_source_intent,
+        "has_time_or_scope": has_time_or_scope,
+        "has_placeholder_terms": bool(placeholder_terms),
+        "placeholder_terms": placeholder_terms,
     }
 
 
@@ -1168,6 +1564,7 @@ def build_evidence_goals_for_chapter(chapter: Dict[str, Any], research_plan: Dic
     chapter_id = str(chapter.get("chapter_id") or "").strip()
     title = str(chapter.get("chapter_title") or "").strip()
     core_question = str(chapter.get("core_question") or chapter.get("chapter_question") or title).strip()
+    academic_plan = _is_academic_or_professional_research_plan(research_plan)
     existing = [dict(item) for item in _as_list(chapter.get("evidence_goals")) if isinstance(item, dict)]
     if not existing:
         for goal in _as_list(research_plan.get("evidence_goals")):
@@ -1178,13 +1575,22 @@ def build_evidence_goals_for_chapter(chapter: Dict[str, Any], research_plan: Dic
             elif str(goal.get("chapter_title") or goal.get("dimension_name") or "").strip() == title:
                 existing.append(dict(goal))
     if not existing:
-        role_specs = [
-            ("metric", "用指标、时间、范围和单位回答本章核心问题"),
-            ("support", "寻找能直接支撑本章判断的高等级证据"),
-            ("counter", "寻找可推翻或收窄本章判断边界的反向证据"),
-            ("case", "寻找公司、客户、订单、采购或落地案例"),
-            ("source_check", "核验关键事实的来源口径与权威出处"),
-        ]
+        if academic_plan:
+            role_specs = [
+                ("metric", "查找招生、就业、岗位、证书、课程或监管等可量化数据"),
+                ("support", "查找课程体系、人才培养、职业路径或政策监管的支撑材料"),
+                ("counter", "查找就业饱和、自动化替代、技能错配或监管责任等反向证据"),
+                ("case", "查找高校培养方案、招聘岗位、职业案例、财务共享或监管案例"),
+                ("source_check", "核验教育部、人社部、财政部、协会、高校或招聘平台来源口径"),
+            ]
+        else:
+            role_specs = [
+                ("metric", "用指标、时间、范围和单位回答本章核心问题"),
+                ("support", "寻找能直接支撑本章判断的高等级证据"),
+                ("counter", "寻找可推翻或收窄本章判断边界的反向证据"),
+                ("case", "寻找公司、客户、订单、采购或落地案例"),
+                ("source_check", "核验关键事实的来源口径与权威出处"),
+            ]
         existing = [
             {
                 "goal_id": f"{chapter_id}_{role}",
@@ -1222,10 +1628,15 @@ def build_evidence_goals_for_chapter(chapter: Dict[str, Any], research_plan: Dic
         copied["chapter_question"] = core_question
         copied["dimension_id"] = copied.get("dimension_id") or chapter_id
         copied["dimension_name"] = copied.get("dimension_name") or title
+        copied["hypothesis_id"] = str(copied.get("hypothesis_id") or chapter.get("hypothesis_id") or "").strip()
+        copied["hypothesis_statement"] = str(copied.get("hypothesis_statement") or chapter.get("hypothesis_statement") or "").strip()
         copied["question"] = str(copied.get("question") or copied.get("evidence_goal") or core_question).strip()
         copied["proof_role"] = proof_role
         copied["required_evidence_mix"] = _as_list(copied.get("required_evidence_mix")) or _as_list(chapter.get("required_evidence_mix"))
         copied["lane_targets"] = _as_list(copied.get("lane_targets") or copied.get("lanes")) or _mix_to_lane_targets(copied["required_evidence_mix"], proof_role)
+        if academic_plan:
+            copied["lane_targets"] = _academic_lane_targets_for_role(proof_role)
+            copied["source_priority"] = _academic_source_priority_for_role(proof_role)
         copied["required_source_levels"] = _as_list(copied.get("required_source_levels")) or ["A", "B"]
         copied["requirement_id"] = _requirement_id_for_goal(copied) or copied["goal_id"]
         copied["required_fields"] = _as_list(copied.get("required_fields")) or _required_fields_for_proof_role(proof_role)
@@ -1233,14 +1644,24 @@ def build_evidence_goals_for_chapter(chapter: Dict[str, Any], research_plan: Dic
         copied["min_sources"] = int(copied.get("min_sources") or (chapter.get("min_ab_sources") if proof_role in {"metric", "source_check"} else 1) or 1)
         goals.append(copied)
     roles_present = {str(goal.get("proof_role") or "").strip().lower() for goal in goals}
-    supplemental_specs = [
-        ("metric", "补齐本章关键指标、时间、范围和单位"),
-        ("support", "补齐本章直接支撑证据"),
-        ("counter", "补齐本章反证、风险和判断边界"),
-        ("case", "补齐本章案例、订单、客户或采购证据"),
-        ("technology_product", "补齐本章技术、产品、专利、标准或产品文档证据"),
-        ("source_check", "补齐本章来源核验和权威出处"),
-    ]
+    supplemental_specs = (
+        [
+            ("metric", "补齐本章招生、就业、岗位、证书、课程或监管指标"),
+            ("support", "补齐本章课程、人才培养、职业路径或监管支撑材料"),
+            ("counter", "补齐本章就业饱和、自动化替代、技能错配或监管责任边界"),
+            ("case", "补齐本章培养方案、招聘岗位、职业案例、财务共享或监管案例"),
+            ("source_check", "补齐本章教育部、人社部、财政部、协会、高校或招聘平台来源核验"),
+        ]
+        if academic_plan
+        else [
+            ("metric", "补齐本章关键指标、时间、范围和单位"),
+            ("support", "补齐本章直接支撑证据"),
+            ("counter", "补齐本章反证、风险和判断边界"),
+            ("case", "补齐本章案例、订单、客户或采购证据"),
+            ("technology_product", "补齐本章技术、产品、专利、标准或产品文档证据"),
+            ("source_check", "补齐本章来源核验和权威出处"),
+        ]
+    )
     for role, description in supplemental_specs:
         if role in roles_present:
             continue
@@ -1253,10 +1674,13 @@ def build_evidence_goals_for_chapter(chapter: Dict[str, Any], research_plan: Dic
                 "chapter_question": core_question,
                 "dimension_id": chapter_id,
                 "dimension_name": title,
+                "hypothesis_id": str(chapter.get("hypothesis_id") or "").strip(),
+                "hypothesis_statement": str(chapter.get("hypothesis_statement") or "").strip(),
                 "question": f"{core_question}：{description}",
                 "proof_role": role,
                 "required_evidence_mix": _as_list(chapter.get("required_evidence_mix")),
-                "lane_targets": _mix_to_lane_targets(_as_list(chapter.get("required_evidence_mix")), role),
+                "lane_targets": _academic_lane_targets_for_role(role) if academic_plan else _mix_to_lane_targets(_as_list(chapter.get("required_evidence_mix")), role),
+                "source_priority": _academic_source_priority_for_role(role) if academic_plan else [],
                 "required_source_levels": ["A", "B"],
                 "required_fields": _required_fields_for_proof_role(role),
                 "claim_strength_ceiling": _claim_strength_ceiling_for_goal({"required_source_levels": ["A", "B"]}, role),
@@ -1287,25 +1711,60 @@ def build_search_tasks_for_goal(
     source_priority = _as_list(goal.get("source_priority"))
     research_object = str(research_plan.get("research_object") or "").strip()
     global_required_terms = _as_list(research_plan.get("global_required_terms"))
-    query_hint = {
-        "metric": "数据 统计 口径",
-        "support": "权威 来源 报告",
-        "counter": "风险 反证 失败",
-        "case": "案例 客户 采购",
-        "filing": "企业公告 财报 招股书",
-        "source_check": "官方 原文 公告",
-        "technology_product": "技术 产品 专利 标准",
-    }[proof_role]
-    topic_terms = _topic_seed_terms(query, chapter, goal)[:3]
+    academic_plan = _is_academic_or_professional_research_plan(research_plan)
+    query_hint = (
+        {
+            "metric": "数据 统计 就业 岗位 证书",
+            "support": "课程 职业 人才 报告",
+            "counter": "风险 替代 错配 监管",
+            "case": "案例 培养方案 招聘岗位",
+            "filing": "政策 专业目录 教学标准",
+            "source_check": "官方 原文 政策 标准",
+            "technology_product": "数智财务 工具 标准",
+        }
+        if academic_plan
+        else {
+            "metric": "数据 统计 口径",
+            "support": "权威 来源 报告",
+            "counter": "风险 反证 失败",
+            "case": "案例 客户 采购",
+            "filing": "企业公告 财报 招股书",
+            "source_check": "官方 原文 公告",
+            "technology_product": "技术 产品 专利 标准",
+        }
+    )[proof_role]
+    topic_anchor_terms = _topic_anchor_terms_for_search(research_plan=research_plan, chapter=chapter, goal=goal)[:4]
+    topic_terms = topic_anchor_terms[:3] or _topic_seed_terms(query, chapter, goal)[:3]
     required_fields = _as_list(goal.get("required_fields")) or _required_fields_for_proof_role(proof_role)
+    localized_query_terms = _contains_cjk(query, research_object, title, core_question, goal_text)
     query_contract = _search_query_contract_terms(
         proof_role=proof_role,
         required_fields=required_fields,
         lane_targets=lanes,
         source_priority=source_priority,
+        localized=localized_query_terms,
+    )
+    if academic_plan and localized_query_terms:
+        query_contract = {
+            **query_contract,
+            "query_terms": _academic_query_terms_for_role(proof_role, query_contract.get("query_terms") or []),
+        }
+    chapter_focus_terms = _chapter_focus_terms_for_search(
+        research_plan=research_plan,
+        chapter=chapter,
+        goal=goal,
+        topic_anchor_terms=topic_anchor_terms,
     )
     query_focus = _compact_iqs_terms([research_object, *global_required_terms, *terms], max_terms=2, max_chars=16)
-    base_query = _compose_iqs_query([topic_terms[:3], query_contract["query_terms"], query_focus, query_hint])
+    base_query = _compose_iqs_query(
+        [
+            topic_terms[:3],
+            chapter_focus_terms[:2],
+            query_contract["query_terms"][:3],
+            query_focus,
+            query_hint,
+        ]
+    )
     task = {
         "task_id": f"{chapter_id}_{str(goal.get('goal_id') or proof_role).replace(' ', '_')}_{proof_role}",
         "agent": "iqs",
@@ -1333,6 +1792,10 @@ def build_search_tasks_for_goal(
             "requirement_id": _requirement_id_for_goal(goal),
             "lane_targets": lanes,
             "source_priority": source_priority,
+            "topic_anchor_terms": topic_anchor_terms,
+            "topic_anchor_required": bool(topic_anchor_terms),
+            "chapter_focus_terms": chapter_focus_terms,
+            "chapter_focus_required": bool(chapter_focus_terms),
         },
         "counter_evidence": proof_role == "counter",
         "research_object": research_object,
@@ -1343,6 +1806,9 @@ def build_search_tasks_for_goal(
         "decision_use": goal.get("decision_use") or research_plan.get("decision_context") or "research",
         "evidence_type": goal.get("evidence_type") or proof_role,
     }
+    task = _ensure_search_query_topic_anchor(task, topic_anchor_terms)
+    task = _ensure_search_query_chapter_focus(task, chapter_focus_terms)
+    task["query_quality"] = _search_task_query_quality(task)
     tasks = [normalize_search_task(task)]
     report_family = str(
         research_plan.get("report_family")
@@ -1355,15 +1821,27 @@ def build_search_tasks_for_goal(
         and report_family in {"industry_deep_report", "industry_scan_report", "deep_industry_report", "industry_report"}
     )
     if _env_flag("BRAIN_ENABLE_DEEP_SEARCH_VARIANTS", True) or force_deep_for_industry:
-        deep_hint = {
-            "metric": "官方统计 原始表",
-            "support": "协会 白皮书 研报",
-            "counter": "失败案例 价格下行",
-            "case": "客户认证 中标",
-            "filing": "年报 公告 招股书",
-            "source_check": "发布机构 披露日期",
-            "technology_product": "产品文档 技术标准 专利",
-        }[proof_role]
+        deep_hint = (
+            {
+                "metric": "官方统计 就业数据 招生数据",
+                "support": "高校 协会 研究报告",
+                "counter": "岗位饱和 自动化替代 技能错配",
+                "case": "培养方案 招聘岗位 职业案例",
+                "filing": "政策文件 专业目录 教学标准",
+                "source_check": "发布机构 披露日期 原文",
+                "technology_product": "数智财务 电子凭证 标准",
+            }
+            if academic_plan
+            else {
+                "metric": "官方统计 原始表",
+                "support": "协会 白皮书 研报",
+                "counter": "失败案例 价格下行",
+                "case": "客户认证 中标",
+                "filing": "年报 公告 招股书",
+                "source_check": "发布机构 披露日期",
+                "technology_product": "产品文档 技术标准 专利",
+            }
+        )[proof_role]
         deep_task = {
             **task,
             "task_id": f"{task['task_id']}_deep",
@@ -1379,6 +1857,9 @@ def build_search_tasks_for_goal(
             "fallback_providers": ["iqs_normal"],
             "source_priority": _as_list(source_priority) + ["official", "filing", "association", "research_report"],
         }
+        deep_task = _ensure_search_query_topic_anchor(deep_task, topic_anchor_terms)
+        deep_task = _ensure_search_query_chapter_focus(deep_task, chapter_focus_terms)
+        deep_task["query_quality"] = _search_task_query_quality(deep_task)
         tasks.append(normalize_search_task(deep_task))
     return tasks
 
@@ -1386,7 +1867,21 @@ def build_search_tasks_for_goal(
 def expand_search_tasks_from_chapters(research_plan: Dict[str, Any], report_blueprint: Dict[str, Any]) -> Dict[str, Any]:
     tasks: List[Dict[str, Any]] = []
     goals: List[Dict[str, Any]] = []
-    for chapter in _as_list(_as_dict(report_blueprint).get("chapters")):
+    chapters: List[Dict[str, Any]] = []
+    hypotheses = [_as_dict(item) for item in _as_list(_as_dict(research_plan).get("hypotheses"))]
+    for index, raw_chapter in enumerate(_as_list(_as_dict(report_blueprint).get("chapters"))):
+        chapter = _as_dict(raw_chapter)
+        if not chapter:
+            continue
+        if not str(chapter.get("hypothesis_id") or "").strip() and index < len(hypotheses):
+            hypothesis = hypotheses[index]
+            chapter = {
+                **chapter,
+                "hypothesis_id": str(hypothesis.get("hypothesis_id") or hypothesis.get("id") or "").strip(),
+                "hypothesis_statement": str(hypothesis.get("statement") or hypothesis.get("hypothesis") or "").strip(),
+            }
+        chapters.append(chapter)
+    for chapter in chapters:
         if not isinstance(chapter, dict):
             continue
         chapter_goals = build_evidence_goals_for_chapter(chapter, research_plan)
@@ -1394,7 +1889,7 @@ def expand_search_tasks_from_chapters(research_plan: Dict[str, Any], report_blue
         for goal in chapter_goals:
             tasks.extend(build_search_tasks_for_goal(chapter=chapter, goal=goal, research_plan=research_plan))
     updated = dict(research_plan)
-    updated["chapters"] = _as_list(_as_dict(report_blueprint).get("chapters"))
+    updated["chapters"] = chapters
     updated["evidence_goals"] = goals
     normalized_tasks: List[Dict[str, Any]] = []
     research_object = str(updated.get("research_object") or "").strip()
@@ -1819,6 +2314,103 @@ def _summarize_dropped_search_tasks(tasks: Sequence[Dict[str, Any]]) -> Dict[str
     }
 
 
+def _summarize_topic_anchor_schedule(tasks: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    total = 0
+    missing: List[Dict[str, Any]] = []
+    missing_count = 0
+    repaired_count = 0
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        total += 1
+        anchors = [str(item).strip() for item in _as_list(task.get("topic_anchor_terms")) if str(item).strip()]
+        status = str(task.get("topic_anchor_status") or "").strip().lower()
+        if bool(task.get("topic_anchor_repaired")) or status == "repaired":
+            repaired_count += 1
+        if anchors and not _query_has_topic_anchor(task.get("query"), anchors):
+            missing_count += 1
+            if len(missing) < 12:
+                missing.append(
+                    {
+                        "task_id": task.get("task_id"),
+                        "chapter_id": task.get("chapter_id"),
+                        "proof_role": task.get("proof_role"),
+                        "query": _compact_text(task.get("query"), max_chars=160),
+                        "topic_anchor_terms": anchors[:4],
+                        "topic_anchor_status": status,
+                    }
+                )
+        elif anchors and status not in {"ok", "repaired"}:
+            missing_count += 1
+            if len(missing) < 12:
+                missing.append(
+                    {
+                        "task_id": task.get("task_id"),
+                        "chapter_id": task.get("chapter_id"),
+                        "proof_role": task.get("proof_role"),
+                        "query": _compact_text(task.get("query"), max_chars=160),
+                        "topic_anchor_terms": anchors[:4],
+                        "topic_anchor_status": status,
+                    }
+                )
+    return {
+        "topic_anchor_total": total,
+        "topic_anchor_coverage": round((total - missing_count) / max(total, 1), 4),
+        "topic_anchor_missing_count": missing_count,
+        "topic_anchor_repaired_count": repaired_count,
+        "topic_anchor_missing_examples": missing,
+    }
+
+
+def _summarize_search_task_query_quality(tasks: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    total = 0
+    score_sum = 0.0
+    placeholder_count = 0
+    low_quality_count = 0
+    low_quality_examples: List[Dict[str, Any]] = []
+    placeholder_examples: List[Dict[str, Any]] = []
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        total += 1
+        quality = _as_dict(task.get("query_quality")) or _search_task_query_quality(task)
+        score = float(quality.get("score") or 0.0)
+        score_sum += score
+        has_placeholder = bool(quality.get("has_placeholder_terms"))
+        if has_placeholder:
+            placeholder_count += 1
+            if len(placeholder_examples) < 8:
+                placeholder_examples.append(
+                    {
+                        "task_id": task.get("task_id"),
+                        "chapter_id": task.get("chapter_id"),
+                        "proof_role": task.get("proof_role"),
+                        "query": _compact_text(task.get("query"), max_chars=160),
+                        "placeholder_terms": _as_list(quality.get("placeholder_terms")),
+                    }
+                )
+        if score < 0.65:
+            low_quality_count += 1
+            if len(low_quality_examples) < 8:
+                low_quality_examples.append(
+                    {
+                        "task_id": task.get("task_id"),
+                        "chapter_id": task.get("chapter_id"),
+                        "proof_role": task.get("proof_role"),
+                        "query": _compact_text(task.get("query"), max_chars=160),
+                        "query_quality": quality,
+                    }
+                )
+    return {
+        "search_task_quality_total": total,
+        "search_task_quality_avg": round(score_sum / max(total, 1), 4),
+        "placeholder_query_count": placeholder_count,
+        "low_quality_query_count": low_quality_count,
+        "placeholder_query_examples": placeholder_examples,
+        "low_quality_query_examples": low_quality_examples,
+    }
+
+
 def build_query_analysis(query: str, route: str, article_brief: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     brief = normalize_article_brief(article_brief, fallback_query=query) if article_brief else {}
     query = planning_query_from_brief(brief, fallback_query=query) if brief else str(query or "").strip()
@@ -1933,6 +2525,8 @@ def build_query_analysis(query: str, route: str, article_brief: Optional[Dict[st
                 [_dynamic_role_query(task) for task in kept_lane_tasks], max_items=max_queries
             )
     dropped_summary = _summarize_dropped_search_tasks(dropped_tasks)
+    topic_anchor_summary = _summarize_topic_anchor_schedule(scheduled_tasks)
+    search_task_quality_summary = _summarize_search_task_query_quality(scheduled_tasks)
     dropped_by_lane = _count_tasks_by_key(dropped_tasks, "scheduled_lane_type", fallback_key="dropped_lane_type")
     scheduled_by_lane = _count_tasks_by_key(scheduled_tasks, "scheduled_lane_type")
     recommended_min_tasks_per_lane = {
@@ -1974,6 +2568,8 @@ def build_query_analysis(query: str, route: str, article_brief: Optional[Dict[st
             "scheduled_by_proof_role": _count_tasks_by_key(scheduled_tasks, "proof_role"),
             "scheduled_by_retrieval_mode": _count_tasks_by_key(scheduled_tasks, "retrieval_mode"),
             "scheduled_by_primary_provider": _count_tasks_by_key(scheduled_tasks, "primary_provider"),
+            **topic_anchor_summary,
+            **search_task_quality_summary,
             "dropped_by_lane": dropped_by_lane,
             "dropped_by_proof_role": _count_tasks_by_key(dropped_tasks, "proof_role"),
             "deduped_by_lane": _count_tasks_by_key(deduped_tasks, "scheduled_lane_type", fallback_key="deduped_lane_type"),
@@ -2827,6 +3423,8 @@ def _run_iqs_role_agent_node(state: BrainAgentState, role_key: str) -> BrainAgen
         "true_a_source_count": int(lane_signal_counts.get("true_a_source_count") or 0),
         "core_ab_source_count": int(lane_signal_counts.get("core_ab_source_count") or 0),
         "valid_metric_count": int(lane_signal_counts.get("valid_metric_count") or 0),
+        "topic_valid_metric_count": int(lane_signal_counts.get("topic_valid_metric_count") or 0),
+        "topic_raw_data_point_count": int(lane_signal_counts.get("topic_raw_data_point_count") or 0),
         "readpage_attempted": sum(int(_as_dict(_as_dict(payload).get("task_result")).get("readpage_attempted") or 0) for payload in task_payloads),
         "readpage_succeeded": sum(int(_as_dict(_as_dict(payload).get("task_result")).get("readpage_succeeded") or 0) for payload in task_payloads),
         "early_stopped": bool(early_stop_state.get("early_stopped")),
@@ -2984,6 +3582,141 @@ def _as_dict(value: Any) -> Dict[str, Any]:
 
 def _as_list(value: Any) -> List[Any]:
     return list(value) if isinstance(value, list) else []
+
+
+_ANALYSIS_MATERIAL_KEYS = (
+    "query",
+    "analysis_ready_evidence",
+    "clean_evidence_list",
+    "normalized_evidence",
+    "fact_cards",
+    "source_registry",
+    "chapter_evidence_packages",
+    "chapter_plan",
+    "report_blueprint",
+    "report_plan",
+    "research_plan",
+    "evidence_requirements",
+    "evidence_gap_ledger",
+    "metadata",
+)
+
+_ANALYSIS_METADATA_KEYS = (
+    "topic_bundle_seed",
+    "topic_bundle_cache_hit",
+    "report_plan",
+    "readpage_fact_extractor_diagnostics",
+)
+
+
+def _analysis_material_payload(
+    evidence_package: Dict[str, Any],
+    *,
+    query: str = "",
+    llm_config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    package = _as_dict(evidence_package)
+    metadata = _as_dict(package.get("metadata"))
+    selected_metadata = {
+        key: metadata.get(key)
+        for key in _ANALYSIS_METADATA_KEYS
+        if key in metadata
+    }
+    selected = {
+        key: package.get(key)
+        for key in _ANALYSIS_MATERIAL_KEYS
+        if key in package and key != "metadata"
+    }
+    if selected_metadata:
+        selected["metadata"] = selected_metadata
+    safe_llm_config = {
+        key: value
+        for key, value in _as_dict(llm_config).items()
+        if key not in {"api_key", "apiKey", "authorization", "headers"}
+    }
+    return {
+        "schema_version": "brain_analysis_material_v1",
+        "query": query or str(package.get("query") or ""),
+        "material": selected,
+        "llm_config": safe_llm_config,
+        "env": {
+            "BRAIN_ENABLE_LLM_EVIDENCE_ANALYSIS": os.getenv("BRAIN_ENABLE_LLM_EVIDENCE_ANALYSIS", ""),
+            "BRAIN_LLM_ANALYSIS_INPUT_VERSION": os.getenv("BRAIN_LLM_ANALYSIS_INPUT_VERSION", ""),
+            "BRAIN_LLM_ANALYSIS_MODE": os.getenv("BRAIN_LLM_ANALYSIS_MODE", ""),
+            "BRAIN_LLM_ANALYSIS_MAX_CHAPTERS": os.getenv("BRAIN_LLM_ANALYSIS_MAX_CHAPTERS", ""),
+            "REPORT_QUALITY_MODE": os.getenv("REPORT_QUALITY_MODE", ""),
+        },
+    }
+
+
+def _annotate_brain_analysis_cache(
+    analysis_state: Dict[str, Any],
+    *,
+    input_hash: str,
+    cache_payload: Optional[Dict[str, Any]] = None,
+    cache_hit: bool = False,
+) -> Dict[str, Any]:
+    state = copy.deepcopy(_as_dict(analysis_state))
+    structured = _as_dict(state.get("structured_analysis"))
+    diagnostics = {
+        **_as_dict(structured.get("analysis_stage_diagnostics")),
+        "brain_analysis_material_hash": input_hash,
+        "brain_analysis_cache_hit": bool(cache_hit),
+    }
+    if cache_payload:
+        diagnostics["brain_analysis_cache"] = _as_dict(cache_payload)
+    structured["analysis_stage_diagnostics"] = diagnostics
+    state["structured_analysis"] = structured
+    if structured:
+        state["answer_text"] = json.dumps(
+            {"structured_analysis": structured},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=json_safe_default,
+        )
+        raw_output = _as_dict(state.get("raw_output"))
+        if raw_output:
+            raw_output["structured_analysis"] = structured
+            state["raw_output"] = raw_output
+    return state
+
+
+def _run_brain_analysis_agent(
+    evidence_package: Dict[str, Any],
+    *,
+    query: str = "",
+    llm_config: Optional[Dict[str, Any]] = None,
+    deadline_ts: Optional[float] = None,
+) -> Dict[str, Any]:
+    input_hash = _stage_guard_hash(
+        _analysis_material_payload(evidence_package, query=query, llm_config=llm_config)
+    )
+    if _stage_guard_cache_enabled("brain_analysis_material"):
+        cached = _stage_guard_get_cached_output(stage="brain_analysis_material", input_hash=input_hash)
+        if cached.get("hit"):
+            return _annotate_brain_analysis_cache(
+                _as_dict(cached.get("output")),
+                input_hash=input_hash,
+                cache_payload=_as_dict(cached),
+                cache_hit=True,
+            )
+    try:
+        state = run_analysis_agent(evidence_package, query=query, llm_config=llm_config, deadline_ts=deadline_ts)
+    except TypeError as exc:
+        if "llm_config" not in str(exc) and "deadline_ts" not in str(exc):
+            raise
+        state = run_analysis_agent(evidence_package, query=query)
+    annotated = _annotate_brain_analysis_cache(
+        _as_dict(state),
+        input_hash=input_hash,
+        cache_hit=False,
+    )
+    if _stage_guard_cache_enabled("brain_analysis_material"):
+        try:
+            _stage_guard_store_output(stage="brain_analysis_material", input_hash=input_hash, output=annotated)
+        except Exception:
+            pass
+    return annotated
 
 
 def _topic_bundle_seed_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -3199,18 +3932,18 @@ def _emit_pre_writer_snapshots(
     """
 
     chapter_evidence_packages = _as_list(evidence_package.get("chapter_evidence_packages"))
+    report_blueprint = (
+        _as_dict(state.get("report_blueprint"))
+        or _as_dict(_as_dict(state.get("query_analysis")).get("report_blueprint"))
+        or _as_dict(evidence_package.get("report_blueprint"))
+        or _as_dict(_as_dict(evidence_package.get("metadata")).get("report_blueprint"))
+        or _as_dict(evidence_package.get("report_plan"))
+        or _as_dict(_as_dict(evidence_package.get("metadata")).get("report_plan"))
+    )
     if not chapter_evidence_packages:
         try:
             from rag_pipeline.agents.chapter_evidence_builder import build_chapter_evidence_packages_from_evidence_package
 
-            report_blueprint = (
-                _as_dict(state.get("report_blueprint"))
-                or _as_dict(_as_dict(state.get("query_analysis")).get("report_blueprint"))
-                or _as_dict(evidence_package.get("report_blueprint"))
-                or _as_dict(_as_dict(evidence_package.get("metadata")).get("report_blueprint"))
-                or _as_dict(evidence_package.get("report_plan"))
-                or _as_dict(_as_dict(evidence_package.get("metadata")).get("report_plan"))
-            )
             source_registry = _as_list(evidence_package.get("source_registry")) or _as_list(evidence_package.get("sources"))
             if report_blueprint:
                 chapter_evidence_packages = build_chapter_evidence_packages_from_evidence_package(
@@ -3223,6 +3956,18 @@ def _emit_pre_writer_snapshots(
                     evidence_package["chapter_evidence_packages"] = chapter_evidence_packages
         except Exception as exc:  # pragma: no cover - snapshot rebuild must never block live runs.
             evidence_package.setdefault("metadata", {})["chapter_evidence_snapshot_error"] = str(exc)
+    if report_blueprint:
+        try:
+            from rag_pipeline.agents.blueprint_refresh import attach_staged_blueprint_refresh
+
+            attach_staged_blueprint_refresh(
+                report_blueprint=report_blueprint,
+                evidence_package=evidence_package,
+                phase="post_evidence_merge",
+                writer_started=False,
+            )
+        except Exception as exc:  # pragma: no cover - diagnostics must never block live runs.
+            evidence_package.setdefault("metadata", {})["blueprint_refresh_error"] = str(exc)
 
     evidence_snapshot_store = _write_stage_snapshot_from_brain(
         state=state,
@@ -3262,6 +4007,55 @@ def _emit_pre_writer_snapshots(
             "chapter_evidence_packages": chapter_snapshot_store,
             "structured_analysis": analysis_snapshot_store,
         }
+
+
+def _attach_curated_evidence_to_package(evidence_package: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach analysis-facing curated evidence notes without mutating the source package in place."""
+
+    package = dict(_as_dict(evidence_package))
+    if not package or not _env_flag("REPORT_EVIDENCE_CURATOR_ENABLED", True):
+        return package
+    try:
+        from rag_pipeline.cache.analysis_memory_cache import build_analysis_shards, persist_analysis_memory_cache
+        from rag_pipeline.agents.evidence_curator_agent import curate_evidence_batch
+        from rag_pipeline.agents.evidence_inventory_agent import build_evidence_inventory
+    except Exception as exc:  # pragma: no cover - curator diagnostics must never block live runs.
+        package.setdefault("metadata", {})["evidence_curator_error"] = str(exc)
+        return package
+
+    candidates: List[Dict[str, Any]] = []
+    for key in ("analysis_ready_evidence", "clean_evidence_list", "supporting_evidence"):
+        candidates.extend([item for item in _as_list(package.get(key)) if isinstance(item, dict)])
+    if not candidates:
+        return package
+
+    curated = curate_evidence_batch(
+        candidates,
+        query=str(package.get("query") or package.get("original_query") or ""),
+        max_items=_env_int("REPORT_EVIDENCE_CURATOR_MAX_ITEMS", 240, min_value=20, max_value=1000),
+    )
+    package["curated_evidence"] = curated
+    inventory = build_evidence_inventory(curated, query=str(package.get("query") or package.get("original_query") or ""))
+    package["evidence_inventory"] = inventory
+    analysis_shards = build_analysis_shards(package)
+    package["analysis_shards"] = analysis_shards
+    metadata = package.setdefault("metadata", {})
+    metadata["curated_evidence_count"] = int(curated.get("curated_evidence_count") or 0)
+    metadata["dirty_blocked_count"] = int(curated.get("dirty_blocked_count") or 0)
+    metadata["curated_input_count"] = int(curated.get("input_count") or 0)
+    metadata["evidence_inventory_count"] = int(inventory.get("inventory_count") or 0)
+    run_id = str(
+        package.get("run_id")
+        or package.get("stage_snapshot_run_id")
+        or os.getenv("REPORT_STAGE_SNAPSHOT_RUN_ID")
+        or ""
+    ).strip()
+    if run_id and _env_flag("REPORT_ANALYSIS_MEMORY_CACHE_ENABLED", True):
+        try:
+            package["analysis_memory_cache"] = persist_analysis_memory_cache(package, run_id=run_id)
+        except Exception as exc:  # pragma: no cover - cache persistence must never block live runs.
+            metadata["analysis_memory_cache_error"] = str(exc)
+    return package
 
 
 def _emit_post_writer_snapshot(state: Dict[str, Any], writer_report: Dict[str, Any]) -> None:
@@ -7144,10 +7938,39 @@ def _payload_source_key(source: Dict[str, Any]) -> str:
     ).strip().lower()
 
 
+def _raw_point_topic_hit(point: Dict[str, Any], task: Dict[str, Any]) -> bool:
+    anchors: List[Any] = []
+    anchors.extend(_as_list(point.get("topic_anchor_terms")))
+    anchors.extend(_as_list(point.get("global_required_terms")))
+    point_task = _as_dict(point.get("search_task"))
+    anchors.extend(_as_list(point_task.get("topic_anchor_terms")))
+    anchors.extend(_as_list(point_task.get("global_required_terms")))
+    anchors.extend(_as_list(task.get("topic_anchor_terms")))
+    anchors.extend(_as_list(task.get("global_required_terms")))
+    for value in (
+        point.get("research_object"),
+        point_task.get("research_object"),
+        task.get("research_object"),
+    ):
+        if str(value or "").strip():
+            anchors.append(value)
+    anchors = [anchor for anchor in anchors if not _is_generic_topic_anchor_term(anchor)]
+    if not anchors:
+        return True
+    text = " ".join(
+        str(point.get(key) or "")
+        for key in ("evidence", "fact", "clean_fact", "content", "metric", "metric_name", "value", "unit")
+    )
+    return _query_has_topic_anchor(text, anchors)
+
+
 def _lane_payload_signal_counts(payloads: Sequence[Dict[str, Any]]) -> Dict[str, int]:
     source_keys: set[str] = set()
     ab_keys: set[str] = set()
     metric_count = 0
+    topic_metric_count = 0
+    raw_point_count = 0
+    topic_raw_point_count = 0
     page_count = 0
     true_a_keys: set[str] = set()
     completed_roles: set[str] = set()
@@ -7213,12 +8036,18 @@ def _lane_payload_signal_counts(payloads: Sequence[Dict[str, Any]]) -> Dict[str,
             item = _as_dict(point)
             if not item:
                 continue
+            raw_point_count += 1
+            point_topic_hit = _raw_point_topic_hit(item, task)
+            if point_topic_hit:
+                topic_raw_point_count += 1
             if (
                 str(item.get("metric") or item.get("metric_name") or item.get("indicator") or "").strip()
                 and str(item.get("value") or item.get("numeric_value") or "").strip()
                 and str(item.get("source") or item.get("source_url") or item.get("url") or "").strip()
             ):
                 metric_count += 1
+                if point_topic_hit:
+                    topic_metric_count += 1
     return {
         "completed_task_count": completed,
         "timed_out_task_count": timed_out,
@@ -7229,6 +8058,9 @@ def _lane_payload_signal_counts(payloads: Sequence[Dict[str, Any]]) -> Dict[str,
         "core_ab_source_count": len(ab_keys),
         "true_a_source_count": len(true_a_keys),
         "valid_metric_count": metric_count,
+        "topic_valid_metric_count": topic_metric_count,
+        "raw_data_point_count": raw_point_count,
+        "topic_raw_data_point_count": topic_raw_point_count,
         "page_result_count": page_count,
         "completed_role_count": len(completed_roles),
         "completed_chapter_count": len(completed_chapters),
@@ -7247,9 +8079,15 @@ def _lane_early_stop_decision(payloads: Sequence[Dict[str, Any]], *, started_at:
     min_pages = _env_int("BRAIN_IQS_LANE_EARLY_STOP_MIN_PAGE_RESULTS", 1, min_value=0, max_value=100)
     min_roles = _env_int("BRAIN_IQS_LANE_EARLY_STOP_MIN_ROLES", 2, min_value=0, max_value=20)
     min_chapters = _env_int("BRAIN_IQS_LANE_EARLY_STOP_MIN_CHAPTERS", 2, min_value=0, max_value=50)
+    min_topic_raw_points = _env_int("BRAIN_IQS_LANE_EARLY_STOP_MIN_TOPIC_RAW_POINTS", 2, min_value=0, max_value=100)
     if elapsed < min_seconds or counts["completed_task_count"] < min_completed:
         return {**counts, "early_stopped": False, "early_stop_reason": ""}
     if _env_flag("BRAIN_IQS_LANE_EARLY_STOP_REQUIRE_READPAGE", True) and counts["page_result_count"] < min_pages:
+        return {**counts, "early_stopped": False, "early_stop_reason": ""}
+    if (
+        _env_flag("BRAIN_IQS_LANE_EARLY_STOP_REQUIRE_TOPIC_RAW_POINTS", True)
+        and counts["topic_raw_data_point_count"] < min_topic_raw_points
+    ):
         return {**counts, "early_stopped": False, "early_stop_reason": ""}
     if counts["completed_role_count"] < min_roles or counts["completed_chapter_count"] < min_chapters:
         return {**counts, "early_stopped": False, "early_stop_reason": ""}
@@ -7718,6 +8556,28 @@ SOFT_NON_EVIDENCE_FOLLOWUP_TYPES = {
     "section_too_short",
     "argument_thin",
     "writing_depth_weak",
+}
+
+NON_SEARCH_REPAIR_ACTIONS = {
+    "reanalyze_existing",
+    "recompose_outline",
+    "rewrite_with_caveat",
+    "expand_claim_writing",
+    "keep_as_directional",
+    "rewrite",
+    "claim_rebuild",
+    "fix_citation_binding",
+    "citation_rebind",
+}
+
+SEARCH_REPAIR_ACTIONS = {
+    "search_more",
+    "live_search",
+    "evidence_search",
+    "metric_source_search",
+    "counter_evidence_search",
+    "source_trace_search",
+    "case_source_search",
 }
 
 EVIDENCE_FOLLOWUP_HINTS = {
@@ -8354,9 +9214,99 @@ def _normalize_followup_payload(item: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
+def _repair_execution_marker(item: Dict[str, Any], key: str) -> str:
+    payload = _as_dict(item)
+    nested = _as_dict(payload.get("search_task")) or _as_dict(payload.get("follow_up_query"))
+    return str(payload.get(key) or nested.get(key) or "").strip().lower()
+
+
+def _is_non_search_repair_action(item: Dict[str, Any]) -> bool:
+    action = _repair_execution_marker(item, "repair_action") or _repair_execution_marker(item, "suggested_action")
+    route = _repair_execution_marker(item, "repair_route")
+    if action in NON_SEARCH_REPAIR_ACTIONS or route in NON_SEARCH_REPAIR_ACTIONS:
+        return True
+    if action in SEARCH_REPAIR_ACTIONS or route in SEARCH_REPAIR_ACTIONS or route.endswith("_search"):
+        return False
+    markers = _followup_marker_values(item)
+    if markers.intersection(NON_EVIDENCE_FOLLOWUP_TYPES):
+        return True
+    if markers.intersection(SOFT_NON_EVIDENCE_FOLLOWUP_TYPES) and not _has_evidence_followup_hint(item, markers):
+        return True
+    return False
+
+
+def _is_search_repair_task(item: Dict[str, Any]) -> bool:
+    payload = _as_dict(item)
+    if not payload:
+        return False
+    if _is_non_search_repair_action(payload):
+        return False
+    route = _repair_execution_marker(payload, "repair_route")
+    action = _repair_execution_marker(payload, "repair_action") or _repair_execution_marker(payload, "suggested_action")
+    if action in SEARCH_REPAIR_ACTIONS or route in SEARCH_REPAIR_ACTIONS or route.endswith("_search"):
+        return True
+    query = str(payload.get("query") or _as_dict(payload.get("search_task")).get("query") or "").strip()
+    agent = str(payload.get("agent") or _as_dict(payload.get("search_task")).get("agent") or "").strip().lower()
+    return bool(query and (agent or _has_evidence_followup_hint(payload)))
+
+
+def _non_search_repair_suggestion(item: Dict[str, Any], *, source: str = "") -> Dict[str, Any]:
+    payload = _as_dict(item)
+    nested = _as_dict(payload.get("search_task")) or payload
+    action = _repair_execution_marker(payload, "repair_action") or _repair_execution_marker(payload, "suggested_action")
+    route = _repair_execution_marker(payload, "repair_route")
+    issue_type = (
+        str(nested.get("issue_type") or nested.get("gap_type") or nested.get("type") or route or action or "repair_suggestion")
+        .strip()
+        .lower()
+    )
+    target = {
+        key: nested.get(key)
+        for key in ("chapter_id", "section_id", "claim_id", "requirement_id", "gap_id")
+        if nested.get(key) not in (None, "", [])
+    }
+    suggestion = {
+        "schema_version": "repair_execution_suggestion_v1",
+        "issue_type": issue_type or "repair_suggestion",
+        "type": issue_type or "repair_suggestion",
+        "repair_action": action or route or "rewrite_with_caveat",
+        "repair_route": route or action or "rewrite_with_caveat",
+        "target": target,
+        "source": source or str(nested.get("source") or nested.get("origin_node") or "repair_task_router"),
+        "diagnostic_only": True,
+        "must_not_render": True,
+        "public_text_allowed": False,
+        "not_for_public_text": True,
+        "executor_should_decide": True,
+    }
+    message = _compact_text(nested.get("message") or nested.get("reason") or nested.get("targets_gap") or nested.get("evidence_goal"), max_chars=240)
+    if message:
+        suggestion["message"] = message
+    return suggestion
+
+
+def _split_repair_tasks_by_execution_route(
+    tasks: Sequence[Dict[str, Any]],
+    *,
+    source: str = "",
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    search_tasks: List[Dict[str, Any]] = []
+    suggestions: List[Dict[str, Any]] = []
+    for task in list(tasks or []):
+        if not isinstance(task, dict):
+            continue
+        if _is_search_repair_task(task):
+            search_tasks.append(task)
+        else:
+            suggestions.append(_non_search_repair_suggestion(task, source=source))
+    return search_tasks, suggestions
+
+
 def _is_non_evidence_followup(item: Dict[str, Any]) -> bool:
     if not _env_flag("BRAIN_FOLLOWUP_SKIP_NON_EVIDENCE_GAPS", True):
         return False
+    if _is_non_search_repair_action(item):
+        return True
     markers = _followup_marker_values(item)
     if markers.intersection(NON_EVIDENCE_FOLLOWUP_TYPES):
         return True
@@ -9454,6 +10404,11 @@ def _post_qa_repair_plan(writer_report: Dict[str, Any], *, max_queries: int) -> 
         if not payload:
             return
         payload.setdefault("source", default_source)
+        if _is_non_search_repair_action(payload):
+            suggestion = _non_search_repair_suggestion(payload, source=default_source)
+            rewrite_reasons.append(suggestion)
+            skipped_non_evidence.append({"type": suggestion.get("issue_type"), "source": default_source})
+            return
         markers = _followup_marker_values(payload)
         if markers.intersection(NON_EVIDENCE_FOLLOWUP_TYPES):
             rewrite_reasons.append(
@@ -9675,7 +10630,11 @@ def _run_evidence_preflight_round(
         )
     else:
         binder_tasks, binder_skipped = [], 0
-    tasks = [*ledger_tasks, *binder_tasks]
+    repair_candidates = [*ledger_tasks, *binder_tasks]
+    tasks, non_search_suggestions = _split_repair_tasks_by_execution_route(
+        repair_candidates,
+        source="evidence_preflight",
+    )
     skipped = ledger_skipped + binder_skipped
     trace.update(
         {
@@ -9687,15 +10646,18 @@ def _run_evidence_preflight_round(
             "ledger_repair_view_status": _as_dict(ledger_view).get("status"),
             "ledger_repair_seed_count": len(ledger_tasks),
             "ledger_repair_skipped_count": ledger_skipped,
+            "repair_task_candidate_count": len(repair_candidates),
             "attempted_task_count": len(tasks),
+            "non_search_repair_suggestion_count": len(non_search_suggestions),
+            "non_search_repair_suggestions": non_search_suggestions[:12],
             "repair_task_summary": _repair_task_summary(tasks),
             "skipped_task_count": skipped,
             "follow_up_queries": tasks,
         }
     )
     if not tasks:
-        trace["status"] = "no_tasks"
-        trace["stop_reason"] = "no_preflight_repair_tasks"
+        trace["status"] = "no_search_repair_tasks" if non_search_suggestions else "no_tasks"
+        trace["stop_reason"] = "repair_actions_are_non_search" if non_search_suggestions else "no_preflight_repair_tasks"
         return {
             "evidence_pool": current_pool,
             "evidence_package": current_package,
@@ -9744,6 +10706,7 @@ def _run_evidence_preflight_round(
         research_plan=_research_plan_from_state(state),
     )
     current_package = _annotate_evidence_package_runtime(current_package, lane_coverage=_lane_coverage_from_state(state), state=state)
+    current_package = _attach_curated_evidence_to_package(current_package)
     state["evidence_package"] = current_package
     if report_plan:
         current_package["report_plan"] = report_plan
@@ -9828,14 +10791,29 @@ def _run_post_qa_repair_round(
         )
     else:
         qa_followups, qa_skipped = [], 0
-    evidence_followups = [*ledger_followups, *qa_followups]
+    repair_candidates = [*ledger_followups, *qa_followups]
+    evidence_followups, non_search_suggestions = _split_repair_tasks_by_execution_route(
+        repair_candidates,
+        source="post_qa_repair",
+    )
     skipped_repair_tasks = ledger_skipped + qa_skipped
     trace["repair_task_summary"] = _repair_task_summary(evidence_followups)
+    trace["repair_task_candidate_count"] = len(repair_candidates)
+    trace["attempted_task_count"] = len(evidence_followups)
+    trace["non_search_repair_suggestion_count"] = len(non_search_suggestions)
+    trace["non_search_repair_suggestions"] = non_search_suggestions[:12]
     trace["skipped_repair_task_count"] = skipped_repair_tasks
     trace["writer_artifact_ledger_sync"] = writer_artifact_ledger_sync
     trace["ledger_repair_view_status"] = _as_dict(ledger_view).get("status")
     trace["ledger_repair_seed_count"] = len(ledger_followups)
     trace["ledger_repair_skipped_count"] = ledger_skipped
+    if non_search_suggestions:
+        plan = {
+            **plan,
+            "rewrite_required": True,
+            "rewrite_reasons": [*_as_list(plan.get("rewrite_reasons")), *non_search_suggestions][:12],
+        }
+        trace["plan"] = plan
     rewrite_required = bool(plan.get("rewrite_required"))
     if not evidence_followups and not rewrite_required:
         trace["status"] = "no_repair_tasks"
@@ -9899,16 +10877,16 @@ def _run_post_qa_repair_round(
             research_plan=_research_plan_from_state(state),
         )
         current_evidence_package = _annotate_evidence_package_runtime(current_evidence_package, lane_coverage=lane_coverage, state=state)
+        current_evidence_package = _attach_curated_evidence_to_package(current_evidence_package)
         if report_plan:
             current_evidence_package["report_plan"] = report_plan
             current_evidence_package.setdefault("metadata", {})
             current_evidence_package["metadata"]["report_plan"] = report_plan
-        try:
-            current_analysis_state = run_analysis_agent(current_evidence_package, query=query, llm_config=build_llm_config("decision"))
-        except TypeError as exc:
-            if "llm_config" not in str(exc):
-                raise
-            current_analysis_state = run_analysis_agent(current_evidence_package, query=query)
+        current_analysis_state = _run_brain_analysis_agent(
+            current_evidence_package,
+            query=query,
+            llm_config=build_llm_config("claim_build"),
+        )
         current_structured_analysis = _as_dict(current_analysis_state.get("structured_analysis"))
         _attach_report_plan(current_evidence_package, current_structured_analysis, report_plan)
         _attach_research_plan(current_evidence_package, current_structured_analysis, _research_plan_from_state(state))
@@ -10148,7 +11126,12 @@ def run_writer_with_layout_refinement(
     if preflight_result.get("updated"):
         current_evidence_pool = [item for item in _as_list(preflight_result.get("evidence_pool")) if isinstance(item, dict)]
         current_evidence_package = _as_dict(preflight_result.get("evidence_package")) or current_evidence_package
-        current_analysis_state = run_analysis_agent(current_evidence_package, query=query, llm_config=build_llm_config("decision"))
+        current_evidence_package = _attach_curated_evidence_to_package(current_evidence_package)
+        current_analysis_state = _run_brain_analysis_agent(
+            current_evidence_package,
+            query=query,
+            llm_config=build_llm_config("claim_build"),
+        )
         current_structured_analysis = _as_dict(current_analysis_state.get("structured_analysis"))
         _attach_report_plan(current_evidence_package, current_structured_analysis, report_plan)
         _attach_research_plan(current_evidence_package, current_structured_analysis, _research_plan_from_state(state))
@@ -10359,11 +11342,16 @@ def run_writer_with_layout_refinement(
             research_plan=_research_plan_from_state(state),
         )
         current_evidence_package = _annotate_evidence_package_runtime(current_evidence_package, lane_coverage=lane_coverage, state=state)
+        current_evidence_package = _attach_curated_evidence_to_package(current_evidence_package)
         if report_plan:
             current_evidence_package["report_plan"] = report_plan
             current_evidence_package.setdefault("metadata", {})
             current_evidence_package["metadata"]["report_plan"] = report_plan
-        current_analysis_state = run_analysis_agent(current_evidence_package, query=query, llm_config=build_llm_config("decision"))
+        current_analysis_state = _run_brain_analysis_agent(
+            current_evidence_package,
+            query=query,
+            llm_config=build_llm_config("claim_build"),
+        )
         current_structured_analysis = _as_dict(current_analysis_state.get("structured_analysis"))
         _attach_report_plan(current_evidence_package, current_structured_analysis, report_plan)
         _attach_research_plan(current_evidence_package, current_structured_analysis, _research_plan_from_state(state))
@@ -12513,12 +13501,17 @@ def merge_outputs_node(state: BrainAgentState) -> BrainAgentState:
         if topic_seed_summary:
             evidence_package.setdefault("metadata", {})["topic_bundle_seed"] = topic_seed_summary
         evidence_package = _annotate_evidence_package_runtime(evidence_package, lane_coverage=lane_coverage, state=state)
+        evidence_package = _attach_curated_evidence_to_package(evidence_package)
         _attach_readpage_fact_extractor_diagnostics(evidence_package, diagnostics=fact_extractor_diagnostics)
         if report_plan:
             evidence_package["report_plan"] = report_plan
             evidence_package.setdefault("metadata", {})
             evidence_package["metadata"]["report_plan"] = report_plan
-        analysis_state = run_analysis_agent(evidence_package, query=str(state.get("query") or ""), llm_config=build_llm_config("decision"))
+        analysis_state = _run_brain_analysis_agent(
+            evidence_package,
+            query=str(state.get("query") or ""),
+            llm_config=build_llm_config("claim_build"),
+        )
         structured_analysis = _as_dict(analysis_state.get("structured_analysis"))
         if report_plan:
             structured_analysis["report_plan"] = report_plan
@@ -12718,15 +13711,16 @@ def merge_outputs_node(state: BrainAgentState) -> BrainAgentState:
     if topic_seed_summary:
         evidence_package.setdefault("metadata", {})["topic_bundle_seed"] = topic_seed_summary
     evidence_package = _annotate_evidence_package_runtime(evidence_package, lane_coverage=lane_coverage, state=state)
+    evidence_package = _attach_curated_evidence_to_package(evidence_package)
     _attach_readpage_fact_extractor_diagnostics(evidence_package, diagnostics=fact_extractor_diagnostics)
     if report_plan:
         evidence_package["report_plan"] = report_plan
         evidence_package.setdefault("metadata", {})
         evidence_package["metadata"]["report_plan"] = report_plan
-    analysis_state = run_analysis_agent(
+    analysis_state = _run_brain_analysis_agent(
         evidence_package,
         query=str(state.get("query") or ""),
-        llm_config=build_llm_config("decision"),
+        llm_config=build_llm_config("claim_build"),
         deadline_ts=_analysis_deadline_ts_for_state(state),
     )
     structured_analysis = _as_dict(analysis_state.get("structured_analysis"))

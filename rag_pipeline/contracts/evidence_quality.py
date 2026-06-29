@@ -2,15 +2,38 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 from urllib.parse import urlparse
 
 from rag_pipeline.contracts.evidence_admission import decide_evidence_admission
+from rag_pipeline.contracts.quality_gate_policy import advisory_weight_mode, public_signal_mode
 
 
 QUALITY_CONTRACT_VERSION = "0.1.0"
 
 REJECTED_STATUSES = {"rejected", "spam", "irrelevant", "blacklisted", "exclude"}
+NON_CLAIM_ALLOWED_USES = {
+    "rejected",
+    "not_allowed",
+    "not_for_writing",
+    "diagnostic_only",
+    "appendix_only",
+    "clue_only",
+    "clue",
+    "search_only",
+}
+NON_CLAIM_ANALYSIS_READINESS = {
+    "blocked",
+    "followup_only",
+    "clue_only",
+    "diagnostic_only",
+}
+BLOCKING_CONTENT_SHAPE_ISSUES = {
+    "pdf_table_or_header_fragment",
+    "browser_or_login_fragment",
+    "page_shell_or_toc_fragment",
+    "nav_or_listing_fragment",
+}
 LOW_QUALITY_ROLES = {"clue", "appendix", "appendix_only"}
 CORE_ROLES = {"core", "core_claim"}
 SUPPORTING_ROLES = {
@@ -23,7 +46,44 @@ SUPPORTING_ROLES = {
     "source_check",
     "technology_product",
 }
-GENERIC_METRIC_NAMES = {"", "unknown", "key_fact", "fact", "metric", "indicator", "关键事实", "定性事实"}
+GENERIC_METRIC_NAMES = {
+    "",
+    "unknown",
+    "key_fact",
+    "fact",
+    "metric",
+    "indicator",
+    "关键事实",
+    "数据指标",
+    "定性事实",
+    "核心指标",
+    "指标",
+}
+PDF_TABLE_FRAGMENT_RE = re.compile(
+    r"(PDF[:：]|\|\s*第\s*\d+\s*卷|Vol\.\s*\d+|doi\s*[:：]?\s*10\.|\|\s*-{2,}\s*\|)",
+    re.I,
+)
+BROWSER_LOGIN_FRAGMENT_RE = re.compile(
+    r"(请登录|登录后|注册\s*登录|cookie|javascript|chrome|返回首页|继续访问)",
+    re.I,
+)
+PAGE_SHELL_FRAGMENT_RE = re.compile(
+    (
+        "目\\s*录.{0,120}(?:/|01).{0,120}(?:02|03).{0,120}(?:04|07)"
+        "|个人信息.{0,100}我的订单.{0,100}我的优惠券"
+        "|我的下载.{0,100}我的上传.{0,100}我的订阅"
+        "|回到首页.{0,100}搜索.{0,100}(?:VIP|付费社群|报告详情)"
+        "|my\\s+orders.{0,100}my\\s+coupons.{0,100}my\\s+downloads"
+    ),
+    re.I | re.S,
+)
+# Scraped navigation / headline lists slip in as "标题A / 04 标题B / 07 标题C",
+# i.e. slash-separated headlines carrying orphan two-digit ordinals. Require the
+# slash to follow whitespace so real dates like "2024/05" are never matched, and
+# only flag when the signature repeats (>=2) to stay conservative.
+NAV_LISTING_FRAGMENT_RE = re.compile(r"(?:^|\s)/\s*\d{2}\s*[一-鿿]")
+
+GENERIC_METRIC_NAME_RE = re.compile(r"^(关键事实|数据指标|定性事实|核心指标|指标)$")
 
 SOURCE_TYPE_TO_LEVEL = {
     "official": "A",
@@ -257,6 +317,51 @@ def _evidence_grade_note(source_level: str, source_subtier: str, claim_type: str
     return "appendix_or_context"
 
 
+def _evidence_weight_hint(
+    *,
+    source_level: str,
+    source_subtier: str,
+    source_tier: str,
+    source_family: str,
+    source_verification_status: str,
+    claim_type: str,
+    proof_role: str,
+    directness: str,
+    metric_proof_gaps: List[str],
+    confidence_score: float,
+    evidence_fit_score: float,
+) -> Dict[str, Any]:
+    if source_level == "A":
+        weight = "high"
+    elif source_level == "B":
+        weight = "medium_high"
+    elif source_level == "C":
+        weight = "medium"
+    elif source_level == "D":
+        weight = "low"
+    else:
+        weight = "unknown"
+    if source_verification_status in {"document_verified", "readpage_verified"} and weight in {"low", "unknown"}:
+        weight = "medium_low"
+    if metric_proof_gaps and weight in {"high", "medium_high"}:
+        weight = "medium"
+    return {
+        "source_level": source_level or "unknown",
+        "source_subtier": source_subtier or "",
+        "source_tier": source_tier or "",
+        "source_family": source_family or "",
+        "source_verification_status": source_verification_status or "",
+        "claim_type": claim_type or "",
+        "proof_role": proof_role or "",
+        "directness": directness or "",
+        "metric_proof_gaps": list(metric_proof_gaps or []),
+        "suggested_weight": weight,
+        "confidence_score": confidence_score,
+        "evidence_fit_score": evidence_fit_score,
+        "model_instruction": "weigh_this_evidence_in_context_do_not_filter_by_source_grade",
+    }
+
+
 def _as_dict(value: Any) -> Dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
 
@@ -298,6 +403,38 @@ def _dedupe(values: List[Any], *, limit: int = 20) -> List[str]:
         if len(result) >= limit:
             break
     return result
+
+
+def evidence_content_shape_issues(item: Mapping[str, Any]) -> List[str]:
+    """Return non-source-grade content-shape issues that should not be written."""
+
+    text = " ".join(
+        str(item.get(key) or "")
+        for key in (
+            "fact",
+            "clean_fact",
+            "content",
+            "clean_content",
+            "text",
+            "claim",
+            "metric",
+            "source_title",
+            "title",
+        )
+    )
+    metric = str(item.get("metric") or item.get("metric_name") or "").strip()
+    issues: List[str] = []
+    if PDF_TABLE_FRAGMENT_RE.search(text):
+        issues.append("pdf_table_or_header_fragment")
+    if BROWSER_LOGIN_FRAGMENT_RE.search(text):
+        issues.append("browser_or_login_fragment")
+    if PAGE_SHELL_FRAGMENT_RE.search(text):
+        issues.append("page_shell_or_toc_fragment")
+    if len(NAV_LISTING_FRAGMENT_RE.findall(text)) >= 2:
+        issues.append("nav_or_listing_fragment")
+    if metric and GENERIC_METRIC_NAME_RE.fullmatch(metric):
+        issues.append("generic_metric_name")
+    return issues
 
 
 def _source_payload(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -424,13 +561,37 @@ def _metric_proof_gaps(item: Dict[str, Any], claim_type: str, fact: str, period:
         gaps.append("value")
     if not period:
         gaps.append("period")
-    if not str(item.get("scope") or "").strip():
+    if not _metric_scope_present(item, fact):
         gaps.append("scope")
     if not _metric_explicit_unit_present(item):
         gaps.append("unit")
     if not _has_traceable_source(item):
         gaps.append("source")
     return _dedupe(gaps, limit=8)
+
+
+def _metric_scope_present(item: Dict[str, Any], fact: str) -> bool:
+    for key in ("scope", "time_or_scope", "subject", "research_object"):
+        if str(item.get(key) or "").strip():
+            return True
+    text = " ".join(
+        str(value or "")
+        for value in (
+            fact,
+            item.get("clean_fact"),
+            item.get("content"),
+            item.get("dimension_name"),
+            item.get("chapter_title"),
+            item.get("evidence_goal"),
+        )
+    )
+    return bool(
+        re.search(
+            r"(中国|全球|国内|海外|全国|行业|产业链|市场|企业|用户|客户|低空经济|机器人|新能源|光伏|储能|汽车|半导体|消费|医疗|金融)",
+            text,
+            re.I,
+        )
+    )
 
 
 def _evidence_fit_score(
@@ -475,7 +636,7 @@ def _analysis_readiness(
 ) -> str:
     if semantic_status in REJECTED_STATUSES or allowed_use == "rejected":
         return "blocked"
-    if source_level == "D":
+    if source_level == "D" and not (public_signal_mode() and allowed_use == "directional_signal" and traceable):
         return "followup_only"
     if claim_type == "hard_metric" and metric_proof_gaps:
         return "context_only" if source_level in {"A", "B"} and traceable else "followup_only"
@@ -640,6 +801,8 @@ class EvidenceNormalizer:
 class EvidenceClassifier:
     strict_quality: bool = False
     directional_c_min_confidence: float = 0.55
+    public_signal: bool = False
+    advisory_weight: bool = False
 
     def classify(self, item: Dict[str, Any]) -> Dict[str, Any]:
         copied = dict(item or {})
@@ -651,8 +814,23 @@ class EvidenceClassifier:
         claim_type = infer_claim_type(copied)
         source_subtier = _source_subtier(copied, source_level)
         source_tier = _source_tier(copied, source_level)
+        source_verification_status = _source_verification_status(copied)
+        source_verified = source_verification_status in VERIFIED_SOURCE_STATUSES
+        traceable = _has_traceable_source(copied)
+        advisory_mode = self.advisory_weight and traceable
+        shape_issues = evidence_content_shape_issues(copied)
+        blocking_shape_issues = [issue for issue in shape_issues if issue in BLOCKING_CONTENT_SHAPE_ISSUES]
 
-        if semantic_status in REJECTED_STATUSES or evidence_role in REJECTED_STATUSES:
+        if blocking_shape_issues:
+            semantic_status = "rejected"
+            evidence_role = "rejected"
+            allowed_use = "not_for_writing"
+            appendix_only = False
+            enterprise_usable = False
+            followup_seed = False
+            usage_tier = "rejected"
+            directness = "clue"
+        elif semantic_status in REJECTED_STATUSES or evidence_role in REJECTED_STATUSES:
             evidence_role = "rejected"
             allowed_use = "rejected"
             appendix_only = False
@@ -660,14 +838,32 @@ class EvidenceClassifier:
             followup_seed = False
             usage_tier = "rejected"
             directness = "clue"
+        elif advisory_mode:
+            if evidence_role in LOW_QUALITY_ROLES:
+                evidence_role = "supporting"
+            allowed_use = "supporting_context"
+            appendix_only = False
+            enterprise_usable = True
+            followup_seed = False
+            usage_tier = "advisory_weight"
+            directness = _directness(copied, proof_role, source_level, evidence_role)
         elif source_level == "D":
-            evidence_role = "clue"
-            allowed_use = "appendix_only"
-            appendix_only = True
-            enterprise_usable = False
-            followup_seed = True
-            usage_tier = "clue_low_quality"
-            directness = "clue"
+            if self.public_signal and semantic_status not in {"weak", "weak_relevance", "appendix"}:
+                evidence_role = "supporting" if evidence_role not in LOW_QUALITY_ROLES else "clue"
+                allowed_use = "directional_signal"
+                appendix_only = False
+                enterprise_usable = True
+                followup_seed = False
+                usage_tier = "public_signal"
+                directness = "clue"
+            else:
+                evidence_role = "clue"
+                allowed_use = "appendix_only"
+                appendix_only = True
+                enterprise_usable = False
+                followup_seed = True
+                usage_tier = "clue_low_quality"
+                directness = "clue"
         elif source_level == "C":
             c_floor = self.directional_c_min_confidence
             if claim_type in {"product_event", "case_signal", "industry_analysis"}:
@@ -718,9 +914,6 @@ class EvidenceClassifier:
         fact = str(copied.get("clean_fact") or copied.get("fact") or copied.get("clean_content") or copied.get("content") or "").strip()
         period = str(copied.get("period") or _source_payload(copied).get("date") or "").strip()
         metric_proof_gaps = _metric_proof_gaps(copied, claim_type, fact, period)
-        traceable = _has_traceable_source(copied)
-        source_verification_status = _source_verification_status(copied)
-        source_verified = source_verification_status in VERIFIED_SOURCE_STATUSES
         evidence_fit_score = _evidence_fit_score(
             source_level=source_level,
             allowed_use=allowed_use,
@@ -779,9 +972,28 @@ class EvidenceClassifier:
             "source_verification_status": source_verification_status,
             "source_verified": source_verified,
             "quality_contract_version": QUALITY_CONTRACT_VERSION,
+            "content_shape_issues": shape_issues,
         }
-        can_support_if_corrobated = allowed_use == "directional_signal" and claim_type != "hard_metric"
+        evidence_weight_hint = _evidence_weight_hint(
+            source_level=source_level,
+            source_subtier=source_subtier,
+            source_tier=source_tier,
+            source_family=card["source_family"],
+            source_verification_status=source_verification_status,
+            claim_type=claim_type,
+            proof_role=proof_role,
+            directness=directness,
+            metric_proof_gaps=metric_proof_gaps,
+            confidence_score=confidence_score,
+            evidence_fit_score=evidence_fit_score,
+        )
+        if self.advisory_weight:
+            card["evidence_weight_policy"] = "advisory_only"
+            card["evidence_weight_hint"] = evidence_weight_hint
+        can_support_if_corrobated = (allowed_use == "directional_signal" and claim_type != "hard_metric") or self.advisory_weight
         return {
+            "status": "rejected" if blocking_shape_issues or allowed_use == "rejected" else "accepted",
+            "reasons": shape_issues,
             "source_level": source_level,
             "source_subtier": source_subtier,
             "source_tier": source_tier,
@@ -796,14 +1008,17 @@ class EvidenceClassifier:
             "enterprise_usable": enterprise_usable,
             "followup_seed": followup_seed,
             "can_support_claim_if_corrobated": can_support_if_corrobated,
-            "can_support_industry_analysis": bool(source_level in {"A", "B"} or can_support_if_corrobated),
+            "can_support_industry_analysis": bool(self.advisory_weight or source_level in {"A", "B"} or can_support_if_corrobated),
             "evidence_grade_note": grade_note,
             "confidence_score": confidence_score,
             "evidence_fit_score": evidence_fit_score,
+            "evidence_weight_policy": "advisory_only" if self.advisory_weight else "graded_admission",
+            "evidence_weight_hint": evidence_weight_hint,
             "metric_proof_gaps": metric_proof_gaps,
             "analysis_readiness": analysis_readiness,
             "source_verification_status": source_verification_status,
             "source_verified": source_verified,
+            "content_shape_issues": shape_issues,
             "evidence_card": card,
         }
 
@@ -817,10 +1032,13 @@ def classify_evidence(
     *,
     strict_quality: bool = False,
     directional_c_min_confidence: float = 0.55,
+    public_signal: Optional[bool] = None,
 ) -> Dict[str, Any]:
     return EvidenceClassifier(
         strict_quality=strict_quality,
         directional_c_min_confidence=directional_c_min_confidence,
+        public_signal=public_signal_mode() if public_signal is None else bool(public_signal),
+        advisory_weight=advisory_weight_mode(),
     ).classify(item)
 
 
@@ -829,12 +1047,14 @@ def apply_evidence_quality_contract(
     *,
     strict_quality: bool = False,
     directional_c_min_confidence: float = 0.55,
+    public_signal: Optional[bool] = None,
 ) -> Dict[str, Any]:
     normalized = normalize_evidence(item)
     classification = classify_evidence(
         normalized,
         strict_quality=strict_quality,
         directional_c_min_confidence=directional_c_min_confidence,
+        public_signal=public_signal,
     )
     merged = {**normalized, **classification}
     admission = _analysis_admission_fields(merged)
@@ -895,35 +1115,76 @@ def _align_analysis_fields_with_admission_decision(item: Dict[str, Any], decisio
 def _analysis_admission_fields(item: Dict[str, Any]) -> Dict[str, Any]:
     semantic_status = str(item.get("semantic_status") or "").strip().lower()
     allowed_use = str(item.get("allowed_use") or "").strip().lower()
+    status = str(item.get("status") or "").strip().lower()
     proof_role = str(item.get("proof_role") or "").strip().lower()
     claim_type = str(item.get("claim_type") or infer_claim_type(item)).strip().lower()
     source_level = str(item.get("source_level") or "").strip().upper()
     traceable = _has_traceable_source(item)
     metric_gaps = _as_list(item.get("metric_proof_gaps"))
+    advisory_mode = advisory_weight_mode()
 
-    if semantic_status in REJECTED_STATUSES or allowed_use == "rejected":
+    if advisory_mode and allowed_use != "rejected":
+        claim_strength_ceiling = "strong"
+    elif allowed_use == "core_claim":
+        claim_strength_ceiling = "strong"
+    elif allowed_use == "supporting":
+        claim_strength_ceiling = "moderate"
+    elif allowed_use == "directional_signal":
+        claim_strength_ceiling = "directional"
+    else:
+        claim_strength_ceiling = "limited_evidence"
+
+    if semantic_status in REJECTED_STATUSES or allowed_use in {"rejected", "not_for_writing"} or status == "rejected":
         return {
             "analysis_eligible": False,
             "analysis_role": "rejected",
-            "evidence_admission_reason": "semantic_rejected",
+            "evidence_admission_reason": "content_shape_rejected" if status == "rejected" else "semantic_rejected",
+            "claim_strength_ceiling": "none",
+        }
+    if advisory_mode and traceable:
+        if proof_role == "counter":
+            role = "counter"
+        elif proof_role in {"technology_product", "technology", "standard"}:
+            role = "technology"
+        elif proof_role in {"case", "customer_case"} or claim_type == "case_signal":
+            role = "case"
+        elif claim_type == "hard_metric" or proof_role == "metric":
+            role = "metric" if not metric_gaps else "contextual"
+        else:
+            role = "claimable"
+        return {
+            "analysis_eligible": True,
+            "analysis_role": role,
+            "evidence_admission_reason": "advisory_weight_only",
+            "claim_strength_ceiling": claim_strength_ceiling,
+        }
+    if source_level == "D" and public_signal_mode() and allowed_use == "directional_signal" and traceable:
+        return {
+            "analysis_eligible": True,
+            "analysis_role": "directional",
+            "evidence_admission_reason": "public_signal_directional",
+            "claim_strength_ceiling": claim_strength_ceiling,
         }
     if source_level == "D" or allowed_use in {"appendix_only", "clue"}:
         return {
             "analysis_eligible": False,
             "analysis_role": "rejected",
             "evidence_admission_reason": "appendix_only" if allowed_use == "appendix_only" else "untraceable_or_low_quality",
+            "claim_strength_ceiling": "none",
         }
     if not traceable:
         return {
             "analysis_eligible": False,
             "analysis_role": "rejected",
             "evidence_admission_reason": "missing_source_ref",
+            "claim_strength_ceiling": "none",
         }
     if claim_type == "hard_metric" and metric_gaps:
         return {
             "analysis_eligible": True,
             "analysis_role": "contextual",
             "evidence_admission_reason": "metric_scope_period_unit_incomplete",
+            "claim_strength_ceiling": "directional",
         }
     if source_level == "C" and allowed_use == "directional_signal":
         role = "directional"
@@ -945,4 +1206,5 @@ def _analysis_admission_fields(item: Dict[str, Any]) -> Dict[str, Any]:
         "analysis_eligible": True,
         "analysis_role": role,
         "evidence_admission_reason": allowed_use or role,
+        "claim_strength_ceiling": claim_strength_ceiling,
     }

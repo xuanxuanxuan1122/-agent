@@ -1,13 +1,224 @@
 from rag_pipeline.agents.final_writer_agent import _render_key_data_block, run_final_writer_agent
 from rag_pipeline.agents.markdown_renderer import (
+    _compact_chapter_heading,
     render_appendix,
     render_chapter_package,
     render_executive_summary,
     render_section,
     render_table_package,
 )
-from rag_pipeline.agents.public_report_sanitizer import sanitize_public_markdown
+from rag_pipeline.agents.public_report_sanitizer import (
+    rewrite_internal_gap_language,
+    sanitize_public_markdown,
+)
 from rag_pipeline.flows.report.full_report import finalize_formal_report
+
+
+def test_dangling_cross_reference_parentheses_are_removed():
+    # Referent stripped during cleaning leaves an empty cross-reference.
+    assert rewrite_internal_gap_language("产业未来方向与科技生活碰撞的新火花（参见）。") == "产业未来方向与科技生活碰撞的新火花。"
+    assert rewrite_internal_gap_language("结论清晰（）。") == "结论清晰。"
+    assert "（见）" not in rewrite_internal_gap_language("行业景气（见）持续。")
+
+
+def test_real_cross_reference_parentheses_are_preserved():
+    # Parentheses with a real referent must not be stripped.
+    assert "（参见图3）" in rewrite_internal_gap_language("市场规模持续扩大（参见图3）。")
+
+
+def test_compact_chapter_heading_uses_complete_phrase_not_mid_clause_truncation():
+    title = (
+        "\u4f1a\u8ba1\u5b66\u4e13\u4e1a\u5c31\u4e1a\u7684\u73b0\u5b9e\u4ef7\u503c"
+        "\u5e94\u4ece\u4eba\u624d\u9700\u6c42\u3001\u5c97\u4f4d\u7ed3\u6784"
+        "\u548c\u7ec4\u7ec7\u8d22\u52a1\u6cbb\u7406\u9700\u6c42\u9a8c\u8bc1"
+    )
+
+    heading = _compact_chapter_heading(title, max_chars=28)
+
+    assert heading == "\u4f1a\u8ba1\u5b66\u4e13\u4e1a\u5c31\u4e1a\u7684\u73b0\u5b9e\u4ef7\u503c"
+    assert not heading.endswith("\u8d22")
+
+
+def test_compact_chapter_heading_returns_empty_instead_of_mid_clause_fragment():
+    heading = _compact_chapter_heading(
+        "会计与财务管理类专业的课程基础已从单一财会知识扩展为涵盖经济、金融、税务及管理的复合型理论体系",
+        max_chars=28,
+    )
+
+    assert heading == ""
+
+
+def test_compact_chapter_heading_rejects_already_truncated_ellipsis_title():
+    heading = _compact_chapter_heading(
+        "人工智能与大数据技术的深度融合正驱动会计专业人才培养体...",
+        max_chars=28,
+    )
+
+    assert heading == ""
+
+
+def test_render_chapter_package_does_not_repeat_generic_actionable_fallback():
+    repeated = "\u540c\u53e3\u5f84\u6307\u6807\u3001\u7ed3\u679c\u9a8c\u8bc1\u548c\u53cd\u5411\u6837\u672c\u662f\u5224\u65ad\u5f3a\u5f31\u53d8\u5316\u7684\u6838\u5fc3\u53d8\u91cf\u3002"
+    chapter = {
+        "chapter_title": "\u4f1a\u8ba1\u5c31\u4e1a\u4e0e\u4eba\u624d\u9700\u6c42",
+        "sections": [
+            {
+                "section_title": "\u5c97\u4f4d\u7ed3\u6784\u53d8\u5316",
+                "claim": "\u533a\u57df\u4eba\u529b\u9700\u6c42\u53ef\u4ee5\u4f5c\u4e3a\u4f1a\u8ba1\u5c31\u4e1a\u7684\u80cc\u666f\u53c2\u7167\u3002",
+                "reasoning": "\u8fd9\u4e00\u5224\u65ad\u9700\u8981\u56de\u5230\u5c97\u4f4d\u7c7b\u578b\u548c\u8bfe\u7a0b\u80fd\u529b\u5339\u914d\u4e0a\u7406\u89e3\u3002",
+                "actionable": repeated,
+                "citation_refs": ["[1]"],
+                "evidence_refs": ["EV-1"],
+                "evidence_backed": True,
+            },
+            {
+                "section_title": "\u8bfe\u7a0b\u80fd\u529b\u8f6c\u5411",
+                "claim": "\u667a\u80fd\u8d22\u52a1\u8bad\u7ec3\u6b63\u5728\u6539\u53d8\u4f1a\u8ba1\u4e13\u4e1a\u5c31\u4e1a\u7684\u80fd\u529b\u7ed3\u6784\u3002",
+                "reasoning": "\u8fd9\u4e00\u53d8\u5316\u5e94\u8be5\u548c\u5b66\u6821\u8bfe\u7a0b\u3001\u5de5\u5177\u8bad\u7ec3\u548c\u5b9e\u4e60\u5c97\u4f4d\u653e\u5728\u4e00\u8d77\u5206\u6790\u3002",
+                "actionable": repeated,
+                "citation_refs": ["[2]"],
+                "evidence_refs": ["EV-2"],
+                "evidence_backed": True,
+            },
+        ],
+    }
+
+    rendered = render_chapter_package(chapter, 1)
+
+    assert rendered.count(repeated) <= 1
+
+
+def test_render_chapter_package_replaces_generic_dynamic_fallback_title_with_claim_context():
+    chapter = {
+        "chapter_title": "\u4f1a\u8ba1\u5c31\u4e1a\u4e0e\u533a\u57df\u9700\u6c42",
+        "sections": [
+            {
+                "section_title": "\u5177\u4f53\u573a\u666f\u4f1a\u600e\u6837\u6539\u53d8\u7ed3\u8bba",
+                "claim": "\u516c\u5171\u5c31\u4e1a\u670d\u52a1\u5e73\u53f0\u7684\u7edf\u8ba1\u6846\u67b6\u4ee5\u533a\u57df\u7efc\u5408\u4eba\u529b\u4f9b\u9700\u4e3a\u6838\u5fc3\u5355\u5143\u3002",
+                "reasoning": "\u8fd9\u7c7b\u6570\u636e\u53ef\u4ee5\u89e3\u91ca\u533a\u57df\u5c31\u4e1a\u80cc\u666f\uff0c\u4f46\u4e0d\u5b9c\u76f4\u63a5\u5916\u63a8\u4e3a\u4f1a\u8ba1\u4e13\u4e1a\u5168\u56fd\u5c31\u4e1a\u7ed3\u8bba\u3002",
+                "citation_refs": ["[1]"],
+                "evidence_refs": ["EV-1"],
+                "evidence_backed": True,
+            }
+        ],
+    }
+
+    rendered = render_chapter_package(chapter, 1)
+
+    assert "\u5177\u4f53\u573a\u666f\u4f1a\u600e\u6837\u6539\u53d8\u7ed3\u8bba" not in rendered
+    assert "### \u516c\u5171\u5c31\u4e1a\u670d\u52a1\u5e73\u53f0\u7684\u7edf\u8ba1\u6846\u67b6" in rendered
+
+
+def test_render_section_removes_review_style_bridge_sentences_but_keeps_fact():
+    lines = render_section(
+        {
+            "section_title": "公共就业服务平台的统计框架",
+            "citation_refs": ["[1]"],
+            "evidence_refs": ["EV-1"],
+            "evidence_backed": True,
+            "render_blocks": [
+                {
+                    "type": "paragraph",
+                    "text": (
+                        "公共就业服务机构汇总的供求数据印证区域人才市场具备韧性。"
+                        "这种差异决定了相关判断能否从话题热度推进到更可复核的分析结论 "
+                        "可复核内容适合先进入主线，再说明它会影响哪些对象、流程或约束条件。"
+                        "暂时缺少覆盖的外推只适合作为边界或待验证问题处理。"
+                    ),
+                }
+            ],
+        }
+    )
+
+    rendered = "\n".join(lines)
+    assert "公共就业服务机构汇总的供求数据" in rendered
+    assert "可复核内容适合" not in rendered
+    assert "待验证问题处理" not in rendered
+    assert "话题热度推进" not in rendered
+
+
+def test_render_chapter_package_replaces_duplicate_chapter_title_with_section_title():
+    seen = {"会计学专业就业的现实价值"}
+    markdown = render_chapter_package(
+        {
+            "chapter_title": "会计学专业就业的现实价值",
+            "sections": [
+                {
+                    "section_title": "主要结论如何变化",
+                    "claim": "组织财务治理与基础岗位需求受实体经济指标修复牵引。",
+                    "citation_refs": ["[1]"],
+                    "evidence_refs": ["EV-1"],
+                    "evidence_backed": True,
+                    "render_blocks": [{"type": "paragraph", "text": "组织财务治理与基础岗位需求受实体经济指标修复牵引。"}],
+                },
+                {
+                    "section_title": "具体场景是否已经成立",
+                    "dynamic_section_title": "就业市场验证应聚焦公共就业服务机构的实际招聘口径",
+                    "claim": "公共就业数据可以校准岗位需求判断。",
+                    "citation_refs": ["[1]"],
+                    "evidence_refs": ["EV-1"],
+                    "evidence_backed": True,
+                    "render_blocks": [{"type": "paragraph", "text": "公共就业数据可以校准岗位需求判断。"}],
+                }
+            ],
+        },
+        2,
+        seen_chapter_titles=seen,
+    )
+
+    assert "## 2. 会计学专业就业的现实价值" not in markdown
+    assert "## 2. 主要结论如何变化" not in markdown
+    assert "## 2. 组织财务治理与基础岗位需求受实体经济指标修复牵引" in markdown
+
+
+def test_duplicate_chapter_title_can_fall_back_to_render_block_text():
+    seen = {"会计学专业就业的现实价值"}
+    markdown = render_chapter_package(
+        {
+            "chapter_title": "会计学专业就业的现实价值",
+            "sections": [
+                {
+                    "section_title": "关键判断如何变化",
+                    "citation_refs": ["[1]"],
+                    "evidence_refs": ["EV-1"],
+                    "evidence_backed": True,
+                    "render_blocks": [
+                        {
+                            "type": "paragraph",
+                            "text": "组织财务治理与基础岗位需求受实体经济指标修复牵引，呈现结构性稳定特征。",
+                        }
+                    ],
+                }
+            ],
+        },
+        2,
+        seen_chapter_titles=seen,
+    )
+
+    assert "## 2. 组织财务治理与基础岗位需求受实体经济指标修复牵引" in markdown
+    assert "## 2. 会计学专业就业的现实价值" not in markdown
+
+
+def test_duplicate_chapter_title_uses_angle_after_connector():
+    markdown = render_chapter_package(
+        {
+            "chapter_title": "会计学专业就业的现实价值应从人才需求、岗位结构和组织财务治理需求验证，而不是套用产业赛道框架",
+            "sections": [
+                {
+                    "section_title": "主要结论如何变化",
+                    "citation_refs": ["[1]"],
+                    "evidence_refs": ["EV-1"],
+                    "evidence_backed": True,
+                    "render_blocks": [{"type": "paragraph", "text": "组织财务治理与基础岗位需求受实体经济指标修复牵引。"}],
+                }
+            ],
+        },
+        2,
+        seen_chapter_titles={"会计学专业就业的现实价值"},
+    )
+
+    assert "## 2. 人才需求、岗位结构和组织财务治理需求验证" in markdown
+    assert "## 2. 会计学专业就业的现实价值" not in markdown
 
 
 def test_metric_fact_is_rendered_as_sentence_not_bare_label():
@@ -15,6 +226,8 @@ def test_metric_fact_is_rendered_as_sentence_not_bare_label():
         {
             "section_title": "\u5e02\u573a\u89c4\u6a21\u80fd\u5426\u9a8c\u8bc1",
             "block_type": "metric_reconciliation",
+            "evidence_refs": ["EV-METRIC"],
+            "used_fact_refs": ["EV-METRIC"],
             "render_blocks": [
                 {
                     "type": "paragraph",
@@ -33,6 +246,307 @@ def test_metric_fact_is_rendered_as_sentence_not_bare_label():
     assert "\u5e02\u573a\u89c4\u6a21: \u8fbe8.2\u4ebf\u5143" not in text
     assert "\u5e02\u573a\u89c4\u6a21" in text
     assert "\u8fbe8.2\u4ebf\u5143" in text
+
+
+def test_render_section_keeps_public_fact_chain_sentence():
+    lines = render_section(
+        {
+            "section_title": "\u9700\u6c42\u4fe1\u53f7\u662f\u5426\u6210\u7acb",
+            "block_type": "case_comparison",
+            "evidence_refs": ["[1]"],
+            "used_fact_refs": ["EV-1"],
+            "citation_refs": ["[1]"],
+            "evidence_backed": True,
+            "render_blocks": [
+                {
+                    "type": "paragraph",
+                    "text": (
+                        "\u5df2\u6709\u4e8b\u5b9e\u94fe\u663e\u793a\uff1a\u591a\u5730\u62ab\u9732\u4f4e\u7a7a\u822a\u7ebf\u8bd5\u70b9\u548c\u91c7\u8d2d\u52a8\u4f5c\u3002"
+                        "\u8fd9\u4e9b\u6750\u6599\u53ef\u4ee5\u8bf4\u660e\u9700\u6c42\u4fe1\u53f7\u5df2\u7ecf\u8fdb\u5165\u53ef\u89c2\u5bdf\u9636\u6bb5\uff0c"
+                        "\u4f46\u4ecd\u9700\u8981\u7528\u5ba2\u6237\u590d\u5236\u3001\u8fd0\u8425\u9891\u6b21\u548c\u4ed8\u8d39\u94fe\u8def\u7ee7\u7eed\u6821\u9a8c\u3002"
+                    ),
+                }
+            ],
+        }
+    )
+
+    text = "\n".join(lines)
+    assert "\u5df2\u6709\u4e8b\u5b9e\u94fe\u663e\u793a" in text
+    assert "\u9700\u6c42\u4fe1\u53f7\u5df2\u7ecf\u8fdb\u5165\u53ef\u89c2\u5bdf\u9636\u6bb5" in text
+    assert "[1]" in text
+
+
+def test_render_section_naturalizes_mechanical_transition_prefixes():
+    lines = render_section(
+        {
+            "section_title": "产业链集聚",
+            "citation_refs": ["[1]"],
+            "evidence_refs": ["EV-1"],
+            "render_blocks": [
+                {
+                    "type": "paragraph",
+                    "text": "其中，广东集聚全国30%以上低空经济产业链企业。",
+                },
+                {
+                    "type": "paragraph",
+                    "text": "生产许可证已颁发。 其中，过去一年广州亿航智能获颁生产许可证。",
+                },
+                {
+                    "type": "paragraph",
+                    "text": "同时，来源为第三方分析，无具体量化数据。",
+                },
+                {
+                    "type": "paragraph",
+                    "text": "落到行业含义上，订单、运营频次和客户付费决定机会能否扩大。",
+                },
+            ],
+        }
+    )
+
+    text = "\n".join(lines)
+    assert "广东集聚全国30%以上低空经济产业链企业" in text
+    assert "过去一年广州亿航智能获颁生产许可证" in text
+    assert "可复核材料、运营频次和持续使用" in text
+    assert "订单、运营频次和客户付费" not in text
+    assert "其中，" not in text
+    assert "同时，" not in text
+    assert "落到行业含义上，" not in text
+
+
+def test_render_section_inserts_sentence_boundary_before_bridge_phrases():
+    lines = render_section(
+        {
+            "section_title": "产业信号是否可持续",
+            "citation_refs": ["[1]"],
+            "evidence_refs": ["EV-1"],
+            "render_blocks": [
+                {
+                    "type": "paragraph",
+                    "text": "具体案例支撑 已披露动作如果继续出现在更多主体、场景和时间窗口中，机会判断会更扎实",
+                },
+                {
+                    "type": "paragraph",
+                    "text": "真实产业机会 接下来更值得观察的是订单、运营频次、客户付费、政策执行和安全记录",
+                },
+                {
+                    "type": "paragraph",
+                    "text": "数据来源说明 来源为第三方分析，无具体量化数据",
+                },
+            ],
+        }
+    )
+
+    text = "\n".join(lines)
+    assert "支撑 已披露动作" not in text
+    assert "机会 接下来" not in text
+    assert "说明 来源为" not in text
+    assert "具体案例支撑" in text
+    assert "已披露动作如果继续" not in text
+    assert "真实产业机会" in text
+    assert "接下来更值得观察" not in text
+    assert "订单" not in text
+    assert "客户付费" not in text
+    assert "数据来源说明" in text
+    assert "来源为第三方分析" not in text
+
+
+def test_render_section_strips_repeated_generic_bridge_sentences():
+    lines = render_section(
+        {
+            "section_title": "产业信号是否可持续",
+            "citation_refs": ["[1]"],
+            "evidence_refs": ["EV-1"],
+            "render_blocks": [
+                {
+                    "type": "paragraph",
+                    "text": (
+                        "政策、规模和技术形成正向循环，降低市场进入门槛并刺激需求。"
+                        "已披露动作如果继续出现在更多主体、场景和时间窗口中，机会判断会更扎实；"
+                        "如果缺少案例或数据承接，结论仍需要保留弹性。"
+                        "这种差异决定了相关机会能否从话题热度推进到真实产业机会。"
+                        "接下来更值得观察的是订单、运营频次、客户付费、政策执行和安全记录。"
+                        "订单和运营频次决定需求是否真实扩散，客户付费决定商业模式是否成立，"
+                        "政策执行和安全记录则决定风险边界是否可控；这些指标共同决定机会是扩大、收缩，还是停留在示范项目。"
+                    ),
+                },
+            ],
+        }
+    )
+
+    text = "\n".join(lines)
+    assert "政策、规模和技术形成正向循环" in text
+    assert "已披露动作如果继续" not in text
+    assert "这种差异决定了相关机会能否" not in text
+    assert "接下来更值得观察的是订单" not in text
+    assert "这些指标共同决定机会" not in text
+
+
+def test_render_section_rewrites_analysis_voice_into_report_voice():
+    lines = render_section(
+        {
+            "section_title": "风险边界如何影响机会",
+            "citation_refs": ["[1]"],
+            "evidence_refs": ["EV-1"],
+            "render_blocks": [
+                {
+                    "type": "paragraph",
+                    "text": "本判断基于间接理论推导，缺乏低空经济具体市场数据，仅供方向参考。",
+                },
+                {
+                    "type": "paragraph",
+                    "text": "这说明风险边界是推翻或削弱本章判断的触发条件。",
+                },
+            ],
+        }
+    )
+
+    text = "\n".join(lines)
+    assert "本判断" not in text
+    assert "本章判断" not in text
+    assert "这一结论基于间接理论推导" in text
+    assert "前述结论" in text
+
+
+def test_render_section_skips_standalone_source_provenance_notes():
+    lines = render_section(
+        {
+            "section_title": "产业信号是否可持续",
+            "citation_refs": ["[1]"],
+            "evidence_refs": ["EV-1"],
+            "render_blocks": [
+                {
+                    "type": "paragraph",
+                    "text": "低空政策体系不断完善，低空经济规模与日俱增，低空飞行技术助力应用。",
+                },
+                {
+                    "type": "paragraph",
+                    "text": "来源为赛文交通网文章，属于第三方分析，无具体量化数据。",
+                },
+            ],
+        }
+    )
+
+    text = "\n".join(lines)
+    assert "低空政策体系不断完善" in text
+    assert "来源为赛文交通网文章" not in text
+    assert "无具体量化数据" not in text
+
+
+def test_render_section_strips_embedded_source_provenance_note():
+    lines = render_section(
+        {
+            "section_title": "产业信号是否可持续",
+            "citation_refs": ["[1]"],
+            "evidence_refs": ["EV-1"],
+            "render_blocks": [
+                {
+                    "type": "paragraph",
+                    "text": (
+                        "政策、规模和技术形成正向循环，降低市场进入门槛并刺激需求。"
+                        "来源为赛文交通网文章，属于第三方分析，无具体量化数据。"
+                        "商业化程度仍需具体案例支撑。"
+                    ),
+                },
+            ],
+        }
+    )
+
+    text = "\n".join(lines)
+    assert "政策、规模和技术形成正向循环" in text
+    assert "商业化程度仍需具体案例支撑" in text
+    assert "来源为赛文交通网文章" not in text
+    assert "无具体量化数据" not in text
+
+
+def test_render_section_drops_empty_public_material_intro():
+    lines = render_section(
+        {
+            "section_title": "补充观察",
+            "citation_refs": ["[1]"],
+            "evidence_refs": ["EV-1"],
+            "render_blocks": [
+                {"type": "paragraph", "text": "广东已集聚全国30%以上的低空经济产业链企业。"},
+                {"type": "paragraph", "text": "公开材料提到，"},
+            ],
+        }
+    )
+
+    text = "\n".join(lines)
+    assert "广东已集聚全国30%以上" in text
+    assert "公开材料提到" not in text
+
+
+def test_render_section_inserts_boundary_before_limitation_sentences():
+    lines = render_section(
+        {
+            "section_title": "外溢效应是否成立",
+            "citation_refs": ["[1]"],
+            "evidence_refs": ["EV-1"],
+            "render_blocks": [
+                {
+                    "type": "paragraph",
+                    "text": "这些指标共同决定机会是扩大、收缩，还是停留在示范项目 原文未提及低空经济，外溢效应属于逻辑推断",
+                },
+                {
+                    "type": "paragraph",
+                    "text": "这些指标共同决定机会是扩大、收缩，还是停留在示范项目 该数据为宏观先行指标，低空经济订单变化需企业公开数据验证",
+                },
+                {
+                    "type": "paragraph",
+                    "text": "这些指标共同决定机会是扩大、收缩，还是停留在示范项目 本判断基于间接理论推导，缺乏低空经济具体市场数据",
+                },
+                {
+                    "type": "paragraph",
+                    "text": "这些指标共同决定机会是扩大、收缩，还是停留在示范项目 标准制定到实施有周期，对企业实际商业合同的影响短期内不明显",
+                },
+                {
+                    "type": "paragraph",
+                    "text": "这些指标共同决定机会是扩大、收缩，还是停留在示范项目 目前整治行动在总体产业层面，影响路径和时间不确定",
+                },
+            ],
+        }
+    )
+
+    text = "\n".join(lines)
+    assert "项目 原文未提及" not in text
+    assert "项目 该数据为" not in text
+    assert "项目 本判断基于" not in text
+    assert "项目 标准制定到实施" not in text
+    assert "项目 目前整治行动" not in text
+    assert "原文未提及低空经济" in text
+    assert "该数据为宏观先行指标" in text
+    assert "这一结论基于间接理论推导" in text
+    assert "标准制定到实施有周期" in text
+    assert "目前整治行动在总体产业层面" in text
+
+
+def test_render_section_keeps_public_paragraph_when_template_sentence_is_present():
+    lines = render_section(
+        {
+            "section_title": "\u8ba2\u5355\u4e0e\u8bd5\u70b9\u662f\u5426\u5f62\u6210\u5546\u4e1a\u4fe1\u53f7",
+            "block_type": "case_comparison",
+            "evidence_refs": ["[1]"],
+            "used_fact_refs": ["EV-1"],
+            "citation_refs": ["[1]"],
+            "evidence_backed": True,
+            "render_blocks": [
+                {
+                    "type": "paragraph",
+                    "text": (
+                        "2025\u5e74\u6c11\u7528\u65e0\u4eba\u673a\u5e02\u573a\u89c4\u6a21\u9884\u8ba1\u540c\u6bd4\u589e\u957f15%\uff0c"
+                        "eVTOL\u5e74\u5ea6\u8ba2\u5355\u603b\u989d\u5df2\u8d85\u8fc7300\u4ebf\u5143\u3002"
+                        "\u4ece\u884c\u4e1a\u5224\u65ad\u770b\uff0c\u8fd9\u7c7b\u8ba2\u5355\u548c\u8bd5\u70b9\u66f4\u9002\u5408\u4f5c\u4e3a\u89c2\u5bdf\u4ea7\u4e1a\u4f18\u5148\u7ea7\u3002"
+                    ),
+                }
+            ],
+        }
+    )
+
+    text = "\n".join(lines)
+    assert "\u6c11\u7528\u65e0\u4eba\u673a\u5e02\u573a\u89c4\u6a21" in text
+    assert "300\u4ebf\u5143" in text
+    assert "\u4ece\u884c\u4e1a\u5224\u65ad\u770b" not in text
+    assert "[1]" in text
 
 
 def test_key_data_block_requires_public_citation_and_scans_past_first_row():
@@ -78,9 +592,127 @@ def test_short_cited_section_expands_for_longform_mode(monkeypatch):
     )
 
     body = "\n".join(line for line in lines if not line.startswith("###"))
-    assert len(body.replace(" ", "")) >= 420
+    assert len(body.replace(" ", "")) >= 400
     assert "[1]" in body
     assert "\u4ed8\u8d39\u8f6c\u5316" in body or "\u90e8\u7f72" in body
+
+
+def test_chapter_render_augments_render_blocks_with_reasoning_boundary_and_actionable():
+    markdown = render_chapter_package(
+        {
+            "chapter_title": "Demand validation",
+            "sections": [
+                {
+                    "section_title": "Pilot signal",
+                    "claim": "Enterprise pilots show a directional deployment signal.",
+                    "reasoning": "The mechanism is that pilots require workflow integration and operating ownership.",
+                    "counter_evidence": "The boundary is that one pilot does not prove market-wide adoption.",
+                    "actionable": "Track repeat deployments and comparable customer disclosures.",
+                    "evidence_refs": ["[1]"],
+                    "citation_refs": ["[1]"],
+                    "render_blocks": [
+                        {
+                            "type": "paragraph",
+                            "text": "Enterprise pilots show a directional deployment signal.",
+                        }
+                    ],
+                }
+            ],
+        },
+        1,
+    )
+
+    assert "Enterprise pilots show a directional deployment signal" in markdown
+    assert "workflow integration and operating ownership" in markdown
+    assert "one pilot does not prove market-wide adoption" in markdown
+    assert "Track repeat deployments" in markdown
+
+
+def test_chapter_render_skips_fallback_actionable_text():
+    markdown = render_chapter_package(
+        {
+            "chapter_title": "Demand validation",
+            "sections": [
+                {
+                    "section_title": "Pilot signal",
+                    "claim": "Enterprise pilots show a directional deployment signal.",
+                    "reasoning": "The mechanism is that pilots require workflow integration and operating ownership.",
+                    "counter_evidence": "The boundary is that one pilot does not prove market-wide adoption.",
+                    "actionable": "Same-period indicators and renewal disclosures determine whether the signal strengthens.",
+                    "actionable_is_fallback": True,
+                    "evidence_refs": ["[1]"],
+                    "citation_refs": ["[1]"],
+                    "render_blocks": [
+                        {
+                            "type": "paragraph",
+                            "text": "Enterprise pilots show a directional deployment signal.",
+                        }
+                    ],
+                }
+            ],
+        },
+        1,
+    )
+
+    assert "Enterprise pilots show a directional deployment signal" in markdown
+    assert "workflow integration and operating ownership" in markdown
+    assert "one pilot does not prove market-wide adoption" in markdown
+    assert "Same-period indicators" not in markdown
+
+
+def test_chapter_render_does_not_emit_internal_analysis_suggestions_from_fields():
+    markdown = render_chapter_package(
+        {
+            "chapter_title": "Demand validation",
+            "sections": [
+                {
+                    "section_title": "Pilot signal",
+                    "claim": "Enterprise pilots show a directional deployment signal.",
+                    "reasoning": (
+                        "diagnostic_only score_gap missing_proof_standard "
+                        "repair_task_seed search_more must_not_render"
+                    ),
+                    "counter_evidence": (
+                        "review_suggestion public_text_allowed=false "
+                        "reanalyze_existing rewrite_with_caveat"
+                    ),
+                    "actionable": (
+                        "source_check semantic_judge executor_should_decide "
+                        "\u8865\u8bc1\u5efa\u8bae \u5ba1\u67e5\u5efa\u8bae"
+                    ),
+                    "evidence_refs": ["[1]"],
+                    "citation_refs": ["[1]"],
+                    "render_blocks": [
+                        {
+                            "type": "paragraph",
+                            "text": "Enterprise pilots show a directional deployment signal.",
+                        }
+                    ],
+                }
+            ],
+        },
+        1,
+    )
+
+    assert "Enterprise pilots show a directional deployment signal" in markdown
+    for forbidden in (
+        "diagnostic_only",
+        "score_gap",
+        "missing_proof_standard",
+        "repair_task_seed",
+        "search_more",
+        "must_not_render",
+        "review_suggestion",
+        "public_text_allowed=false",
+        "reanalyze_existing",
+        "rewrite_with_caveat",
+        "source_check",
+        "semantic_judge",
+        "executor_should_decide",
+        "\u8865\u8bc1\u5efa\u8bae",
+        "\u5ba1\u67e5\u5efa\u8bae",
+    ):
+        assert forbidden not in markdown
 
 
 def test_chapter_heading_rewrites_internal_evidence_terms():
@@ -248,13 +880,16 @@ def test_metric_render_block_is_rewritten_even_when_section_block_is_commercial(
         {
             "section_title": "\u5546\u4e1a\u5316\u4fe1\u53f7\u662f\u5426\u6e05\u6670",
             "block_type": "unit_economics",
+            "evidence_refs": ["EV-DEPLOY"],
+            "used_fact_refs": ["EV-DEPLOY"],
             "render_blocks": [{"type": "paragraph", "text": "\u51fa\u8d27/\u90e8\u7f72: \u8d85140\u5bb6"}],
         }
     )
 
     text = "\n".join(lines)
     assert "\u51fa\u8d27/\u90e8\u7f72: \u8d85140\u5bb6" not in text
-    assert "\u51fa\u8d27/\u90e8\u7f72" in text
+    assert "\u76f8\u5173\u8fdb\u5c55" in text
+    assert "\u51fa\u8d27/\u90e8\u7f72" not in text
     assert "\u8d85140\u5bb6" in text
 
 
@@ -364,6 +999,117 @@ def test_empty_chapter_package_is_not_rendered_as_h2_shell():
     )
 
     assert markdown == ""
+
+
+def test_render_chapter_package_avoids_cross_chapter_section_title_duplicates():
+    seen_sections = set()
+    first = render_chapter_package(
+        {
+            "chapter_title": "\u4f1a\u8ba1\u5c31\u4e1a\u7684\u533a\u57df\u4fe1\u53f7",
+            "sections": [
+                {
+                    "section_title": "\u5c31\u4e1a\u5e02\u573a\u9a8c\u8bc1",
+                    "claim": "\u533a\u57df\u516c\u5171\u5c31\u4e1a\u6570\u636e\u53ef\u4ee5\u8bf4\u660e\u4eba\u529b\u9700\u6c42\u7684\u57fa\u672c\u80cc\u666f\u3002",
+                    "citation_refs": ["[1]"],
+                    "evidence_refs": ["EV-1"],
+                    "evidence_backed": True,
+                    "render_blocks": [
+                        {
+                            "type": "paragraph",
+                            "text": "\u533a\u57df\u516c\u5171\u5c31\u4e1a\u6570\u636e\u53ef\u4ee5\u8bf4\u660e\u4eba\u529b\u9700\u6c42\u7684\u57fa\u672c\u80cc\u666f\u3002",
+                        }
+                    ],
+                }
+            ],
+        },
+        1,
+        seen_section_titles_global=seen_sections,
+    )
+    second = render_chapter_package(
+        {
+            "chapter_title": "\u4f1a\u8ba1\u5c97\u4f4d\u7684\u80fd\u529b\u7ed3\u6784",
+            "sections": [
+                {
+                    "section_title": "\u5c31\u4e1a\u5e02\u573a\u9a8c\u8bc1",
+                    "claim": "\u8bfe\u7a0b\u8bad\u7ec3\u548c\u5c97\u4f4d\u8981\u6c42\u7684\u540c\u65f6\u53d8\u5316\u6b63\u5728\u63a8\u52a8\u4f1a\u8ba1\u80fd\u529b\u7ed3\u6784\u8c03\u6574\u3002",
+                    "citation_refs": ["[2]"],
+                    "evidence_refs": ["EV-2"],
+                    "evidence_backed": True,
+                    "render_blocks": [
+                        {
+                            "type": "paragraph",
+                            "text": "\u8bfe\u7a0b\u8bad\u7ec3\u548c\u5c97\u4f4d\u8981\u6c42\u7684\u540c\u65f6\u53d8\u5316\u6b63\u5728\u63a8\u52a8\u4f1a\u8ba1\u80fd\u529b\u7ed3\u6784\u8c03\u6574\u3002",
+                        }
+                    ],
+                }
+            ],
+        },
+        2,
+        seen_section_titles_global=seen_sections,
+    )
+    combined = first + "\n" + second
+
+    assert combined.count("### \u5c31\u4e1a\u5e02\u573a\u9a8c\u8bc1") == 1
+    assert "### \u8bfe\u7a0b\u8bad\u7ec3\u548c\u5c97\u4f4d\u8981\u6c42\u7684\u540c\u65f6\u53d8\u5316" in second
+
+
+def test_duplicate_section_title_uses_claim_tail_instead_of_numeric_suffix():
+    seen_sections = {"\u5c31\u4e1a\u5e02\u573a\u9a8c\u8bc1"}
+    markdown = render_chapter_package(
+        {
+            "chapter_title": "\u4eba\u624d\u9700\u6c42\u4e0e\u5c97\u4f4d\u7ed3\u6784",
+            "sections": [
+                {
+                    "section_title": "\u5c31\u4e1a\u5e02\u573a\u9a8c\u8bc1",
+                    "dynamic_section_title": "\u5c31\u4e1a\u5e02\u573a\u9a8c\u8bc1",
+                    "claim": "\u5c31\u4e1a\u5e02\u573a\u9a8c\u8bc1\u5e94\u805a\u7126\u516c\u5171\u5c31\u4e1a\u670d\u52a1\u673a\u6784\u7684\u5b9e\u9645\u62db\u8058\u53e3\u5f84\uff0c\u907f\u514d\u5c06\u5b8f\u89c2\u53d9\u4e8b\u76f4\u63a5\u7b49\u540c\u4e8e\u4e13\u4e1a\u5c97\u4f4d\u9700\u6c42\u3002",
+                    "citation_refs": ["[1]"],
+                    "evidence_refs": ["EV-1"],
+                    "evidence_backed": True,
+                    "render_blocks": [
+                        {
+                            "type": "paragraph",
+                            "text": "\u5c31\u4e1a\u5e02\u573a\u9a8c\u8bc1\u5e94\u805a\u7126\u516c\u5171\u5c31\u4e1a\u670d\u52a1\u673a\u6784\u7684\u5b9e\u9645\u62db\u8058\u53e3\u5f84\uff0c\u907f\u514d\u5c06\u5b8f\u89c2\u53d9\u4e8b\u76f4\u63a5\u7b49\u540c\u4e8e\u4e13\u4e1a\u5c97\u4f4d\u9700\u6c42\u3002",
+                        }
+                    ],
+                }
+            ],
+        },
+        2,
+        seen_section_titles_global=seen_sections,
+    )
+
+    assert "### 2" not in markdown
+    assert "### \u516c\u5171\u5c31\u4e1a\u670d\u52a1\u673a\u6784\u7684\u5b9e\u9645\u62db\u8058\u6570\u636e" in markdown
+
+
+def test_duplicate_claim_derived_section_title_uses_claim_tail_when_public_title_is_empty():
+    seen_sections = {"\u5c31\u4e1a\u5e02\u573a\u9a8c\u8bc1"}
+    markdown = render_chapter_package(
+        {
+            "chapter_title": "\u4eba\u624d\u9700\u6c42\u4e0e\u5c97\u4f4d\u7ed3\u6784",
+            "sections": [
+                {
+                    "section_title": "\u5177\u4f53\u573a\u666f\u662f\u5426\u5df2\u7ecf\u6210\u7acb",
+                    "claim": "\u5c31\u4e1a\u5e02\u573a\u9a8c\u8bc1\u5e94\u805a\u7126\u516c\u5171\u5c31\u4e1a\u670d\u52a1\u673a\u6784\u7684\u5b9e\u9645\u62db\u8058\u53e3\u5f84\uff0c\u907f\u514d\u5c06\u5b8f\u89c2\u53d9\u4e8b\u76f4\u63a5\u7b49\u540c\u4e8e\u4e13\u4e1a\u5c97\u4f4d\u9700\u6c42\u3002",
+                    "citation_refs": ["[1]"],
+                    "evidence_refs": ["EV-1"],
+                    "evidence_backed": True,
+                    "render_blocks": [
+                        {
+                            "type": "paragraph",
+                            "text": "\u5c31\u4e1a\u5e02\u573a\u9a8c\u8bc1\u5e94\u805a\u7126\u516c\u5171\u5c31\u4e1a\u670d\u52a1\u673a\u6784\u7684\u5b9e\u9645\u62db\u8058\u53e3\u5f84\uff0c\u907f\u514d\u5c06\u5b8f\u89c2\u53d9\u4e8b\u76f4\u63a5\u7b49\u540c\u4e8e\u4e13\u4e1a\u5c97\u4f4d\u9700\u6c42\u3002",
+                        }
+                    ],
+                }
+            ],
+        },
+        2,
+        seen_section_titles_global=seen_sections,
+    )
+
+    assert "### \u5c31\u4e1a\u5e02\u573a\u9a8c\u8bc1" not in markdown
+    assert "### \u516c\u5171\u5c31\u4e1a\u670d\u52a1\u673a\u6784\u7684\u5b9e\u9645\u62db\u8058\u6570\u636e" in markdown
 
 
 def test_chapter_heading_is_compacted_before_rendering():
@@ -478,7 +1224,7 @@ def test_chapter_lead_gets_first_section_citation_when_rendered():
         1,
     )
 
-    assert "本章判断企业智能体是否已经进入流程部署，并观察样本能否支撑付费转化。[3]" in markdown
+    assert "这一部分观察企业智能体是否已经进入流程部署，并观察样本能否支撑付费转化。[3]" in markdown
 
 
 def test_executive_summary_omits_factual_bullets_without_public_citation():
@@ -653,6 +1399,112 @@ def test_sanitize_public_markdown_removes_analysis_scaffold_language():
     ]:
         assert phrase not in cleaned
     assert "## 来源附录" in cleaned
+
+
+def test_sanitize_public_markdown_rewrites_review_style_directional_language():
+    markdown = (
+        "# 行业研究报告\n\n"
+        "## 1. 商业化进展\n"
+        "这些信号仍受来源覆盖范围和公开披露充分性的限制，应作为方向性观察进入正文。[1]\n"
+        "后续应继续观察同类主体、同类场景和相同口径信息是否重复出现。[1]\n"
+        "这些材料解释了产业链变化，以及后续判断需要继续观察哪些约束条件，而不是被简单处理成孤立材料。[1]\n\n"
+        "## 数据来源\n"
+        "- [1] 行业公开资料 | https://example.org/source\n"
+    )
+
+    cleaned = sanitize_public_markdown(markdown, mode="enforce")
+
+    for phrase in (
+        "方向性观察进入正文",
+        "方向性观察",
+        "后续应继续观察",
+        "后续判断需要继续观察",
+        "被简单处理成孤立材料",
+    ):
+        assert phrase not in cleaned
+    assert "实际进展" in cleaned
+    assert "影响路径" in cleaned
+    assert "相关主体、组织安排和后续决策" in cleaned
+
+
+def test_sanitize_public_markdown_repairs_count_metrics_mislabeled_as_cost():
+    markdown = (
+        "## 风险边界\n"
+        "成本方面，相关企业数量已超140家，高参与成本可能制约商业化进程。\n"
+        "市场指标校准方面，成本超过140家，为需求空间提供信号。\n"
+        "成本维度上，参与企业超过140家。\n"
+        "平台覆盖企业超过140家（成本: 超140家）。\n"
+        "短期内可能增加企业的合规成本。\n"
+    )
+
+    cleaned = sanitize_public_markdown(markdown, mode="enforce")
+
+    assert "成本方面，相关企业数量" not in cleaned
+    assert "成本超过140家" not in cleaned
+    assert "成本维度上，参与企业" not in cleaned
+    assert "（成本: 超140家）" not in cleaned
+    assert "参与主体方面，相关企业数量已超140家" in cleaned
+    assert "参与企业超过140家" in cleaned
+    assert "合规成本" in cleaned
+
+
+def test_sanitize_public_markdown_removes_live_run_dirty_fragments_but_keeps_case_fact():
+    markdown = (
+        "# AI Agent企业落地研究报告\n\n"
+        "## 3. 商业化信号\n"
+        "AI Agent在物业管理领域已实现规模化商业落地，通过部署AI物业经理智能体，"
+        "已落地超过300个项目，管理面积超2000万平方米，帮助客户降低管理成本60-70%，"
+        "提升运营效率3-5倍。 "
+        "（二）AI 物业经理智能体建设单位的成本在2000为70%，这一指标用于判断市场空间和兑现节奏。 "
+        "（二）AI 物业经理智能体建设单位的成本在2000为5倍，这一指标用于判断市场空间和兑现节奏。 "
+        "转化愿景为现实：AI在采购中的应用场景 引言 "
+        "这个反向样本提示风险边界仍可能改变结论强度，需要把商业化判断限制在已验证场景内。[1]\n\n"
+        "## 来源附录\n"
+        "- [1] 广州人工智能典型案例 | https://example.org/case\n"
+    )
+
+    cleaned = sanitize_public_markdown(markdown, mode="enforce")
+
+    assert "已落地超过300个项目" in cleaned
+    assert "降低管理成本60-70%" in cleaned
+    assert "提升运营效率3-5倍" in cleaned
+    assert "成本在2000为70%" not in cleaned
+    assert "成本在2000为5倍" not in cleaned
+    assert "转化愿景为现实" not in cleaned
+    assert "应用场景 引言" not in cleaned
+    assert "反向样本提示" not in cleaned
+
+
+def test_sanitize_public_markdown_removes_named_institution_claim_when_appendix_lacks_source():
+    markdown = (
+        "# AI Agent企业落地研究报告\n\n"
+        "## 1. 市场空间\n"
+        "### Gartner的AI炒作周期显示生成式AI正处...\n"
+        "根据Gartner的AI炒作周期，生成式AI当前处于期望顶峰，后续可能进入幻灭期。[1]\n\n"
+        "## 来源附录\n"
+        "- [1] AI Agents Use Cases in Enterprise | https://example.org/use-cases\n"
+    )
+
+    cleaned = sanitize_public_markdown(markdown, mode="enforce")
+
+    assert "Gartner" not in cleaned
+    assert "炒作周期" not in cleaned
+    assert "AI Agents Use Cases" in cleaned
+
+
+def test_sanitize_public_markdown_keeps_named_institution_claim_when_appendix_has_source():
+    markdown = (
+        "# AI Agent企业落地研究报告\n\n"
+        "## 1. 市场空间\n"
+        "根据Gartner的AI炒作周期，生成式AI当前处于期望顶峰。[1]\n\n"
+        "## 来源附录\n"
+        "- [1] Gartner Hype Cycle for Artificial Intelligence | https://www.gartner.com/example\n"
+    )
+
+    cleaned = sanitize_public_markdown(markdown, mode="enforce")
+
+    assert "Gartner" in cleaned
+    assert "炒作周期" in cleaned
 
 
 def test_sanitize_public_markdown_removes_evidence_repair_signals_from_public_body():

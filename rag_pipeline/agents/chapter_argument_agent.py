@@ -4,10 +4,16 @@ import os
 import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+from .public_report_sanitizer import remove_hard_industry_templates
 from .report_contracts import ClaimUnit, EvidenceFactCard
 from .layout_claim_matcher import claim_supported_block_types
 from .section_composer import compose_section_paragraph
 from .section_body_rewrite_agent import body_rewrite_max_sections, rewrite_sections_for_report
+
+try:
+    from rag_pipeline.contracts.public_text_guard import public_text_quality
+except Exception:  # pragma: no cover - optional public text guard.
+    public_text_quality = None  # type: ignore
 
 
 AGENT_NAME = "chapter_argument_agent"
@@ -71,6 +77,20 @@ BAD_FACT_PATTERNS.extend(
         r"\*\s*\u9996\u9875\s*\*\s*\u5feb\u8baf",
         r"\bProduct\s*\*\s*Solutions\s*\*\s*Pricing\b",
         r"\bResources\s*\*\s*About\b",
+    ]
+)
+BAD_FACT_PATTERNS.extend(
+    [
+        r"/newstatic/images/logo",
+        r"(?:^|/|\\)logo\.(?:gif|png|jpg|jpeg|webp|svg)\b",
+        r"\u6570\u636e\u4e2d\u5fc3",
+        r"\u5168\u7403\u8d22\u7ecf\u5feb\u8baf",
+        r"\u8d22\u7ecf\u5feb\u8baf",
+        r"\u884c\u60c5\u4e2d\u5fc3",
+        r"Choice\s*\u6570\u636e",
+        r"\u4e1c\u65b9\u8d22\u5bcc",
+        r"\u81ea\u9009\u80a1|\u80a1\u5427",
+        r"(?:\[[^\]]{0,80}\]\((?:https?:)?//[^)]+|/[^)]+\).*){2,}",
     ]
 )
 
@@ -161,14 +181,49 @@ def _is_bad_public_fact(value: Any) -> bool:
     text = str(value or "")
     if not text:
         return True
-    return _is_snippet_like_public_text(text) or any(re.search(pattern, text, flags=re.I) for pattern in BAD_FACT_PATTERNS)
+    if public_text_quality is not None:
+        try:
+            if public_text_quality(text).get("severity") == "reject":
+                return True
+        except Exception:
+            pass
+    return (
+        _is_snippet_like_public_text(text)
+        or _is_metric_row_fragment_text(text)
+        or any(re.search(pattern, text, flags=re.I) for pattern in BAD_FACT_PATTERNS)
+    )
+
+
+def _is_metric_row_fragment_text(value: Any) -> bool:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        return False
+    if re.match(r"^(?:市场规模|关键事实|数据指标|定性事实|指标|规模|价格|报告编号|客服|订购电话)\s*[:：]", text):
+        return True
+    if re.search(r"(?:电子版|纸介版|纸质版)\s*[:：]?\s*\d+(?:\.\d+)?\s*元", text):
+        return True
+    if re.search(r"(?:订购电话|客服电话|客服|报告编号)\s*[:：]?", text) and re.search(r"\d{3,}", text):
+        return True
+    return False
 
 
 def _is_snippet_like_public_text(value: Any) -> bool:
     text = re.sub(r"\s+", " ", str(value or "")).strip()
     if not text:
         return False
+    if re.search(r"####\s*(?:\u5b57\u53f7|font|share)", text, flags=re.I):
+        return True
+    if re.search(r"\u5b57\u53f7\s*[-\u2014]\s*\u5927\s*[-\u2014]\s*\u4e2d\s*[-\u2014]\s*\u5c0f\s*\u5206\u4eab", text):
+        return True
+    if re.search(r"!\s*\[\s*\]\s*\(", text):
+        return True
+    if re.search(r"[_-]\u65f6\u653f\u8981\u95fb[_-].*(?:####|!\s*\[\s*\]\s*\()", text):
+        return True
     if re.search(r"字体\s*[:：]\s*大\s*中\s*小", text):
+        return True
+    if re.search(r"字体\s*[:：]\s*\(?\s*javascript", text, flags=re.I):
+        return True
+    if re.search(r"(?:记者|主持人)\s*[:：].{0,220}(?:请问|谢谢|提问)", text):
         return True
     if re.search(r"国内垂直领域研报服务|以下为本次访谈实录|电子工程专辑|爱分析访谈", text):
         return True
@@ -284,6 +339,8 @@ def _clean_fact_anchor(value: Any, max_chars: int = 220) -> str:
 
 def _is_bad_section_title(value: Any) -> bool:
     text = str(value or "")
+    if text != remove_hard_industry_templates(text):
+        return True
     if text in {"代表性案例对比", "反向信号与失效条件", "市场空间是否成立", "付费转化是否成立"}:
         return True
     lowered = text.lower()
@@ -319,6 +376,10 @@ def _invalid_metric_item(item: Dict[str, Any]) -> bool:
     if re.search(r"\u6210\u672c", metric) and (re.search(r"\u5bb6$", value) or not fact):
         return True
     if re.search(r"\u5e02\u573a\u89c4\u6a21|\u878d\u8d44", metric) and re.search(r"%", value):
+        return True
+    if "generic_metric_name" in {str(issue or "") for issue in _as_list(item.get("content_shape_issues"))} and _is_metric_row_fragment_text(fact or value):
+        return True
+    if _is_metric_row_fragment_text(fact):
         return True
     return False
 
@@ -392,6 +453,115 @@ def _by_chapter(items: Sequence[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any
     return result
 
 
+def _norm_identity(value: Any) -> str:
+    return re.sub(r"[^0-9a-zA-Z]+", "", str(value or "").strip().lower())
+
+
+def _chapter_identity_keys(chapter: Dict[str, Any]) -> List[str]:
+    keys = [
+        chapter.get("chapter_id"),
+        chapter.get("cluster_id"),
+        *_as_list(chapter.get("chapter_id_aliases")),
+        *_as_list(chapter.get("source_plan_chapter_ids")),
+    ]
+    return _dedupe([key for key in keys if str(key or "").strip()], limit=32)
+
+
+def _chapter_claim_ids(chapter: Dict[str, Any]) -> set[str]:
+    claim_ids = {
+        str(value or "").strip()
+        for value in _as_list(chapter.get("claim_ids"))
+        if str(value or "").strip()
+    }
+    for section in _as_list(chapter.get("section_plan")):
+        if not isinstance(section, dict):
+            continue
+        for value in (
+            section.get("claim_id"),
+            _as_dict(section.get("matched_llm_claim")).get("claim_id"),
+            _as_dict(section.get("matched_llm_claim")).get("id"),
+        ):
+            text = str(value or "").strip()
+            if text:
+                claim_ids.add(text)
+    return claim_ids
+
+
+def _units_for_chapter(
+    units_by_chapter: Dict[str, List[Dict[str, Any]]],
+    all_units: Sequence[Dict[str, Any]],
+    chapter: Dict[str, Any],
+    *,
+    normalize_to_chapter: bool = False,
+) -> List[Dict[str, Any]]:
+    chapter_id = str(chapter.get("chapter_id") or "").strip()
+    keys = _chapter_identity_keys(chapter)
+    normalized_keys = {_norm_identity(key) for key in keys if _norm_identity(key)}
+    claim_ids = _chapter_claim_ids(chapter)
+    selected: List[Dict[str, Any]] = []
+    seen: set[int] = set()
+
+    def _add(unit: Dict[str, Any]) -> None:
+        marker = id(unit)
+        if marker in seen:
+            return
+        seen.add(marker)
+        copied = dict(unit) if normalize_to_chapter and chapter_id else unit
+        if normalize_to_chapter and chapter_id:
+            copied.setdefault("source_chapter_id", unit.get("source_chapter_id") or unit.get("chapter_id"))
+            copied["chapter_id"] = chapter_id
+            if str(copied.get("claim_id") or "").strip() in claim_ids:
+                copied["selected_by_final_chapter"] = True
+                copied["force_public_render_context"] = True
+        selected.append(copied)
+
+    for key in keys:
+        for unit in units_by_chapter.get(str(key or ""), []):
+            _add(unit)
+    for unit in all_units:
+        if not isinstance(unit, dict):
+            continue
+        unit_claim_id = str(unit.get("claim_id") or unit.get("id") or "").strip()
+        if unit_claim_id and unit_claim_id in claim_ids:
+            _add(unit)
+            continue
+        unit_key = _norm_identity(unit.get("chapter_id"))
+        if unit_key and unit_key in normalized_keys:
+            _add(unit)
+    return selected
+
+
+def _chapter_lookup_value(mapping: Dict[str, Any], chapter: Dict[str, Any], default: Any = None) -> Any:
+    for key in _chapter_identity_keys(chapter):
+        text = str(key or "")
+        if text in mapping:
+            return mapping[text]
+    normalized = {_norm_identity(key): value for key, value in mapping.items() if _norm_identity(key)}
+    for key in _chapter_identity_keys(chapter):
+        norm = _norm_identity(key)
+        if norm and norm in normalized:
+            return normalized[norm]
+    return default
+
+
+def _chapter_lookup_items(mapping: Dict[str, List[Dict[str, Any]]], chapter: Dict[str, Any]) -> List[Dict[str, Any]]:
+    selected: List[Dict[str, Any]] = []
+    seen: set[int] = set()
+    normalized_map = {_norm_identity(key): value for key, value in mapping.items() if _norm_identity(key)}
+    for key in _chapter_identity_keys(chapter):
+        candidates = list(mapping.get(str(key or ""), []))
+        norm = _norm_identity(key)
+        if norm:
+            candidates.extend(normalized_map.get(norm, []))
+        for item in candidates:
+            marker = id(item)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            selected.append(item)
+    return selected
+
+
 PUBLIC_CLAIM_ROLES = {
     "metric_claim",
     "counter_claim",
@@ -424,6 +594,17 @@ def _context_only_claim(unit: Dict[str, Any]) -> bool:
 
 def _apply_argument_unit_public_policy(unit: Dict[str, Any]) -> Dict[str, Any]:
     copied = dict(unit)
+    if (
+        copied.get("diagnostic_only") is True
+        or copied.get("must_not_render") is True
+        or copied.get("not_for_public_text") is True
+        or copied.get("public_text_allowed") is False
+        or str(copied.get("allowed_use") or "").strip().lower() == "diagnostic_only"
+    ):
+        copied["public_render"] = False
+        copied["omit_from_report"] = True
+        copied.setdefault("internal_reason", "diagnostic_only_argument_unit")
+        return copied
     if (
         _context_only_claim(copied)
         and not copied.get("force_public_render_context")
@@ -586,9 +767,9 @@ def _variable_for_block_type(block_type: str) -> str:
     if block == "metric_reconciliation":
         return "市场指标"
     if block in {"case_comparison", "customer_painpoint_matrix"}:
-        return "部署深度"
+        return "具体场景"
     if block == "unit_economics":
-        return "商业化"
+        return "兑现条件"
     if block == "technology_maturity":
         return "技术成熟度"
     if block in {"risk_trigger", "verification_checklist", "scenario_analysis"}:
@@ -795,10 +976,10 @@ SECTION_TITLE_BY_BLOCK_TYPE = {
     "risk_trigger": "边界条件",
     "verification_checklist": "后续观察变量",
     "case_argument": "案例事实",
-    "customer_painpoint_matrix": "需求与付费证据",
+    "customer_painpoint_matrix": "需求与使用约束",
     "competitive_positioning": "竞争变量",
     "technology_maturity": "技术变量与约束",
-    "unit_economics": "商业化证据",
+    "unit_economics": "兑现条件",
 }
 
 GENERIC_PUBLIC_SECTION_TITLES = {
@@ -850,13 +1031,13 @@ def _chapter_variable(chapter: Dict[str, Any], block_type: str) -> str:
     if block_type == "metric_reconciliation" or re.search(r"规模|增速|指标|口径|市场", blob):
         return "市场空间"
     if block_type == "unit_economics" or re.search(r"付费|商业化|收入|订单|续约|采购", blob):
-        return "付费转化"
+        return "兑现条件"
     if block_type in {"customer_painpoint_matrix", "case_comparison"} or re.search(r"客户|场景|需求|部署|采购", blob):
-        return "需求场景"
+        return "具体场景"
     if block_type == "competitive_positioning" or re.search(r"竞争|玩家|生态|渠道|替代", blob):
         return "玩家格局"
     if block_type == "technology_maturity" or re.search(r"技术|工具|权限|安全|部署|标准", blob):
-        return "部署卡点"
+        return "执行卡点"
     if block_type in {"risk_trigger", "verification_checklist", "scenario_analysis"} or re.search(r"风险|反证|边界|失败|治理", blob):
         return "失效条件"
     return "判断主线"
@@ -1017,7 +1198,7 @@ def _section_from_unit(
         package_supporting_facts = _facts_for_refs(evidence_package, evidence_refs, collections, limit=3)
     if not package_supporting_facts and evidence_package and evidence_refs:
         package_supporting_facts = _facts_for_refs(evidence_package, evidence_refs, list(PUBLIC_EVIDENCE_COLLECTIONS), limit=3)
-    if not package_supporting_facts and evidence_package and block_type:
+    if not package_supporting_facts and evidence_package and block_type and not evidence_refs:
         package_supporting_facts = _facts_from_collections(evidence_package, collections, limit=3)
     supporting_facts = _dedupe([*package_supporting_facts, *unit_supporting_facts], limit=3)
     fact_cards = (
@@ -1206,6 +1387,14 @@ def _section_from_unit(
     if not mechanism and mechanism_for_evidence:
         mechanism = mechanism_for_evidence
     evidence_backed = bool(used_fact_refs and supporting_facts and mechanism_for_evidence and fact_card_match and not template_removed)
+    unreferenced_public_section = bool(cleaned_blocks and not used_fact_refs)
+    composition_status = composition.get("composition_status") or "legacy"
+    body_composition_status = composition.get("body_composition_status") or "fact_passthrough"
+    if unreferenced_public_section:
+        cleaned_blocks = []
+        evidence_backed = False
+        composition_status = "dropped"
+        body_composition_status = "dropped_unreferenced_section"
     section_title = _public_section_title(unit, chapter, index=index, layout_section=layout_section)
     section_plan = _build_section_plan(
         title=section_title,
@@ -1236,6 +1425,16 @@ def _section_from_unit(
         "requirement_id": unit.get("requirement_id") or "",
         "requirement_ids": _as_list(unit.get("requirement_ids")),
         "claim_strength_ceiling": unit.get("claim_strength_ceiling") or "",
+        "writer_advice_actions": _as_list(unit.get("writer_advice_actions")),
+        "writer_advice_tone": unit.get("writer_advice_tone") or "",
+        "writer_advice_do_not_add_new_facts": bool(unit.get("writer_advice_do_not_add_new_facts")),
+        "writer_advice_preserve_fact_refs": bool(unit.get("writer_advice_preserve_fact_refs")),
+        "paragraph_plan_id": unit.get("paragraph_plan_id") or "",
+        "paragraph_claim_ids": _as_list(unit.get("paragraph_claim_ids")),
+        "paragraph_main_claim_id": unit.get("paragraph_main_claim_id") or "",
+        "paragraph_supporting_claim_ids": _as_list(unit.get("paragraph_supporting_claim_ids")),
+        "narrative_role": unit.get("narrative_role") or "",
+        "narrative_do_not_render": bool(unit.get("narrative_do_not_render")),
         "lineage": _as_dict(unit.get("lineage")),
         "analysis_role": unit.get("analysis_role") or "",
         "source_support_map": _as_dict(unit.get("source_support_map")),
@@ -1251,11 +1450,12 @@ def _section_from_unit(
         "evidence_refs": evidence_refs,
         "used_fact_refs": used_fact_refs,
         "render_blocks": cleaned_blocks,
-        "public_render": True,
+        "public_render": not unreferenced_public_section,
+        "omit_from_report": bool(unreferenced_public_section),
         "layout_generated": bool(unit.get("layout_generated")),
         "evidence_backed": evidence_backed,
-        "composition_status": composition.get("composition_status") or "legacy",
-        "body_composition_status": composition.get("body_composition_status") or "fact_passthrough",
+        "composition_status": composition_status,
+        "body_composition_status": body_composition_status,
         "variable_explanation": composition.get("variable_explanation") or "",
         "composer_variable_explanation_count": composition.get("composer_variable_explanation_count") or 0,
         "composer_expansion_status": composition.get("composer_expansion_status") or "",
@@ -1457,6 +1657,8 @@ def _analysis_section_can_reuse_refs(section: Dict[str, Any]) -> bool:
     by `_section_duplicate_key`, and repeated fact text is still checked below.
     """
 
+    if section.get("claim_id") and _section_reference_keys(section):
+        return True
     return bool(
         (section.get("claim_id") or "_llm_extra_" in str(section.get("section_id") or ""))
         and (
@@ -1557,10 +1759,15 @@ def run_chapter_argument_agent(
     del llm_client
     report_blueprint = _as_dict(report_blueprint)
     layout_by_chapter = _layout_by_chapter(micro_layouts)
-    all_units = [
-        _apply_argument_unit_public_policy(item)
+    raw_argument_units = [
+        dict(item)
         for item in list(argument_units or [])
         if isinstance(item, dict)
+    ]
+    raw_units_by_chapter = _by_chapter(raw_argument_units)
+    all_units = [
+        _apply_argument_unit_public_policy(item)
+        for item in raw_argument_units
     ]
     all_units_by_chapter = _by_chapter(all_units)
     units_by_chapter = _by_chapter(public_argument_units(all_units))
@@ -1576,11 +1783,28 @@ def run_chapter_argument_agent(
         if not isinstance(chapter, dict):
             continue
         chapter_id = str(chapter.get("chapter_id") or f"chapter_{index}")
-        units = units_by_chapter.get(chapter_id, [])
-        raw_units = all_units_by_chapter.get(chapter_id, [])
-        evidence_package = _as_dict(evidence_by_chapter.get(chapter_id))
-        public_tables = _public_tables(tables_by_chapter.get(chapter_id, []))
-        layout_sections = _layout_sections(_as_dict(layout_by_chapter.get(chapter_id)))
+        raw_selected_units = _units_for_chapter(
+            raw_units_by_chapter,
+            raw_argument_units,
+            chapter,
+            normalize_to_chapter=True,
+        )
+        if not raw_selected_units:
+            raw_selected_units = _units_for_chapter(
+                all_units_by_chapter,
+                all_units,
+                chapter,
+                normalize_to_chapter=True,
+            )
+        policy_selected_units = [
+            _apply_argument_unit_public_policy(item)
+            for item in raw_selected_units
+        ]
+        units = public_argument_units(policy_selected_units)
+        raw_units = policy_selected_units
+        evidence_package = _as_dict(_chapter_lookup_value(evidence_by_chapter, chapter, {}))
+        public_tables = _public_tables(_chapter_lookup_items(tables_by_chapter, chapter))
+        layout_sections = _layout_sections(_as_dict(_chapter_lookup_value(layout_by_chapter, chapter, {})))
         available_units = [dict(unit) for unit in units]
         dropped_sections: List[Dict[str, Any]] = []
         sections: List[Dict[str, Any]] = []

@@ -886,7 +886,7 @@ def clean_reformatted_report(markdown: str, sources: Optional[List[Dict[str, Any
     if sources is not None:
         text = normalize_report_citations(text, _valid_source_ids(sources))
         text = append_sources_appendix(text, sources)
-    text = sanitize_public_markdown(text)
+    text = sanitize_public_markdown(text, mode="enforce")
     return text
 
 

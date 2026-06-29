@@ -1,4 +1,5 @@
 from rag_pipeline.agents.chapter_argument_agent import run_chapter_argument_agent
+from rag_pipeline.agents.chapter_evidence_builder import _internal_metric_name
 
 
 def test_same_evidence_id_is_not_rendered_twice_in_one_chapter():
@@ -204,3 +205,8 @@ def test_same_fact_text_is_not_rendered_twice_with_different_refs():
         item.get("reason") == "repeated_fact_within_chapter"
         for item in packages[0].get("dropped_sections", [])
     )
+
+
+def test_internal_metric_name_filters_generic_inferred_names():
+    assert _internal_metric_name("数据指标") is True
+    assert _internal_metric_name("定性事实") is True

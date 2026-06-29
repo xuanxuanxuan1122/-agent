@@ -4,6 +4,8 @@ import gzip
 import json
 import os
 import re
+import shutil
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -92,6 +94,17 @@ def _save_full_payload() -> bool:
 
 def _compress_large_payload() -> bool:
     return _env_flag("STAGE_SNAPSHOT_COMPRESS_LARGE_PAYLOAD", True)
+
+
+def _full_payload_replayable_only() -> bool:
+    """When on, only replayable stages get their full payload persisted.
+
+    The full-payload files are only consumable by a (future) replay/partial-rerun
+    driver — they are never read back by the live pipeline. A non-replayable
+    stage's full payload therefore can't drive anything, so this lever lets prod
+    keep just the (small) manifest/diagnostics for those stages and skip the
+    multi-MB payload write. Default off → behaviour unchanged."""
+    return _env_flag("STAGE_SNAPSHOT_FULL_PAYLOAD_REPLAYABLE_ONLY", False)
 
 
 def _max_payload_bytes() -> int:
@@ -202,9 +215,14 @@ def write_stage_snapshot(
     run = _safe_name(run_id, max_chars=120)
     stage_dir = stage_snapshot_cache_root() / run / stage
     stage_dir.mkdir(parents=True, exist_ok=True)
+    replayable = snapshot_is_replayable(stage, payload)
     payload_info: Dict[str, Any] = {}
+    full_payload_skipped = ""
     if _save_full_payload():
-        payload_info = _write_payload(stage_dir / "payload.json", payload)
+        if replayable or not _full_payload_replayable_only():
+            payload_info = _write_payload(stage_dir / "payload.json", payload)
+        else:
+            full_payload_skipped = "non_replayable_payload_skipped"
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "stage_name": stage,
@@ -217,7 +235,8 @@ def write_stage_snapshot(
         "full_payload_compressed": bool(payload_info.get("compressed")),
         "full_payload_bytes": payload_info.get("bytes", 0),
         "full_payload_too_large": bool(payload_info.get("too_large")),
-        "replayable": snapshot_is_replayable(stage, payload),
+        "full_payload_skipped": full_payload_skipped,
+        "replayable": replayable,
     }
     if stage == "evidence_package":
         manifest["replayable_missing"] = evidence_package_replay_missing(payload)
@@ -243,10 +262,15 @@ def load_stage_snapshot(run_id: str, stage_name: str) -> Dict[str, Any]:
             "manifest_path": str(manifest_path),
             "error": str(exc),
         }
-    payload_path = Path(str(manifest.get("full_payload_path") or ""))
+    # A manifest can legitimately carry no full payload (full-payload saving
+    # disabled, or replayable-only mode skipped a non-replayable stage). Guard
+    # against the empty string — Path("") is Path("."), which exists and would
+    # be misread as a corrupt payload.
+    raw_payload_path = str(manifest.get("full_payload_path") or "").strip()
+    payload_path = Path(raw_payload_path) if raw_payload_path else None
     payload = None
     payload_error: Optional[str] = None
-    if payload_path.exists():
+    if payload_path is not None and payload_path.exists():
         try:
             payload = _read_payload(payload_path)
         except (OSError, json.JSONDecodeError, UnicodeDecodeError, gzip.BadGzipFile, EOFError) as exc:
@@ -258,7 +282,7 @@ def load_stage_snapshot(run_id: str, stage_name: str) -> Dict[str, Any]:
             "stage_name": stage_name,
             "manifest": manifest,
             "manifest_path": str(manifest_path),
-            "payload_path": str(payload_path),
+            "payload_path": str(payload_path or ""),
             "error": payload_error,
         }
     return {"status": "loaded", "manifest": manifest, "payload": payload}
@@ -275,3 +299,71 @@ def list_stage_snapshots(run_id: str) -> List[Dict[str, Any]]:
         except Exception:
             continue
     return snapshots
+
+
+def stage_snapshot_retention_max_runs() -> int:
+    return _env_int("STAGE_SNAPSHOT_RETENTION_MAX_RUNS", 100, min_value=0, max_value=1_000_000)
+
+
+def stage_snapshot_retention_max_age_days() -> int:
+    return _env_int("STAGE_SNAPSHOT_RETENTION_MAX_AGE_DAYS", 0, min_value=0, max_value=100_000)
+
+
+def prune_stage_snapshots(
+    *,
+    max_runs: Optional[int] = None,
+    max_age_days: Optional[int] = None,
+    keep_run_id: str = "",
+) -> Dict[str, Any]:
+    """Delete old per-run snapshot directories so the cache does not grow without
+    bound (each run leaves a ~MB tree and nothing here is reaped otherwise).
+
+    Keeps the newest ``max_runs`` run directories (by mtime) and drops anything
+    older than ``max_age_days``; ``0`` disables that limit. ``keep_run_id`` (the
+    in-flight run) is never deleted regardless of caps. Fail-open: any IO error
+    is swallowed so retention never blocks report delivery.
+    """
+    max_runs = stage_snapshot_retention_max_runs() if max_runs is None else max(0, int(max_runs))
+    max_age_days = stage_snapshot_retention_max_age_days() if max_age_days is None else max(0, int(max_age_days))
+    result: Dict[str, Any] = {"deleted_count": 0, "deleted": [], "kept_count": 0, "errors": 0}
+    if max_runs <= 0 and max_age_days <= 0:
+        result["status"] = "disabled"
+        return result
+    root = stage_snapshot_cache_root()
+    if not root.exists():
+        result["status"] = "no_cache"
+        return result
+    keep_name = _safe_name(keep_run_id, max_chars=120) if keep_run_id else ""
+    try:
+        run_dirs = [child for child in root.iterdir() if child.is_dir()]
+    except OSError as exc:
+        return {**result, "status": "list_failed", "error": str(exc)}
+    run_dirs.sort(key=lambda child: _safe_mtime(child), reverse=True)
+    now = time.time()
+    kept = 0
+    for child in run_dirs:
+        if keep_name and child.name == keep_name:
+            continue
+        kept += 1
+        over_count = max_runs > 0 and kept > max_runs
+        too_old = max_age_days > 0 and (now - _safe_mtime(child)) > max_age_days * 86400
+        if not (over_count or too_old):
+            continue
+        kept -= 1
+        try:
+            shutil.rmtree(child)
+            result["deleted_count"] += 1
+            if len(result["deleted"]) < 50:
+                result["deleted"].append(child.name)
+        except OSError:
+            result["errors"] += 1
+    result["kept_count"] = kept
+    result["status"] = "pruned"
+    return result
+
+
+def _safe_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0

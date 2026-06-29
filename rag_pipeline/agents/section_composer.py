@@ -4,6 +4,7 @@ import os
 import re
 from typing import Any, Dict, Iterable, List, Sequence
 
+from .public_report_sanitizer import remove_hard_industry_templates
 from .report_contracts import ClaimUnit, EvidenceFactCard
 
 
@@ -24,6 +25,16 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 def _text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _as_list(value: Any) -> List[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, set):
+        return list(value)
+    return []
 
 
 def _dedupe(values: Iterable[str], *, limit: int = 4) -> List[str]:
@@ -121,7 +132,19 @@ def _public_subject(value: str, fallback: str) -> str:
 def _is_snippet_like(text: str) -> bool:
     if not text:
         return True
+    if re.search(r"####\s*(?:\u5b57\u53f7|font|share)", text, flags=re.I):
+        return True
+    if re.search(r"\u5b57\u53f7\s*[-\u2014]\s*\u5927\s*[-\u2014]\s*\u4e2d\s*[-\u2014]\s*\u5c0f\s*\u5206\u4eab", text):
+        return True
+    if re.search(r"!\s*\[\s*\]\s*\(", text):
+        return True
+    if re.search(r"[_-]\u65f6\u653f\u8981\u95fb[_-].*(?:####|!\s*\[\s*\]\s*\()", text):
+        return True
     if re.search(r"字体\s*[:：]\s*大\s*中\s*小", text):
+        return True
+    if re.search(r"字体\s*[:：]\s*\(?\s*javascript", text, flags=re.I):
+        return True
+    if re.search(r"(?:记者|主持人)\s*[:：].{0,220}(?:请问|谢谢|提问)", text):
         return True
     if re.search(r"国内垂直领域研报服务|以下为本次访谈实录|电子工程专辑|爱分析访谈", text):
         return True
@@ -157,7 +180,8 @@ def _clean_analysis_basis_text(value: Any, *, max_chars: int = 260) -> str:
     if not text:
         return ""
     if re.search(
-        r"\b(?:semantic\s+judge|metric\s+fields\s+incomplete|not_allowed_until_repaired|currency_(?:usd|cny))\b",
+        r"\b(?:semantic\s+judge|metric\s+fields\s+incomplete|not_allowed_until_repaired|currency_(?:usd|cny)"
+        r"|writer_advice|expand_claim_writing|body_short|must_not_render|diagnostic_only|public_text_allowed)\b",
         text,
         flags=re.I,
     ):
@@ -217,10 +241,30 @@ def _valid_cards(cards: Sequence[EvidenceFactCard], lens: str) -> List[EvidenceF
     return result
 
 
+def _content_shape_issues(card: EvidenceFactCard) -> set[str]:
+    raw = card.raw if isinstance(card.raw, dict) else {}
+    values: List[Any] = []
+    for payload in (
+        raw,
+        raw.get("public_fact_card") if isinstance(raw.get("public_fact_card"), dict) else {},
+        raw.get("evidence_card") if isinstance(raw.get("evidence_card"), dict) else {},
+        raw.get("analysis_input") if isinstance(raw.get("analysis_input"), dict) else {},
+    ):
+        if not isinstance(payload, dict):
+            continue
+        issues = payload.get("content_shape_issues")
+        if isinstance(issues, str):
+            values.append(issues)
+        elif isinstance(issues, (list, tuple, set)):
+            values.extend(issues)
+    return {str(item or "").strip() for item in values if str(item or "").strip()}
+
+
 def _metric_sentence(card: EvidenceFactCard) -> str:
     subject = _public_subject(card.subject, "相关主体")
     variable = card.variable or "关键指标"
-    value = card.value
+    shape_issues = _content_shape_issues(card)
+    value = "" if "generic_metric_name" in shape_issues else card.value
     unit = "" if str(card.unit or "").strip().lower() in {"currency_usd", "currency_cny", "money", "unknown"} else card.unit
     if value and unit and unit not in value:
         value = f"{value}{unit}"
@@ -229,28 +273,28 @@ def _metric_sentence(card: EvidenceFactCard) -> str:
     if value:
         prefix = f"{subject}的{variable}"
         if period:
-            return f"{prefix}在{period}为{value}，这一指标用于判断市场空间和兑现节奏。"
-        return f"{prefix}为{value}，这一指标用于判断市场空间和兑现节奏。"
-    return f"{fact}，这一事实用于校准{variable}的规模和可比性。"
+            return f"{prefix}在{period}为{value}，这一指标需要放回主体、范围和时间窗口中理解。"
+        return f"{prefix}为{value}，这一指标需要结合统计范围和同口径材料理解。"
+    return f"{fact}，这一事实用于校准{variable}的范围、时间和可比性。"
 
 
 def _case_sentence(card: EvidenceFactCard) -> str:
-    subject = _public_subject(card.subject, "相关玩家")
+    subject = _public_subject(card.subject, "相关主体")
     fact = card.distilled_fact.rstrip("。.")
-    variable = card.variable or "落地深度"
-    return f"{subject}的动作显示{variable}已经出现可观察样本；{fact}。这类样本的意义在于验证需求是否从试用进入具体流程。"
+    variable = card.variable or "具体进展"
+    return f"{subject}的材料显示{variable}已经出现可观察样本；{fact}。这类样本的意义在于帮助判断变化发生在哪里、影响了哪些主体。"
 
 
 def _technology_sentence(card: EvidenceFactCard) -> str:
     fact = card.distilled_fact.rstrip("。.")
     variable = card.variable or "技术成熟度"
-    return f"{fact}。它对应的关键变量是{variable}，会影响工具调用、权限、安全和部署稳定性。"
+    return f"{fact}。这条材料说明{variable}出现阶段性进展，仍需结合可靠性、成本、适用场景和执行条件判断影响范围。"
 
 
 def _risk_sentence(card: EvidenceFactCard) -> str:
     fact = card.distilled_fact.rstrip("。.")
     variable = card.variable or "风险边界"
-    return f"{fact}。这个反向样本提示{variable}仍可能改变结论强度，需要把商业化判断限制在已验证场景内。"
+    return f"{fact}。这个反向样本提示{variable}仍可能改变结论强度，需要把判断限制在材料能够覆盖的范围内。"
 
 
 def _boundary_sentence(lens: str, card: EvidenceFactCard, strength: str) -> str:
@@ -259,16 +303,16 @@ def _boundary_sentence(lens: str, card: EvidenceFactCard, strength: str) -> str:
         return "边界在于指标的主体、范围、期间和统计口径是否保持一致。"
     if lens in {"case", "commercial", "competition"}:
         if variable:
-            return f"边界在于{variable}是否能从单点样本延伸到更多客户、流程和付费链路。"
-        return "边界在于样本是否能延伸到更多客户、流程和付费链路。"
+            return f"边界在于{variable}是否能在更多主体、场景和时间窗口中重复出现。"
+        return "边界在于样本是否能在更多主体、场景和时间窗口中重复出现。"
     if lens == "technology":
         if variable:
             return f"边界在于{variable}是否同时满足可靠性、权限、安全和集成成本要求。"
-        return "边界在于可靠性、权限、安全和集成成本是否同时满足部署要求。"
+        return "边界在于可靠性、权限、安全和集成成本是否同时满足实际使用要求。"
     if lens == "risk":
         if variable:
-            return f"触发条件是{variable}进一步扩大，进而压低部署节奏、ROI 预期或责任分配确定性。"
-        return "触发条件是反向样本继续扩大，进而压低部署节奏、ROI 预期或责任分配确定性。"
+            return f"触发条件是{variable}进一步扩大，进而改变执行节奏、成本预期或责任分配确定性。"
+        return "触发条件是反向样本继续扩大，进而改变执行节奏、成本预期或责任分配确定性。"
     if strength in {"directional", "weak"} and variable:
         return f"边界在于{variable}能否在更多可追溯样本中重复出现。"
     return ""
@@ -279,13 +323,13 @@ def _variable_explanation(lens: str, card: EvidenceFactCard) -> str:
     if not variable:
         return ""
     if lens == "metric":
-        return f"这说明{variable}不是单个数值本身，而是需求空间、商业化节奏和口径可比性的共同信号。"
+        return f"这说明{variable}不是单个数值本身，而是主体、范围、期间和口径可比性的共同结果。"
     if lens in {"case", "commercial"}:
-        return f"这说明{variable}的关键不只是出现案例，而是案例是否具备部署深度、客户复制和付费链路。"
+        return f"这说明{variable}的关键不只是出现案例，而是案例是否能解释具体主体、场景和影响路径。"
     if lens == "competition":
         return f"这说明{variable}会影响玩家分化、渠道控制和生态入口的判断。"
     if lens == "technology":
-        return f"这说明{variable}会影响可靠性、权限、安全和集成成本，进而决定能否进入生产流程。"
+        return f"这说明{variable}需要同时观察可靠性、成本、场景适配和执行条件，避免把单点能力直接外推为整体结论。"
     if lens == "risk":
         return f"这说明{variable}是推翻或削弱本章判断的触发条件。"
     return f"{variable}需要结合来源范围、场景深度和时间窗口一起判断，避免把背景信息直接外推为结论。"
@@ -301,15 +345,32 @@ def _general_sentence(card: EvidenceFactCard, lens: str) -> str:
     if lens == "risk":
         return _risk_sentence(card)
     fact = card.distilled_fact.rstrip("。.")
-    variable = card.variable or "章节判断"
-    return f"{fact}。该信息只能在已引用来源覆盖的范围内支撑对{variable}的方向性判断。"
+    return f"{fact}。"
 
 
 def _claim_analysis_parts(claim_unit: ClaimUnit, *, known_facts: Sequence[str] = ()) -> List[str]:
     parts: List[str] = []
+    raw = claim_unit.raw if isinstance(claim_unit.raw, dict) else {}
+    narrative_supporting = [
+        _clean_analysis_basis_text(item, max_chars=320)
+        for item in _as_list(raw.get("narrative_supporting_claims"))[:3]
+    ]
+    narrative_role = str(raw.get("narrative_role") or "").strip().lower()
+    role_bridge = ""
+    if narrative_supporting:
+        if narrative_role == "mechanism":
+            role_bridge = "这些材料放在一起看，重点不只是单点事实，而是它们共同指向的因果关系和执行条件。"
+        elif narrative_role == "business_implication":
+            role_bridge = "这些材料共同指向后续影响，需要同时观察主体行动、资源配置和外部约束如何变化。"
+        elif narrative_role == "constraint":
+            role_bridge = "这些限制条件会影响判断强度，需要和前面的正向材料放在同一框架中理解。"
+        else:
+            role_bridge = "这些材料相互补充，使判断从单个样本转向更连续的场景信号。"
     values: List[Any] = [
         claim_unit.claim,
         claim_unit.paragraph_seed,
+        role_bridge,
+        *narrative_supporting,
         *[_clean_analysis_basis_text(item) for item in claim_unit.evidence_basis[:2]],
         claim_unit.reasoning_chain,
         _clean_analysis_basis_text(claim_unit.limitation_boundary),
@@ -342,7 +403,9 @@ def _select_cards_for_claim(cards: Sequence[EvidenceFactCard], claim_unit: Claim
 
 
 def _join_public_sentences(parts: Sequence[str]) -> str:
-    return " ".join(part.strip() for part in _dedupe(parts, limit=16) if part.strip()).strip()
+    return remove_hard_industry_templates(
+        " ".join(part.strip() for part in _dedupe(parts, limit=16) if part.strip()).strip()
+    )
 
 
 def _compact_len(text: str) -> int:
@@ -351,6 +414,37 @@ def _compact_len(text: str) -> int:
 
 def _section_target_chars() -> int:
     return _env_int("REPORT_COMPOSER_TARGET_SECTION_CHARS", 450, min_value=120, max_value=1200)
+
+
+def _expand_to_target_enabled() -> bool:
+    raw = os.getenv("REPORT_COMPOSER_EXPAND_TO_TARGET")
+    if raw is not None and str(raw).strip():
+        return _env_flag("REPORT_COMPOSER_EXPAND_TO_TARGET", False)
+    blueprint_source = str(os.getenv("REPORT_BLUEPRINT_SOURCE", "") or "").strip().lower()
+    return blueprint_source in {"claim_first", "claims", "analysis_claims"}
+
+
+WRITER_ADVICE_EXPANSION_ACTIONS = {
+    "expand_claim_writing",
+    "rewrite_with_caveat",
+    "keep_as_directional",
+}
+
+
+def _writer_advice_actions(claim_unit: ClaimUnit) -> List[Dict[str, Any]]:
+    raw = claim_unit.raw if isinstance(claim_unit.raw, dict) else {}
+    actions = raw.get("writer_advice_actions")
+    if not isinstance(actions, list):
+        return []
+    return [dict(item) for item in actions if isinstance(item, dict)]
+
+
+def _writer_advice_requires_expansion(claim_unit: ClaimUnit) -> bool:
+    for item in _writer_advice_actions(claim_unit):
+        action = str(item.get("action") or item.get("suggested_action") or "").strip().lower()
+        if action in WRITER_ADVICE_EXPANSION_ACTIONS:
+            return True
+    return False
 
 
 def _expansion_sentences(
@@ -364,37 +458,79 @@ def _expansion_sentences(
     first = selected[0]
     subject = _public_subject(first.subject, "相关主体")
     variable = first.variable or first.action_or_signal or first.time_or_scope or "本章变量"
+    if variable in {"章节信号", "本章变量", "相关变量"} or "章节信号" in variable:
+        variable = "相关变量"
     clean_basis = [_clean_analysis_basis_text(item) for item in claim_unit.evidence_basis]
     fact_basis = _dedupe([card.distilled_fact for card in selected] + [item for item in clean_basis if item], limit=4)
     facts_text = "；".join(fact_basis[:2])
+    fact_reference = facts_text or (selected[0].distilled_fact if selected else "")
     if lens == "metric":
-        mechanism = f"从分析口径看，{variable}需要同时观察主体、范围、期间和单位是否一致；只有这些口径能够对齐，指标才适合用来判断市场空间、需求弹性和商业化节奏。"
-        implication = f"因此，本节不把单个数值当成完整结论，而是把{subject}相关指标放在需求兑现、付费链路和竞争进入节奏之间交叉理解。"
+        mechanism = f"从分析口径看，{variable}需要同时观察主体、范围、期间和单位是否一致；只有这些口径能够对齐，指标才适合用于解释趋势变化。"
+        implication = f"因此，本节不把单个数值当成完整结论，而是把{subject}相关指标放在时间窗口、比较对象和影响路径之间交叉理解。"
     elif lens in {"case", "commercial"}:
-        mechanism = f"从机制上看，{variable}的价值不在于出现一个案例，而在于案例是否进入真实流程、是否需要权限和系统集成、是否能形成可重复的客户使用路径。"
-        implication = f"因此，{subject}的样本更适合作为落地深度信号，而不是直接外推为全行业成熟；后续判断应继续围绕部署深度、客户复制和付费链路展开。"
+        mechanism = f"从机制上看，{variable}的价值不在于出现一个案例，而在于案例是否说明真实场景、责任分工和执行条件已经发生变化。"
+        implication = f"因此，{subject}的样本会把分析重点推向具体主体、影响范围和可持续性：只有这些条件连续出现，案例才有更强解释力。"
     elif lens == "technology":
-        mechanism = f"从技术成熟度看，{variable}会同时影响可靠性、权限治理、安全边界和集成成本；这些变量决定产品能否从演示环境进入生产流程。"
-        implication = f"因此，本节把技术事实转化为落地约束：能力本身只是入口，稳定运行、责任划分和系统兼容才决定商业化速度。"
+        mechanism = f"从技术成熟度看，{variable}会同时影响可靠性、权限治理、安全边界和集成成本；这些变量决定相关能力能否进入稳定使用。"
+        implication = f"因此，本节把技术事实转化为执行约束：能力本身只是入口，稳定运行、责任划分和系统兼容才决定实际影响。"
     elif lens == "risk":
-        mechanism = f"从风险边界看，{variable}一旦扩大，就可能压低部署节奏、ROI 预期或责任分配确定性，从而改变原有机会判断的强度。"
+        mechanism = f"从风险边界看，{variable}一旦扩大，就可能改变执行节奏、成本预期或责任分配确定性，从而改变原有判断的强度。"
         implication = f"因此，风险事实不应被放在附录里处理，而应进入正文成为约束条件，帮助区分已经验证的机会和仍需谨慎对待的假设。"
     elif lens == "competition":
-        mechanism = f"从竞争结构看，{variable}会影响玩家分化、渠道控制、生态入口和客户迁移成本；同一事实在不同玩家手中可能代表不同的壁垒。"
-        implication = f"因此，本节关注的不只是参与者数量，而是哪些能力真正沉淀为客户入口、交付能力和可持续优势。"
+        mechanism = f"从竞争结构看，{variable}会影响主体分化、资源控制、协作入口和切换成本；同一事实在不同主体中可能代表不同能力。"
+        implication = f"因此，本节关注的不只是参与者数量，而是哪些能力真正沉淀为组织能力、执行能力和可持续优势。"
     else:
-        mechanism = f"从本章证据看，{variable}需要与来源范围、场景深度和时间窗口一起判断，避免把背景信息直接外推为结论。"
-        implication = f"因此，本节只在已引用事实覆盖的范围内说明判断边界，不把单一材料扩展成强结论。"
+        mechanism = f"结合现有公开信息，{variable}需要放回主体、场景和时间窗口中理解，重点看它是否改变岗位任务、组织安排或资源配置。"
+        implication = f"因此，分析不只罗列材料，而要说明这种变化如何传导到相关主体的行动选择和后续决策。"
     boundary = _clean_analysis_basis_text(claim_unit.limitation_boundary) if claim_unit.limitation_boundary else ""
     if not boundary:
         if strength in {"strong", "moderate", "decision_ready", "core_claim"}:
-            boundary = f"边界在于这些事实仍需要与更多来源中的同类变量相互印证，尤其要观察{variable}是否能持续出现在不同客户、不同场景或不同时间窗口。"
+            boundary = f"边界在于{variable}能否出现在更多主体、更多场景或更连续的时间窗口中；如果只停留在少数披露，结论仍需保留弹性。"
         else:
-            boundary = f"由于该判断属于方向性分析，结论应限定在已引用事实能够覆盖的场景内，重点看{variable}后续是否重复出现并形成更稳定的证据链。"
-    question_sentence = f"围绕章节问题“{chapter_question}”，本节只保留能被已引用事实支撑的判断，并说明其适用边界。" if chapter_question else ""
-    fact_sentence = f"已有事实链显示：{facts_text}。" if facts_text else ""
-    depth_sentence = f"进一步看，{variable}需要同时接受场景深度、组织采纳、交付成本和持续使用的检验；这些条件越完整，相关事实越能从单点样本转化为可解释的行业信号。"
-    return [fact_sentence, mechanism, implication, boundary, question_sentence, depth_sentence]
+            boundary = f"现阶段更关键的是看{variable}是否带来具体的主体变化、行为变化或结果变化；如果这些条件不足，表述需要保持审慎。"
+    context_sentence = f"放回具体问题看，重点不是只确认{variable}是否出现，而是解释它怎样改变相关主体的行为、资源投入和协作关系。" if chapter_question else ""
+    fact_sentence = f"公开信息包括：{facts_text}。" if facts_text else ""
+    depth_sentence = f"进一步看，{variable}需要同时接受场景深度、组织采纳、执行成本和持续性的检验；这些条件越完整，相关事实越能从单点样本转化为可解释的分析材料。"
+    subject_sentence = (
+        f"对{subject}而言，这一变化首先影响的是任务分工和能力配置：原本偏执行的工作会更多被流程、工具和数据口径约束，"
+        f"从而要求相关主体重新安排人员能力、系统接口和责任边界。"
+    )
+    evidence_sentence = (
+        f"结合已引用材料，{fact_reference}这一事实不应只作为背景信息处理；"
+        f"它更适合用来解释为什么{variable}会成为观察岗位变化、组织调整和能力迁移的切入点。"
+        if fact_reference
+        else ""
+    )
+    comparison_sentence = (
+        f"如果把这一信号与相邻事实对照，分析重点会从“有没有变化”转向“变化发生在哪里、谁承担变化成本、哪些环节先受影响”。"
+        f"这会把单点事实放进连续变化中观察，使岗位任务、组织安排和能力要求之间的关系更清楚。"
+    )
+    pathway_sentence = (
+        f"沿着这个路径继续拆解，{variable}会同时作用于三个层面：一是相关主体如何定义任务，"
+        f"二是组织如何配置工具和人员，三是外部环境如何改变执行难度。三个层面合在一起，才构成较完整的解释链条。"
+    )
+    synthesis_sentence = (
+        f"因此，本节的重点不是把{subject}写成孤立案例，而是把它作为连接事实、机制和影响范围的节点："
+        f"事实说明发生了什么，机制解释为什么重要，影响范围则决定这一变化能走多远。"
+    )
+    limit_sentence = (
+        f"需要保留的边界是：当前材料能够说明{variable}带来的方向变化，"
+        f"但尚不能自动推出所有主体都会以同样速度调整；不同地区、院校、企业规模和岗位层级仍可能呈现差异。"
+    )
+    return [
+        fact_sentence,
+        mechanism,
+        implication,
+        subject_sentence,
+        evidence_sentence,
+        context_sentence,
+        depth_sentence,
+        comparison_sentence,
+        pathway_sentence,
+        synthesis_sentence,
+        limit_sentence,
+        boundary,
+    ]
 
 
 def _expand_to_target(
@@ -405,12 +541,15 @@ def _expand_to_target(
     selected: Sequence[EvidenceFactCard],
     chapter_question: str,
     strength: str,
+    force_expand: bool = False,
 ) -> tuple[str, str]:
     target = _section_target_chars()
     parts = [part for part in base_parts if _text(part)]
     known_facts = [card.distilled_fact for card in selected if _text(card.distilled_fact)]
     status = "base"
-    if not _env_flag("REPORT_COMPOSER_EXPAND_TO_TARGET", False):
+    added_expansion = False
+    expansion_enabled = force_expand or _expand_to_target_enabled()
+    if not expansion_enabled:
         paragraph = _join_public_sentences(parts)
         if _compact_len(paragraph) < target:
             status = "base_no_expand" if paragraph else "insufficient_facts"
@@ -427,6 +566,7 @@ def _expand_to_target(
                 if _would_repeat_known_fact(parts, sentence, known_facts):
                     continue
                 parts.append(sentence)
+                added_expansion = True
             if _compact_len(_join_public_sentences(parts)) >= target:
                 status = "expanded"
                 break
@@ -435,7 +575,80 @@ def _expand_to_target(
         status = "expanded"
     elif len(selected) < 2 and not claim_unit.reasoning_chain:
         status = "insufficient_facts"
+    elif added_expansion:
+        status = "expanded"
+    if force_expand and added_expansion:
+        status = "writer_advice_expanded"
     return paragraph, status
+
+
+def _claim_depth_pack(claim_unit: ClaimUnit) -> Dict[str, Any]:
+    pack = claim_unit.raw.get("claim_depth_pack") if isinstance(claim_unit.raw, dict) else {}
+    if not isinstance(pack, dict):
+        return {}
+    if pack.get("diagnostic_only") or pack.get("must_not_render") or pack.get("public_text_allowed") is False:
+        return {}
+    return pack
+
+
+def _claim_depth_pack_parts(
+    pack: Dict[str, Any],
+    *,
+    claim_unit: ClaimUnit,
+    selected: Sequence[EvidenceFactCard],
+) -> List[str]:
+    known_facts = [card.distilled_fact for card in selected if card.distilled_fact]
+    parts: List[str] = []
+    for key in ("judgement", "judgment", "evidence_chain", "mechanism", "segmentation", "implication", "boundary"):
+        text = _clean_analysis_basis_text(pack.get(key), max_chars=520)
+        if not text:
+            continue
+        if key in {"judgement", "judgment"} and claim_unit.claim and _fact_norm(text) == _fact_norm(claim_unit.claim):
+            continue
+        if _would_repeat_known_fact(parts, text, known_facts):
+            continue
+        parts.append(text)
+    return _dedupe(parts, limit=7)
+
+
+def _paragraph_from_claim_depth_pack(
+    pack: Dict[str, Any],
+    *,
+    claim_unit: ClaimUnit,
+    selected: Sequence[EvidenceFactCard],
+    fallback_parts: Sequence[str],
+    lens: str,
+    chapter_question: str,
+    strength: str,
+    force_expand: bool = False,
+) -> tuple[str, str]:
+    parts = [claim_unit.claim] if claim_unit.claim and not _is_snippet_like(claim_unit.claim) else []
+    parts.extend(_claim_depth_pack_parts(pack, claim_unit=claim_unit, selected=selected))
+    if len(parts) < 3:
+        parts.extend(fallback_parts)
+    status = "claim_depth_pack"
+    known_facts = [card.distilled_fact for card in selected if card.distilled_fact]
+    if (force_expand or _expand_to_target_enabled()) and _compact_len(_join_public_sentences(parts)) < _section_target_chars():
+        added_expansion = False
+        for sentence in _expansion_sentences(
+            lens=lens,
+            claim_unit=claim_unit,
+            selected=selected,
+            chapter_question=chapter_question,
+            strength=strength,
+        ):
+            if not sentence or _would_repeat_known_fact(parts, sentence, known_facts):
+                continue
+            parts.append(sentence)
+            added_expansion = True
+            if _compact_len(_join_public_sentences(parts)) >= _section_target_chars():
+                break
+        paragraph = _join_public_sentences(_dedupe(parts, limit=18))
+        if _compact_len(paragraph) >= _section_target_chars():
+            status = "claim_depth_pack_writer_advice_expanded" if force_expand else "claim_depth_pack_expanded"
+        elif added_expansion:
+            status = "claim_depth_pack_writer_advice_partial" if force_expand else "claim_depth_pack_partial"
+    return _join_public_sentences(_dedupe(parts, limit=18)), status
 
 
 def compose_section_paragraph(
@@ -476,21 +689,37 @@ def compose_section_paragraph(
         status = "composed"
     else:
         status = "composed_directional"
-    paragraph, expansion_status = _expand_to_target(
-        base_parts=[
-            *_claim_analysis_parts(
-                claim_unit,
-                known_facts=[card.distilled_fact for card in selected if card.distilled_fact],
-            ),
-            *sentences[:2],
-            variable_explanation,
-        ],
-        lens=lens,
-        claim_unit=claim_unit,
-        selected=selected,
-        chapter_question=chapter_question,
-        strength=strength,
-    )
+    base_parts = [
+        *_claim_analysis_parts(
+            claim_unit,
+            known_facts=[card.distilled_fact for card in selected if card.distilled_fact],
+        ),
+        *sentences[:2],
+        variable_explanation,
+    ]
+    depth_pack = _claim_depth_pack(claim_unit)
+    writer_advice_expand = _writer_advice_requires_expansion(claim_unit)
+    if depth_pack:
+        paragraph, expansion_status = _paragraph_from_claim_depth_pack(
+            depth_pack,
+            claim_unit=claim_unit,
+            selected=selected,
+            fallback_parts=base_parts,
+            lens=lens,
+            chapter_question=chapter_question,
+            strength=strength,
+            force_expand=writer_advice_expand,
+        )
+    else:
+        paragraph, expansion_status = _expand_to_target(
+            base_parts=base_parts,
+            lens=lens,
+            claim_unit=claim_unit,
+            selected=selected,
+            chapter_question=chapter_question,
+            strength=strength,
+            force_expand=writer_advice_expand,
+        )
     if claim_unit.claim and not _is_snippet_like(claim_unit.claim):
         claim = claim_unit.claim
     else:
@@ -505,6 +734,11 @@ def compose_section_paragraph(
         boundary = _boundary_sentence(lens, selected[0], strength)
     elif chapter_question:
         boundary = _boundary_sentence(lens, selected[0], strength)
+    claim = remove_hard_industry_templates(claim)
+    mechanism = remove_hard_industry_templates(mechanism)
+    boundary = remove_hard_industry_templates(boundary)
+    variable_explanation = remove_hard_industry_templates(variable_explanation)
+    paragraph = remove_hard_industry_templates(paragraph)
     return {
         "composition_status": status,
         "body_composition_status": "composed",

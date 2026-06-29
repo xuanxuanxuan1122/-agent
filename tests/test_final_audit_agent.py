@@ -315,6 +315,67 @@ def test_final_audit_sets_large_default_output_budget(monkeypatch):
     assert int(captured["config"]["max_output_tokens"]) >= 8192
 
 
+def test_final_audit_default_input_budget_truncates_oversized_reports(monkeypatch):
+    _configure_deepseek_final_audit(monkeypatch)
+    monkeypatch.setenv("REPORT_ENABLE_FINAL_AUDIT", "true")
+    monkeypatch.setenv("REPORT_FINAL_AUDIT_BLOCKING", "false")
+    monkeypatch.delenv("REPORT_FINAL_AUDIT_MAX_CHARS", raising=False)
+    captured = {}
+
+    def fake_call_openai_compatible_json(*, config, system_prompt, user_payload):
+        captured["user_payload"] = user_payload
+        return {
+            "payload": {
+                "status": "warning",
+                "overall_score": 72,
+                "critical_findings": [],
+                "publish_recommendation": "publish_with_caveats",
+                "summary": "Large report audited with compacted input.",
+            },
+            "usage": {"total_tokens": 10},
+            "llm_call": {"task": "final_audit", "model": "deepseek-v4-pro", "status": "success"},
+        }
+
+    monkeypatch.setattr(final_audit_agent, "call_openai_compatible_json", fake_call_openai_compatible_json)
+
+    long_body = "# Report\n\n" + ("Evidence-backed paragraph [1].\n\n" * 6000)
+    result = final_audit_agent.run_final_audit(
+        report_markdown=long_body + "\n## Sources\n- [1] Source | https://www.stats.gov.cn/source",
+        clean_evidence={"sources": [{"id": "1", "title": "Source", "url": "https://www.stats.gov.cn/source"}]},
+    )
+
+    truncation = captured["user_payload"]["report_truncation"]
+    assert result["success"] is True
+    assert truncation["truncated"] is True
+    assert truncation["included_chars"] <= 70000
+    assert "FINAL_AUDIT_TRUNCATED_MIDDLE" in captured["user_payload"]["report_markdown"]
+
+
+def test_final_audit_normalizer_limits_finding_lists(monkeypatch):
+    monkeypatch.setenv("REPORT_FINAL_AUDIT_MAX_FINDINGS", "2")
+
+    normalized = final_audit_agent._normalize_audit_payload(
+        {
+            "status": "fatal",
+            "overall_score": 42,
+            "publish_recommendation": "hold",
+            "critical_findings": [{"message": f"critical {index}"} for index in range(5)],
+            "unsupported_claims": [{"message": f"unsupported {index}"} for index in range(4)],
+            "citation_issues": [{"message": f"citation {index}"} for index in range(3)],
+            "scope_or_method_issues": [{"message": f"scope {index}"} for index in range(3)],
+            "risk_section_feedback": [{"message": f"risk {index}"} for index in range(3)],
+            "summary": "too many findings",
+        }
+    )
+
+    assert len(normalized["critical_findings"]) == 2
+    assert len(normalized["unsupported_claims"]) == 2
+    assert len(normalized["citation_issues"]) == 2
+    assert normalized["finding_overflow_counts"]["critical_findings"] == 3
+    assert normalized["finding_overflow_counts"]["unsupported_claims"] == 2
+    assert normalized["finding_list_limit"] == 2
+
+
 def test_final_audit_drops_false_future_date_fatal_when_date_is_not_future(monkeypatch):
     _configure_deepseek_final_audit(monkeypatch)
     monkeypatch.setenv("REPORT_ENABLE_FINAL_AUDIT", "true")

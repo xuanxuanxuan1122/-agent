@@ -291,7 +291,7 @@ FORBIDDEN_EXACT_PUBLIC_TITLES = {
     "代表性案例对比",
     "反向信号与失效条件",
     "市场空间是否成立",
-    "付费转化是否成立",
+    "兑现条件是否成立",
 }
 TITLE_FORBIDDEN_TERMS = {
     "证据",
@@ -306,8 +306,8 @@ TITLE_FORBIDDEN_TERMS = {
 LOW_SPECIFIC_VARIABLES = {
     "竞争变量",
     "指标口径",
-    "付费验证",
-    "需求场景",
+    "兑现验证",
+    "具体场景",
     "验证变量",
     "可验证信号",
     "关键事实",
@@ -697,17 +697,17 @@ def _title_from_variable(variable: str, block_type: str) -> str:
         if block_type == "unit_economics":
             return "玩家能力能否变现"
         return "玩家动作有哪些差异"
-    if re.search(r"技术产业链|技术|部署卡点", variable):
+    if re.search(r"技术产业链|技术|部署卡点|执行卡点", variable):
         if block_type in {"case_comparison", "customer_painpoint_matrix"}:
-            return "哪些技术环节开始落地"
-        return "部署卡点在哪里"
+            return "哪些技术环节进入实际应用"
+        return "执行卡点在哪里"
     if re.search(r"商业化进展|付费转化|付费", variable):
         if block_type == "unit_economics":
-            return "商业化走到哪一步"
-        return "哪些场景先出现付费"
+            return "兑现条件走到哪一步"
+        return "哪些场景先出现持续使用"
     if re.search(r"需求验证|需求", variable):
         if block_type == "unit_economics":
-            return "需求能否转成付费"
+            return "需求能否转成持续使用"
         return "需求是否走出试用"
     if re.search(r"规模价格", variable):
         if block_type in {"case_comparison", "customer_painpoint_matrix"}:
@@ -1284,6 +1284,12 @@ def run_micro_layout_agent(
             for block_id in _as_dict(claim_layout_match_diagnostics.get("matches")).keys()
             if str(block_id or "")
         }
+        matched_block_ids.update(
+            str(_as_dict(block).get("block_id") or _as_dict(block).get("section_id") or "")
+            for block in public_block_plan
+            if _as_dict(block).get("matched_llm_claim")
+            and str(_as_dict(block).get("block_id") or _as_dict(block).get("section_id") or "")
+        )
         has_claim_context = any(_as_list(value) for value in _as_dict(claim_units_by_chapter).values())
         demoted_public_blocks: List[Dict[str, Any]] = []
         if has_claim_context and public_block_plan:
@@ -1301,9 +1307,10 @@ def run_micro_layout_agent(
                     block_payload = _as_dict(block)
                     block_id = str(block_payload.get("block_id") or block_payload.get("section_id") or f"block_{index}")
                     if block_id in matched_block_ids:
-                        matched_claim = _as_dict(_as_dict(claim_layout_match_diagnostics.get("matches")).get(block_id))
+                        matched_claim = _as_dict(_as_dict(claim_layout_match_diagnostics.get("matches")).get(block_id)) or _as_dict(block_payload.get("matched_llm_claim"))
                         claim_refs = set(normalize_evidence_refs(matched_claim))
-                        if claim_refs and seen_matched_claim_refs.intersection(claim_refs):
+                        claim_first_block = str(block_payload.get("selection_reason") or "") == "claim_first_section_plan"
+                        if not claim_first_block and claim_refs and seen_matched_claim_refs.intersection(claim_refs):
                             demoted_public_blocks.append(
                                 {
                                     **block_payload,
@@ -1361,7 +1368,7 @@ def run_micro_layout_agent(
         for index, block in enumerate(public_block_plan, start=1):
             section = _section_for_block(package, block, index=index, fallback_refs=fallback_refs)
             block_id = str(_as_dict(block).get("block_id") or _as_dict(block).get("section_id") or f"block_{index}")
-            matched_claim = _as_dict(matched_claims_by_block.get(block_id))
+            matched_claim = _as_dict(matched_claims_by_block.get(block_id)) or _as_dict(_as_dict(block).get("matched_llm_claim"))
             if matched_claim:
                 section = _enrich_section_with_matched_claim(package, section, matched_claim)
             raw_sections.append(section)

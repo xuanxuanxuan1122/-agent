@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
+
 from rag_pipeline.agents import brain_agent, web_analysis_agent
 from rag_pipeline.agents.readpage_fact_extractor_agent import (
+    _split_page_into_chunks,
     _source_ref,
     extract_fact_cards_from_pages,
     reset_budget,
@@ -77,6 +80,37 @@ def test_readpage_extractor_rejects_navigation_and_keeps_body_fact(monkeypatch):
     assert card["proof_role"] == "case"
     assert "case_comparison" in card["block_affinity"]
     assert card["chapter_id"] == "ch_02"
+
+
+def test_readpage_fact_card_low_source_level_is_directional_not_rejected():
+    from rag_pipeline.agents import readpage_fact_extractor_agent as agent
+
+    card = {
+        "distilled_fact": "垂直媒体报道称，2025年人形机器人商业化订单开始增多。",
+        "fact_type": "case",
+        "source_url": "https://www.cs.com.cn/news/humanoid",
+        "source_ref": "S1",
+        "source_level": "C",
+        "source_verification_status": "readpage_verified",
+        "proof_role": "case",
+    }
+    task = {"required_source_level": ["A", "B"], "proof_role": "case"}
+
+    normalized, rejected = agent._validated_card(
+        card,
+        source_url="https://www.cs.com.cn/news/humanoid",
+        source_ref="S1",
+        source_level="C",
+        verification_status="readpage_verified",
+        proof_role="case",
+        search_task=task,
+    )
+
+    assert rejected == []
+    assert normalized is not None
+    assert normalized["allowed_use"] == "directional_signal"
+    assert normalized["claim_strength_hint"] == "directional"
+    assert normalized["source_level_gap"] == {"required": ["A", "B"], "actual": "C"}
 
 
 def test_iqs_research_node_passes_search_options_to_fact_extractor(monkeypatch):
@@ -546,6 +580,74 @@ def test_fallback_metric_sentence_yields_table_ready_fact_card(monkeypatch):
     assert card["period"] == "2025"
 
 
+def test_fallback_skips_markdown_chrome_before_metric_sentence(monkeypatch):
+    monkeypatch.setattr("rag_pipeline.agents.readpage_fact_extractor_agent.llm_config_is_ready", lambda config: False)
+    monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_CACHE_ENABLED", "false")
+    pages = [
+        {
+            "source_id": "S1",
+            "title": "Embodied AI market report",
+            "url": "https://www.askci.com/news/chanye/example.shtml",
+            "content": "\n".join(
+                [
+                    "Embodied AI market report ![](//img.example/share.png) [share](https://www.askci.com/share)",
+                    "- [2025-2030 related report![](//img.example/hot.png)](https://www.askci.com/reports/example)",
+                    "The research institute says China embodied AI market size reached 9150 billion yuan in 2025.",
+                    "Analysts forecast China embodied AI market size will reach 10904 billion yuan in 2026.",
+                ]
+            ),
+            "source_level": "B",
+        }
+    ]
+
+    result = extract_fact_cards_from_pages(
+        query="embodied AI market size metric",
+        page_results=pages,
+        search_task={
+            "task_id": "ST-H1",
+            "requirement_id": "H1_metric",
+            "gap_id": "GAP-metric",
+            "proof_role": "metric",
+            "required_fields": ["metric", "value", "unit", "period", "source"],
+        },
+    )
+
+    assert result["fallback_used"] is True
+    assert len(result["fact_cards"]) >= 1
+    facts = " ".join(str(item.get("distilled_fact") or "") for item in result["fact_cards"])
+    assert "9150 billion yuan" in facts
+    assert "share.png" not in facts
+
+
+def test_fallback_rejects_browser_warning_and_link_only_chrome(monkeypatch):
+    monkeypatch.setattr("rag_pipeline.agents.readpage_fact_extractor_agent.llm_config_is_ready", lambda config: False)
+    monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_CACHE_ENABLED", "false")
+
+    result = extract_fact_cards_from_pages(
+        query="embodied AI funding",
+        page_results=[
+            {
+                "source_id": "S1",
+                "title": "Browser warning",
+                "url": "https://www.wap.cfi.cn/p20260319003907.html",
+                "content": "\n".join(
+                    [
+                        "# Your connection is not private",
+                        "Attackers might be trying to steal your information from www.wap.cfi.cn.",
+                        "- [Finance](//finance.eastmoney.com/)",
+                        "- [Focus](//finance.eastmoney.com/yaowen.html)",
+                    ]
+                ),
+                "source_level": "C",
+            }
+        ],
+        search_task={"task_id": "ST-risk", "requirement_id": "REQ-risk", "proof_role": "funding"},
+    )
+
+    assert result["fallback_used"] is True
+    assert result["fact_cards"] == []
+
+
 def test_readpage_rejected_spans_emit_repair_summary(monkeypatch):
     def fake_llm(*, config, system_prompt, user_payload):
         return {
@@ -810,6 +912,7 @@ def test_report_level_budget_limits_llm_extractor_calls(monkeypatch):
     monkeypatch.setattr("rag_pipeline.agents.readpage_fact_extractor_agent.call_openai_compatible_json", fake_llm)
     monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_CACHE_ENABLED", "false")
     monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_MAX_CALLS_PER_REPORT", "2")
+    monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_MAX_PAGES_PER_TASK", "4")
     monkeypatch.setenv("REPORT_STAGE_SNAPSHOT_RUN_ID", "budget-test-readpage-extractor")
 
     pages = [
@@ -888,6 +991,414 @@ def test_budget_used_is_per_call_delta_and_resets(monkeypatch):
 
     assert third["budget_used"] == 1
     assert third["budget_exhausted"] is False
+
+
+def test_fallback_fact_cards_are_cached_after_llm_error(monkeypatch, tmp_path):
+    calls = []
+
+    def failing_llm(*, config, system_prompt, user_payload):
+        calls.append(user_payload["source"]["url"])
+        raise RuntimeError("model output truncated")
+
+    monkeypatch.setattr("rag_pipeline.agents.readpage_fact_extractor_agent.llm_config_is_ready", lambda config: True)
+    monkeypatch.setattr("rag_pipeline.agents.readpage_fact_extractor_agent.call_openai_compatible_json", failing_llm)
+    monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_CACHE_ENABLED", "true")
+    monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_CACHE_PATH", str(tmp_path / "fact_cache"))
+    monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_MAX_CALLS_PER_REPORT", "10")
+    monkeypatch.setenv("REPORT_STAGE_SNAPSHOT_RUN_ID", "fallback-cache-test")
+    reset_budget("fallback-cache-test")
+
+    page = {
+        "source_id": "SRC-market",
+        "title": "Humanoid robot market",
+        "url": "https://www.salesforce.com/news/humanoid-market",
+        "content": "The report says humanoid robot market size reached 120 billion yuan in 2025.",
+        "source_verification_status": "readpage_verified",
+        "source_level": "B",
+    }
+    task = {
+        "proof_role": "metric",
+        "chapter_id": "CH_market",
+        "requirement_id": "REQ_market",
+        "required_fields": ["metric", "value", "unit", "period", "source"],
+    }
+
+    first = extract_fact_cards_from_pages(query="humanoid robot market size metric", page_results=[page], search_task=task)
+    second = extract_fact_cards_from_pages(query="humanoid robot market size metric", page_results=[page], search_task=task)
+
+    assert first["fallback_used"] is True
+    assert first["llm_error_count"] == 1
+    assert first["fact_card_count"] >= 1
+    assert first["cache_hit_count"] == 0
+    assert second["cache_hit_count"] == 1
+    assert second["llm_error_count"] == 0
+    assert second["fact_card_count"] == first["fact_card_count"]
+    assert calls == ["https://www.salesforce.com/news/humanoid-market"]
+
+
+def test_long_page_uses_chunk_extraction_before_whole_page_llm(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_llm(*, config, system_prompt, user_payload):
+        calls.append(user_payload.get("chunk", {}).get("chunk_index"))
+        assert user_payload.get("chunk"), "long pages should be chunked before calling the LLM"
+        return {
+            "payload": {
+                "fact_cards": [
+                    {
+                        "subject": "humanoid robot market",
+                        "action_or_signal": "Humanoid robot market size reached 120 billion yuan in 2025.",
+                        "variable": "market size",
+                        "distilled_fact": "Humanoid robot market size reached 120 billion yuan in 2025.",
+                        "fact_type": "metric",
+                        "metric": "market size",
+                        "value": "120",
+                        "unit": "billion yuan",
+                        "period": "2025",
+                        "source_url": user_payload["source"]["url"],
+                        "source_ref": user_payload["source"]["source_ref"],
+                        "source_level": "B",
+                        "source_verification_status": "readpage_verified",
+                        "proof_role": "metric",
+                        "block_affinity": ["metric_reconciliation"],
+                        "claim_strength_hint": "directional",
+                    }
+                ]
+            },
+            "usage": {},
+        }
+
+    monkeypatch.setattr("rag_pipeline.agents.readpage_fact_extractor_agent.llm_config_is_ready", lambda config: True)
+    monkeypatch.setattr("rag_pipeline.agents.readpage_fact_extractor_agent.call_openai_compatible_json", fake_llm)
+    monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_CACHE_ENABLED", "false")
+    monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_CHUNK_ENABLED", "true")
+    monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_CHUNK_TRIGGER_CHARS", "300")
+    monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_MAX_CHUNKS_PER_PAGE", "2")
+    monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_MAX_CALLS_PER_REPORT", "10")
+    monkeypatch.setenv("REPORT_STAGE_SNAPSHOT_RUN_ID", "chunk-long-page-test")
+    reset_budget("chunk-long-page-test")
+
+    page = {
+        "source_id": "SRC-market",
+        "title": "Humanoid robot market",
+        "url": "https://www.salesforce.com/news/humanoid-market",
+        "content": "\n\n".join(
+            [
+                "# Navigation",
+                "Login Contact Subscribe " * 20,
+                "## Market size",
+                "Humanoid robot market size reached 120 billion yuan in 2025.",
+                "## Extra context",
+                "Manufacturers are expanding deployment pilots. " * 20,
+            ]
+        ),
+        "source_level": "B",
+    }
+
+    result = extract_fact_cards_from_pages(
+        query="humanoid robot market size metric",
+        page_results=[page],
+        search_task={
+            "proof_role": "metric",
+            "chapter_id": "CH_market",
+            "requirement_id": "REQ_market",
+            "required_fields": ["metric", "value", "unit", "period", "source"],
+        },
+    )
+
+    assert result["chunk_mode_used"] is True
+    assert result["chunk_trigger_reason"] == "page_too_long"
+    assert result["chunk_attempted"] >= 1
+    assert result["fact_card_count"] == 1
+    card = result["fact_cards"][0]
+    assert card["chunk_index"] >= 1
+    assert "120 billion yuan" in card["chunk_evidence_span"]
+    assert calls and all(item is not None for item in calls)
+
+
+def test_chunk_extraction_results_are_cached(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_llm(*, config, system_prompt, user_payload):
+        calls.append(user_payload.get("chunk", {}).get("chunk_index"))
+        return {
+            "payload": {
+                "fact_cards": [
+                    {
+                        "subject": "humanoid robot market",
+                        "action_or_signal": "Humanoid robot market size reached 120 billion yuan in 2025.",
+                        "variable": "market size",
+                        "distilled_fact": "Humanoid robot market size reached 120 billion yuan in 2025.",
+                        "fact_type": "metric",
+                        "metric": "market size",
+                        "value": "120",
+                        "unit": "billion yuan",
+                        "period": "2025",
+                        "source_url": user_payload["source"]["url"],
+                        "source_ref": user_payload["source"]["source_ref"],
+                        "source_level": "B",
+                        "source_verification_status": "readpage_verified",
+                        "proof_role": "metric",
+                        "block_affinity": ["metric_reconciliation"],
+                    }
+                ]
+            },
+            "usage": {},
+        }
+
+    monkeypatch.setattr("rag_pipeline.agents.readpage_fact_extractor_agent.llm_config_is_ready", lambda config: True)
+    monkeypatch.setattr("rag_pipeline.agents.readpage_fact_extractor_agent.call_openai_compatible_json", fake_llm)
+    monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_CACHE_ENABLED", "true")
+    monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_CACHE_PATH", str(tmp_path / "fact_cache"))
+    monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_CHUNK_ENABLED", "true")
+    monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_CHUNK_TRIGGER_CHARS", "200")
+    monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_MAX_CHUNKS_PER_PAGE", "1")
+    monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_MAX_CALLS_PER_REPORT", "10")
+    monkeypatch.setenv("REPORT_STAGE_SNAPSHOT_RUN_ID", "chunk-cache-test")
+    reset_budget("chunk-cache-test")
+
+    page = {
+        "source_id": "SRC-market",
+        "title": "Humanoid robot market",
+        "url": "https://www.salesforce.com/news/humanoid-market",
+        "content": "## Market size\nHumanoid robot market size reached 120 billion yuan in 2025.\n" + ("context " * 80),
+        "source_level": "B",
+    }
+    task = {
+        "proof_role": "metric",
+        "chapter_id": "CH_market",
+        "requirement_id": "REQ_market",
+        "required_fields": ["metric", "value", "unit", "period", "source"],
+    }
+
+    first = extract_fact_cards_from_pages(query="humanoid robot market size metric", page_results=[page], search_task=task)
+    second = extract_fact_cards_from_pages(query="humanoid robot market size metric", page_results=[page], search_task=task)
+
+    assert first["chunk_fact_card_count"] == 1
+    assert first["chunk_cache_hit_count"] == 0
+    assert second["chunk_cache_hit_count"] == 1
+    assert second["fact_card_count"] == first["fact_card_count"]
+    assert calls == [1]
+
+
+def test_chunk_extraction_caps_fact_cards_and_sends_output_limits(monkeypatch):
+    def noisy_llm(*, config, system_prompt, user_payload):
+        assert user_payload["chunk"]["max_fact_cards"] == 3
+        assert user_payload["chunk"]["max_fact_chars"] <= 220
+        cards = []
+        for index in range(6):
+            cards.append(
+                {
+                    "subject": f"case {index}",
+                    "action_or_signal": f"Customer deployment signal {index} in 2026.",
+                    "variable": "deployment",
+                    "distilled_fact": f"Customer deployment signal {index} in 2026.",
+                    "fact_type": "case",
+                    "source_url": user_payload["source"]["url"],
+                    "source_ref": user_payload["source"]["source_ref"],
+                    "source_level": "B",
+                    "source_verification_status": "readpage_verified",
+                    "proof_role": "case",
+                    "block_affinity": ["case_comparison"],
+                }
+            )
+        return {"payload": {"fact_cards": cards}, "usage": {}}
+
+    monkeypatch.setattr("rag_pipeline.agents.readpage_fact_extractor_agent.llm_config_is_ready", lambda config: True)
+    monkeypatch.setattr("rag_pipeline.agents.readpage_fact_extractor_agent.call_openai_compatible_json", noisy_llm)
+    monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_CACHE_ENABLED", "false")
+    monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_CHUNK_ENABLED", "true")
+    monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_CHUNK_TRIGGER_CHARS", "300")
+    monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_CHUNK_MAX_FACT_CARDS", "3")
+    monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_MAX_CHUNKS_PER_PAGE", "1")
+    monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_MAX_CALLS_PER_REPORT", "10")
+    monkeypatch.setenv("REPORT_STAGE_SNAPSHOT_RUN_ID", "chunk-output-limit-test")
+    reset_budget("chunk-output-limit-test")
+
+    result = extract_fact_cards_from_pages(
+        query="customer deployment cases",
+        page_results=[
+            {
+                "source_id": "SRC-case",
+                "title": "Deployment cases",
+                "url": "https://finance.people.com.cn/case",
+                "content": "## Cases\n" + ("Customer deployment signal in 2026. " * 40),
+                "source_level": "B",
+            }
+        ],
+        search_task={"proof_role": "case", "chapter_id": "CH_case", "requirement_id": "REQ_case"},
+    )
+
+    assert result["chunk_mode_used"] is True
+    assert result["chunk_fact_card_count"] == 3
+    assert result["fact_card_count"] == 3
+
+
+def test_medium_page_uses_chunk_extraction_by_default(monkeypatch):
+    calls = []
+
+    def fake_llm(*, config, system_prompt, user_payload):
+        calls.append(user_payload.get("chunk", {}).get("chunk_index"))
+        return {
+            "payload": {
+                "fact_cards": [
+                    {
+                        "subject": "embodied intelligence deployment",
+                        "action_or_signal": "State Grid planned to invest 6.8 billion yuan to procure 8,500 robots in 2026.",
+                        "variable": "procurement",
+                        "distilled_fact": "State Grid planned to invest 6.8 billion yuan to procure 8,500 robots in 2026.",
+                        "fact_type": "case",
+                        "source_url": user_payload["source"]["url"],
+                        "source_ref": user_payload["source"]["source_ref"],
+                        "source_level": "B",
+                        "source_verification_status": "readpage_verified",
+                        "proof_role": "case",
+                        "block_affinity": ["case_comparison"],
+                    }
+                ]
+            },
+            "usage": {},
+        }
+
+    monkeypatch.setattr("rag_pipeline.agents.readpage_fact_extractor_agent.llm_config_is_ready", lambda config: True)
+    monkeypatch.setattr("rag_pipeline.agents.readpage_fact_extractor_agent.call_openai_compatible_json", fake_llm)
+    monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_CACHE_ENABLED", "false")
+    monkeypatch.delenv("READPAGE_FACT_EXTRACTOR_CHUNK_TRIGGER_CHARS", raising=False)
+    monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_CHUNK_ENABLED", "true")
+    monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_MAX_CHUNKS_PER_PAGE", "1")
+    monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_MAX_CALLS_PER_REPORT", "10")
+    monkeypatch.setenv("REPORT_STAGE_SNAPSHOT_RUN_ID", "chunk-default-threshold-test")
+    reset_budget("chunk-default-threshold-test")
+
+    page = {
+        "source_id": "SRC-medium",
+        "title": "Embodied intelligence goes to factory",
+        "url": "https://finance.people.com.cn/embodied",
+        "content": "## Case signal\nState Grid planned to invest 6.8 billion yuan to procure 8,500 robots in 2026.\n"
+        + ("Industrial deployment context. " * 85),
+        "source_level": "B",
+    }
+
+    result = extract_fact_cards_from_pages(
+        query="embodied intelligence case procurement",
+        page_results=[page],
+        search_task={"proof_role": "case", "chapter_id": "CH_case", "requirement_id": "REQ_case"},
+    )
+
+    assert len(page["content"]) >= 1800
+    assert result["chunk_mode_used"] is True
+    assert result["fact_card_count"] == 1
+    assert calls == [1]
+
+
+def test_zero_valid_llm_result_falls_back_to_rule_extraction(monkeypatch):
+    calls = []
+
+    def empty_llm(*, config, system_prompt, user_payload):
+        calls.append(user_payload["source"]["url"])
+        return {"payload": {"fact_cards": []}, "usage": {}}
+
+    monkeypatch.setattr("rag_pipeline.agents.readpage_fact_extractor_agent.llm_config_is_ready", lambda config: True)
+    monkeypatch.setattr("rag_pipeline.agents.readpage_fact_extractor_agent.call_openai_compatible_json", empty_llm)
+    monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_CACHE_ENABLED", "false")
+    monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_CHUNK_ENABLED", "false")
+    monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_ZERO_VALID_FALLBACK_ENABLED", "true")
+    monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_MAX_CALLS_PER_REPORT", "10")
+    monkeypatch.setenv("REPORT_STAGE_SNAPSHOT_RUN_ID", "zero-valid-fallback-test")
+    reset_budget("zero-valid-fallback-test")
+
+    result = extract_fact_cards_from_pages(
+        query="local policy embodied intelligence target",
+        page_results=[
+                {
+                    "source_id": "SRC-policy",
+                    "title": "Local AI action plan",
+                    "url": "https://www.lg.gov.cn/policy",
+                    "content": "Longgang District released the AI Longgang Three-Year Action Plan for 2025-2027, targeting AI application in more than 80% of key industries by 2027.",
+                "source_level": "A",
+                "source_verification_status": "readpage_verified",
+            }
+        ],
+        search_task={"proof_role": "policy", "chapter_id": "CH_policy", "requirement_id": "REQ_policy"},
+    )
+
+    assert calls == ["https://www.lg.gov.cn/policy"]
+    assert result["zero_valid_fallback_used"] is True, json.dumps(result, ensure_ascii=False)
+    assert result["fallback_used"] is True
+    assert result["fact_card_count"] >= 1
+    assert any("2027" in str(card.get("distilled_fact") or "") for card in result["fact_cards"])
+
+
+def test_rule_fallback_skips_pdf_table_header_and_keeps_fact_sentence(monkeypatch):
+    monkeypatch.setattr("rag_pipeline.agents.readpage_fact_extractor_agent.llm_config_is_ready", lambda config: False)
+    monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_CACHE_ENABLED", "false")
+    monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_ZERO_VALID_FALLBACK_ENABLED", "true")
+    monkeypatch.setenv("REPORT_STAGE_SNAPSHOT_RUN_ID", "pdf-header-fallback-test")
+    reset_budget("pdf-header-fallback-test")
+
+    page = {
+        "source_id": "SRC-pdf",
+        "title": "\u4f4e\u7a7a\u7ecf\u6d4e\u4ea7\u4e1a\u94fe\u7814\u7a76\u4e13\u9898",
+        "url": "https://pdf.dfcfw.com/pdf/low-altitude.pdf",
+        "content": "\n".join(
+            [
+                "|||证券研究报告 ||22026年02月08日 026 年02 月06 日| |---|---|---|---| |低空经济产业链研究专题一|从产品到生态、从试点到常态，低空经济的发展潜力与机遇||优于大市| |核心观点|行业研究·行业专题||| |国防军工 优于大市·维持|||",
+                "\u4f4e\u7a7a\u7ecf\u6d4e\u662f\u4f9d\u6258\u4f4e\u7a7a\u822a\u7a7a\u6d3b\u52a8\u5e26\u52a8\u76f8\u5173\u4ea7\u4e1a\u521b\u65b0\u548c\u573a\u666f\u5e94\u7528\u5f62\u6210\u7684\u7efc\u5408\u6027\u7ecf\u6d4e\u5f62\u6001\u3002",
+                "\u622a\u81f32024\u5e74\uff0c\u6211\u56fd\u5728\u518c\u901a\u7528\u822a\u7a7a\u5668\u603b\u91cf\u3001\u901a\u7528\u822a\u7a7a\u4f01\u4e1a\u6570\u91cf\u5747\u521b\u65b0\u9ad8\u3002",
+            ]
+        ),
+        "source_level": "B",
+        "source_verification_status": "document_verified",
+    }
+
+    result = extract_fact_cards_from_pages(
+        query="\u4e2d\u56fd\u4f4e\u7a7a\u7ecf\u6d4e\u4ea7\u4e1a\u94fe",
+        page_results=[page],
+        search_task={"proof_role": "support", "chapter_id": "CH_market", "requirement_id": "REQ_market"},
+    )
+
+    facts = "\n".join(str(card.get("distilled_fact") or "") for card in result["fact_cards"])
+    assert result["fallback_used"] is True
+    assert result["fact_card_count"] >= 1
+    assert "证券研究报告" not in facts
+    assert "|||" not in facts
+    assert "\u4f4e\u7a7a\u7ecf\u6d4e" in facts
+
+
+def test_chunk_ranking_prefers_order_contract_and_customer_case_segments(monkeypatch):
+    monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_CHUNK_MAX_CHARS", "360")
+    monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_MAX_CHUNKS_PER_PAGE", "1")
+    weak_sections = []
+    for index in range(12):
+        weak_sections.extend(
+            [
+                f"## Weak context {index}",
+                f"2025年，人形机器人公司在展会、演示和试点场景中继续推进技术验证，第{index}批样机展示了运动控制能力。",
+                "Manufacturing clients are watching product stability and pilot progress. " * 4,
+            ]
+        )
+
+    page = {
+        "title": "Humanoid robot commercialization",
+        "content": "\n\n".join(
+            [
+                "# Industry background",
+                "Humanoid robot companies are showing demos at conferences. " * 8,
+                "姚卯青称，当前人形机器人的投资回报率ROI不及成熟的机械臂系统，真正的价值在于补足非标准化环节。",
+                *weak_sections,
+                "## Order signal",
+                "2025年下半年，多家中国人形机器人企业披露千台级订单，包括优必选、宇树科技、智元机器人、松延动力、星尘智能、智平方、众擎机器人、加速进化8家企业。",
+                "智元机器人与龙旗科技签下数亿元合作协议，计划部署近千台机器人；星尘智能披露与仙工智能的千台级合作。",
+            ]
+        ),
+    }
+
+    chunks = _split_page_into_chunks(page, proof_role="case")
+    joined = "\n".join(str(item.get("chunk_text") or "") for item in chunks)
+
+    assert len(chunks) == 1
+    assert "千台级订单" in joined
+    assert "数亿元合作协议" in joined
 
 
 def test_brain_fact_extractor_diagnostics_survive_to_score_paths():

@@ -199,6 +199,141 @@ def test_repair_context_seed_dedup_uses_shared_seen_keys():
     assert second_skipped == 1
 
 
+def test_repair_task_execution_route_splits_search_from_writer_suggestions():
+    search_tasks, suggestions = brain_agent_module._split_repair_tasks_by_execution_route(
+        [
+            {
+                "query": "AI Agent official adoption metric period unit",
+                "agent": "iqs",
+                "gap_id": "GAP-metric",
+                "repair_route": "metric_source_search",
+                "proof_role": "metric",
+            },
+            {
+                "query": "expand the existing section with caveats",
+                "agent": "iqs",
+                "gap_id": "GAP-body",
+                "repair_action": "rewrite_with_caveat",
+                "repair_route": "rewrite_with_caveat",
+                "type": "body_short",
+                "chapter_id": "ch_01",
+            },
+        ],
+        source="unit_test",
+    )
+
+    assert [item["gap_id"] for item in search_tasks] == ["GAP-metric"]
+    assert len(suggestions) == 1
+    assert suggestions[0]["repair_action"] == "rewrite_with_caveat"
+    assert suggestions[0]["target"]["chapter_id"] == "ch_01"
+    assert suggestions[0]["diagnostic_only"] is True
+    assert suggestions[0]["must_not_render"] is True
+    assert suggestions[0]["public_text_allowed"] is False
+
+
+def test_post_qa_repair_plan_routes_non_search_followups_to_rewrite_reasons():
+    plan = brain_agent_module._post_qa_repair_plan(
+        {
+            "qa_result": {
+                "evidence_repair_followups": [
+                    {
+                        "query": "do not search; rewrite existing claim cautiously",
+                        "repair_route": "rewrite_with_caveat",
+                        "repair_action": "rewrite_with_caveat",
+                        "type": "claim_overreach",
+                        "claim_id": "claim-1",
+                    }
+                ]
+            }
+        },
+        max_queries=4,
+    )
+
+    assert plan["evidence_followups"] == []
+    assert plan["rewrite_required"] is True
+    assert plan["rewrite_reasons"][0]["repair_action"] == "rewrite_with_caveat"
+    assert plan["rewrite_reasons"][0]["must_not_render"] is True
+
+
+def test_post_qa_repair_plan_routes_writer_advice_followups_to_reanalysis():
+    plan = brain_agent_module._post_qa_repair_plan(
+        {
+            "required_followups": [
+                {
+                    "schema_version": "writer_advice_required_followup_v1",
+                    "type": "section_ref_binding_invalid_only",
+                    "issue_type": "section_ref_binding_invalid_only",
+                    "repair_route": "reanalyze_existing",
+                    "repair_action": "reanalyze_existing",
+                    "chapter_id": "ch_02",
+                    "section_id": "ch_02_b1",
+                    "diagnostic_only": True,
+                    "must_not_render": True,
+                    "public_text_allowed": False,
+                    "allowed_for_writing": False,
+                }
+            ]
+        },
+        max_queries=4,
+    )
+
+    assert plan["evidence_followups"] == []
+    assert plan["rewrite_required"] is True
+    assert plan["rewrite_reasons"][0]["repair_action"] == "reanalyze_existing"
+    assert plan["rewrite_reasons"][0]["target"]["chapter_id"] == "ch_02"
+    assert plan["rewrite_reasons"][0]["must_not_render"] is True
+
+
+def test_evidence_preflight_non_search_repair_seed_does_not_run_followup(monkeypatch):
+    def fake_ledger_items(*, state, max_tasks, seen_keys):
+        return (
+            [
+                {
+                    "query": "expand existing section from bound claims",
+                    "agent": "iqs",
+                    "gap_id": "GAP-body",
+                    "repair_action": "rewrite_with_caveat",
+                    "repair_route": "rewrite_with_caveat",
+                    "type": "body_short",
+                    "chapter_id": "ch_01",
+                }
+            ],
+            {"status": "ready", "repair_task_seeds": [{"gap_id": "GAP-body"}]},
+            0,
+        )
+
+    def fake_binder(**_kwargs):
+        return {"evidence_refinement_plan": {"status": "no_tasks", "top_priorities": [], "follow_up_queries": []}}
+
+    def fail_followups(**_kwargs):
+        raise AssertionError("non-search repair suggestions must not run web followups")
+
+    monkeypatch.setattr(brain_agent_module, "_ledger_repair_items_from_state", fake_ledger_items)
+    monkeypatch.setattr("rag_pipeline.agents.evidence_binder.run_evidence_binder", fake_binder)
+    monkeypatch.setattr(brain_agent_module, "run_followup_queries", fail_followups)
+
+    result = brain_agent_module._run_evidence_preflight_round(
+        state={"metadata": {}, "stage_snapshot_run_id": "run-a"},
+        children={},
+        evidence_pool=[],
+        evidence_package={},
+        structured_analysis={},
+        report_plan={},
+        query="AI agent adoption",
+        max_followups=4,
+        started=0.0,
+    )
+
+    trace = result["evidence_preflight_trace"][0]
+    assert trace["status"] == "no_search_repair_tasks"
+    assert trace["stop_reason"] == "repair_actions_are_non_search"
+    assert trace["attempted_task_count"] == 0
+    assert trace["repair_task_candidate_count"] == 1
+    assert trace["non_search_repair_suggestion_count"] == 1
+    assert trace["non_search_repair_suggestions"][0]["repair_action"] == "rewrite_with_caveat"
+    assert result["updated"] is False
+
+
 def test_evidence_preflight_includes_ledger_repair_seed(monkeypatch):
     captured = {}
 
@@ -255,6 +390,92 @@ def test_evidence_preflight_includes_ledger_repair_seed(monkeypatch):
     assert captured["follow_up_queries"][0]["gap_id"] == "GAP-live"
     assert captured["follow_up_queries"][0]["origin_node"] == "artifact_ledger"
     assert result["updated"] is False
+
+
+def test_post_qa_non_search_repair_seed_skips_followup_and_reaches_writer(monkeypatch):
+    captured = {}
+
+    def fake_ledger_items(*, state, max_tasks, seen_keys):
+        return (
+            [
+                {
+                    "query": "rewrite existing section with caveat",
+                    "agent": "iqs",
+                    "gap_id": "GAP-overreach",
+                    "repair_action": "rewrite_with_caveat",
+                    "repair_route": "rewrite_with_caveat",
+                    "type": "claim_overreach",
+                    "claim_id": "claim-1",
+                }
+            ],
+            {"status": "ready", "repair_task_seeds": [{"gap_id": "GAP-overreach"}]},
+            0,
+        )
+
+    def fail_followups(**_kwargs):
+        raise AssertionError("non-search repair suggestions must not run web followups")
+
+    def fake_writer_agent(**kwargs):
+        captured["post_qa_repair_context"] = kwargs["structured_analysis"]["post_qa_repair_context"]
+        return {
+            "writer_report": {
+                "report_status": "final_clean",
+                "report_markdown": "clean draft with cautious language",
+                "qa_result": {"passed": True, "quality_score": 90},
+            }
+        }
+
+    monkeypatch.setattr(brain_agent_module, "_post_qa_repair_needed", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        brain_agent_module,
+        "_post_qa_repair_plan",
+        lambda *_args, **_kwargs: {
+            "status": "no_repair_tasks",
+            "evidence_followups": [],
+            "rewrite_required": False,
+            "rewrite_reasons": [],
+        },
+    )
+    monkeypatch.setattr(brain_agent_module, "_ledger_repair_items_from_state", fake_ledger_items)
+    monkeypatch.setattr(brain_agent_module, "run_followup_queries", fail_followups)
+    monkeypatch.setattr(brain_agent_module, "run_writer_agent", fake_writer_agent)
+    monkeypatch.setattr(
+        brain_agent_module,
+        "_attach_reformatter_preflight_feedback",
+        lambda **kwargs: kwargs["writer_report"],
+    )
+
+    result = brain_agent_module._run_post_qa_repair_round(
+        state={"metadata": {}, "stage_snapshot_run_id": "run-a"},
+        children={},
+        best={
+            "writer_report": {
+                "report_status": "needs_review",
+                "report_markdown": "thin draft",
+                "qa_result": {"passed": False, "quality_score": 10},
+            },
+            "evidence_pool": [],
+            "evidence_package": {},
+            "structured_analysis": {},
+            "analysis_state": {},
+            "layout_refinement_trace": [],
+        },
+        report_plan={},
+        query="AI agent adoption",
+        search_task_schedule={},
+        lane_coverage={},
+        max_followups=4,
+        started=0.0,
+    )
+
+    trace = result["post_qa_repair_trace"][0]
+    assert trace["attempted_task_count"] == 0
+    assert trace["repair_task_candidate_count"] == 1
+    assert trace["non_search_repair_suggestion_count"] == 1
+    assert trace["status"] == "completed"
+    assert captured["post_qa_repair_context"]["rewrite_required"] is True
+    assert captured["post_qa_repair_context"]["rewrite_reasons"][0]["repair_action"] == "rewrite_with_caveat"
+    assert captured["post_qa_repair_context"]["rewrite_reasons"][0]["must_not_render"] is True
 
 
 def test_post_qa_repair_includes_ledger_repair_seed(monkeypatch):

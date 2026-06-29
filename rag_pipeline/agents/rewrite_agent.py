@@ -137,6 +137,9 @@ def _strip_internal_labels(text: str) -> str:
         if label in safe_terms:
             continue
         value = value.replace(label, "")
+    # Keep the mojibake alternatives: older QA/review artifacts were sometimes
+    # written after a UTF-8/GBK display mismatch, and those labels can still
+    # surface when replaying cached writer packages.
     value = re.sub(r"(?m)^\s*(?:QA|Validation|质量检查|璐ㄩ噺妫€鏌?).*$", "", value)
     return value
 
@@ -190,12 +193,8 @@ def _downgrade_semantic_claims(text: str) -> str:
     ]
     for pattern, replacement in replacements:
         value = re.sub(pattern, replacement, value)
-    if "现有公开材料更适合支持方向性观察" not in value and re.search(r"阶段性判断|初步显示|线索支持|方向性", value):
-        paragraphs = value.split("\n\n")
-        insert_at = 1 if paragraphs and paragraphs[0].lstrip().startswith("#") else 0
-        boundary = "现有公开材料更适合支持方向性观察；涉及规模、盈利、份额或政策传导的判断，仍需要同口径数据、较高等级来源和反向样本继续验证。"
-        paragraphs.insert(min(insert_at + 1, len(paragraphs)), boundary)
-        value = "\n\n".join(paragraphs)
+    # Keep semantic downgrades local. Do not inject a fixed boundary paragraph;
+    # repeated template sentences became a public-report fingerprint.
     return value
 
 

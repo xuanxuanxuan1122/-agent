@@ -17,6 +17,7 @@ from rag_pipeline.agents.claim_builder_agent import run_claim_builder_agent
 from rag_pipeline.agents.chapter_argument_agent import run_chapter_argument_agent
 from rag_pipeline.agents.micro_layout_agent import run_micro_layout_agent
 from rag_pipeline.agents.final_writer_agent import run_final_writer_agent
+from rag_pipeline.agents.qa_agent import run_qa_agent
 from rag_pipeline.flows.report.final_audit_agent import run_final_audit
 from rag_pipeline.flows.report.full_report import render_score_markdown, write_formal_markdown, write_score_markdown
 
@@ -423,6 +424,41 @@ def _micro_layouts_need_rebuild(micro_layouts: List[Dict[str, Any]]) -> bool:
     return False
 
 
+def _regenerated_writer_report(
+    *,
+    package: Dict[str, Any],
+    writer_output: Dict[str, Any],
+    markdown: str,
+    structured_analysis: Dict[str, Any],
+    chapter_evidence_packages: List[Dict[str, Any]],
+    argument_units: List[Dict[str, Any]],
+    chapter_packages: List[Dict[str, Any]],
+    micro_layouts: List[Dict[str, Any]],
+    table_packages: List[Dict[str, Any]],
+    render_artifacts: Dict[str, Any],
+    qa_result: Dict[str, Any],
+) -> Dict[str, Any]:
+    old_writer_report = _as_dict(package.get("writer_report"))
+    return {
+        **old_writer_report,
+        **_as_dict(writer_output),
+        "report_markdown": markdown,
+        "report_status": old_writer_report.get("report_status") or "formal_scored",
+        "source_registry": writer_output.get("source_registry") or [],
+        "structured_analysis": structured_analysis,
+        "chapter_evidence_packages": chapter_evidence_packages,
+        "argument_units": argument_units,
+        "chapter_packages": chapter_packages,
+        "micro_layouts": micro_layouts,
+        "table_packages": table_packages,
+        "render_artifacts": render_artifacts,
+        "qa_result": qa_result,
+        "validation": qa_result,
+        "quality_findings": _as_list(qa_result.get("quality_findings")),
+        "review_suggestions": _as_list(qa_result.get("review_suggestions")),
+    }
+
+
 def regenerate(package_path: Path, output_path: Path | None = None) -> Path:
     package = _load_rebuild_package(package_path)
     chapter_evidence_packages = _augment_chapter_evidence_packages(package)
@@ -491,9 +527,26 @@ def regenerate(package_path: Path, output_path: Path | None = None) -> Path:
         },
         "source_registry": writer_output.get("source_registry") or [],
     }
+    qa_result = run_qa_agent(
+        report_markdown=markdown,
+        report_blueprint=report_blueprint,
+        chapter_packages=chapter_packages,
+        table_packages=table_packages,
+        decision_package={},
+        risk_package={},
+        package_quality_report={},
+        search_task_schedule=_as_dict(package.get("search_task_schedule")),
+        lane_coverage=_as_dict(package.get("lane_coverage")),
+        metric_normalization_table=_as_list(_as_dict(package.get("evidence_package")).get("metric_normalization_table")),
+        analytics_outputs=_as_list(package.get("analytics_outputs")),
+        coverage_matrix=_as_list(package.get("coverage_matrix")),
+        missing_proof_standards=_as_list(package.get("missing_proof_standards")),
+        evidence_health_summary=_as_dict(package.get("evidence_health_summary"))
+        or _as_dict(_as_dict(package.get("evidence_package")).get("evidence_health_summary")),
+    )
     final_audit = run_final_audit(
         report_markdown=markdown,
-        validation=_as_dict(_as_dict(package.get("writer_report")).get("validation")),
+        validation=qa_result,
         clean_evidence=None,
         writer_package_payload=audit_package,
         query=str(package.get("query") or ""),
@@ -509,19 +562,19 @@ def regenerate(package_path: Path, output_path: Path | None = None) -> Path:
         "table_packages": table_packages,
         "source_registry": writer_output.get("source_registry") or [],
     }
-    writer_report = {
-        **_as_dict(package.get("writer_report")),
-        "report_markdown": markdown,
-        "report_status": _as_dict(package.get("writer_report")).get("report_status") or "formal_scored",
-        "source_registry": writer_output.get("source_registry") or [],
-        "structured_analysis": structured_analysis,
-        "chapter_evidence_packages": chapter_evidence_packages,
-        "argument_units": argument_units,
-        "chapter_packages": chapter_packages,
-        "micro_layouts": micro_layouts,
-        "table_packages": table_packages,
-        "render_artifacts": render_artifacts,
-    }
+    writer_report = _regenerated_writer_report(
+        package=package,
+        writer_output=writer_output,
+        markdown=markdown,
+        structured_analysis=structured_analysis,
+        chapter_evidence_packages=chapter_evidence_packages,
+        argument_units=argument_units,
+        chapter_packages=chapter_packages,
+        micro_layouts=micro_layouts,
+        table_packages=table_packages,
+        render_artifacts=render_artifacts,
+        qa_result=qa_result,
+    )
     score_path = output.with_name(output.name.replace("_report.md", "_score.md")) if output.name.endswith("_report.md") else output.with_name(output.stem + "_score.md")
     score_markdown = render_score_markdown(
         query=str(package.get("query") or ""),

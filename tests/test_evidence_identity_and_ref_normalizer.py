@@ -31,6 +31,38 @@ def test_evidence_alias_map_resolves_explicit_aliases_without_fuzzy_merge():
     assert canonicalize_evidence_id("EV-04-L24", alias_map) == ""
 
 
+def test_evidence_alias_map_resolves_line_level_l_variant_when_unambiguous():
+    alias_map = build_evidence_alias_map(
+        [
+            {
+                "evidence_id": "EV-04-22",
+                "source_id": "SRC-1",
+            }
+        ]
+    )
+
+    resolved = resolve_evidence_refs(["EV-04-L22"], alias_map)
+
+    assert canonicalize_evidence_id("EV-04-L22", alias_map) == "EV-04-22"
+    assert resolved["resolved_fact_ids"] == ["EV-04-22"]
+    assert resolved["alias_resolved_refs"] == [{"raw_ref": "EV-04-L22", "canonical_ref": "EV-04-22"}]
+
+
+def test_evidence_alias_map_preserves_exact_ids_when_line_level_l_variant_also_exists():
+    alias_map = build_evidence_alias_map(
+        [
+            {"evidence_id": "EV-04-22", "source_id": "SRC-1"},
+            {"evidence_id": "EV-04-L22", "source_id": "SRC-2"},
+        ]
+    )
+
+    resolved = resolve_evidence_refs(["EV-04-L22", "EV-04-22"], alias_map)
+
+    assert resolved["resolved_fact_ids"] == ["EV-04-L22", "EV-04-22"]
+    assert resolved["ambiguous_refs"] == []
+    assert resolved["alias_resolved_refs"] == []
+
+
 def test_evidence_alias_map_marks_conflicting_alias_as_ambiguous():
     alias_map = build_evidence_alias_map(
         [

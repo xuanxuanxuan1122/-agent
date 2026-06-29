@@ -489,18 +489,60 @@ def _dimension_text(item: Dict[str, Any]) -> str:
 
 
 def _source_payload(item: Dict[str, Any]) -> Dict[str, Any]:
+    top_level_url = str(
+        item.get("source_url")
+        or item.get("canonical_url")
+        or item.get("url")
+        or item.get("link")
+        or item.get("source_link")
+        or ""
+    ).strip()
+    top_level_title = str(
+        item.get("source_title")
+        or item.get("title")
+        or item.get("source_name")
+        or ""
+    ).strip()
     source = _as_dict(item.get("source"))
     if source:
-        return source
+        payload = dict(source)
+        if top_level_url and not str(payload.get("url") or payload.get("link") or "").strip():
+            payload["url"] = top_level_url
+        if top_level_title and not str(payload.get("title") or payload.get("name") or "").strip():
+            payload["title"] = top_level_title
+        return payload
     source_text = str(item.get("source") or "").strip()
     if source_text:
-        return {"title": source_text, "name": source_text}
+        if re.match(r"^https?://", source_text, flags=re.I):
+            parsed = urlparse(source_text)
+            title = top_level_title or parsed.netloc or source_text
+            return {"title": title, "name": title, "url": source_text}
+        payload = {"title": source_text, "name": source_text}
+        if top_level_url:
+            payload["url"] = top_level_url
+        return payload
     for candidate in _as_list(item.get("key_sources")):
         if isinstance(candidate, dict):
-            return dict(candidate)
+            payload = dict(candidate)
+            if top_level_url and not str(payload.get("url") or payload.get("link") or "").strip():
+                payload["url"] = top_level_url
+            if top_level_title and not str(payload.get("title") or payload.get("name") or "").strip():
+                payload["title"] = top_level_title
+            return payload
         candidate_text = str(candidate or "").strip()
         if candidate_text:
-            return {"title": candidate_text, "name": candidate_text}
+            if re.match(r"^https?://", candidate_text, flags=re.I):
+                parsed = urlparse(candidate_text)
+                title = top_level_title or parsed.netloc or candidate_text
+                return {"title": title, "name": title, "url": candidate_text}
+            payload = {"title": candidate_text, "name": candidate_text}
+            if top_level_url:
+                payload["url"] = top_level_url
+            return payload
+    if top_level_url:
+        parsed = urlparse(top_level_url)
+        title = top_level_title or parsed.netloc or top_level_url
+        return {"title": title, "name": title, "url": top_level_url}
     return {}
 
 

@@ -2,6 +2,15 @@ from rag_pipeline.agents.chapter_argument_agent import _is_snippet_like_public_t
 from rag_pipeline.agents.public_report_sanitizer import sanitize_public_markdown
 
 
+def test_chapter_argument_treats_web_ui_fragments_as_snippets():
+    fragment = (
+        "中国人形机器人产业“加速跑”_时政要闻_上海市统计局：#### 字号 - 大 - 中 - 小 分享 "
+        "1. 中国人形机器人产业“加速跑” 上海市统计局 2025-02-20 ! []("
+    )
+
+    assert _is_snippet_like_public_text(fragment)
+
+
 def test_search_snippet_lead_is_rewritten_or_removed_from_public_section():
     snippet = (
         "Over the weekend, the Futian district government in Shenzhen, "

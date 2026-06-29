@@ -6,11 +6,40 @@ from rag_pipeline.agents.citation_manifest import (
     merge_source_registries,
 )
 from rag_pipeline.agents.final_writer_agent import (
+    _sort_adjacent_citation_groups,
     _traceable_source_registry,
     finalize_markdown_citations,
     run_final_writer_agent,
 )
 from rag_pipeline.flows.report.final_audit_agent import run_deterministic_audit
+
+
+def test_adjacent_citation_groups_are_sorted_and_deduped():
+    # Citations inherit claim order, so a sentence can end with [2][3][1].
+    assert _sort_adjacent_citation_groups("市场竞争激烈。[2][3][1]") == "市场竞争激烈。[1][2][3]"
+    # Non-adjacent duplicates inside a group are removed.
+    assert _sort_adjacent_citation_groups("结论[4][3][4]") == "结论[3][4]"
+    # A single citation is untouched.
+    assert _sort_adjacent_citation_groups("仅一处[5]") == "仅一处[5]"
+    # Separate groups in the same line are each sorted independently.
+    assert _sort_adjacent_citation_groups("甲[2][1]，乙[9][8]") == "甲[1][2]，乙[8][9]"
+
+
+def test_finalize_markdown_citations_emits_sorted_adjacent_groups():
+    body = "Case [9], risk [8], metric [7] all support this. [9][8][7]"
+    manifest = {
+        "appendix_sources": [
+            {"ref": "[7]", "title": "Metric source", "url": "https://example.org/metric"},
+            {"ref": "[8]", "title": "Risk source", "url": "https://example.org/risk"},
+            {"ref": "[9]", "title": "Case source", "url": "https://example.org/case"},
+        ],
+        "evidence_to_citation": {"EV-M": "[7]", "EV-R": "[8]", "EV-C": "[9]"},
+    }
+
+    rewritten, _sources, _diagnostics = finalize_markdown_citations(body, manifest, manifest["appendix_sources"])
+
+    # The trailing multi-ref group must read ascending after renumbering.
+    assert rewritten.endswith("[1][2][3]")
 
 
 def test_final_citation_reconciliation_renumbers_body_and_appendix_by_final_body_order():
@@ -89,6 +118,32 @@ def test_finalize_is_idempotent_for_reentrant_passes_with_registry_priority():
     )
     assert third_body == second_body
     assert [s["title"] for s in third_sources] == [s["title"] for s in second_sources]
+
+
+def test_finalize_uses_full_registry_for_inline_source_refs_missing_from_manifest():
+    body = "行业信号来自地方平台覆盖企业超过140家 [30]，政策侧提供需求牵引 [5]。"
+    manifest = {
+        "appendix_sources": [
+            {"ref": "[1]", "title": "Manifest-only source", "url": "https://example.org/manifest"}
+        ],
+        "evidence_to_citation": {"EV-1": "[1]"},
+    }
+    full_registry = [
+        {"ref": "[5]", "title": "Policy source", "url": "https://example.org/policy"},
+        {"ref": "[30]", "title": "Platform source", "url": "https://example.org/platform"},
+    ]
+
+    rewritten, sources, diagnostics = finalize_markdown_citations(
+        body,
+        manifest,
+        full_registry,
+        prefer_registry_refs=True,
+    )
+
+    assert rewritten == "行业信号来自地方平台覆盖企业超过140家 [1]，政策侧提供需求牵引 [2]。"
+    assert [source["title"] for source in sources] == ["Platform source", "Policy source"]
+    assert diagnostics["final_citation_reconciliation_status"] == "ok"
+    assert diagnostics["final_missing_appendix_refs"] == []
 
 
 def test_final_citation_reconciliation_observes_unresolved_final_body_refs_without_deleting_by_default():
@@ -534,6 +589,61 @@ def test_final_writer_renders_manifest_appendix_from_claim_refs(monkeypatch):
     )["fatal"] is False
 
 
+def test_final_writer_does_not_promote_stale_inline_refs_from_full_registry(monkeypatch):
+    monkeypatch.setenv("REPORT_FINAL_WRITER_SOURCE_APPENDIX", "true")
+    monkeypatch.setenv("REPORT_ENABLE_LLM_CHAPTER_NARRATIVE", "false")
+
+    output = run_final_writer_agent(
+        query="humanoid robot commercialization",
+        report_blueprint={
+            "report_shell": {"front_blocks": [], "back_blocks": ["appendix"]},
+            "chapters": [{"chapter_id": "ch_01", "chapter_title": "Commercialization signals"}],
+        },
+        chapter_packages=[
+            {
+                "chapter_id": "ch_01",
+                "chapter_title": "Commercialization signals",
+                "sections": [
+                    {
+                        "section_id": "s1",
+                        "section_title": "Deployment signal",
+                        "claim": "Humanoid robot deployment is becoming visible in industrial scenarios [3].",
+                        "reasoning": "The cited company report describes commercial orders and delivery progress [3].",
+                        "mechanism": "Order delivery is a stronger commercialization signal than a demo [3].",
+                        "used_fact_refs": ["EV-24"],
+                        "evidence_refs": ["EV-24"],
+                        "evidence_backed": True,
+                    }
+                ],
+            }
+        ],
+        source_registry=[
+            {
+                "ref": "[3]",
+                "title": "Unrelated climate disclosure standard",
+                "url": "https://www.asc.net.cn/climate-standard",
+                "source_level": "A",
+            },
+            {
+                "ref": "[24]",
+                "evidence_id": "EV-24",
+                "title": "Humanoid robot annual report delivery note",
+                "url": "https://www.ubtrobot.com/investors/humanoid-annual-report",
+                "source_level": "B",
+            },
+        ],
+    )
+
+    markdown = output["report_markdown"]
+    assert "Unrelated climate disclosure standard" not in markdown
+    assert "Humanoid robot annual report delivery note" in markdown
+    assert "[3]" not in markdown
+    assert "[1]" in markdown
+    assert [source["title"] for source in output["source_registry"]] == [
+        "Humanoid robot annual report delivery note"
+    ]
+
+
 def test_manifest_blocks_cited_title_only_source():
     chapters = [{"chapter_id": "ch_01", "sections": [{"section_id": "s1", "evidence_refs": ["EV-2"]}]}]
     sources = [{"ref": "[2]", "evidence_id": "EV-2", "title": "Untethered title only source"}]
@@ -714,6 +824,41 @@ def test_merge_source_registries_does_not_merge_different_traceable_urls_by_alia
         "http://kjj.siping.gov.cn/kjxx/kpxcl/202605/t20260512_766150.html",
     }
     assert all(source.get("url") == source.get("source_url", source.get("url")) for source in merged)
+
+
+def test_manifest_does_not_resolve_ambiguous_local_source_id_to_first_source():
+    chapters = [
+        {
+            "chapter_id": "ch_01",
+            "sections": [
+                {
+                    "section_id": "s1",
+                    "used_fact_refs": ["4"],
+                    "claim": "A market-size claim must not bind to an arbitrary source sharing a local id.",
+                }
+            ],
+        }
+    ]
+    sources = [
+        {
+            "id": "4",
+            "evidence_id": "EV-A",
+            "title": "Tax bureau article",
+            "url": "https://tax.example.org/a",
+        },
+        {
+            "id": "4",
+            "evidence_id": "EV-B",
+            "title": "Industry research article",
+            "url": "https://research.example.org/b",
+        },
+    ]
+
+    manifest = build_citation_manifest(chapters=chapters, claim_units=[], source_registry=sources)
+
+    assert manifest["citation_manifest_status"] == "blocked"
+    assert "4" in manifest["missing_evidence_refs"]
+    assert "4" not in manifest["evidence_to_citation"]
 
 
 def test_manifest_dedupes_public_refs_by_logical_source_not_object_identity():
@@ -1058,6 +1203,91 @@ def test_final_writer_removes_unresolved_final_body_citation_before_appendix(mon
     )
 
 
+def test_final_writer_rebinds_stale_inline_registry_refs_from_render_blocks(monkeypatch):
+    monkeypatch.setenv("REPORT_FINAL_WRITER_SOURCE_APPENDIX", "true")
+    monkeypatch.setenv("REPORT_CITATION_AUDIT_MUTATION_MODE", "diagnostic_only")
+
+    output = run_final_writer_agent(
+        query="人形机器人",
+        report_blueprint={
+            "report_shell": {"front_blocks": [], "back_blocks": ["appendix"]},
+            "chapters": [{"chapter_id": "ch_01", "chapter_title": "商业化信号"}],
+        },
+        chapter_packages=[
+            {
+                "chapter_id": "ch_01",
+                "chapter_title": "商业化信号",
+                "sections": [
+                    {
+                        "section_id": "s1",
+                        "section_title": "平台覆盖",
+                        "claim": "地方平台覆盖企业超过140家。",
+                        "reasoning": "该平台披露了覆盖企业数量。",
+                        "used_fact_refs": ["EV-OK"],
+                        "evidence_refs": ["EV-OK"],
+                        "citation_refs": ["EV-OK"],
+                        "render_blocks": [
+                            {
+                                "type": "paragraph",
+                                "text": "地方平台覆盖企业超过140家，说明商业化服务链条已开始成形 [30]",
+                            }
+                        ],
+                        "supporting_facts": ["地方平台覆盖企业超过140家。"],
+                        "evidence_backed": True,
+                    }
+                ],
+            }
+        ],
+        source_registry=[
+            {
+                "ref": "EV-OK",
+                "evidence_id": "EV-OK",
+                "title": "平台覆盖企业事实源",
+                "url": "https://www.miit.gov.cn/evidence-ok",
+                "source_level": "B",
+            },
+            {
+                "ref": "[30]",
+                "title": "原始编号平台来源",
+                "url": "https://www.gov.cn/source-30",
+                "source_level": "C",
+            },
+        ],
+    )
+
+    assert "[30]" not in output["report_markdown"]
+    assert output["final_citation_audit"]["final_citation_reconciliation_status"] == "ok"
+    assert output["final_citation_audit"]["final_missing_appendix_refs"] == []
+
+
+def test_final_writer_rebinds_global_block_inline_registry_refs(monkeypatch):
+    monkeypatch.setenv("REPORT_FINAL_WRITER_SOURCE_APPENDIX", "true")
+    monkeypatch.setenv("REPORT_CITATION_AUDIT_MUTATION_MODE", "diagnostic_only")
+
+    output = run_final_writer_agent(
+        query="人形机器人",
+        report_blueprint={
+            "report_shell": {"front_blocks": [], "back_blocks": ["risk_triggers", "appendix"]},
+            "chapters": [],
+        },
+        chapter_packages=[],
+        risk_package={"risk_items": [{"risk_type": "执行风险", "description": "平台覆盖企业超过140家，说明服务链条正在形成 [30]。"}]},
+        source_registry=[
+            {
+                "ref": "[30]",
+                "title": "原始编号平台来源",
+                "url": "https://www.gov.cn/source-30",
+                "source_level": "C",
+            },
+        ],
+    )
+
+    assert "[30]" not in output["report_markdown"]
+    assert "原始编号平台来源" in output["report_markdown"]
+    assert output["final_citation_audit"]["final_citation_reconciliation_status"] == "ok"
+    assert output["final_citation_audit"]["final_missing_appendix_refs"] == []
+
+
 def test_final_writer_drops_factual_section_when_manifest_filters_its_only_source(monkeypatch):
     monkeypatch.setenv("REPORT_FINAL_WRITER_SOURCE_APPENDIX", "true")
     monkeypatch.setenv("REPORT_SOURCE_CLAIM_GATE_MODE", "strict")
@@ -1257,7 +1487,7 @@ def test_final_writer_preserves_analysis_claim_from_single_company_source(monkey
     assert output["source_claim_support"]["section_dropped_due_to_source_claim_mismatch_count"] == 0
 
 
-def test_final_writer_reports_analysis_claim_to_section_transfer(monkeypatch):
+def test_final_writer_backfills_unrendered_analysis_claims_as_observation_sections(monkeypatch):
     monkeypatch.setenv("REPORT_FINAL_WRITER_SOURCE_APPENDIX", "true")
 
     output = run_final_writer_agent(
@@ -1344,11 +1574,405 @@ def test_final_writer_reports_analysis_claim_to_section_transfer(monkeypatch):
 
     transfer = output["analysis_transfer"]
     assert transfer["analysis_claim_count"] == 2
-    assert transfer["rendered_analysis_section_count"] == 1
-    assert transfer["claim_lost_after_analysis_count"] == 1
-    assert transfer["claim_to_section_transfer_rate"] == 0.5
-    assert transfer["analysis_claim_ids_rendered"] == ["claim-rendered"]
-    assert transfer["claim_lost_after_analysis_reasons"] == {"not_rendered_in_public_sections": 1}
+    assert transfer["rendered_analysis_claim_count"] == 2
+    assert transfer["claim_lost_after_analysis_count"] == 0
+    assert transfer["claim_to_section_transfer_rate"] == 1.0
+    assert transfer["analysis_claim_ids_rendered"] == ["claim-rendered", "claim-not-rendered"]
+    assert transfer["claim_lost_after_analysis_reasons"] == {}
+    assert "A second analyzed claim exists but no public section consumes it" in output["report_markdown"]
+    assert "pilot as directional demand evidence" in output["report_markdown"]
+    assert "### 补充观察" in output["report_markdown"]
+    assert "观察" in output["report_markdown"] or "待验证" in output["report_markdown"]
+
+def test_final_writer_backfills_distinct_claims_even_when_they_share_refs(monkeypatch):
+    monkeypatch.setenv("REPORT_FINAL_WRITER_SOURCE_APPENDIX", "true")
+    monkeypatch.setenv("REPORT_EVIDENCE_MODE", "public_signal")
+
+    output = run_final_writer_agent(
+        query="AI Agent",
+        report_blueprint={
+            "report_shell": {"front_blocks": [], "back_blocks": ["appendix"]},
+            "chapters": [{"chapter_id": "ch_01", "chapter_title": "Demand validation"}],
+        },
+        claim_units=[
+            {
+                "claim_id": "claim-rendered",
+                "chapter_id": "ch_01",
+                "claim": "Salesforce disclosed an enterprise AI Agent pilot.",
+                "used_fact_refs": ["EV-1"],
+                "evidence_refs": ["EV-1"],
+                "source_support_map": {"claim": ["EV-1"]},
+                "claim_strength": "directional",
+            },
+            {
+                "claim_id": "claim-shared-ref",
+                "chapter_id": "ch_01",
+                "claim": "The same source also supports a separate directional deployment observation.",
+                "used_fact_refs": ["EV-1"],
+                "evidence_refs": ["EV-1"],
+                "source_support_map": {"claim": ["EV-1"]},
+                "claim_strength": "directional",
+            },
+        ],
+        chapter_packages=[
+            {
+                "chapter_id": "ch_01",
+                "chapter_title": "Demand validation",
+                "sections": [
+                    {
+                        "section_id": "s_rendered",
+                        "section_title": "Enterprise pilot signal",
+                        "claim_id": "claim-rendered",
+                        "claim": "Salesforce disclosed an enterprise AI Agent pilot.",
+                        "reasoning": "The disclosure is directional demand evidence.",
+                        "used_fact_refs": ["EV-1"],
+                        "evidence_refs": ["EV-1"],
+                        "render_blocks": [{"type": "paragraph", "text": "Salesforce disclosed an enterprise AI Agent pilot."}],
+                        "evidence_backed": True,
+                    }
+                ],
+            }
+        ],
+        source_registry=[
+            {
+                "ref": "EV-1",
+                "evidence_id": "EV-1",
+                "title": "Salesforce enterprise AI Agent pilot note",
+                "url": "https://www.salesforce.com/news/agent-pilot",
+                "source_level": "C",
+                "source_verification_status": "search_result_only",
+            }
+        ],
+    )
+
+    transfer = output["analysis_transfer"]
+    assert transfer["analysis_claim_count"] == 2
+    assert transfer["rendered_analysis_claim_count"] == 2
+    assert transfer["claim_lost_after_analysis_count"] == 0
+    assert "The same source also supports a separate directional deployment observation" in output["report_markdown"]
+
+
+def test_final_writer_backfill_uses_analysis_reasoning_boundary_and_actionable(monkeypatch):
+    monkeypatch.setenv("REPORT_FINAL_WRITER_SOURCE_APPENDIX", "true")
+    monkeypatch.setenv("REPORT_EVIDENCE_MODE", "public_signal")
+
+    output = run_final_writer_agent(
+        query="AI Agent",
+        report_blueprint={
+            "report_shell": {"front_blocks": [], "back_blocks": ["appendix"]},
+            "chapters": [{"chapter_id": "ch_01", "chapter_title": "Demand validation"}],
+        },
+        claim_units=[
+            {
+                "claim_id": "claim-rich",
+                "chapter_id": "ch_01",
+                "claim": "Enterprise pilots show that deployment interest has moved beyond pure concept discussion.",
+                "reasoning": "Pilot disclosure gives a concrete deployment signal, while repeated deployments would be needed before stronger adoption claims.",
+                "counter_evidence": "The signal is still single-source and should be treated as directional until more buyers are visible.",
+                "actionable": "Track follow-up customer deployments, renewal disclosures, and comparable vendor announcements.",
+                "used_fact_refs": ["EV-1"],
+                "evidence_refs": ["EV-1"],
+                "source_support_map": {"claim": ["EV-1"], "mechanism": ["EV-1"], "boundary": ["EV-1"]},
+                "claim_strength": "directional",
+            },
+        ],
+        chapter_packages=[
+            {
+                "chapter_id": "ch_01",
+                "chapter_title": "Demand validation",
+                "sections": [],
+            }
+        ],
+        source_registry=[
+            {
+                "ref": "EV-1",
+                "evidence_id": "EV-1",
+                "title": "Salesforce enterprise AI Agent pilot note",
+                "url": "https://www.salesforce.com/news/agent-pilot",
+                "source_level": "C",
+                "source_verification_status": "search_result_only",
+            }
+        ],
+    )
+
+    markdown = output["report_markdown"]
+    assert "Pilot disclosure gives a concrete deployment signal" in markdown
+    assert "single-source and should be treated as directional" in markdown
+    assert "Track follow-up customer deployments" in markdown
+
+
+def test_final_writer_backfill_drops_internal_analysis_fields_from_public_body(monkeypatch):
+    monkeypatch.setenv("REPORT_FINAL_WRITER_SOURCE_APPENDIX", "true")
+    monkeypatch.setenv("REPORT_EVIDENCE_MODE", "public_signal")
+
+    output = run_final_writer_agent(
+        query="AI Agent",
+        report_blueprint={
+            "report_shell": {"front_blocks": [], "back_blocks": ["appendix"]},
+            "chapters": [{"chapter_id": "ch_01", "chapter_title": "Demand validation"}],
+        },
+        claim_units=[
+            {
+                "claim_id": "claim-internal-fields",
+                "chapter_id": "ch_01",
+                "claim": "Enterprise pilots show that deployment interest has moved beyond pure concept discussion.",
+                "reasoning": (
+                    "diagnostic_only score_gap missing_proof_standard "
+                    "repair_task_seed search_more must_not_render"
+                ),
+                "counter_evidence": (
+                    "review_suggestion public_text_allowed=false "
+                    "reanalyze_existing rewrite_with_caveat"
+                ),
+                "actionable": (
+                    "source_check semantic_judge executor_should_decide "
+                    "\u8865\u8bc1\u5efa\u8bae \u5ba1\u67e5\u5efa\u8bae"
+                ),
+                "used_fact_refs": ["EV-1"],
+                "evidence_refs": ["EV-1"],
+                "source_support_map": {"claim": ["EV-1"]},
+                "claim_strength": "directional",
+            },
+        ],
+        chapter_packages=[
+            {
+                "chapter_id": "ch_01",
+                "chapter_title": "Demand validation",
+                "sections": [],
+            }
+        ],
+        source_registry=[
+            {
+                "ref": "EV-1",
+                "evidence_id": "EV-1",
+                "title": "Salesforce enterprise AI Agent pilot note",
+                "url": "https://www.salesforce.com/news/agent-pilot",
+                "source_level": "C",
+                "source_verification_status": "search_result_only",
+            }
+        ],
+    )
+
+    markdown = output["report_markdown"]
+    assert "deployment interest has moved beyond pure concept discussion" in markdown
+    for forbidden in (
+        "diagnostic_only",
+        "score_gap",
+        "missing_proof_standard",
+        "repair_task_seed",
+        "search_more",
+        "must_not_render",
+        "review_suggestion",
+        "public_text_allowed=false",
+        "reanalyze_existing",
+        "rewrite_with_caveat",
+        "source_check",
+        "semantic_judge",
+        "executor_should_decide",
+        "\u8865\u8bc1\u5efa\u8bae",
+        "\u5ba1\u67e5\u5efa\u8bae",
+    ):
+        assert forbidden not in markdown
+
+
+def test_final_writer_backfill_uses_evidence_basis_to_thicken_public_section(monkeypatch):
+    monkeypatch.setenv("REPORT_FINAL_WRITER_SOURCE_APPENDIX", "true")
+    monkeypatch.setenv("REPORT_EVIDENCE_MODE", "public_signal")
+
+    output = run_final_writer_agent(
+        query="AI Agent",
+        report_blueprint={
+            "report_shell": {"front_blocks": [], "back_blocks": ["appendix"]},
+            "chapters": [{"chapter_id": "ch_01", "chapter_title": "Demand validation"}],
+        },
+        claim_units=[
+            {
+                "claim_id": "claim-evidence-basis",
+                "chapter_id": "ch_01",
+                "claim": "Enterprise AI Agent adoption is moving from isolated pilots toward workflow deployment.",
+                "evidence_basis": [
+                    "A SaaS vendor disclosed customer-service workflow pilots for enterprise agent products.",
+                    {
+                        "distilled_fact": (
+                            "An industry media report described manufacturers testing agents in scheduling, "
+                            "customer support, and internal knowledge retrieval."
+                        )
+                    },
+                ],
+                "reasoning": (
+                    "The useful signal is not the product label itself, but whether the agent is attached to "
+                    "a repeatable workflow with owners, budgets, and measurable operating outcomes."
+                ),
+                "limitation_boundary": (
+                    "These examples still do not prove broad paid adoption, so the conclusion should stay directional."
+                ),
+                "decision_implication": (
+                    "Track repeat deployment announcements and renewal disclosures before treating the theme as mature."
+                ),
+                "used_fact_refs": ["EV-1", "EV-2"],
+                "evidence_refs": ["EV-1", "EV-2"],
+                "source_support_map": {"claim": ["EV-1", "EV-2"], "mechanism": ["EV-1"], "boundary": ["EV-2"]},
+                "claim_strength": "directional",
+            },
+        ],
+        chapter_packages=[
+            {
+                "chapter_id": "ch_01",
+                "chapter_title": "Demand validation",
+                "sections": [],
+            }
+        ],
+        source_registry=[
+            {
+                "ref": "EV-1",
+                "evidence_id": "EV-1",
+                "title": "Enterprise agent pilot disclosure",
+                "url": "https://www.salesforce.com/news/agent-pilot",
+                "source_level": "C",
+                "source_verification_status": "search_result_only",
+            },
+            {
+                "ref": "EV-2",
+                "evidence_id": "EV-2",
+                "title": "Industry media agent workflow report",
+                "url": "https://example.com/agent-workflow-report",
+                "source_level": "C",
+                "source_verification_status": "search_result_only",
+            },
+        ],
+    )
+
+    markdown = output["report_markdown"]
+    assert "customer-service workflow pilots" in markdown
+    assert "manufacturers testing agents in scheduling" in markdown
+    assert "Public evidence points include" not in markdown
+    assert "把这些公开信息放在一起看" not in markdown
+    for forbidden in (
+        "公开事实包括",
+        "事实说明",
+        "这组事实",
+        "这些事实",
+        "这一判断",
+        "围绕“",
+        "后续应",
+        "行业含义在于",
+        "作为早期产业信号理解",
+        "信息罗列",
+        "外推边界",
+        "这些材料把",
+        "判断成立的条件",
+        "事实指向",
+        "已披露相关事实",
+        "报告能否",
+        "报告需要",
+        "读者",
+        "已披露动作如果继续",
+        "接下来更值得观察",
+    ):
+        assert forbidden not in markdown
+    assert "repeatable workflow with owners, budgets" in markdown
+    assert "do not prove broad paid adoption" in markdown
+    assert "Track repeat deployment announcements" in markdown
+    assert markdown.count("do not prove broad paid adoption") == 1
+    assert markdown.count("Track repeat deployment announcements") == 1
+    body = markdown.split("## 来源附录", 1)[0]
+    assert len(body) >= 650
+
+
+def test_final_writer_backfill_does_not_render_mechanical_default_observation_text(monkeypatch):
+    monkeypatch.setenv("REPORT_FINAL_WRITER_SOURCE_APPENDIX", "true")
+    monkeypatch.setenv("REPORT_EVIDENCE_MODE", "public_signal")
+
+    output = run_final_writer_agent(
+        query="低空经济",
+        report_blueprint={
+            "report_shell": {"front_blocks": [], "back_blocks": ["appendix"]},
+            "chapters": [{"chapter_id": "ch_01", "chapter_title": "商业化信号"}],
+        },
+        claim_units=[
+            {
+                "claim_id": "claim-defaults",
+                "chapter_id": "ch_01",
+                "claim": "广东低空经济产业链集聚度已经形成早期商业化基础。",
+                "evidence_basis": ["广东集聚全国30%以上低空经济产业链企业。"],
+                "used_fact_refs": ["EV-1"],
+                "evidence_refs": ["EV-1"],
+                "source_support_map": {"claim": ["EV-1"]},
+                "claim_strength": "directional",
+            },
+        ],
+        chapter_packages=[
+            {
+                "chapter_id": "ch_01",
+                "chapter_title": "商业化信号",
+                "sections": [],
+            }
+        ],
+        source_registry=[
+            {
+                "ref": "EV-1",
+                "evidence_id": "EV-1",
+                "title": "广东低空经济产业链公开材料",
+                "url": "https://example.com/low-altitude-guangdong",
+                "source_level": "C",
+                "source_verification_status": "search_result_only",
+            }
+        ],
+    )
+
+    markdown = output["report_markdown"]
+    assert "广东集聚全国30%以上低空经济产业链企业" in markdown
+    for forbidden in (
+        "后续仍需",
+        "阶段性观察",
+        "下一步可以继续跟踪",
+        "可验证数据",
+        "同类来源",
+    ):
+        assert forbidden not in markdown
+
+
+def test_citation_manifest_resolves_claim_fact_ids_and_source_ids():
+    manifest = build_citation_manifest(
+        chapters=[
+            {
+                "chapter_id": "ch_01",
+                "sections": [
+                    {
+                        "section_id": "s_1",
+                        "claim_id": "claim-1",
+                        "claim": "A traceable claim is rendered from analysis.",
+                    }
+                ],
+            }
+        ],
+        claim_units=[
+            {
+                "claim_id": "claim-1",
+                "chapter_id": "ch_01",
+                "section_id": "s_1",
+                "claim": "A traceable claim is rendered from analysis.",
+                "fact_ids": ["EV-F-1"],
+                "source_ids": ["SRC-42"],
+            }
+        ],
+        source_registry=[
+            {
+                "source_id": "SRC-42",
+                "ref": "EV-F-1",
+                "evidence_id": "EV-F-1",
+                "evidence_refs": ["EV-F-1"],
+                "title": "Traceable industry note",
+                "url": "https://example.org/traceable-industry-note",
+                "source_level": "C",
+            }
+        ],
+    )
+
+    assert manifest["citation_manifest_status"] == "ok"
+    assert manifest["evidence_to_citation"]["EV-F-1"] == "[1]"
+    assert manifest["evidence_to_citation"]["SRC-42"] == "[1]"
+    assert manifest["section_citation_refs"]["s_1"] == ["[1]"]
 
 
 def test_final_writer_counts_analysis_transfer_by_refs_when_section_loses_claim_id(monkeypatch):
@@ -1421,6 +2045,82 @@ def test_final_writer_counts_analysis_transfer_by_refs_when_section_loses_claim_
     assert transfer["rendered_analysis_claim_count"] == 1
     assert transfer["claim_to_section_transfer_rate"] == 1.0
     assert transfer["analysis_claim_ids_rendered"] == ["claim-ref-rendered"]
+
+
+def test_final_writer_transfer_ignores_idless_expansion_units_in_loss_denominator(monkeypatch):
+    monkeypatch.setenv("REPORT_FINAL_WRITER_SOURCE_APPENDIX", "true")
+
+    output = run_final_writer_agent(
+        query="AI Agent",
+        report_blueprint={
+            "report_shell": {"front_blocks": [], "back_blocks": ["appendix"]},
+            "chapters": [{"chapter_id": "ch_01", "chapter_title": "Demand validation"}],
+        },
+        analysis_claim_units=[
+            {
+                "claim_id": "claim-rendered",
+                "chapter_id": "ch_01",
+                "claim": "Traceable deployment evidence supports a directional demand claim.",
+                "used_fact_refs": ["EV-1"],
+                "evidence_refs": ["EV-1"],
+                "claim_strength": "directional",
+            },
+            {
+                "chapter_id": "ch_01",
+                "claim": "An expansion paragraph can use evidence without being an analysis claim.",
+                "used_fact_refs": ["EV-1"],
+                "evidence_refs": ["EV-1"],
+                "claim_strength": "directional",
+            },
+        ],
+        chapter_packages=[
+            {
+                "chapter_id": "ch_01",
+                "chapter_title": "Demand validation",
+                "sections": [
+                    {
+                        "section_id": "s_rendered",
+                        "claim_id": "claim-rendered",
+                        "claim": "Traceable deployment evidence supports a directional demand claim.",
+                        "reasoning": "The evidence indicates a deployment signal that can support directional analysis.",
+                        "used_fact_refs": ["EV-1"],
+                        "evidence_refs": ["EV-1"],
+                        "render_blocks": [
+                            {
+                                "type": "paragraph",
+                                "text": "Traceable deployment evidence supports a directional demand claim.",
+                            }
+                        ],
+                        "supporting_facts": [
+                            {
+                                "evidence_id": "EV-1",
+                                "distilled_fact": "Traceable deployment evidence supports a directional demand claim.",
+                                "source_title": "Traceable deployment note",
+                            }
+                        ],
+                        "evidence_backed": True,
+                    }
+                ],
+            }
+        ],
+        source_registry=[
+            {
+                "ref": "EV-1",
+                "evidence_id": "EV-1",
+                "title": "Salesforce AI Agent deployment note",
+                "url": "https://www.salesforce.com/news/ai-agent-deployment",
+                "source_level": "C",
+                "source_verification_status": "search_result_only",
+            }
+        ],
+    )
+
+    transfer = output["analysis_transfer"]
+    assert transfer["analysis_claim_count"] == 1
+    assert transfer["rendered_analysis_claim_count"] == 1
+    assert transfer["claim_lost_after_analysis_count"] == 0
+    assert transfer["claim_to_section_transfer_rate"] == 1.0
+    assert transfer["claim_lost_after_analysis_reasons"] == {"missing_claim_id": 1}
 
 
 def test_final_writer_balanced_gate_preserves_weak_source_claim_after_analysis(monkeypatch):
@@ -1698,7 +2398,7 @@ def test_final_writer_omits_chapter_when_all_sections_dropped_after_citation_gat
     assert output["source_claim_support"]["empty_chapter_omitted_after_source_gate_count"] == 1
 
 
-def test_final_writer_permissive_gate_keeps_unresolved_factual_section(monkeypatch):
+def test_final_writer_permissive_gate_does_not_render_unresolved_factual_section(monkeypatch):
     monkeypatch.setenv("REPORT_FINAL_WRITER_SOURCE_APPENDIX", "true")
     monkeypatch.delenv("REPORT_SOURCE_CLAIM_GATE_MODE", raising=False)
 
@@ -1730,8 +2430,8 @@ def test_final_writer_permissive_gate_keeps_unresolved_factual_section(monkeypat
     )
 
     markdown = output["report_markdown"]
-    assert "## 1. Technology maturity" in markdown
-    assert "Technology maturity constrains production deployment" in markdown
+    assert "## 1. Technology maturity" not in markdown
+    assert "Technology maturity constrains production deployment" not in markdown
     support = output["source_claim_support"]
     assert support["source_gate_mode"] == "permissive"
     assert support["diagnostic_only"] is True

@@ -8,7 +8,12 @@ from rag_pipeline.agents.report_contracts import (
 )
 from rag_pipeline.agents.chapter_argument_agent import run_chapter_argument_agent
 from rag_pipeline.agents.section_composer import compose_section_paragraph
-from rag_pipeline.agents.writer_agent_clean import _chapter_expandable, _expand_chapter_packages_for_body_target
+from rag_pipeline.agents.writer_agent_clean import (
+    _chapter_expandable,
+    _expand_chapter_packages_for_body_target,
+    _estimated_public_body_chars,
+    _is_bad_expansion_fact,
+)
 from rag_pipeline.contracts.report_contract import build_report_contract_from_package
 
 
@@ -303,6 +308,42 @@ def test_composer_turns_metric_fact_card_into_natural_paragraph():
     assert result["composer_variable_explanation_count"] == 1
 
 
+def test_composer_does_not_turn_generic_metric_shape_issue_into_hard_metric_sentence():
+    card = EvidenceFactCard(
+        evidence_id="EV-GENERIC-METRIC",
+        chapter_id="ch_01",
+        subject="产业政策",
+        variable="成本",
+        value="达到100亿",
+        time_or_scope="2026年",
+        distilled_fact="政策材料提出相关产业规模目标达到100亿元。",
+        fact_type="metric",
+        block_affinity=["metric_reconciliation"],
+        source_ref="[1]",
+        source_level="B",
+        raw={"content_shape_issues": ["generic_metric_name"]},
+    )
+    claim = ClaimUnit(
+        claim_id="CL-GENERIC-METRIC",
+        chapter_id="ch_01",
+        claim="产业规模目标只能作为方向性政策信号。",
+        evidence_refs=["EV-GENERIC-METRIC"],
+        claim_strength="directional",
+    )
+
+    result = compose_section_paragraph(
+        fact_cards=[card],
+        claim_unit=claim,
+        block_type="metric_reconciliation",
+        chapter_question="规模信号是否支持机会判断？",
+    )
+
+    paragraph = result["paragraph"]
+    assert "成本在2026年为达到100亿" not in paragraph
+    assert "成本为达到100亿" not in paragraph
+    assert "政策材料提出相关产业规模目标达到100亿元" in paragraph
+
+
 def test_internal_metric_unit_enum_does_not_leak_into_fact_card_or_paragraph():
     card = EvidenceFactCard.from_legacy_dict(
         {
@@ -482,7 +523,7 @@ def test_composer_uses_claim_unit_analysis_fields_for_richer_paragraph():
 
 
 def test_composer_expands_valid_claim_to_research_paragraph(monkeypatch):
-    monkeypatch.setenv("REPORT_COMPOSER_TARGET_SECTION_CHARS", "420")
+    monkeypatch.setenv("REPORT_COMPOSER_TARGET_SECTION_CHARS", "850")
     monkeypatch.setenv("REPORT_COMPOSER_EXPAND_TO_TARGET", "true")
     card = EvidenceFactCard(
         evidence_id="EV-LONG",
@@ -569,6 +610,7 @@ def test_composer_longform_does_not_repeat_same_fact_sentence(monkeypatch):
 
 def test_composer_default_does_not_generate_generic_template_filler(monkeypatch):
     monkeypatch.delenv("REPORT_COMPOSER_EXPAND_TO_TARGET", raising=False)
+    monkeypatch.delenv("REPORT_BLUEPRINT_SOURCE", raising=False)
     monkeypatch.setenv("REPORT_COMPOSER_TARGET_SECTION_CHARS", "850")
     card = EvidenceFactCard(
         evidence_id="EV-GENERIC",
@@ -603,6 +645,159 @@ def test_composer_default_does_not_generate_generic_template_filler(monkeypatch)
     assert "事实转成判断" not in paragraph
     assert "核心连接点" not in paragraph
     assert "这一事实用于判断" not in paragraph
+
+
+def test_claim_first_composer_expands_by_default_without_manual_flag(monkeypatch):
+    monkeypatch.delenv("REPORT_COMPOSER_EXPAND_TO_TARGET", raising=False)
+    monkeypatch.setenv("REPORT_BLUEPRINT_SOURCE", "claim_first")
+    monkeypatch.setenv("REPORT_COMPOSER_TARGET_SECTION_CHARS", "850")
+    card = EvidenceFactCard(
+        evidence_id="EV-CLAIM-FIRST",
+        chapter_id="ch_01",
+        subject="Humanoid robot commercialization",
+        variable="deployment depth",
+        action_or_signal="entered pilot deployment",
+        distilled_fact="Humanoid robot vendors reported pilot deployment and early customer validation signals.",
+        fact_type="case",
+        block_affinity=["case_comparison"],
+        source_ref="[2]",
+        source_level="B",
+    )
+    claim = ClaimUnit(
+        claim_id="CL-CLAIM-FIRST",
+        chapter_id="ch_01",
+        claim="Humanoid robot commercialization is moving from concept discussion into pilot deployment signals.",
+        evidence_refs=["EV-CLAIM-FIRST"],
+        evidence_basis=[
+            "The cited source describes pilot deployment and early customer validation rather than only product announcements.",
+        ],
+        reasoning_chain="Pilot deployment matters because it tests customer workflow fit, operating reliability, and whether vendors can move beyond demonstration scenarios.",
+        limitation_boundary="The conclusion remains directional until deployment scale, paid conversion, and repeat usage are visible across more customers.",
+        claim_strength="directional",
+    )
+
+    result = compose_section_paragraph(
+        fact_cards=[card],
+        claim_unit=claim,
+        block_type="case_comparison",
+        chapter_question="Can humanoid robots move from concept heat to durable commercialization?",
+    )
+
+    assert result["composer_expansion_status"] == "expanded"
+    assert len(result["paragraph"].replace(" ", "")) >= 350
+
+
+def test_claim_first_composer_expansion_does_not_emit_pipeline_meta_language(monkeypatch):
+    monkeypatch.delenv("REPORT_COMPOSER_EXPAND_TO_TARGET", raising=False)
+    monkeypatch.setenv("REPORT_BLUEPRINT_SOURCE", "claim_first")
+    monkeypatch.setenv("REPORT_COMPOSER_TARGET_SECTION_CHARS", "850")
+    card = EvidenceFactCard(
+        evidence_id="EV-META",
+        chapter_id="ch_01",
+        subject="Humanoid robot shipment signal",
+        variable="shipment growth",
+        action_or_signal="reported",
+        distilled_fact="Humanoid robot shipment signals indicate early commercialization momentum in the cited source.",
+        fact_type="metric",
+        block_affinity=["metric_reconciliation"],
+        source_ref="[3]",
+        source_level="B",
+    )
+    claim = ClaimUnit(
+        claim_id="CL-META",
+        chapter_id="ch_01",
+        claim="Shipment growth is a directional commercialization signal.",
+        evidence_refs=["EV-META"],
+        evidence_basis=[],
+        reasoning_chain="",
+        limitation_boundary="",
+        claim_strength="directional",
+    )
+
+    chapter_question = "Do scale, growth, and price signals support an opportunity judgment?"
+    result = compose_section_paragraph(
+        fact_cards=[card],
+        claim_unit=claim,
+        block_type="metric_reconciliation",
+        chapter_question=chapter_question,
+    )
+
+    paragraph = result["paragraph"]
+    assert result["composer_expansion_status"] in {"expanded", "insufficient_facts"}
+    assert chapter_question not in paragraph
+    assert "围绕章节问题" not in paragraph
+    assert "本节只保留" not in paragraph
+    assert "已引用事实支撑" not in paragraph
+    assert "适用边界" not in paragraph
+
+
+def test_claim_first_composer_respects_manual_expand_disable(monkeypatch):
+    monkeypatch.setenv("REPORT_BLUEPRINT_SOURCE", "claim_first")
+    monkeypatch.setenv("REPORT_COMPOSER_EXPAND_TO_TARGET", "false")
+    monkeypatch.setenv("REPORT_COMPOSER_TARGET_SECTION_CHARS", "420")
+    card = EvidenceFactCard(
+        evidence_id="EV-CLAIM-FIRST-OFF",
+        chapter_id="ch_01",
+        subject="Humanoid robot commercialization",
+        variable="deployment depth",
+        distilled_fact="Humanoid robot vendors reported pilot deployment and early customer validation signals.",
+        fact_type="case",
+        block_affinity=["case_comparison"],
+        source_ref="[2]",
+        source_level="B",
+    )
+    claim = ClaimUnit(
+        claim_id="CL-CLAIM-FIRST-OFF",
+        chapter_id="ch_01",
+        claim="Humanoid robot commercialization is moving into pilot deployment signals.",
+        evidence_refs=["EV-CLAIM-FIRST-OFF"],
+        evidence_basis=["The cited source describes pilot deployment."],
+        claim_strength="directional",
+    )
+
+    result = compose_section_paragraph(
+        fact_cards=[card],
+        claim_unit=claim,
+        block_type="case_comparison",
+        chapter_question="Can humanoid robots move into commercialization?",
+    )
+
+    assert result["composer_expansion_status"] == "base_no_expand"
+
+
+def test_composer_risk_sentence_uses_public_boundary_language():
+    card = EvidenceFactCard(
+        evidence_id="EV-RISK",
+        chapter_id="ch_03",
+        subject="AI Agent security risk",
+        variable="风险边界",
+        action_or_signal="risk warning",
+        distilled_fact="AI Agent自主决策能力可能带来权限越界和安全治理压力",
+        fact_type="counter",
+        block_affinity=["risk_boundary"],
+        source_ref="[10]",
+        source_level="B",
+    )
+    claim = ClaimUnit(
+        claim_id="CL-RISK",
+        chapter_id="ch_03",
+        claim="AI Agent大规模落地仍需要把安全治理作为边界条件。",
+        evidence_refs=["EV-RISK"],
+        evidence_basis=["The cited source discusses permission and security risks."],
+        claim_strength="directional",
+    )
+
+    result = compose_section_paragraph(
+        fact_cards=[card],
+        claim_unit=claim,
+        block_type="risk_boundary",
+        chapter_question="Which risks can change the commercialization conclusion?",
+    )
+
+    paragraph = result["paragraph"]
+    assert "反向样本提示" not in paragraph
+    assert "需要把商业化判断限制在已验证场景内" not in paragraph
+    assert "边界" in paragraph
 
 
 def test_composer_does_not_promote_raw_evidence_basis_snippets():
@@ -646,6 +841,49 @@ def test_composer_does_not_promote_raw_evidence_basis_snippets():
     assert "近日，市经济和信息化局统计" not in combined
     assert "国内垂直领域研报服务" not in combined
     assert "电子工程专辑" not in combined
+
+
+def test_web_ui_page_fragments_are_not_public_expansion_facts():
+    fragment = (
+        "中国人形机器人产业“加速跑”_时政要闻_上海市统计局：#### 字号 - 大 - 中 - 小 分享 "
+        "1. 中国人形机器人产业“加速跑” 上海市统计局 2025-02-20 ! []("
+    )
+
+    assert _is_bad_expansion_fact(fragment)
+
+    card = EvidenceFactCard.from_legacy_dict(
+        {
+            "evidence_id": "EV-ui",
+            "source_ref": "S1",
+            "distilled_fact": "人形机器人产业政策和商业化信号持续出现。",
+            "public_fact_card": {
+                "source_ref": "S1",
+                "distilled_fact": "人形机器人产业政策和商业化信号持续出现。",
+                "fact_type": "directional",
+            },
+        }
+    )
+    claim = ClaimUnit(
+        claim="人形机器人产业商业化信号仍处于方向性验证阶段。",
+        evidence_refs=["EV-ui"],
+        evidence_basis=[fragment],
+        claim_strength="directional",
+    )
+
+    result = compose_section_paragraph(
+        fact_cards=[card],
+        claim_unit=claim,
+        block_type="integrated_signal",
+        chapter_question="商业化信号是否已经足够明确？",
+    )
+
+    combined = " ".join(
+        [str(result.get("paragraph") or "")]
+        + [str(item) for item in result.get("supporting_facts") or []]
+    )
+    assert "#### 字号" not in combined
+    assert "! [](" not in combined
+    assert "_时政要闻_" not in combined
 
 
 def test_high_quality_mode_does_not_add_deterministic_expansion_sections(monkeypatch):
@@ -747,6 +985,94 @@ def test_composer_removes_empty_connector_subject_from_public_sentence():
 
     assert "为此的动作显示" not in result["paragraph"]
     assert "为此的动作显示" not in result["claim"]
+
+
+def test_composer_does_not_add_ai_tool_template_to_technology_industry_fact(monkeypatch):
+    monkeypatch.delenv("REPORT_COMPOSER_EXPAND_TO_TARGET", raising=False)
+    monkeypatch.delenv("REPORT_BLUEPRINT_SOURCE", raising=False)
+    card = EvidenceFactCard(
+        evidence_id="EV-TECH-HUMANOID",
+        chapter_id="ch_01",
+        subject="\u4e2d\u56fd\u4eba\u5f62\u673a\u5668\u4eba",
+        variable="\u6280\u672f\u6210\u719f\u5ea6",
+        distilled_fact="\u4eba\u5f62\u673a\u5668\u4eba\u8fd0\u52a8\u63a7\u5236\u4e0e\u6574\u673a\u6027\u80fd\u5df2\u901a\u8fc7\u8d5b\u4e8b\u9a8c\u8bc1",
+        fact_type="technology",
+        block_affinity=["technology_maturity"],
+        source_ref="[1]",
+        source_level="B",
+    )
+
+    result = compose_section_paragraph(
+        fact_cards=[card],
+        claim_unit=ClaimUnit(chapter_id="ch_01", claim_strength="directional"),
+        block_type="technology_maturity",
+        chapter_question="\u6280\u672f\u6210\u719f\u5ea6\u5982\u4f55\u5f71\u54cd\u5546\u4e1a\u5316\uff1f",
+    )
+
+    assert "\u5b83\u5bf9\u5e94\u7684\u5173\u952e\u53d8\u91cf" not in result["paragraph"]
+    assert "\u5de5\u5177\u8c03\u7528" not in result["paragraph"]
+    assert "\u6743\u9650" not in result["paragraph"]
+
+
+def test_chapter_argument_filters_metric_row_fragments_from_public_supporting_facts():
+    packages = run_chapter_argument_agent(
+        report_blueprint={"chapters": [{"chapter_id": "ch_01", "chapter_title": "Commercialization"}]},
+        micro_layouts=[
+            {
+                "chapter_id": "ch_01",
+                "sections": [
+                    {
+                        "section_id": "s_metric",
+                        "block_type": "technology_maturity",
+                        "required_evidence_refs": ["EV-M"],
+                        "dynamic_section_title": "Technology signal",
+                    }
+                ],
+            }
+        ],
+        argument_units=[
+            {
+                "chapter_id": "ch_01",
+                "section_id": "s_metric",
+                "block_type": "technology_maturity",
+                "claim": "Humanoid robot technology has early commercialization signals.",
+                "reasoning": "The technology signal needs to be discussed cautiously.",
+                "used_fact_refs": ["EV-M"],
+                "evidence_refs": ["EV-M"],
+                "public_render": True,
+                "supporting_facts": ["\u5e02\u573a\u89c4\u6a21: \u8fbe1540\u4ebf\u7f8e\u5143"],
+                "evidence_basis": ["Humanoid robot technology has early commercialization signals."],
+                "claim_strength": "directional",
+            }
+        ],
+        chapter_evidence_packages=[
+            {
+                "chapter_id": "ch_01",
+                "evidence_items": [
+                    {
+                        "evidence_id": "EV-M",
+                        "fact": "\u5e02\u573a\u89c4\u6a21: \u8fbe1540\u4ebf\u7f8e\u5143",
+                        "clean_fact": "\u5e02\u573a\u89c4\u6a21: \u8fbe1540\u4ebf\u7f8e\u5143",
+                        "content_shape_issues": ["generic_metric_name"],
+                        "allowed_use": "directional_signal",
+                        "analysis_readiness": "followup_only",
+                    }
+                ],
+            }
+        ],
+    )
+
+    section = packages[0]["sections"][0]
+    public_blob = " ".join(
+        [
+            section.get("claim", ""),
+            section.get("reasoning", ""),
+            section.get("mechanism", ""),
+            section.get("composed_paragraph", ""),
+            " ".join(section.get("supporting_facts") or []),
+        ]
+    )
+    assert "\u5e02\u573a\u89c4\u6a21:" not in public_blob
 
 
 def test_chapter_argument_uses_composer_for_layout_fallback_metric_section():
@@ -884,6 +1210,34 @@ def test_chapter_argument_does_not_render_context_only_claim_as_public_section()
     assert package["omit_from_report"] is True
     assert package["sections"] == []
     assert package["dropped_sections"][0]["reason"] == "context_claim_not_public"
+
+
+def test_chapter_argument_does_not_render_diagnostic_only_argument_unit():
+    packages = run_chapter_argument_agent(
+        report_blueprint={"chapters": [{"chapter_id": "ch_01", "chapter_title": "Diagnostics"}]},
+        micro_layouts=[],
+        argument_units=[
+            {
+                "chapter_id": "ch_01",
+                "claim_id": "CL-diagnostic",
+                "claim": "A review suggestion says this section should be rewritten.",
+                "reasoning": "This diagnostic text must not become public body copy.",
+                "used_fact_refs": ["EV-1"],
+                "evidence_refs": ["EV-1"],
+                "supporting_facts": ["Traceable fact."],
+                "diagnostic_only": True,
+                "must_not_render": True,
+                "public_text_allowed": False,
+                "public_render": True,
+            }
+        ],
+        chapter_evidence_packages=[],
+    )
+
+    package = packages[0]
+    assert package["omit_from_report"] is True
+    assert package["sections"] == []
+    assert package["dropped_sections"][0]["reason"] == "diagnostic_only_argument_unit"
 
 
 def test_chapter_argument_clean_public_text_preserves_long_analysis_after_clipping():
@@ -1409,3 +1763,315 @@ def test_chapter_expandable_allows_bounded_supporting_ab_evidence():
     }
 
     assert _chapter_expandable(chapter) is True
+
+
+def test_body_expansion_does_not_append_template_sections_to_claim_backed_chapter(monkeypatch):
+    monkeypatch.setenv("REPORT_ENABLE_BODY_EXPANSION", "true")
+
+    chapter = {
+        "chapter_id": "ch_claims",
+        "chapter_title": "Accounting education signals",
+        "chapter_fact_digest": [
+            "Accounting programs are adapting digital finance course requirements.",
+            "Employers describe demand for accounting data-analysis skills.",
+        ],
+        "sections": [
+            {
+                "section_id": "s1",
+                "claim_id": "CL-01",
+                "section_title": "Program update signal",
+                "claim": "Accounting programs are adapting digital finance course requirements.",
+                "reasoning": "The cited source describes the program update and its training scope.",
+                "evidence_refs": ["[1]"],
+                "used_fact_refs": ["[1]"],
+                "supporting_facts": ["Accounting programs are adapting digital finance course requirements."],
+                "public_render": True,
+                "evidence_backed": True,
+            },
+            {
+                "section_id": "s2",
+                "claim_id": "CL-02",
+                "section_title": "Employer demand signal",
+                "claim": "Employers describe demand for accounting data-analysis skills.",
+                "reasoning": "The cited source describes employer requirements and training expectations.",
+                "evidence_refs": ["[2]"],
+                "used_fact_refs": ["[2]"],
+                "supporting_facts": ["Employers describe demand for accounting data-analysis skills."],
+                "public_render": True,
+                "evidence_backed": True,
+            },
+        ],
+        "evidence_quality_summary": {
+            "supporting_evidence_count": 2,
+            "source_level_distribution": {"A": 1, "B": 1},
+        },
+    }
+
+    expanded = _expand_chapter_packages_for_body_target([chapter], target_chars=20_000)
+
+    sections = expanded[0]["sections"]
+    assert [section.get("claim_id") for section in sections] == ["CL-01", "CL-02"]
+    assert not any(section.get("expansion_generated") for section in sections)
+
+
+def test_public_evidence_digest_expands_claim_backed_chapter_without_internal_language(monkeypatch):
+    monkeypatch.setenv("REPORT_ENABLE_BODY_EXPANSION", "true")
+    monkeypatch.setenv("REPORT_ENABLE_PUBLIC_EVIDENCE_DIGEST", "true")
+    monkeypatch.setenv("REPORT_PUBLIC_EVIDENCE_DIGEST_MAX_SECTIONS_PER_CHAPTER", "2")
+
+    chapter = {
+        "chapter_id": "ch_claims",
+        "chapter_title": "Accounting education signals",
+        "chapter_fact_digest": [
+            {
+                "distilled_fact": "Accounting programs are adapting digital finance course requirements.",
+                "evidence_id": "EV-1",
+                "source_ref": "[1]",
+                "fact_type": "policy_signal",
+            },
+            {
+                "distilled_fact": "Employers describe demand for accounting data-analysis skills.",
+                "evidence_id": "EV-2",
+                "source_ref": "[2]",
+                "fact_type": "case_signal",
+            },
+            {
+                "distilled_fact": "Professional training providers are adding intelligent finance practice modules.",
+                "evidence_id": "EV-3",
+                "source_ref": "[3]",
+                "fact_type": "market_signal",
+            },
+        ],
+        "sections": [
+            {
+                "section_id": "s1",
+                "claim_id": "CL-01",
+                "section_title": "Program update signal",
+                "claim": "Accounting programs are adapting digital finance course requirements.",
+                "reasoning": "The cited source describes the program update and its training scope.",
+                "evidence_refs": ["EV-1"],
+                "used_fact_refs": ["EV-1"],
+                "citation_refs": ["[1]"],
+                "supporting_facts": ["Accounting programs are adapting digital finance course requirements."],
+                "public_render": True,
+                "evidence_backed": True,
+            }
+        ],
+    }
+
+    expanded = _expand_chapter_packages_for_body_target([chapter], target_chars=5_000)
+
+    digest_sections = [section for section in expanded[0]["sections"] if section.get("public_digest_generated")]
+    assert digest_sections
+    digest = digest_sections[0]
+    assert digest["public_render"] is True
+    assert digest["public_text_allowed"] is True
+    assert digest["diagnostic_only"] is False
+    assert digest["must_not_render"] is False
+    assert digest["used_fact_refs"]
+    assert digest["citation_refs"]
+    text = " ".join(
+        str(digest.get(key) or "")
+        for key in ("section_title", "claim", "reasoning", "mechanism", "counter_evidence", "actionable")
+    )
+    for forbidden in (
+        "事实说明",
+        "证据链",
+        "claim_unit",
+        "diagnostic",
+        "score_gap",
+        "QA",
+        "方向性观察进入正文",
+        "后续应继续观察",
+        "后续判断需要继续观察",
+        "被简单处理成孤立材料",
+    ):
+        assert forbidden not in text
+
+
+def test_public_evidence_digest_uses_section_plan_citation_refs(monkeypatch):
+    monkeypatch.setenv("REPORT_ENABLE_BODY_EXPANSION", "true")
+    monkeypatch.setenv("REPORT_ENABLE_PUBLIC_EVIDENCE_DIGEST", "true")
+
+    chapter = {
+        "chapter_id": "ch_claims",
+        "chapter_title": "Accounting education signals",
+        "sections": [
+            {
+                "section_id": "s1",
+                "claim_id": "CL-01",
+                "section_title": "Program update signal",
+                "claim": "Accounting programs are adapting digital finance course requirements.",
+                "reasoning": "The cited source describes the program update and its training scope.",
+                "evidence_refs": ["EV-1"],
+                "used_fact_refs": ["EV-1"],
+                "section_plan": {"used_fact_refs": ["[12]"]},
+                "supporting_facts": [
+                    "Accounting programs are adapting digital finance course requirements.",
+                    "Employers describe demand for accounting data-analysis skills.",
+                ],
+                "public_render": True,
+                "evidence_backed": True,
+            }
+        ],
+    }
+
+    expanded = _expand_chapter_packages_for_body_target([chapter], target_chars=5_000)
+    digest_sections = [section for section in expanded[0]["sections"] if section.get("public_digest_generated")]
+
+    assert digest_sections
+    assert digest_sections[0]["citation_refs"] == ["[12]"]
+
+
+def test_public_evidence_digest_refs_resolve_through_citation_manifest(monkeypatch):
+    from rag_pipeline.agents.citation_manifest import attach_manifest_citations, build_citation_manifest
+
+    monkeypatch.setenv("REPORT_ENABLE_BODY_EXPANSION", "true")
+    monkeypatch.setenv("REPORT_ENABLE_PUBLIC_EVIDENCE_DIGEST", "true")
+    monkeypatch.setenv("REPORT_PUBLIC_EVIDENCE_DIGEST_MAX_SECTIONS_PER_CHAPTER", "1")
+
+    chapter = {
+        "chapter_id": "ch_claims",
+        "chapter_title": "Accounting education signals",
+        "sections": [
+            {
+                "section_id": "s1",
+                "claim_id": "CL-01",
+                "section_title": "Program update signal",
+                "claim": "Accounting programs are adapting digital finance course requirements.",
+                "reasoning": "The cited source describes the program update and its training scope.",
+                "evidence_refs": ["EV-1"],
+                "used_fact_refs": ["EV-1"],
+                "supporting_facts": [
+                    "Accounting programs are adapting digital finance course requirements.",
+                    "Employers describe demand for accounting data-analysis skills.",
+                ],
+                "public_render": True,
+                "evidence_backed": True,
+            }
+        ],
+    }
+    sources = [
+        {
+            "ref": "[7]",
+            "title": "Verified education source",
+            "url": "https://example.org/education",
+            "evidence_refs": ["EV-1"],
+            "used_fact_refs": ["EV-1"],
+        }
+    ]
+
+    expanded = _expand_chapter_packages_for_body_target([chapter], target_chars=5_000)
+    manifest = build_citation_manifest(chapters=expanded, claim_units=[], source_registry=sources)
+    attached = attach_manifest_citations(expanded, manifest)
+    digest_sections = [section for section in attached[0]["sections"] if section.get("public_digest_generated")]
+
+    assert manifest["citation_manifest_status"] == "ok"
+    assert digest_sections
+    assert digest_sections[0]["citation_refs"] == ["[1]"]
+
+
+def test_estimated_public_body_chars_does_not_count_unrendered_fact_digest():
+    chapter = {
+        "chapter_id": "ch_01",
+        "chapter_title": "Accounting education signals",
+        "chapter_fact_digest": ["Unrendered fact digest. " * 500],
+        "sections": [
+            {
+                "section_id": "s1",
+                "claim": "A short rendered claim.",
+                "reasoning": "A short rendered claim.",
+                "render_blocks": [{"type": "paragraph", "text": "A short rendered claim."}],
+                "public_render": True,
+            }
+        ],
+    }
+
+    assert _estimated_public_body_chars([chapter]) < 500
+
+
+def test_estimated_public_body_chars_does_not_double_count_section_fields():
+    paragraph = "A rendered public paragraph."
+    repeated = "Duplicated internal section analysis. " * 300
+    chapter = {
+        "chapter_id": "ch_01",
+        "chapter_title": "Accounting education signals",
+        "sections": [
+            {
+                "section_id": "s1",
+                "section_title": "Visible section",
+                "claim": repeated,
+                "reasoning": repeated,
+                "mechanism": repeated,
+                "counter_evidence": repeated,
+                "actionable": repeated,
+                "decision_implication": repeated,
+                "render_blocks": [{"type": "paragraph", "text": paragraph}],
+                "public_render": True,
+            }
+        ],
+    }
+
+    assert _estimated_public_body_chars([chapter]) < 500
+
+
+def test_chapter_argument_composed_sections_survive_public_rendering():
+    from rag_pipeline.agents.claim_builder_agent import run_claim_builder_agent
+    from rag_pipeline.agents.markdown_renderer import render_chapter_package
+
+    claim_units = []
+    evidence_items = []
+    for index in range(1, 5):
+        ref = f"[{index}]"
+        claim_id = f"CL-{index:02d}"
+        fact = f"Evidence {index}: accounting programs and digital finance requirements are discussed by source {index}."
+        claim_units.append(
+            {
+                "claim_id": claim_id,
+                "chapter_id": "ch_01",
+                "claim": f"Claim {index}: accounting education demand signal {index} is visible in public materials.",
+                "claim_strength": "directional",
+                "evidence_refs": [ref],
+                "used_fact_refs": [ref],
+                "source_support_map": {"claim": [ref]},
+                "supporting_facts": [fact],
+                "public_render": True,
+            }
+        )
+        evidence_items.append(
+            {
+                "evidence_id": ref,
+                "source_ref": ref,
+                "source_level": "C",
+                "public_fact_card": {
+                    "distilled_fact": fact,
+                    "fact_type": "general",
+                    "block_affinity": ["integrated_signal"],
+                },
+                "public_fact_quality": {"eligible_for_report": True},
+            }
+        )
+    chapter_evidence_packages = [
+        {
+            "chapter_id": "ch_01",
+            "supporting_evidence": evidence_items,
+            "core_evidence": evidence_items,
+        }
+    ]
+    argument_units = run_claim_builder_agent(
+        structured_analysis={"claim_units": claim_units},
+        chapter_evidence_packages=chapter_evidence_packages,
+    )
+
+    packages = run_chapter_argument_agent(
+        report_blueprint={"chapters": [{"chapter_id": "ch_01", "chapter_title": "Accounting education signals"}]},
+        argument_units=argument_units,
+        chapter_evidence_packages=chapter_evidence_packages,
+    )
+
+    markdown = render_chapter_package(packages[0], 1)
+
+    for index in range(1, 5):
+        assert f"Claim {index}:" in markdown
+        assert f"[{index}]" in markdown
+    assert "已引用来源覆盖" not in markdown

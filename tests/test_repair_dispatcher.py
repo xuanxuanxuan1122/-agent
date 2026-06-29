@@ -84,3 +84,20 @@ def test_rejected_span_summary_turns_missing_fields_into_repair_seed():
     assert summary["repair_task_seed"]["gap_id"] == "GAP-metric"
     assert summary["repair_task_seed"]["required_field_focus"] == "period"
     assert "raw_page" not in str(summary)
+
+
+def test_dispatcher_keeps_review_suggestion_as_non_search_repair_action():
+    seed = dispatch_repair_seed(
+        {
+            "schema_version": "review_suggestion_v1",
+            "issue_type": "low_claim_conversion",
+            "diagnostic_only": True,
+            "must_not_render": True,
+            "public_text_allowed": False,
+        }
+    )
+
+    assert seed["repair_action"] == "reanalyze_existing"
+    assert seed["repair_route"] == "reanalyze_existing"
+    assert seed["allowed_for_writing"] is False
+    assert seed["query"] == ""

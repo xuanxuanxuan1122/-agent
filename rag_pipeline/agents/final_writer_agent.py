@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import copy
 import os
 import re
 from collections import Counter
 from urllib.parse import urlparse
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+from rag_pipeline.contracts.quality_gate_policy import public_signal_mode
 from rag_pipeline.contracts.source_registry import renumber_sources_by_first_citation as _contract_renumber_sources_by_first_citation
 from .citation_manifest import (
     attach_manifest_citations,
@@ -15,6 +17,7 @@ from .citation_manifest import (
     merge_source_registries,
 )
 from .chapter_narrative_agent import run_chapter_narrative
+from .public_narrative_bridge import build_public_bridge_pack
 
 from .markdown_renderer import (
     _key_data_bullet_from_table_row,
@@ -33,6 +36,7 @@ from .markdown_renderer import (
 from .public_report_sanitizer import (
     apply_public_narrative_gate,
     has_internal_gap_language,
+    remove_hard_industry_templates,
     public_narrative_leak_audit,
     public_text_artifact_counts,
     rewrite_internal_gap_language,
@@ -43,6 +47,15 @@ from .report_contracts import (
     resolve_section_source_refs,
     text_has_factual_claim,
 )
+
+try:
+    from rag_pipeline.observability.probe_api import emit_transform as _probe_emit_transform
+    from rag_pipeline.observability.probe_context import (
+        current_probe_context_from_env as _current_probe_context_from_env,
+    )
+except Exception:  # pragma: no cover - observability must never block rendering
+    _probe_emit_transform = None
+    _current_probe_context_from_env = None
 from rag_pipeline.contracts.public_text_guard import public_text_quality
 
 
@@ -221,6 +234,71 @@ def _as_list(value: Any) -> List[Any]:
     return list(value) if isinstance(value, list) else []
 
 
+def _probe_int(value: Any) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _emit_final_writer_probe(
+    result: Dict[str, Any],
+    *,
+    chapter_packages: Optional[Sequence[Dict[str, Any]]] = None,
+) -> None:
+    if _probe_emit_transform is None or _current_probe_context_from_env is None:
+        return
+    try:
+        probe = _current_probe_context_from_env()
+        if probe is None:
+            return
+        chapters = [item for item in list(chapter_packages or []) if isinstance(item, dict)]
+        input_sections = sum(len(_as_list(chapter.get("sections"))) for chapter in chapters) or len(chapters)
+        markdown = str(result.get("report_markdown") or "")
+        sections = _as_list(result.get("sections"))
+        citation_manifest = _as_dict(result.get("citation_manifest"))
+        final_citation_audit = _as_dict(result.get("final_citation_audit"))
+        source_claim_support = _as_dict(result.get("source_claim_support"))
+        public_leak_audit = _as_dict(result.get("public_narrative_leak_audit"))
+        unresolved_removed = _probe_int(final_citation_audit.get("final_unresolved_citation_removed_count"))
+        excluded_untraceable = _probe_int(result.get("excluded_untraceable_source_count"))
+        source_dropped = _probe_int(source_claim_support.get("dropped_section_count"))
+        public_leaks = _probe_int(public_leak_audit.get("blocker_count"))
+        _probe_emit_transform(
+            probe,
+            stage="final_writer",
+            module="final_writer_agent",
+            input_count=input_sections,
+            output_count=len(sections) or (1 if markdown.strip() else 0),
+            drop_count=unresolved_removed + excluded_untraceable + source_dropped,
+            status="ok" if markdown.strip() and public_leaks == 0 else "warning",
+            reason_counts={
+                "final_unresolved_citation_removed": unresolved_removed,
+                "excluded_untraceable_source": excluded_untraceable,
+                "source_claim_gate_dropped": source_dropped,
+                "public_narrative_leak_remaining": public_leaks,
+            },
+            id_coverage={
+                "citation_manifest_ok": 1.0 if citation_manifest.get("citation_manifest_status") == "ok" else 0.0,
+                "source_registry_present": 1.0 if _as_list(result.get("source_registry")) else 0.0,
+            },
+            metrics={
+                "markdown_chars": len(markdown),
+                "source_count": _probe_int(result.get("source_count")),
+                "section_count": len(sections),
+            },
+            diagnostics={
+                "markdown_chars": len(markdown),
+                "citation_manifest_status": citation_manifest.get("citation_manifest_status") or "",
+                "final_unresolved_citation_removed_count": unresolved_removed,
+                "source_count": _probe_int(result.get("source_count")),
+                "format_warning_count": len(_as_list(result.get("format_warnings"))),
+            },
+        )
+    except Exception:
+        return
+
+
 def _dedupe_strings(values: Sequence[Any], *, limit: int = 200) -> List[str]:
     result: List[str] = []
     seen = set()
@@ -236,7 +314,7 @@ def _dedupe_strings(values: Sequence[Any], *, limit: int = 200) -> List[str]:
 
 
 def _public_text(value: Any) -> str:
-    text = rewrite_internal_gap_language(str(value or "").strip())
+    text = remove_hard_industry_templates(rewrite_internal_gap_language(str(value or "").strip()))
     if has_internal_gap_language(text):
         return ""
     guard = public_text_quality(text)
@@ -390,17 +468,18 @@ def _source_allowed_for_report(source: Dict[str, Any], *, query: str = "") -> bo
     identity_lower = identity.lower()
     source_type = str(source.get("source_type") or source.get("type") or "").strip().lower()
     source_level = str(source.get("source_level") or source.get("credibility") or "").strip().upper()
-    if source_level == "D":
+    public_signal = public_signal_mode()
+    if source_level == "D" and not public_signal:
         return False
     if source.get("source_title_url_mismatch_suspected"):
         return False
     if re.search(r"\bIQS\s*来源\b|^IQS来源$|example\.(?:com|gov|org)", identity, flags=re.I):
         return False
-    if source_type in {"self_media", "social", "forum", "wiki", "seo", "search_page", "aggregator"}:
+    if source_type in {"self_media", "social", "forum", "wiki", "seo", "search_page", "aggregator"} and not public_signal:
         return False
     if any(re.search(pattern, title, flags=re.I) for pattern in LOW_QUALITY_REPORT_SOURCE_TITLE_PATTERNS):
         return False
-    if any(host == domain or host.endswith("." + domain) for domain in LOW_QUALITY_REPORT_SOURCE_DOMAINS):
+    if any(host == domain or host.endswith("." + domain) for domain in LOW_QUALITY_REPORT_SOURCE_DOMAINS) and not public_signal:
         return False
     topic_id = _detect_query_topic(query_text)
     if topic_id and _topic_filter_excludes_source(
@@ -1033,6 +1112,87 @@ def _body_citation_refs(markdown: str) -> List[str]:
     return refs
 
 
+_PUBLIC_INLINE_CITATION_RE = re.compile(r"(?:\s*\[\d{1,5}\])+")
+_INLINE_CITATION_SCRUB_SKIP_KEYS = {
+    "citation_refs",
+    "evidence_refs",
+    "used_fact_refs",
+    "used_evidence_ids",
+    "supporting_evidence_refs",
+    "source_refs",
+    "refs",
+    "ref",
+    "original_ref",
+    "source_ref",
+    "citation_ref",
+    "id",
+    "section_id",
+    "chapter_id",
+    "claim_id",
+    "evidence_id",
+    "source_id",
+    "requirement_id",
+    "url",
+    "source_url",
+}
+
+
+def _strip_inline_public_citation_markers(value: Any, *, key: str = "") -> Any:
+    if isinstance(value, str):
+        if key in _INLINE_CITATION_SCRUB_SKIP_KEYS:
+            return value
+        return _PUBLIC_INLINE_CITATION_RE.sub("", value).strip()
+    if isinstance(value, list):
+        return [_strip_inline_public_citation_markers(item, key=key) for item in value]
+    if isinstance(value, dict):
+        return {
+            item_key: _strip_inline_public_citation_markers(item_value, key=str(item_key))
+            for item_key, item_value in value.items()
+        }
+    return value
+
+
+def _section_has_explicit_citation_refs(section: Dict[str, Any]) -> bool:
+    return any(
+        _as_list(section.get(key))
+        for key in ("citation_refs", "used_fact_refs", "evidence_refs", "supporting_evidence_refs")
+    )
+
+
+def _strip_inline_citations_from_public_chapters(
+    chapters: Sequence[Dict[str, Any]],
+    *,
+    require_explicit_refs: bool = False,
+) -> List[Dict[str, Any]]:
+    """Remove stale numeric citation markers from public prose fields.
+
+    Section citation refs are assigned by the citation manifest. Inline ``[N]``
+    markers embedded earlier by analysis, body rewrite, or narrative drafts
+    refer to a different source registry and must not be allowed to pull those
+    stale sources into the final appendix.
+    """
+
+    result: List[Dict[str, Any]] = []
+    for chapter in list(chapters or []):
+        if not isinstance(chapter, dict):
+            continue
+        copied = copy.deepcopy(chapter)
+        sections: List[Dict[str, Any]] = []
+        for section in _as_list(copied.get("sections")):
+            if not isinstance(section, dict):
+                continue
+            if require_explicit_refs and not _section_has_explicit_citation_refs(section):
+                sections.append(dict(section))
+                continue
+            sections.append(_strip_inline_public_citation_markers(section))
+        copied["sections"] = sections
+        if not require_explicit_refs:
+            copied = _strip_inline_public_citation_markers(copied)
+        result.append(copied)
+    return result
+
+
+
 def _collapse_adjacent_duplicate_citations(markdown: str) -> tuple[str, int]:
     removed_count = 0
 
@@ -1053,6 +1213,26 @@ def _collapse_adjacent_duplicate_citations(markdown: str) -> tuple[str, int]:
 
     rewritten = re.sub(r"(?:\[\d{1,5}\][ \t]*){2,}", replace_sequence, str(markdown or ""))
     return rewritten, removed_count
+
+
+def _sort_adjacent_citation_groups(markdown: str) -> str:
+    """Sort and de-duplicate runs of adjacent numeric citations.
+
+    Citations inherit claim/reference order, so a sentence can end with
+    ``[2][3][1]``. Readers expect ascending, de-duplicated markers, so this
+    cosmetic pass rewrites each run of two or more adjacent ``[n]`` tokens into
+    sorted, unique order (``[1][2][3]``). It runs after renumbering so the
+    numbers are already final.
+    """
+
+    def replace_sequence(match: re.Match[str]) -> str:
+        numbers = [int(item) for item in re.findall(r"\[(\d{1,5})\]", match.group(0))]
+        if len(numbers) < 2:
+            return match.group(0)
+        ordered = sorted(dict.fromkeys(numbers))
+        return "".join(f"[{number}]" for number in ordered)
+
+    return re.sub(r"(?:\[\d{1,5}\]){2,}", replace_sequence, str(markdown or ""))
 
 
 def _citationless_factual_segments(markdown: str, *, limit: int = 8) -> List[str]:
@@ -1296,6 +1476,7 @@ def finalize_markdown_citations(
 
     rewritten_body = re.sub(r"\[(\d{1,5})\]", replace, original_body)
     rewritten_body, duplicate_removed_count = _collapse_adjacent_duplicate_citations(rewritten_body)
+    rewritten_body = _sort_adjacent_citation_groups(rewritten_body)
     if can_mutate:
         rewritten_body, bullet_drop_diagnostics = _drop_citationless_factual_bullets(rewritten_body)
         rewritten_body, short_line_drop_diagnostics = _drop_short_citationless_factual_lines(rewritten_body)
@@ -1398,6 +1579,67 @@ def _split_rendered_source_appendix(markdown: str) -> tuple[str, str]:
     if appendix_start is None:
         return str(markdown or "").strip(), ""
     return "\n".join(lines[:appendix_start]).strip(), "\n".join(lines[appendix_start:]).strip()
+
+
+_PUBLIC_SUMMARY_HEADING_RE = re.compile(
+    r"(?m)^##\s*(?:\u6838\u5fc3\u89c2\u70b9|\u6838\u5fc3\u89c2\u5bdf|\u4e3b\u8981\u7ed3\u8bba|\u5173\u952e\u5224\u65ad|"
+    r"executive\s+summary|key\s+judgments?)",
+    re.I,
+)
+
+
+def _compact_cited_summary_line(line: str, *, max_chars: int = 260) -> str:
+    text = re.sub(r"\s+", " ", str(line or "").strip())
+    if not text or not CITATION_RE.search(text):
+        return ""
+    text = re.sub(r"^\s*[-*]\s+", "", text).strip()
+    text = re.sub(r"^#+\s+", "", text).strip()
+    if not text or "|" in text[:8]:
+        return ""
+    cited_fragments = re.findall(
+        r"[^。！？.!?\n]{18,220}(?:[。！？.!?])?\s*(?:\[\d{1,5}\])+",
+        text,
+    )
+    if cited_fragments:
+        text = cited_fragments[0].strip()
+    if len(text) > max_chars:
+        refs = "".join(re.findall(r"\[\d{1,5}\]", text)[-3:])
+        text = text[: max_chars - max(8, len(refs))].rstrip(" ，,；;。.!?") + "。" + refs
+    return _public_text(text)
+
+
+def _ensure_public_core_observation_block(markdown: str) -> str:
+    source = str(markdown or "").strip()
+    if not source or _PUBLIC_SUMMARY_HEADING_RE.search(source):
+        return source
+    body, appendix = _split_rendered_source_appendix(source)
+    if not body.strip():
+        return source
+    candidates: List[str] = []
+    seen = set()
+    for line in body.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or stripped.startswith("|"):
+            continue
+        candidate = _compact_cited_summary_line(stripped)
+        if not candidate:
+            continue
+        key = re.sub(r"\[\d{1,5}\]", "", candidate).strip()
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(candidate)
+        if len(candidates) >= 3:
+            break
+    if not candidates:
+        return source
+    lines = body.splitlines()
+    insert_at = 1 if lines and re.match(r"^#\s+", lines[0].strip()) else 0
+    while insert_at < len(lines) and not lines[insert_at].strip():
+        insert_at += 1
+    block = ["", "## \u6838\u5fc3\u89c2\u5bdf", *[f"- {item}" for item in candidates], ""]
+    updated_body = "\n".join([*lines[:insert_at], *block, *lines[insert_at:]]).strip()
+    return "\n\n".join(part for part in [updated_body, appendix] if str(part or "").strip())
 
 
 def _rewrite_final_markdown_with_reconciled_appendix(
@@ -2055,13 +2297,18 @@ def _apply_source_claim_support_gate(
                 retained["source_claim_gate_warning"] = reason
                 diagnostics["permissive_retained_unresolved_section_count"] += 1
                 if len(diagnostics["relaxed_section_examples"]) < 8:
+                    action = (
+                        "renderer_skips_unreferenced_fact_section"
+                        if reason == "factual_section_without_resolved_ref"
+                        else "retained_with_diagnostic"
+                    )
                     diagnostics["relaxed_section_examples"].append(
                         {
                             "chapter_id": chapter.get("chapter_id"),
                             "section_id": section.get("section_id"),
                             "block_type": section.get("block_type"),
                             "reason": reason,
-                            "action": "retained_with_diagnostic",
+                            "action": action,
                             "diagnostic_only": True,
                             "claim": str(section.get("claim") or "")[:220],
                         }
@@ -2085,13 +2332,18 @@ def _apply_source_claim_support_gate(
                     retained["claim_strength"] = "directional"
                 diagnostics["permissive_retained_unresolved_section_count"] += 1
                 if len(diagnostics["relaxed_section_examples"]) < 8:
+                    action = (
+                        "renderer_skips_unreferenced_fact_section"
+                        if reason == "factual_section_without_resolved_ref"
+                        else "retained_with_warning"
+                    )
                     diagnostics["relaxed_section_examples"].append(
                         {
                             "chapter_id": chapter.get("chapter_id"),
                             "section_id": section.get("section_id"),
                             "block_type": section.get("block_type"),
                             "reason": reason,
-                            "action": "retained_with_warning",
+                            "action": action,
                             "claim": str(section.get("claim") or "")[:220],
                         }
                     )
@@ -2460,10 +2712,15 @@ def _analysis_transfer_diagnostics(
         for section in rendered_sections
         if _claim_refs_for_transfer(section)
     ]
+    tracked_claims = [
+        claim
+        for claim in analysis_claims
+        if str(claim.get("claim_id") or claim.get("id") or "").strip()
+    ]
     matched_ids: List[str] = []
     matched_by_ref_ids: List[str] = []
     lost_ids: List[str] = []
-    for claim in analysis_claims:
+    for claim in tracked_claims:
         claim_id = str(claim.get("claim_id") or claim.get("id") or "").strip()
         claim_refs = set(_claim_refs_for_transfer(claim))
         matched_by_id = bool(claim_id and claim_id in rendered_id_set)
@@ -2479,8 +2736,9 @@ def _analysis_transfer_diagnostics(
     matched_ids = _dedupe_strings(matched_ids, limit=200)
     matched_by_ref_ids = _dedupe_strings(matched_by_ref_ids, limit=200)
     lost_ids = _dedupe_strings(lost_ids, limit=200)
+    claim_count = len(claim_ids)
     rendered_claim_count = len(matched_ids)
-    missing_id_count = max(0, claim_count - len(claim_ids))
+    missing_id_count = max(0, len(analysis_claims) - len(tracked_claims))
     reason_counts: Dict[str, int] = {}
     if lost_ids:
         reason_counts["not_rendered_in_public_sections"] = len(lost_ids)
@@ -2505,6 +2763,225 @@ def _analysis_transfer_diagnostics(
         "analysis_claim_ids_lost": lost_ids[:50],
         "analysis_fact_usage_count": sum(len(_claim_refs_for_transfer(item)) for item in analysis_claims),
     }
+
+
+def _claim_public_text(item: Dict[str, Any]) -> str:
+    return str(item.get("claim") or item.get("judgment") or item.get("takeaway") or "").strip()
+
+
+def _claim_evidence_text(value: Any) -> str:
+    if isinstance(value, dict):
+        raw = (
+            value.get("distilled_fact")
+            or value.get("fact")
+            or value.get("fact_text")
+            or value.get("summary")
+            or value.get("text")
+            or value.get("claim")
+            or value.get("source_title")
+        )
+    else:
+        raw = value
+    return _public_text(raw)
+
+
+def _claim_evidence_basis_texts(item: Dict[str, Any], *, limit: int = 4) -> List[str]:
+    candidates: List[Any] = []
+    for key in ("evidence_basis", "supporting_facts", "fact_cards", "facts"):
+        candidates.extend(_as_list(item.get(key)))
+    texts = [text for text in (_claim_evidence_text(value) for value in candidates) if text]
+    return _dedupe_strings(texts, limit=limit)
+
+
+def _claim_public_bridge_pack(item: Dict[str, Any]) -> Dict[str, Any]:
+    return build_public_bridge_pack(
+        claim=_claim_public_text(item),
+        evidence_texts=_claim_evidence_basis_texts(item, limit=4),
+        block_type=str(item.get("block_type") or item.get("section_role") or item.get("analysis_role") or ""),
+        claim_strength=str(item.get("claim_strength") or ""),
+        boundary=(
+            item.get("counter_evidence")
+            or item.get("limitation_boundary")
+            or item.get("boundary")
+            or item.get("limitations")
+        ),
+    )
+
+
+def _claim_evidence_context_text(item: Dict[str, Any]) -> str:
+    bridge_text = _public_text(_claim_public_bridge_pack(item).get("evidence_context"))
+    if bridge_text:
+        return bridge_text
+    facts = _claim_evidence_basis_texts(item, limit=3)
+    if not facts:
+        return ""
+    cleaned = [re.sub(r"[\s。.!?！？；;,，]+$", "", fact).strip() for fact in facts if str(fact or "").strip()]
+    if not cleaned:
+        return ""
+    return _public_text("公开材料提到，" + "；".join(cleaned) + "。")
+
+
+def _claim_public_interpretation_text(item: Dict[str, Any]) -> str:
+    bridge = _claim_public_bridge_pack(item)
+    bridge_parts = _dedupe_strings(
+        [bridge.get("mechanism_bridge"), bridge.get("implication_bridge")],
+        limit=2,
+    )
+    bridge_text = _public_text(" ".join(bridge_parts))
+    if bridge_text:
+        return bridge_text
+    if not (_claim_evidence_basis_texts(item, limit=1) or _claim_public_text(item)):
+        return ""
+    return _public_text(
+        "公开材料如果已经呈现明确主体、具体场景、连续动作或风险约束，就更接近可分析的早期变化；"
+        "如果缺少明确主体、连续动作或可复核结果，结论就只能限制在具体场景内。"
+        "判断能否继续增强，取决于主体行动、适用场景、资源投入和约束条件是否同步改善。"
+    )
+
+
+def _claim_public_render_allowed(item: Dict[str, Any]) -> bool:
+    if not isinstance(item, dict):
+        return False
+    if item.get("diagnostic_only") or item.get("not_for_public_text") or item.get("must_not_render"):
+        return False
+    for suggestion in _as_list(item.get("claim_review_suggestions")) + _as_list(item.get("review_suggestions")):
+        suggestion_dict = _as_dict(suggestion)
+        permission = str(suggestion_dict.get("suggested_writing_permission") or "").strip().lower()
+        use_level = str(suggestion_dict.get("suggested_evidence_use_level") or "").strip().lower()
+        if permission in {"repair_before_publication", "not_allowed_until_repaired"}:
+            return False
+        if use_level in {"diagnostic_only", "not_for_writing"}:
+            return False
+    return True
+
+
+def _claim_backfill_section(item: Dict[str, Any], index: int) -> Dict[str, Any]:
+    claim_id = str(item.get("claim_id") or item.get("id") or f"claim_{index}").strip()
+    claim_text = _public_text(_claim_public_text(item))[:420].strip()
+    refs = _claim_refs_for_transfer(item)
+    strength = str(item.get("claim_strength") or "directional").strip() or "directional"
+    evidence_context = _claim_evidence_context_text(item)
+    has_explicit_interpretation = any(
+        str(item.get(key) or "").strip()
+        for key in (
+            "reasoning",
+            "mechanism",
+            "analysis_reasoning",
+            "actionable",
+            "decision_implication",
+            "implication",
+            "next_step",
+        )
+    )
+    interpretation = "" if has_explicit_interpretation else _claim_public_interpretation_text(item)
+    reasoning = _public_text(
+        item.get("reasoning")
+        or item.get("mechanism")
+        or item.get("analysis_reasoning")
+        or "材料已经提供一个可观察入口：如果相关主体的行动继续扩展到更多场景、资源投入和执行结果，判断基础会更稳。"
+    )
+    boundary = _public_text(
+        item.get("counter_evidence")
+        or item.get("limitation_boundary")
+        or item.get("boundary")
+        or item.get("limitations")
+        or "当前材料覆盖范围有限，结论只能落在已披露主体和场景内，不能直接推到全行业成熟。"
+    )
+    actionable = _public_text(
+        item.get("actionable")
+        or item.get("decision_implication")
+        or item.get("implication")
+        or item.get("next_step")
+        or "更值得看的，是主体行动是否持续、适用场景是否扩大、执行成本和风险约束是否同步改善。"
+    )
+    section_id_slug = re.sub(r"[^A-Za-z0-9_\-]+", "_", claim_id).strip("_") or f"claim_{index}"
+    render_blocks = [
+        {"type": "paragraph", "text": text}
+        for text in _dedupe_strings([claim_text, evidence_context, reasoning, interpretation, boundary, actionable], limit=6)
+        if text
+    ]
+    return {
+        "section_id": f"analysis_observation_{section_id_slug}",
+        "section_title": "补充观察",
+        "block_type": "directional_observation",
+        "section_role": "directional_observation",
+        "claim_id": claim_id,
+        "claim_strength": strength,
+        "analysis_role": item.get("analysis_role") or "directional",
+        "source_support_map": item.get("source_support_map") or {"claim": refs},
+        "claim": claim_text,
+        "evidence_context": evidence_context,
+        "interpretation": interpretation,
+        "reasoning": reasoning,
+        "counter_evidence": boundary,
+        "actionable": actionable,
+        "used_fact_refs": refs,
+        "evidence_refs": refs,
+        "supporting_facts": [
+            {"distilled_fact": text}
+            for text in _claim_evidence_basis_texts(item, limit=6)
+        ],
+        "render_blocks": render_blocks,
+        "public_render": True,
+        "layout_generated": True,
+        "evidence_backed": bool(refs),
+        "observation_only": True,
+        "force_render_observation": False,
+    }
+
+
+def _backfill_unrendered_analysis_claim_sections(
+    chapters: Sequence[Dict[str, Any]],
+    claim_units: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    public_chapters = [dict(chapter) for chapter in list(chapters or []) if isinstance(chapter, dict)]
+    rendered_claim_ids = {
+        str(section.get("claim_id") or section.get("id") or "").strip()
+        for section in _iter_public_sections(public_chapters)
+        if str(section.get("claim_id") or section.get("id") or "").strip()
+    }
+    rendered_ref_sets = [
+        set(_claim_refs_for_transfer(section))
+        for section in _iter_public_sections(public_chapters)
+        if _claim_refs_for_transfer(section)
+    ]
+    chapter_index: Dict[str, Dict[str, Any]] = {}
+    for chapter in public_chapters:
+        chapter_id = str(chapter.get("chapter_id") or "").strip()
+        if chapter_id:
+            chapter_index.setdefault(chapter_id, chapter)
+
+    for index, claim in enumerate(list(claim_units or []), start=1):
+        if not isinstance(claim, dict) or not _is_analysis_claim_for_transfer(claim):
+            continue
+        claim_id = str(claim.get("claim_id") or claim.get("id") or "").strip()
+        claim_refs = set(_claim_refs_for_transfer(claim))
+        if claim_id and claim_id in rendered_claim_ids:
+            continue
+        if not claim_id and claim_refs and any(claim_refs.intersection(refs) for refs in rendered_ref_sets):
+            continue
+        if not _claim_public_render_allowed(claim):
+            continue
+        section = _claim_backfill_section(claim, index)
+        chapter_id = str(claim.get("chapter_id") or "").strip()
+        target = chapter_index.get(chapter_id)
+        if not target:
+            target = {
+                "chapter_id": chapter_id or "analysis_observations",
+                "chapter_title": "补充观察与待验证问题",
+                "sections": [],
+                "lead": "",
+            }
+            public_chapters.append(target)
+            chapter_index[str(target.get("chapter_id") or "")] = target
+        sections = [item for item in _as_list(target.get("sections")) if isinstance(item, dict)]
+        sections.append(section)
+        target["sections"] = sections
+        if claim_id:
+            rendered_claim_ids.add(claim_id)
+        if claim_refs:
+            rendered_ref_sets.append(claim_refs)
+    return public_chapters
 
 
 def should_render_chapter(chapter: Dict[str, Any]) -> bool:
@@ -2728,6 +3205,7 @@ def run_final_writer_agent(
     report_blueprint = _as_dict(report_blueprint)
     chapter_packages = [item for item in list(chapter_packages or []) if isinstance(item, dict)]
     public_chapters = [_public_chapter(chapter) for chapter in chapter_packages if should_render_chapter(chapter)]
+    public_chapters = _strip_inline_citations_from_public_chapters(public_chapters, require_explicit_refs=True)
     table_packages = _all_table_packages(public_chapters, [item for item in list(table_packages or []) if isinstance(item, dict)])
     table_packages = [
         table
@@ -2763,10 +3241,15 @@ def run_final_writer_agent(
         [item for item in list(full_source_registry or []) if isinstance(item, dict)],
         query=query,
     )
+    traceable_source_registry = [item for item in list(source_registry or []) if isinstance(item, dict)]
     manifest_claim_units = [
         *[item for item in list(claim_units or []) if isinstance(item, dict)],
         *[item for key in ("claim_units", "key_claims", "key_judgments") for item in _as_list(decision_package.get(key)) if isinstance(item, dict)],
     ]
+    public_chapters = _backfill_unrendered_analysis_claim_sections(
+        public_chapters,
+        [item for item in list(analysis_claim_units or manifest_claim_units or []) if isinstance(item, dict)],
+    )
     public_chapters, manifest_claim_units, ref_lineage_diagnostics = _filter_rendered_refs_with_source_registry(
         chapters=public_chapters,
         claim_units=manifest_claim_units,
@@ -2798,6 +3281,7 @@ def run_final_writer_agent(
         query=query,
     )
     public_chapters = attach_manifest_citations(public_chapters, citation_manifest)
+    public_chapters = _strip_inline_citations_from_public_chapters(public_chapters)
     chapter_narrative_diagnostics: Dict[str, Any] = {
         "enabled": False,
         "status": "skipped",
@@ -2831,6 +3315,8 @@ def run_final_writer_agent(
             "rejected_reasons": {},
             "failure_reasons": {f"runtime_error:{type(exc).__name__}": 1},
         }
+    public_chapters = attach_manifest_citations(public_chapters, citation_manifest)
+    public_chapters = _strip_inline_citations_from_public_chapters(public_chapters)
     public_chapters, manifest_section_support = _drop_factual_sections_without_manifest_citations(
         public_chapters,
         unresolved_ref_reasons=_as_list(citation_manifest.get("filtered_unresolved_ref_reasons")),
@@ -2851,8 +3337,12 @@ def run_final_writer_agent(
             if isinstance(item, dict)
         ],
         public_chapters=public_chapters,
-    )
+        )
     source_registry = manifest_appendix_sources(citation_manifest)
+    citation_reconciliation_registry = merge_source_registries(
+        source_registry,
+        traceable_source_registry,
+    )
 
     shell = _as_dict(report_blueprint.get("report_shell"))
     front_blocks = _as_block_list(shell.get("front_blocks"), ["executive_summary", "key_data"])
@@ -2895,6 +3385,8 @@ def run_final_writer_agent(
         if rendered:
             parts.append(rendered)
             front_section_titles.append(GLOBAL_BLOCK_TITLES.get(summary_title_key if block_key in SUMMARY_BLOCKS else block_key, block_key))
+    seen_chapter_titles: set[str] = set()
+    seen_section_titles_global: set[str] = set()
     for index, chapter in enumerate(public_chapters, start=1):
         parts.append(
             render_chapter_package(
@@ -2902,6 +3394,8 @@ def run_final_writer_agent(
                 index,
                 previous_chapter=public_chapters[index - 2] if index > 1 else None,
                 next_chapter=public_chapters[index] if index < len(public_chapters) else None,
+                seen_chapter_titles=seen_chapter_titles,
+                seen_section_titles_global=seen_section_titles_global,
             )
         )
     appendix_requested = False
@@ -2926,8 +3420,9 @@ def run_final_writer_agent(
     body_markdown, source_registry, final_citation_audit = finalize_markdown_citations(
         body_markdown,
         citation_manifest,
-        source_registry,
+        citation_reconciliation_registry,
     )
+    body_markdown = _ensure_public_core_observation_block(body_markdown)
     parts = [body_markdown]
     citation_appendix_required = bool(CITATION_RE.search(body_markdown))
     if (appendix_requested and source_appendix_enabled) or citation_appendix_required:
@@ -2948,7 +3443,7 @@ def run_final_writer_agent(
     markdown = normalize_markdown_spacing(markdown)
     naturalness_before = public_text_artifact_counts(markdown)
     public_narrative_before = public_narrative_leak_audit(markdown)
-    markdown = sanitize_public_markdown(markdown)
+    markdown = sanitize_public_markdown(markdown, mode="enforce")
     public_narrative_after_sanitize = public_narrative_leak_audit(markdown)
     markdown = _renumber_public_chapter_headings(markdown)
     markdown = normalize_markdown_spacing(markdown)
@@ -2988,6 +3483,7 @@ def run_final_writer_agent(
             final_citation_audit["final_unresolved_citation_removed_count"] = len(
                 final_citation_audit["final_unresolved_citation_refs"]
             )
+    markdown = _ensure_public_core_observation_block(markdown)
     markdown = normalize_markdown_spacing(markdown)
     public_narrative_after = public_narrative_leak_audit(markdown)
     public_narrative_gate = {
@@ -3009,7 +3505,7 @@ def run_final_writer_agent(
     }
     naturalness_after = public_text_artifact_counts(markdown)
     warnings = collect_format_warnings(markdown)
-    return {
+    result = {
         "agent": AGENT_NAME,
         "report_markdown": markdown,
         "sections": [
@@ -3047,3 +3543,5 @@ def run_final_writer_agent(
             "residual_truncated_punctuation_count": naturalness_after.get("truncated_punctuation_cleaned_count", 0),
         },
     }
+    _emit_final_writer_probe(result, chapter_packages=chapter_packages)
+    return result

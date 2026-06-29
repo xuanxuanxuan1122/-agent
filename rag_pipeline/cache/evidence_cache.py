@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 from urllib.parse import urlparse
 
+from rag_pipeline.contracts.quality_gate_policy import advisory_weight_mode, public_signal_mode
 from rag_pipeline.runtime_cache import json_safe_default
 
 logger = logging.getLogger(__name__)
@@ -282,6 +283,12 @@ def _record_is_polluted(row: sqlite3.Row, raw: Dict[str, Any]) -> bool:
     source.setdefault("url", row["source_url"] or raw.get("source_url") or raw.get("url") or "")
     source.setdefault("title", raw.get("source_title") or raw.get("title") or "")
     source.setdefault("publisher", raw.get("publisher") or "")
+    if raw.get("source_title_url_mismatch_suspected") or source.get("source_title_url_mismatch_suspected"):
+        return True
+    if raw.get("source_binding_fuzzy") and raw.get("source_title_missing"):
+        return True
+    if source.get("source_binding_fuzzy") and source.get("source_title_missing"):
+        return True
     fact = row["fact_description"] or raw.get("fact") or raw.get("clean_fact") or raw.get("content") or ""
     return _is_fake_or_placeholder_source(source, fact) or _looks_like_error_or_page_shell(fact, title=source.get("title"))
 
@@ -486,12 +493,42 @@ def _cache_enabled() -> bool:
     return _env_flag("EVIDENCE_CACHE_ENABLED", True)
 
 
+def evidence_cache_read_enabled() -> bool:
+    """Global gate for reusing persisted evidence/search payloads."""
+    return _cache_enabled() and _env_flag("EVIDENCE_CACHE_READ_ENABLED", False)
+
+
 def _cache_path() -> Path:
     raw = os.getenv("EVIDENCE_CACHE_PATH", "output/cache/evidence_cache.sqlite")
     path = Path(raw)
     if not path.is_absolute():
         path = Path.cwd() / path
     return path
+
+
+class _ClosingConn:
+    """sqlite3 context-manager proxy that closes the file handle on exit."""
+
+    __slots__ = ("_conn",)
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def __enter__(self) -> "_ClosingConn":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        try:
+            if exc_type is None:
+                self._conn.commit()
+            else:
+                self._conn.rollback()
+        finally:
+            self._conn.close()
+        return False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conn, name)
 
 
 class EvidenceCache:
@@ -514,7 +551,7 @@ class EvidenceCache:
             conn.execute(f"PRAGMA journal_mode={journal_mode}")
         except sqlite3.OperationalError:
             conn.execute("PRAGMA journal_mode=MEMORY")
-        return conn
+        return _ClosingConn(conn)  # type: ignore[return-value]
 
     def _ensure_schema(self) -> None:
         if self._initialized or not self.enabled():
@@ -630,10 +667,14 @@ class EvidenceCache:
             "source_priority": sorted(_normalized_list(task.get("source_priority") or options.get("source_priority"))),
             "must_have_terms": sorted(_normalized_list(task.get("must_have_terms") or options.get("must_have_terms"))),
             "forbidden_terms": sorted(_normalized_list(task.get("forbidden_terms") or options.get("forbidden_terms"))),
+            "topic_anchor_terms": sorted(_normalized_list(task.get("topic_anchor_terms") or options.get("topic_anchor_terms"))),
         }
         return "search:" + _hash_payload(payload)
 
     def lookup_search(self, query: str, search_options: Dict[str, Any], search_task: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        if not evidence_cache_read_enabled():
+            record_cache_bypass("evidence_cache_read_disabled", search=True)
+            return None
         if not _env_flag("EVIDENCE_CACHE_SEARCH_READ_ENABLED", True):
             record_cache_bypass("persistent_search_read_disabled", search=True)
             return None
@@ -772,6 +813,9 @@ class EvidenceCache:
         required_fields: Optional[Sequence[str]] = None,
         max_hits: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
+        if not evidence_cache_read_enabled():
+            record_cache_bypass("evidence_cache_read_disabled", evidence=True)
+            return []
         if not _env_flag("EVIDENCE_CACHE_EVIDENCE_READ_ENABLED", True):
             record_cache_bypass("persistent_evidence_read_disabled", evidence=True)
             return []
@@ -780,9 +824,12 @@ class EvidenceCache:
         required = {str(item).strip().lower() for item in list(required_fields or _as_list(task.get("required_fields"))) if str(item).strip()}
         proof_role = str(task.get("proof_role") or task.get("evidence_type") or "").strip().lower()
         min_levels = [str(item).strip().upper() for item in (min_source_level if isinstance(min_source_level, (list, tuple, set)) else [min_source_level]) if str(item).strip()]
+        if public_signal_mode() and "D" not in min_levels:
+            min_levels.append("D")
         minimum_rank = min((_SOURCE_LEVEL_RANK.get(level, 0) for level in min_levels), default=0)
         required_source_types = _task_source_type_hints(task)
         terms = self._task_terms(task)
+        topic_anchor_terms = self._topic_anchor_terms(task)
         if not terms:
             return []
         now = _now()
@@ -813,6 +860,8 @@ class EvidenceCache:
                         if not (proof_role == "source_check" and row_role in {"source_check", "metric", "filing", "official_data", "support"}):
                             continue
                     if not _row_matches_source_type(row, raw, required_source_types):
+                        continue
+                    if not self._row_matches_topic_anchor(row, raw, topic_anchor_terms):
                         continue
                     if not self._required_fields_satisfied(row, raw, required):
                         continue
@@ -865,6 +914,7 @@ class EvidenceCache:
         ):
             values.append(task.get(key))
         values.extend(_as_list(task.get("topic_terms")))
+        values.extend(_as_list(task.get("topic_anchor_terms")))
         values.extend(_as_list(task.get("must_have_terms")))
         values.extend(_as_list(task.get("blocking_gaps")))
         tokens: List[str] = []
@@ -875,6 +925,47 @@ class EvidenceCache:
                     seen.add(token)
                     tokens.append(token)
         return tokens[:80]
+
+    def _topic_anchor_terms(self, task: Dict[str, Any]) -> List[str]:
+        terms = _normalized_list(task.get("topic_anchor_terms"))
+        if not terms:
+            terms = _normalized_list(_as_dict(task.get("search_task")).get("topic_anchor_terms"))
+        return terms[:8]
+
+    def _row_matches_topic_anchor(self, row: sqlite3.Row, raw: Dict[str, Any], anchors: Sequence[str]) -> bool:
+        if not anchors:
+            return True
+        query_terms = " ".join(str(item) for item in _json_loads(row["query_terms_json"], []) if str(item).strip())
+        source = _as_dict(raw.get("source"))
+        haystack = " ".join(
+            [
+                str(row["topic_key"] or ""),
+                str(row["fact_description"] or ""),
+                str(row["metric_name"] or ""),
+                str(row["source_domain"] or ""),
+                str(raw.get("content") or raw.get("fact") or raw.get("clean_fact") or ""),
+                str(source.get("title") or ""),
+                str(source.get("publisher") or ""),
+                str(source.get("url") or raw.get("source_url") or ""),
+                query_terms,
+            ]
+        ).lower()
+        compact_haystack = re.sub(r"\s+", "", haystack)
+        for anchor in anchors:
+            text = str(anchor or "").strip().lower()
+            if not text:
+                continue
+            variants = [text]
+            compact = re.sub(r"\s+", "", text)
+            if compact.startswith("中国") and len(compact) > 2:
+                variants.append(compact[2:])
+            if compact.startswith("国内") and len(compact) > 2:
+                variants.append(compact[2:])
+            for variant in variants:
+                variant_key = re.sub(r"\s+", "", variant.lower())
+                if variant and (variant in haystack or (variant_key and variant_key in compact_haystack)):
+                    return True
+        return False
 
     def _required_fields_satisfied(self, row: sqlite3.Row, raw: Dict[str, Any], required: set[str]) -> bool:
         if not required:
@@ -1076,7 +1167,10 @@ class EvidenceCache:
         semantic_status = str(item.get("semantic_status") or "").strip().lower()
         if semantic_status in _REJECTED_ROLES or role in _REJECTED_ROLES:
             return {}
-        if source_level == "D" or allowed_use in _APPENDIX_ONLY_USES:
+        if (
+            (source_level == "D" and not (public_signal_mode() or advisory_weight_mode()))
+            or (allowed_use in _APPENDIX_ONLY_USES and not advisory_weight_mode())
+        ):
             return {}
         fact = str(item.get("fact") or item.get("clean_fact") or item.get("content") or item.get("fact_description") or "").strip()
         metric = str(item.get("metric") or item.get("metric_name") or item.get("indicator") or "").strip()

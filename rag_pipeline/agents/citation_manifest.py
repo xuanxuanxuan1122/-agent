@@ -89,6 +89,8 @@ def _source_identity_refs(source: Dict[str, Any]) -> set[str]:
     refs = {
         str(source.get("ref") or "").strip(),
         str(source.get("id") or "").strip(),
+        str(source.get("source_id") or "").strip(),
+        str(source.get("canonical_source_id") or "").strip(),
         str(source.get("evidence_id") or "").strip(),
         str(source.get("source_ref") or "").strip(),
         str(source.get("citation_ref") or "").strip(),
@@ -132,12 +134,22 @@ def _source_exclusion_reason(source: Dict[str, Any]) -> str:
 
 
 def _source_lookup(source_registry: Sequence[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    lookup: Dict[str, Dict[str, Any]] = {}
+    candidates: Dict[str, List[Dict[str, Any]]] = {}
     for source in list(source_registry or []):
         if not isinstance(source, dict):
             continue
         for ref in _source_identity_refs(source):
-            lookup.setdefault(ref, source)
+            candidates.setdefault(ref, []).append(source)
+    lookup: Dict[str, Dict[str, Any]] = {}
+    for ref, sources in candidates.items():
+        locations = {
+            str(source.get("url") or source.get("source_url") or source.get("document_ref") or source.get("document_id") or source.get("doc_id") or source.get("page_ref") or "").strip().lower()
+            for source in sources
+            if str(source.get("url") or source.get("source_url") or source.get("document_ref") or source.get("document_id") or source.get("doc_id") or source.get("page_ref") or "").strip()
+        }
+        if len(locations) > 1:
+            continue
+        lookup[ref] = sources[0]
     return lookup
 
 
@@ -479,7 +491,17 @@ def _section_refs(section: Dict[str, Any]) -> List[str]:
 
 def _claim_refs(claim: Dict[str, Any]) -> List[str]:
     refs: List[Any] = []
-    for key in ("used_evidence_ids", "used_fact_refs", "evidence_refs", "supporting_evidence_refs", "supporting_evidence"):
+    for key in (
+        "used_evidence_ids",
+        "used_fact_refs",
+        "fact_ids",
+        "evidence_refs",
+        "supporting_fact_refs",
+        "supporting_evidence_refs",
+        "supporting_evidence",
+        "source_ids",
+        "source_refs",
+    ):
         refs.extend(_as_list(claim.get(key)))
     return _dedupe(refs, limit=24)
 
@@ -520,6 +542,7 @@ def build_citation_manifest(
     filtered_cited_sources: List[Dict[str, Any]] = []
     used_refs: List[str] = []
     first_section_by_chapter: Dict[str, str] = {}
+    section_by_claim_id: Dict[str, str] = {}
     section_ids = set()
     for chapter in list(chapters or []):
         chapter_id = str(_as_dict(chapter).get("chapter_id") or "").strip()
@@ -531,6 +554,9 @@ def build_citation_manifest(
                 section_ids.add(section_id)
                 if chapter_id:
                     first_section_by_chapter.setdefault(chapter_id, section_id)
+                claim_id = str(section.get("claim_id") or section.get("id") or "").strip()
+                if claim_id:
+                    section_by_claim_id.setdefault(claim_id, section_id)
 
     def assign(ref: str) -> str:
         text = str(ref or "").strip()
@@ -581,6 +607,8 @@ def build_citation_manifest(
         for ref in refs:
             assign(ref)
         section_id = str(claim_dict.get("section_id") or "").strip()
+        if not section_id:
+            section_id = section_by_claim_id.get(str(claim_dict.get("claim_id") or claim_dict.get("id") or "").strip(), "")
         if not section_id or section_id not in section_ids:
             section_id = first_section_by_chapter.get(str(claim_dict.get("chapter_id") or "").strip(), "")
         if section_id and section_id in section_ids and citations:

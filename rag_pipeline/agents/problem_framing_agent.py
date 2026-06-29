@@ -144,6 +144,35 @@ def _looks_like_ai_industry(query: str) -> bool:
     )
 
 
+ACADEMIC_OR_PROFESSIONAL_FIELDS = {
+    "会计学",
+    "审计学",
+    "财务管理",
+    "经济学",
+    "金融学",
+    "法学",
+    "管理学",
+    "教育学",
+    "心理学",
+    "统计学",
+    "计算机科学",
+    "数据科学",
+}
+
+
+def _looks_like_academic_or_professional_field(query: str) -> bool:
+    text = re.sub(r"\s+", "", str(query or "")).strip()
+    if not text:
+        return False
+    if text in ACADEMIC_OR_PROFESSIONAL_FIELDS:
+        return True
+    if re.search(r"行业|产业|市场|公司|产品|商业化|投资|供应链|机会|风险|竞争格局|客户|订单|采购|上市公司", text):
+        return False
+    if len(text) <= 12 and re.search(r"(?:学|学科|专业)$", text):
+        return True
+    return bool(len(text) <= 16 and re.search(r"学科|专业|课程|就业|职业|证书|考研", text))
+
+
 def _bundle(
     *,
     metric_terms: List[str],
@@ -453,9 +482,9 @@ def _ai_industry_hypotheses(query: str, decision_use: str) -> List[Dict[str, Any
         ),
         _hypothesis(
             3,
-            claim=f"{subject}机会兑现的关键在企业客户付费、行业应用深度和可复制交付能力",
-            must_prove=["客户付费", "采购订单", "行业应用", "续费率", "ROI"],
-            must_disprove=["试点停滞", "客户预算不足", "部署效果不及预期", "续费率低"],
+            claim=f"{subject}机会兑现的关键在实际应用深度、可复制执行能力和持续使用结果",
+            must_prove=["实际应用", "可复制执行", "持续使用", "效果反馈", "ROI"],
+            must_disprove=["试点停滞", "预算不足", "执行效果不及预期", "持续使用不足"],
             bundle=_bundle(
                 metric_terms=["付费率", "渗透率", "采购金额", "续费率", "ROI"],
                 case_terms=["金融AI", "制造AI", "政务AI", "医疗AI", "企业采购", "标杆客户"],
@@ -502,12 +531,12 @@ def _generic_hypotheses(query: str, decision_use: str) -> List[Dict[str, Any]]:
         _hypothesis(
             1,
             claim=f"{subject}是否存在真实需求和可验证市场空间，而不是概念热度",
-            must_prove=["市场规模", "需求增速", "付费/采购主体", "使用或订单案例"],
-            must_disprove=["需求不可持续", "只停留在试点", "缺少客户预算"],
+            must_prove=["市场规模", "需求增速", "明确使用主体", "可复核案例"],
+            must_disprove=["需求不可持续", "只停留在早期样本", "缺少预算或资源投入"],
             bundle=_bundle(
-                metric_terms=["市场规模", "增速", "渗透率", "活跃用户/客户", "订单"],
-                case_terms=["客户", "订单", "采购", "使用案例", "落地案例"],
-                counter_terms=["失败案例", "需求放缓", "预算收缩", "订单取消"],
+                metric_terms=["市场规模", "增速", "渗透率", "活跃用户", "使用规模"],
+                case_terms=["使用案例", "应用场景", "主体行动", "可复核样本"],
+                counter_terms=["失败案例", "需求放缓", "预算收缩", "项目取消"],
             ),
             decision_use=decision_use,
         ),
@@ -525,13 +554,13 @@ def _generic_hypotheses(query: str, decision_use: str) -> List[Dict[str, Any]]:
         ),
         _hypothesis(
             3,
-            claim=f"{subject}哪些环节已有商业化证据，哪些仍处于概念或试点",
-            must_prove=["商业化收入", "客户验证", "可复制交付", "复购/留存"],
-            must_disprove=["仅概念宣传", "试点未扩张", "收入未披露"],
+            claim=f"{subject}哪些环节已有实际进展，哪些仍处于概念或早期样本",
+            must_prove=["实际收入或使用结果", "主体验证", "可复制执行", "留存或持续使用"],
+            must_disprove=["仅概念宣传", "早期样本未扩张", "结果未披露"],
             bundle=_bundle(
-                metric_terms=["收入", "订单", "客户数量", "留存/复购", "交付成本"],
-                case_terms=["客户案例", "付费案例", "规模化交付", "复购", "合同"],
-                counter_terms=["试点停滞", "客户未采购", "商业化收入不足"],
+                metric_terms=["收入", "使用数量", "主体数量", "留存", "执行成本"],
+                case_terms=["使用案例", "持续使用案例", "可复制执行", "合同"],
+                counter_terms=["试点停滞", "使用不足", "收入披露不足"],
             ),
             decision_use=decision_use,
         ),
@@ -544,6 +573,68 @@ def _generic_hypotheses(query: str, decision_use: str) -> List[Dict[str, Any]]:
                 metric_terms=["成本", "供给", "效率", "合规成本", "研发投入"],
                 case_terms=["技术路线", "基础设施", "监管案例", "替代方案"],
                 counter_terms=["替代技术", "供给过剩", "监管风险", "需求不及预期"],
+            ),
+            decision_use=decision_use,
+        ),
+    ]
+
+
+def _academic_or_professional_field_hypotheses(query: str, decision_use: str) -> List[Dict[str, Any]]:
+    subject = _research_subject(query)
+    return [
+        _hypothesis(
+            1,
+            claim=f"{subject}的现实价值应从人才需求、岗位结构和组织财务治理需求验证，而不是套用产业赛道框架",
+            must_prove=["就业需求", "岗位招聘", "薪酬或就业质量", "用人单位需求", "人才培养规模"],
+            must_disprove=["岗位饱和", "基础岗位被自动化替代", "就业质量下降", "专业培养与岗位需求错配"],
+            bundle=_bundle(
+                metric_terms=["招生规模", "就业率", "岗位数量", "薪酬", "证书通过率"],
+                case_terms=["高校培养方案", "招聘岗位", "事务所岗位", "企业财务岗位", "职业案例"],
+                counter_terms=["岗位饱和", "低端岗位自动化替代", "就业质量下降", "技能错配"],
+                filing_terms=["教育部", "人社部", "财政部", "高校培养方案", "职业标准"],
+                expert_terms=["高校课程体系", "职业教育研究", "CPA协会", "会计人才报告", "就业质量报告"],
+            ),
+            decision_use=decision_use,
+        ),
+        _hypothesis(
+            2,
+            claim=f"{subject}的知识体系需要区分课程基础、专业能力、实务训练和证书要求",
+            must_prove=["课程体系", "能力要求", "职业标准", "证书要求", "实务技能"],
+            must_disprove=["课程与实务脱节", "证书价值下降", "基础能力被工具替代", "培养目标模糊"],
+            bundle=_bundle(
+                metric_terms=["课程学分", "专业建设点", "证书报考人数", "考试通过率", "实习实践比例"],
+                case_terms=["培养方案", "核心课程", "实训项目", "职业资格", "高校专业介绍"],
+                counter_terms=["课程同质化", "实务训练不足", "证书通过率下降", "岗位能力错配"],
+                filing_terms=["本科专业目录", "高校培养方案", "会计专业教学标准", "职业资格公告"],
+                expert_terms=["教育评估报告", "专业建设研究", "会计教育论文", "人才培养白皮书"],
+            ),
+            decision_use=decision_use,
+        ),
+        _hypothesis(
+            3,
+            claim=f"{subject}的职业路径正在被财务共享、数智化工具和AI改造",
+            must_prove=["财务共享", "会计信息化", "电子凭证", "AI财务", "数据分析能力"],
+            must_disprove=["基础核算岗位减少", "工具替代人工", "技能升级不足", "数字化投入不足"],
+            bundle=_bundle(
+                metric_terms=["财务共享中心数量", "电子凭证覆盖", "数字化岗位需求", "AI财务应用", "岗位技能要求"],
+                case_terms=["财务共享案例", "电子凭证试点", "数智财务岗位", "企业财务数字化", "AI会计工具"],
+                counter_terms=["基础岗位收缩", "自动化替代", "系统落地失败", "合规风险", "技能错配"],
+                filing_terms=["电子凭证政策", "财政部通知", "企业数字化案例", "行业协会报告"],
+                expert_terms=["数智财务研究", "会计信息化报告", "财务共享白皮书", "AI财务观察"],
+            ),
+            decision_use=decision_use,
+        ),
+        _hypothesis(
+            4,
+            claim=f"{subject}的风险边界来自监管变化、职业伦理、证书门槛和实践经验要求",
+            must_prove=["会计准则", "审计监管", "内控合规", "职业伦理", "证书门槛"],
+            must_disprove=["监管趋严导致责任上升", "伦理违规案例", "证书门槛提高", "实践经验不足"],
+            bundle=_bundle(
+                metric_terms=["监管处罚数量", "准则修订", "证书报考人数", "审计处罚", "内控缺陷"],
+                case_terms=["监管案例", "审计处罚", "职业伦理案例", "内控整改", "证书要求"],
+                counter_terms=["合规成本上升", "审计失败", "职业责任风险", "证书内卷", "经验门槛提高"],
+                filing_terms=["财政部", "证监会", "审计署", "会计准则", "监管处罚公告"],
+                expert_terms=["会计监管研究", "审计质量报告", "职业伦理研究", "内控合规报告"],
             ),
             decision_use=decision_use,
         ),
@@ -573,6 +664,9 @@ def run_problem_framing_agent(
     elif _looks_like_ai_industry(query):
         core_question = f"{research_object}的机会、焦虑来源和可兑现路径分别是什么，哪些判断能被公开证据支撑？"
         hypotheses = _ai_industry_hypotheses(query, decision_context)
+    elif _looks_like_academic_or_professional_field(query):
+        core_question = f"{research_object}应从学科知识体系、人才需求、职业路径和数字化/监管变化哪些维度展开，哪些判断能被公开数据和案例支撑？"
+        hypotheses = _academic_or_professional_field_hypotheses(query, decision_context)
     else:
         core_question = f"{research_object}当前是否具备可验证的市场机会，哪些判断能被证据证明？"
         hypotheses = _generic_hypotheses(query, decision_context)
@@ -581,6 +675,7 @@ def run_problem_framing_agent(
         "core_question": core_question,
         "research_object": research_object,
         "decision_context": decision_context,
+        "research_domain": "academic_or_professional_field" if _looks_like_academic_or_professional_field(query) else "general_market_research",
         "article_brief": brief,
         "planning_query": query,
         "article_direction": str(brief.get("direction") or ""),
@@ -615,6 +710,26 @@ SOURCE_PRIORITY_BY_ROLE = {
     "counter": ["风险", "下滑", "失败案例", "监管", "负面"],
     "filing": ["年报", "公告", "招股书", "投资者关系", "财报"],
     "source_check": ["官方", "原文", "政策文件", "协会", "白皮书"],
+}
+
+
+ACADEMIC_ROLE_SPECS = [
+    ("support", "支撑材料", ["official_data", "market_research"], "official_data"),
+    ("metric", "指标口径", ["official_data", "market_research"], "market_data"),
+    ("case", "案例/实践材料", ["market_research", "news_event", "official_data"], "case"),
+    ("counter", "反向证据", ["news_event", "market_research"], "counter"),
+    ("filing", "政策/标准/公告", ["official_data", "market_research"], "filing"),
+    ("source_check", "来源交叉验证", ["official_data", "market_research"], "source_check"),
+]
+
+
+ACADEMIC_SOURCE_PRIORITY_BY_ROLE = {
+    "support": ["官方", "教育部", "人社部", "财政部", "高校", "协会", "研究报告"],
+    "metric": ["统计", "就业数据", "招生数据", "证书数据", "高校", "协会"],
+    "case": ["培养方案", "招聘岗位", "职业案例", "高校案例", "监管案例"],
+    "counter": ["就业风险", "自动化替代", "岗位饱和", "技能错配", "监管风险"],
+    "filing": ["政策文件", "专业目录", "教学标准", "职业资格公告", "监管公告"],
+    "source_check": ["官方", "原文", "政策文件", "协会", "高校", "研究报告"],
 }
 
 
@@ -663,6 +778,9 @@ def _build_chapter_goal_task_packages(
     goals: List[Dict[str, Any]] = []
     tasks: List[Dict[str, Any]] = []
     topic_terms = _topic_anchor_terms(query)
+    academic_field = _looks_like_academic_or_professional_field(query)
+    role_specs = ACADEMIC_ROLE_SPECS if academic_field else ROLE_SPECS
+    source_priority_by_role = ACADEMIC_SOURCE_PRIORITY_BY_ROLE if academic_field else SOURCE_PRIORITY_BY_ROLE
     for index, hypothesis in enumerate(hypotheses[:8], start=1):
         hypothesis_id = str(hypothesis.get("hypothesis_id") or f"H{index}").strip()
         statement = _compact(hypothesis.get("statement") or hypothesis.get("claim_to_test") or query, 120)
@@ -671,7 +789,7 @@ def _build_chapter_goal_task_packages(
         counter_required = bool(hypothesis.get("counter_evidence_required", False))
         chapter_goals: List[Dict[str, Any]] = []
         chapter_tasks: List[Dict[str, Any]] = []
-        for role_index, (role, label, lane_targets, evidence_type) in enumerate(ROLE_SPECS, start=1):
+        for role_index, (role, label, lane_targets, evidence_type) in enumerate(role_specs, start=1):
             if role == "counter" and not (counter_required or hypothesis.get("must_disprove")):
                 continue
             terms = _terms_for_role(hypothesis, role)
@@ -688,7 +806,7 @@ def _build_chapter_goal_task_packages(
                 "expected_metrics": terms,
                 "must_have_terms": must_have_terms[:5],
                 "forbidden_terms": [],
-                "source_priority": SOURCE_PRIORITY_BY_ROLE.get(role, lane_targets),
+                "source_priority": source_priority_by_role.get(role, lane_targets),
                 "freshness": "recent",
                 "min_sources": 2 if proof_standard == "strong" else 1,
                 "evidence_type": evidence_type,
@@ -716,7 +834,7 @@ def _build_chapter_goal_task_packages(
                 "min_source_level": "A" if proof_standard == "strong" else "B",
                 "must_have_terms": must_have_terms,
                 "forbidden_terms": [],
-                "source_priority": SOURCE_PRIORITY_BY_ROLE.get(role, lane_targets),
+                "source_priority": source_priority_by_role.get(role, lane_targets),
                 "hypothesis_id": hypothesis_id,
                 "hypothesis_statement": statement,
                 "proof_standard": proof_standard,
@@ -803,6 +921,7 @@ def apply_problem_framing(plan: Dict[str, Any], framing: Dict[str, Any]) -> Dict
         "c_level_is_directional_signal": True,
         "single_evidence_cannot_be_claim": True,
         "reject_generic_industry_fallback": True,
+        "research_domain": framing.get("research_domain") or plan.get("research_domain"),
         "topic_anchor_terms": _as_list(framing.get("topic_anchor_terms")) or _topic_anchor_terms(str(plan.get("query") or "")),
     }
     return {
@@ -810,6 +929,7 @@ def apply_problem_framing(plan: Dict[str, Any], framing: Dict[str, Any]) -> Dict
         "core_question": framing.get("core_question") or plan.get("core_question") or plan.get("query"),
         "research_object": framing.get("research_object") or plan.get("research_object"),
         "decision_context": framing.get("decision_context") or plan.get("decision_context"),
+        "research_domain": framing.get("research_domain") or plan.get("research_domain"),
         "problem_framing": framing,
         "legacy_planner_chapters": legacy_chapters,
         "legacy_planner_dimensions": plan.get("dimensions") or [],

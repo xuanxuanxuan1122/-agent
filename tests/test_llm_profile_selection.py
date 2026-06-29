@@ -3,9 +3,15 @@ from __future__ import annotations
 import os
 import re
 from argparse import Namespace
+from pathlib import Path
 
-from rag_pipeline.flows.report.full_report import apply_llm_profile_to_environment, select_llm_profile
+from rag_pipeline.flows.report.full_report import (
+    apply_llm_profile_to_environment,
+    apply_selected_profile_to_task_model_routing,
+    select_llm_profile,
+)
 from rag_pipeline.config import search_config
+from rag_pipeline.agents import research_planner
 from rag_pipeline.agents.report_profile_registry import select_report_profile
 
 
@@ -100,6 +106,52 @@ def test_build_llm_config_for_task_routes_to_function_profile(monkeypatch):
     assert "fallback_config" not in final_audit
 
 
+def test_cli_llm_profile_can_override_quality_task_model_routing(monkeypatch):
+    _profile(
+        monkeypatch,
+        "qwen",
+        model="qwen3.6-plus",
+        url="https://dashscope.example/v1",
+        disable_thinking="true",
+    )
+    _profile(
+        monkeypatch,
+        "deepseek-v4-pro",
+        model="deepseek-v4-pro",
+        url="https://api.deepseek.example/chat/completions",
+        disable_thinking="false",
+    )
+    monkeypatch.setenv("RAG_MODEL_PLANNING_PROFILE", "deepseek-v4-pro")
+    monkeypatch.setenv("RAG_MODEL_BODY_REWRITE_PROFILE", "deepseek-v4-pro")
+    monkeypatch.setenv("RAG_MODEL_FINAL_AUDIT_PROFILE", "deepseek-v4-pro")
+    monkeypatch.setenv("READPAGE_FACT_EXTRACTOR_MODEL_PROFILE", "deepseek-v4-pro")
+
+    selected = select_llm_profile(Namespace(llm_profile="qwen", select_llm=False, no_interactive_input=True))
+    overrides = apply_selected_profile_to_task_model_routing(selected, force=True)
+
+    assert overrides["RAG_MODEL_PLANNING_PROFILE"] == "deepseek-v4-pro"
+    assert overrides["RAG_MODEL_BODY_REWRITE_PROFILE"] == "deepseek-v4-pro"
+    assert overrides["RAG_MODEL_FINAL_AUDIT_PROFILE"] == "deepseek-v4-pro"
+    assert overrides["READPAGE_FACT_EXTRACTOR_MODEL_PROFILE"] == "deepseek-v4-pro"
+    assert os.environ["RAG_MODEL_PLANNING_PROFILE"] == "qwen"
+    assert os.environ["RAG_MODEL_BODY_REWRITE_PROFILE"] == "qwen"
+    assert os.environ["RAG_MODEL_FINAL_AUDIT_PROFILE"] == "qwen"
+    assert os.environ["READPAGE_FACT_EXTRACTOR_MODEL_PROFILE"] == "qwen"
+
+
+def test_research_planner_llm_config_enforces_large_output_floor(monkeypatch):
+    monkeypatch.setenv("REPORT_PLANNING_MAX_OUTPUT_TOKENS", "8192")
+    monkeypatch.setattr(
+        research_planner,
+        "build_llm_config_for_task",
+        lambda task_name: {"model": "planner", "max_output_tokens": 4096},
+    )
+
+    config = research_planner._llm_config()
+
+    assert config["max_output_tokens"] == 8192
+
+
 def test_quality_tasks_respect_explicit_function_profile(monkeypatch):
     _profile(
         monkeypatch,
@@ -139,7 +191,6 @@ def test_build_llm_config_from_profile_handles_model_pool_names(monkeypatch):
         "qwen": "qwen3.6-plus",
         "deepseek-v4-pro": "deepseek-v4-pro",
         "deepseek-v4-flash": "deepseek-v4-flash",
-        "gemini-3.5-flash": "gemini-3.5-flash",
     }
     for profile, model in profiles.items():
         _profile(
@@ -155,6 +206,16 @@ def test_build_llm_config_from_profile_handles_model_pool_names(monkeypatch):
         assert config["provider"] == "openai_compatible"
         assert config["model"] == model
         assert config["url"] == f"https://{profile}.example/v1"
+
+
+def test_env_example_does_not_advertise_removed_model_profiles():
+    env_example = Path(__file__).resolve().parents[1] / ".env.example"
+    content = env_example.read_text(encoding="utf-8")
+    removed_profile_name = "ge" + "mini"
+    removed_profile_env_prefix = "RAG_LLM_PROFILE_" + "GE" + "MINI"
+
+    assert removed_profile_name not in content.lower()
+    assert removed_profile_env_prefix not in content
 
 
 def test_build_llm_config_for_task_falls_back_to_legacy_synthesis(monkeypatch):

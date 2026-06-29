@@ -113,6 +113,9 @@ def test_bridge_backfills_claim_section_requirements_via_fact_layer(tmp_path, mo
     # and lineage_edge_total must report the persisted graph (not the per-call delta).
     monkeypatch.setenv("ARTIFACT_LEDGER_PATH", str(tmp_path / "artifact_ledger.sqlite"))
     monkeypatch.setenv("ARTIFACT_OBJECT_ROOT", str(tmp_path / "objects"))
+    # The re-ingest assertion below checks the NOT EXISTS edge idempotency, not
+    # the content-hash skip; disable dedupe so the second ingest re-walks.
+    monkeypatch.setenv("ARTIFACT_LEDGER_DEDUPE_INGEST", "0")
     store = ArtifactStore()
     store.upsert_run(run_id="run-bf", query="AI Agent", status="running")
 
@@ -357,6 +360,10 @@ def test_bridge_recovers_section_claim_ids_from_fact_overlap(tmp_path, monkeypat
 def test_bridge_repeated_ingest_does_not_duplicate_lineage_edges(tmp_path, monkeypatch):
     monkeypatch.setenv("ARTIFACT_LEDGER_PATH", str(tmp_path / "artifact_ledger.sqlite"))
     monkeypatch.setenv("ARTIFACT_OBJECT_ROOT", str(tmp_path / "objects"))
+    # Exercise the underlying add_lineage_edge NOT EXISTS idempotency directly:
+    # disable the higher-level content-hash dedupe so the second ingest actually
+    # re-walks and the NOT EXISTS guard (not the skip) is what yields 0 new edges.
+    monkeypatch.setenv("ARTIFACT_LEDGER_DEDUPE_INGEST", "0")
     store = ArtifactStore()
     store.upsert_run(run_id="run-repeat", query="AI Agent", status="running")
 
@@ -400,6 +407,53 @@ def test_bridge_repeated_ingest_does_not_duplicate_lineage_edges(tmp_path, monke
     assert first_summary["lineage_edge_count"] == 1
     assert second_summary["lineage_edge_count"] == 0
     assert edge_count == 1
+
+
+def test_bridge_dedupe_guard_skips_unchanged_reingest(tmp_path, monkeypatch):
+    # Default (dedupe on): re-ingesting the IDENTICAL package is skipped entirely
+    # (no re-walk), but a changed package is processed.
+    monkeypatch.setenv("ARTIFACT_LEDGER_PATH", str(tmp_path / "artifact_ledger.sqlite"))
+    monkeypatch.setenv("ARTIFACT_OBJECT_ROOT", str(tmp_path / "objects"))
+    monkeypatch.delenv("ARTIFACT_LEDGER_DEDUPE_INGEST", raising=False)
+    store = ArtifactStore()
+    store.upsert_run(run_id="run-dedupe", query="AI Agent", status="running")
+
+    def package(fact_count):
+        return {
+            "evidence_package": {
+                "report_contract": {
+                    "evidence_requirements": {
+                        "requirements": [{"requirement_id": "H1_metric", "chapter_id": "ch_01", "proof_role": "metric"}]
+                    }
+                },
+                "analysis_ready_evidence": [
+                    {
+                        "evidence_id": f"EV-{i}",
+                        "requirement_id": "H1_metric",
+                        "source_id": f"SRC-{i}",
+                        "fact": f"Official metric number {i}.",
+                        "source_level": "A",
+                        "source": {"id": f"SRC-{i}", "url": f"https://example.com/{i}", "title": "Official"},
+                    }
+                    for i in range(fact_count)
+                ],
+            }
+        }
+
+    first = ingest_writer_package_artifacts(store, run_id="run-dedupe", writer_package=package(1), writer_report={})
+    assert not first.get("skipped_unchanged")
+    assert first["fact_card_count"] == 1
+
+    # identical content -> skipped, counts preserved from the prior real ingest
+    second = ingest_writer_package_artifacts(store, run_id="run-dedupe", writer_package=package(1), writer_report={})
+    assert second.get("skipped_unchanged") is True
+    assert second["fact_card_count"] == 1
+
+    # changed content -> NOT skipped, the new fact is walked
+    third = ingest_writer_package_artifacts(store, run_id="run-dedupe", writer_package=package(2), writer_report={})
+    assert not third.get("skipped_unchanged")
+    assert third["fact_card_count"] == 2
+    assert len(store.list_fact_cards("run-dedupe")) == 2
 
 
 def test_bridge_infers_live_research_plan_requirements_for_facts_and_gaps(tmp_path, monkeypatch):

@@ -10,6 +10,12 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from rag_pipeline.quality.regression import summarize_repair_effectiveness
 
+try:
+    from rag_pipeline.observability.stage_probe import readpage_stage_diagnostics, write_stage_probe_from_package
+except Exception:  # pragma: no cover - trace must remain optional during partial installs.
+    readpage_stage_diagnostics = None  # type: ignore[assignment]
+    write_stage_probe_from_package = None  # type: ignore[assignment]
+
 logger = logging.getLogger(__name__)
 
 VALID_STATUSES = {"ok", "warning", "error", "degraded", "skipped"}
@@ -522,19 +528,34 @@ def write_run_trace_from_package(
             diagnostics=quality,
         )
 
-    auto_readpage = _as_dict(raw_metadata.get("auto_readpage"))
-    if auto_readpage:
+    evidence_package = _as_dict(package.get("evidence_package")) or _as_dict(_as_dict(report.get("render_artifacts")).get("evidence_package"))
+    fact_diag = _fact_extractor_diag(package, report)
+    readpage_diag = (
+        readpage_stage_diagnostics(
+            metadata=raw_metadata,
+            raw_output=raw_output,
+            evidence_package=evidence_package,
+            writer_report=report,
+            fact_extractor_diag=fact_diag,
+        )
+        if readpage_stage_diagnostics
+        else _as_dict(raw_metadata.get("auto_readpage"))
+    )
+    if readpage_diag:
         context.emit(
             stage="readpage",
-            status="ok" if _safe_int(auto_readpage.get("failed")) == 0 else "warning",
-            input_count=auto_readpage.get("attempted"),
-            output_count=auto_readpage.get("succeeded"),
-            drop_count=auto_readpage.get("failed"),
-            sample_ids=_as_list(auto_readpage.get("urls")),
-            diagnostics={"errors": _as_list(auto_readpage.get("errors"))[:5], "enabled": auto_readpage.get("enabled")},
+            status="ok" if _safe_int(readpage_diag.get("failed")) == 0 else "warning",
+            input_count=readpage_diag.get("attempted"),
+            output_count=readpage_diag.get("succeeded"),
+            drop_count=readpage_diag.get("failed"),
+            sample_ids=_as_list(readpage_diag.get("urls")),
+            diagnostics={
+                "source": readpage_diag.get("source"),
+                "errors": _as_list(readpage_diag.get("errors"))[:5],
+                "enabled": readpage_diag.get("enabled"),
+            },
         )
 
-    fact_diag = _fact_extractor_diag(package, report)
     if fact_diag:
         context.emit(
             stage="fact_extractor",
@@ -550,7 +571,6 @@ def write_run_trace_from_package(
             diagnostics=fact_diag,
         )
 
-    evidence_package = _as_dict(package.get("evidence_package")) or _as_dict(_as_dict(report.get("render_artifacts")).get("evidence_package"))
     if evidence_package:
         raw_items = _as_list(evidence_package.get("raw_data_points")) or _as_list(evidence_package.get("raw_evidence"))
         analysis_ready = _as_list(evidence_package.get("analysis_ready_evidence"))
@@ -720,10 +740,43 @@ def write_run_trace_from_package(
     )
 
     context.write_summary(final_status=final_status or "completed")
+    stage_probe_result: Dict[str, Any] = {
+        "enabled": False,
+        "stage_probe_path": "",
+        "dataflow_summary_path": "",
+        "packet_count": 0,
+    }
+    if write_stage_probe_from_package is not None:
+        try:
+            stage_probe_result = write_stage_probe_from_package(
+                run_id=context.run_id,
+                output_dir=context.output_dir,
+                writer_package=package,
+                writer_report=report,
+                base_name=context.base_name,
+            )
+        except Exception as exc:  # pragma: no cover - observability must never block report generation.
+            logger.warning("Stage probe sidecar failed", extra={"error": str(exc), "run_id": context.run_id})
+            stage_probe_result = {
+                "enabled": False,
+                "stage_probe_path": "",
+                "dataflow_summary_path": "",
+                "packet_count": 0,
+                "error": str(exc),
+            }
     return {
         "enabled": True,
         "run_id": context.run_id,
         "trace_path": str(context.trace_path),
         "summary_path": str(context.summary_path),
         "event_count": len(context._events),
+        "stage_probe_enabled": bool(stage_probe_result.get("enabled")),
+        "stage_probe_path": str(stage_probe_result.get("stage_probe_path") or ""),
+        "dataflow_summary_path": str(stage_probe_result.get("dataflow_summary_path") or ""),
+        "stage_probe_packet_count": _safe_int(stage_probe_result.get("packet_count")),
+        "module_probe_enabled": bool(stage_probe_result.get("module_probe_enabled")),
+        "module_probe_path": str(stage_probe_result.get("module_probe_path") or ""),
+        "lineage_graph_path": str(stage_probe_result.get("lineage_graph_path") or ""),
+        "health_metrics_path": str(stage_probe_result.get("health_metrics_path") or ""),
+        "module_probe_event_count": _safe_int(stage_probe_result.get("module_probe_event_count")),
     }

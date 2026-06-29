@@ -86,6 +86,7 @@ def _new_diagnostics(*, enabled: Optional[bool] = None) -> Dict[str, Any]:
         "llm_called_count": 0,
         "rejected_reasons": {},
         "failure_reasons": {},
+        "failure_error_samples": [],
         "failed_chapter_ids": [],
         "model": "",
         "fallback_model_used_count": 0,
@@ -95,6 +96,34 @@ def _new_diagnostics(*, enabled: Optional[bool] = None) -> Dict[str, Any]:
 def _record_count(bucket: Dict[str, int], key: str) -> None:
     key = str(key or "unknown").strip() or "unknown"
     bucket[key] = int(bucket.get(key, 0)) + 1
+
+
+def _format_llm_error(config: Dict[str, Any], exc: Exception) -> str:
+    model = _text(config.get("model") or config.get("profile")) or "unknown_model"
+    message = _text(str(exc))
+    if message:
+        return f"{model}:{type(exc).__name__}:{message[:300]}"
+    return f"{model}:{type(exc).__name__}"
+
+
+def _append_failure_error_sample(
+    diagnostics: Dict[str, Any],
+    *,
+    chapter_id: str,
+    exc: Exception,
+) -> None:
+    samples = _as_list(diagnostics.get("failure_error_samples"))
+    if len(samples) >= 20:
+        return
+    message = _text(str(exc))
+    samples.append(
+        {
+            "chapter_id": chapter_id,
+            "error_type": type(exc).__name__,
+            "message": message[:500],
+        }
+    )
+    diagnostics["failure_error_samples"] = samples
 
 
 def _render_paragraph(section: Dict[str, Any]) -> str:
@@ -184,16 +213,10 @@ def _system_prompt() -> str:
         "改写成更连贯、专业、自然的章节叙事。只能使用输入 facts 和原段落中的事实。"
         "不得新增事实、数字、公司、来源或引用；不得提高 claim_strength；不得输出补证建议、"
         "QA、Clean、fatal、EV、URL 或内部诊断语言。每个 section 必须保留原 used_fact_refs "
-        "和 citation_refs。证据不足时保持短，不为了篇幅扩写或推断。返回 JSON："
+        "和 citation_refs。你可以在事实边界内展开机制、场景含义、产业影响和限制条件，"
+        "但不能把方向性信号写成强结论。返回 JSON："
         "{\"chapter_lead\":\"...\", \"sections\":[{\"section_id\":\"...\", "
         "\"paragraph\":\"...\", \"used_fact_refs\":[...], \"citation_refs\":[...]}]}。"
-    )
-    return (
-        "你是行研报告章节主笔。你的任务是把同一章内已经由确定性 composer 生成的段落，"
-        "改写成更连贯、专业、自然的章节叙事。只允许使用输入 facts 和原段落中的事实。"
-        "不得新增事实、数字、公司、来源或引用；不得提高 claim_strength；不得输出补证建议、QA、Clean、fatal、EV、URL 或内部诊断。"
-        "每个 section 必须保留原 used_fact_refs 和 citation_refs。"
-        "返回 JSON：{\"chapter_lead\":\"...\", \"sections\":[{\"section_id\":\"...\", \"paragraph\":\"...\", \"used_fact_refs\":[...], \"citation_refs\":[...]}]}。"
     )
 
 
@@ -467,7 +490,7 @@ def run_chapter_narrative(
                         used_fallback_model = attempt_index > 0
                         break
                     except Exception as exc:
-                        errors.append(f"{_text(attempt_config.get('model') or attempt_config.get('profile'))}:{type(exc).__name__}")
+                        errors.append(_format_llm_error(attempt_config, exc))
                         continue
                 if not payload:
                     raise RuntimeError(errors[-1] if errors else "llm_error")
@@ -516,8 +539,13 @@ def run_chapter_narrative(
             output.append(rewritten_chapter)
         except Exception as exc:
             diagnostics["fallback_count"] += 1
-            diagnostics["failed_chapter_ids"].append(_text(chapter.get("chapter_id")) or str(chapter_index + 1))
+            chapter_id = _text(chapter.get("chapter_id")) or str(chapter_index + 1)
+            diagnostics["failed_chapter_ids"].append(chapter_id)
             _record_count(diagnostics["failure_reasons"], f"llm_error:{type(exc).__name__}")
+            detail = _text(str(exc))
+            if detail:
+                _record_count(diagnostics["failure_reasons"], f"llm_error_detail:{detail[:180]}")
+            _append_failure_error_sample(diagnostics, chapter_id=chapter_id, exc=exc)
             output.append(dict(chapter))
         previous_takeaway = _text(_as_dict(chapter.get("chapter_summary")).get("key_takeaway"))
     diagnostics["status"] = "green" if diagnostics["success_count"] else ("yellow" if diagnostics["fallback_count"] else "skipped")

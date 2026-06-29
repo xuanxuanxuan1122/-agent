@@ -231,15 +231,199 @@ def _strict_quality_mode() -> bool:
     return str(raw or "").strip().lower() in {"1", "true", "yes", "on", "strict"}
 
 
+_READPAGE_CONTENT_PLATFORM_HINTS = (
+    "toutiao.com",
+    "sohu.com",
+    "baijiahao.baidu.com",
+    "csdn.net",
+    "blog.csdn.net",
+    "xueqiu.com",
+    "m.163.com",
+    "163.com",
+    "weibo.cn",
+    "weibo.com",
+    "qq.com",
+    "zhihu.com",
+    "bilibili.com",
+    "juejin.cn",
+    "wenku.baidu.com",
+    "docin.com",
+    "renrendoc.com",
+    "mparticle.uc.cn",
+)
+_READPAGE_MAINSTREAM_MEDIA_HINTS = (
+    "people.com.cn",
+    "xinhuanet.com",
+    "news.cn",
+    "chinanews.com.cn",
+    "cctv.com",
+    "stcn.com",
+    "cs.com.cn",
+    "cnstock.com",
+    "21jingji.com",
+    "yicai.com",
+    "caixin.com",
+    "thepaper.cn",
+    "finance.sina.com.cn",
+    "finance.sina.cn",
+    "t.cj.sina.cn",
+    "finance.china.com.cn",
+    "finance.eastmoney.com",
+    "jrj.com.cn",
+    "cfi.cn",
+    "36kr.com",
+    "10jqka.com.cn",
+)
+_READPAGE_INDUSTRY_RESEARCH_HINTS = (
+    "askci.com",
+    "qianzhan.com",
+    "chinairn.com",
+    "iyiou.com",
+    "analysys.cn",
+    "iresearch.cn",
+    "199it.com",
+    "leadleo.com",
+    "chinabaogao.com",
+    "pdf.dfcfw.com",
+)
+_READPAGE_FILING_HINTS = (
+    "sec.gov",
+    "cninfo.com.cn",
+    "sse.com.cn",
+    "szse.cn",
+    "hkexnews.hk",
+    "np-info.eastmoney.com",
+)
+_READPAGE_COMPANY_HINTS = (
+    "developer.aliyun.com",
+    "aliyun.com",
+    "huawei.com",
+    "tencent.com",
+    "baidu.com",
+    "microsoft.com",
+    "unitree.com",
+    "ubtrobot.com",
+    "agibot.com",
+    "galbot.com",
+)
+_READPAGE_TOPIC_TERMS = (
+    "ai",
+    "agent",
+    "robot",
+    "embodied",
+    "\u5177\u8eab",
+    "\u4eba\u5f62\u673a\u5668\u4eba",
+    "\u673a\u5668\u4eba",
+    "\u4eba\u5de5\u667a\u80fd",
+    "\u667a\u80fd\u4f53",
+)
+_READPAGE_FACT_TERMS = (
+    "market",
+    "scale",
+    "report",
+    "research",
+    "case",
+    "order",
+    "customer",
+    "roi",
+    "risk",
+    "cost",
+    "policy",
+    "filing",
+    "annual report",
+    "\u5e02\u573a\u89c4\u6a21",
+    "\u7814\u7a76\u62a5\u544a",
+    "\u767d\u76ae\u4e66",
+    "\u653f\u7b56",
+    "\u89c4\u5212",
+    "\u884c\u52a8\u65b9\u6848",
+    "\u573a\u666f",
+    "\u8ba2\u5355",
+    "\u7b7e\u7ea6",
+    "\u4ea4\u4ed8",
+    "\u843d\u5730",
+    "\u6848\u4f8b",
+    "\u5ba2\u6237",
+    "\u5546\u4e1a\u5316",
+    "\u6210\u672c",
+    "\u98ce\u9669",
+    "\u6295\u8d44\u56de\u62a5",
+    "\u878d\u8d44",
+    "\u4ea7\u4e1a\u94fe",
+)
+
+
 def _low_credibility_domain(domain: str) -> bool:
     text = str(domain or "").lower()
     return any(hint.lower() in text for hint in _LOW_CREDIBILITY_HINTS)
+
+
+def _domain_matches(domain: str, hints: Sequence[str]) -> bool:
+    text = str(domain or "").lower()
+    return any(hint and hint.lower() in text for hint in hints)
+
+
+def _readpage_source_bucket(domain: str) -> str:
+    text = str(domain or "").lower()
+    if text.endswith(".gov.cn") or "gov.cn" in text or text.endswith(".gov") or ".gov." in text:
+        return "official_gov"
+    if _domain_matches(text, _READPAGE_FILING_HINTS):
+        return "filing_or_ir"
+    if _domain_matches(text, _READPAGE_MAINSTREAM_MEDIA_HINTS):
+        return "mainstream_media"
+    if _domain_matches(text, _READPAGE_INDUSTRY_RESEARCH_HINTS):
+        return "industry_research"
+    if _domain_matches(text, _READPAGE_COMPANY_HINTS):
+        return "company_or_vendor"
+    if _domain_matches(text, _READPAGE_CONTENT_PLATFORM_HINTS):
+        return "content_platform"
+    return "other"
+
+
+def _contains_any_term(text: str, terms: Sequence[str]) -> bool:
+    lowered = str(text or "").lower()
+    return any(term and term.lower() in lowered for term in terms)
+
+
+def _readpage_lane_score(bucket: str, text: str, options: Dict[str, Any]) -> float:
+    search_task = _as_dict(options.get("search_task"))
+    lane_text = " ".join(
+        [
+            str(options.get("proof_role") or ""),
+            str(options.get("evidence_type") or ""),
+            " ".join(str(value or "") for value in _as_list(options.get("lane_targets"))),
+            " ".join(str(value or "") for value in _as_list(options.get("source_priority"))),
+            str(search_task.get("proof_role") or ""),
+            " ".join(str(value or "") for value in _as_list(search_task.get("lane_targets"))),
+            " ".join(str(value or "") for value in _as_list(search_task.get("source_priority"))),
+        ]
+    ).lower()
+    score = 0.0
+    if any(token in lane_text for token in ("official", "policy", "official_data", "\u653f\u7b56")) and bucket == "official_gov":
+        score += 0.35
+    if any(token in lane_text for token in ("market", "research", "report", "whitepaper", "market_research", "\u5e02\u573a", "\u7814\u62a5")) and bucket == "industry_research":
+        score += 0.35
+    if any(token in lane_text for token in ("risk", "counter", "news", "mainstream_media", "\u98ce\u9669", "\u53cd\u8bc1")) and bucket == "mainstream_media":
+        score += 0.30
+    if any(token in lane_text for token in ("case", "customer", "order", "customer_case", "\u6848\u4f8b", "\u8ba2\u5355")):
+        if bucket in {"mainstream_media", "company_or_vendor", "filing_or_ir"}:
+            score += 0.25
+        elif bucket == "content_platform":
+            score += 0.10
+    if _contains_any_term(text, _READPAGE_TOPIC_TERMS):
+        score += 0.22
+    fact_hits = sum(1 for term in _READPAGE_FACT_TERMS if term.lower() in text.lower())
+    score += min(0.42, fact_hits * 0.06)
+    if re.search(r"\d+(?:\.\d+)?\s*(?:%|亿元|万亿元|万元|万台|台|家|项|个|倍|年|亿美元|usd|million|billion)", text, re.I):
+        score += 0.18
+    return round(score, 4)
 
 
 def _authoritative_readpage_score(item: Dict[str, Any], search_options: Optional[Dict[str, Any]] = None) -> float:
     options = _as_dict(search_options)
     url = str(item.get("url") or item.get("link") or item.get("source_url") or "").strip()
     domain = _domain(url)
+    bucket = _readpage_source_bucket(domain)
     text = " ".join(
         [
             domain,
@@ -252,8 +436,20 @@ def _authoritative_readpage_score(item: Dict[str, Any], search_options: Optional
         ]
     ).lower()
     score = 0.20
-    if _low_credibility_domain(domain):
-        score -= 0.75
+    if bucket == "official_gov":
+        score += 1.25
+    elif bucket == "filing_or_ir":
+        score += 1.15
+    elif bucket == "mainstream_media":
+        score += 0.95
+    elif bucket == "industry_research":
+        score += 0.85
+    elif bucket == "company_or_vendor":
+        score += 0.45
+    elif bucket == "content_platform":
+        score -= 0.30
+    elif _low_credibility_domain(domain):
+        score -= 0.35
     if any(fragment in domain for fragment in _HIGH_CREDIBILITY_DOMAINS) or domain.endswith(".gov") or ".gov." in domain:
         score += 1.20
     if re.search(r"(sec\.gov|cninfo|sse\.com|szse|hkexnews|10-k|annual report|filing|公告|年报|财报|招股书|交易所)", text):
@@ -264,6 +460,7 @@ def _authoritative_readpage_score(item: Dict[str, Any], search_options: Optional
         score += 0.55
     if re.search(r"(product|docs|developer|patent|standard|技术|产品|专利|标准|文档)", text):
         score += 0.45
+    score += _readpage_lane_score(bucket, text, options)
     try:
         score += min(0.35, max(0.0, float(item.get("web_final_score") or item.get("rerank_score") or 0.0)) * 0.35)
     except (TypeError, ValueError):
@@ -321,11 +518,57 @@ def select_auto_readpage_urls(
         if score < min_score:
             low_quality.append((score, item))
             continue
-        bucket = low_quality if _low_credibility_domain(_domain(url)) else candidates
-        bucket.append((score, item))
-    for _, item in sorted(candidates, key=lambda pair: pair[0], reverse=True):
+        candidates.append((score, item))
+    traceable_candidates = [
+        pair
+        for pair in candidates
+        if _readpage_source_bucket(_domain(str((pair[1].get("url") or pair[1].get("link") or pair[1].get("source_url") or "")))) != "content_platform"
+    ]
+    clue_candidates = [
+        pair
+        for pair in candidates
+        if _readpage_source_bucket(_domain(str((pair[1].get("url") or pair[1].get("link") or pair[1].get("source_url") or "")))) == "content_platform"
+    ]
+    ranked_candidates = sorted(traceable_candidates, key=lambda pair: pair[0], reverse=True)
+    max_per_bucket = _env_int("IQS_AUTO_READPAGE_MAX_PER_SOURCE_BUCKET", 2, min_value=0, max_value=20)
+    bucket_counts: Dict[str, int] = {}
+
+    def add_scored_item(item: Dict[str, Any]) -> bool:
+        url = item.get("url") or item.get("link") or item.get("source_url")
+        bucket = _readpage_source_bucket(_domain(str(url or "")))
+        before = len(selected)
+        add(url)
+        if len(selected) > before:
+            bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
+            return True
+        return False
+
+    deferred_candidates: List[tuple[float, Dict[str, Any]]] = []
+    if max_per_bucket > 1:
+        for score, item in ranked_candidates:
+            url = item.get("url") or item.get("link") or item.get("source_url")
+            bucket = _readpage_source_bucket(_domain(str(url or "")))
+            if bucket_counts.get(bucket, 0) >= 1:
+                deferred_candidates.append((score, item))
+                continue
+            add_scored_item(item)
+        second_pass = deferred_candidates
+    else:
+        second_pass = ranked_candidates
+
+    overflow_candidates: List[tuple[float, Dict[str, Any]]] = []
+    for score, item in second_pass:
+        url = item.get("url") or item.get("link") or item.get("source_url")
+        bucket = _readpage_source_bucket(_domain(str(url or "")))
+        if max_per_bucket > 0 and bucket_counts.get(bucket, 0) >= max_per_bucket:
+            overflow_candidates.append((score, item))
+            continue
+        add_scored_item(item)
+    for _, item in overflow_candidates:
         add(item.get("url") or item.get("link") or item.get("source_url"))
-    if not selected and _env_flag("IQS_AUTO_READPAGE_ALLOW_LOW_QUALITY_FALLBACK", False):
+    for _, item in sorted(clue_candidates, key=lambda pair: pair[0], reverse=True):
+        add_scored_item(item)
+    if len(selected) < limit and _env_flag("IQS_AUTO_READPAGE_ALLOW_LOW_QUALITY_FALLBACK", True):
         for _, item in sorted(low_quality, key=lambda pair: pair[0], reverse=True):
             add(item.get("url") or item.get("link") or item.get("source_url"))
     return selected
@@ -784,6 +1027,25 @@ def _short_list(value: Any, *, limit: int = 8, item_chars: int = 80) -> List[str
     return result
 
 
+def _query_text_has_topic_anchor(text: Any, anchors: Sequence[Any]) -> bool:
+    query_key = re.sub(r"\s+", "", str(text or "").lower())
+    if not query_key:
+        return False
+    for anchor in anchors:
+        anchor_key = re.sub(r"\s+", "", str(anchor or "").lower())
+        if anchor_key and anchor_key in query_key:
+            return True
+    return False
+
+
+def _ensure_query_text_topic_anchor(text: Any, anchors: Sequence[Any], *, max_chars: int = 100) -> str:
+    cleaned = _clean_search_query(str(text or ""), max_chars=max_chars)
+    anchor_terms = _short_list(list(anchors or []), limit=4, item_chars=40)
+    if not anchor_terms or _query_text_has_topic_anchor(cleaned, anchor_terms):
+        return cleaned
+    return _clean_search_query(" ".join([*anchor_terms[:2], cleaned]).strip(), max_chars=max_chars)
+
+
 def _compact_query_rewrite_task(task: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "task_id": str(task.get("task_id") or task.get("id") or "").strip(),
@@ -805,6 +1067,8 @@ def _compact_query_rewrite_task(task: Dict[str, Any]) -> Dict[str, Any]:
         "must_have_terms": _short_list(task.get("must_have_terms"), limit=8, item_chars=60),
         "forbidden_terms": _short_list(task.get("forbidden_terms"), limit=8, item_chars=60),
         "source_priority": _short_list(task.get("source_priority"), limit=8, item_chars=80),
+        "topic_anchor_terms": _short_list(task.get("topic_anchor_terms"), limit=6, item_chars=40),
+        "topic_anchor_status": str(task.get("topic_anchor_status") or "").strip(),
     }
 
 
@@ -847,6 +1111,7 @@ def _query_rewrite_payload(
         compact_task["required_source_level"] = compact_task.get("required_source_level", [])[:3]
         compact_task["lane_targets"] = compact_task.get("lane_targets", [])[:3]
         compact_task["reject_if"] = compact_task.get("reject_if", [])[:5]
+        compact_task["topic_anchor_terms"] = compact_task.get("topic_anchor_terms", [])[:4]
         payload["search_task"] = compact_task
     payload["query"] = _compact_text(payload.get("query"), 160)
     return payload
@@ -862,6 +1127,8 @@ def _web_cache_allowed(search_options: Optional[Dict[str, Any]]) -> bool:
     if str(options.get("disable_cache") or "").strip().lower() in {"1", "true", "yes", "on"}:
         return False
     if str(options.get("cache_ttl_seconds") or "").strip() == "0":
+        return False
+    if not _env_flag("EVIDENCE_CACHE_READ_ENABLED", False):
         return False
     return _env_flag("IQS_AGENT_CACHE_ENABLED", True)
 
@@ -907,6 +1174,8 @@ def _iqs_search_cache_allowed(search_options: Optional[Dict[str, Any]]) -> bool:
     if str(options.get("disable_cache") or "").strip().lower() in {"1", "true", "yes", "on"}:
         return False
     if str(options.get("cache_ttl_seconds") or "").strip() == "0":
+        return False
+    if not _env_flag("EVIDENCE_CACHE_READ_ENABLED", False):
         return False
     return _env_flag("IQS_SEARCH_CACHE_ENABLED", True)
 
@@ -1150,12 +1419,13 @@ def build_task_query_plan(query: str, base_options: Dict[str, Any]) -> List[Dict
     required_fields = _compact_query_terms(_as_list(search_task.get("required_fields")), limit=8, max_chars=16)
     required_source_level = _compact_query_terms(_as_list(search_task.get("required_source_level") or search_task.get("min_source_level")), limit=4, max_chars=8)
     lane_targets = _compact_query_terms(_as_list(search_task.get("lane_targets")), limit=5, max_chars=18)
+    topic_anchor_terms = _compact_query_terms(_as_list(search_task.get("topic_anchor_terms")), limit=6, max_chars=18)
     query_enhancers = _compact_query_terms(
         [*_as_list(search_task.get("query_enhancers")), *_as_list(source_strategy.get("query_enhancers"))],
         limit=8,
         max_chars=18,
     )
-    base = task_query
+    base = _ensure_query_text_topic_anchor(task_query, topic_anchor_terms, max_chars=120)
     must = " ".join(must_terms[:2])
     field_terms = " ".join(required_fields[:5])
     lane_terms = " ".join(lane_targets[:3])
@@ -1226,6 +1496,8 @@ def build_task_query_plan(query: str, base_options: Dict[str, Any]) -> List[Dict
                 "must_have_terms": must_terms,
                 "forbidden_terms": forbidden_terms,
                 "source_priority": source_priority,
+                "topic_anchor_terms": topic_anchor_terms,
+                "topic_anchor_status": search_task.get("topic_anchor_status"),
                 "search_task": dict(search_task),
             }
         )
@@ -1337,7 +1609,8 @@ def build_llm_query_plan(
             "- Metric tasks should prioritize official statistics, industry reports, surveys, PDFs, and annual reports.\n"
             "- Filing/source_check tasks should prioritize annual reports, announcements, prospectuses, exchanges, and investor relations.\n"
             "- Counter tasks should search for failure, cost, unclear ROI, security, compliance, cancellation, and delay evidence.\n"
-            "- Output each item with requirement_id, gap_id, proof_role, required_fields, and source_priority when present."
+            "- Preserve topic_anchor_terms in every query; never drop the research object when rewriting.\n"
+            "- Output each item with requirement_id, gap_id, proof_role, required_fields, topic_anchor_terms, and source_priority when present."
         )
     try:
         budget["query_rewrite_call_count"] = int(budget.get("query_rewrite_call_count") or 0) + 1
@@ -1359,14 +1632,15 @@ def build_llm_query_plan(
     for raw in values:
         if not isinstance(raw, dict):
             continue
-        text = _clean_search_query(raw.get("text"), max_chars=100)
+        task = _as_dict(search_task or base_options.get("search_task"))
+        topic_anchor_terms = _short_list(raw.get("topic_anchor_terms") or task.get("topic_anchor_terms"), limit=6, item_chars=40)
+        text = _ensure_query_text_topic_anchor(raw.get("text"), topic_anchor_terms, max_chars=100)
         if not text:
             continue
         intent = str(raw.get("intent") or classify_query_intent(text)).strip()
         if intent not in {"数据型", "新闻型", "政策型", "分析型", "财报型"}:
             intent = _dynamic_intent_label(intent, text)
         routed_options = _route_options_for_intent(intent, base_options)
-        task = _as_dict(search_task or base_options.get("search_task"))
         source_strategy = source_strategy_for_role(task.get("proof_role"), overrides=_as_dict(task.get("source_strategy")))
         required_fields = _as_list(raw.get("required_fields")) or _as_list(task.get("required_fields"))
         required_source_level = _as_list(raw.get("required_source_level")) or _as_list(task.get("required_source_level") or task.get("min_source_level"))
@@ -1403,6 +1677,8 @@ def build_llm_query_plan(
                 "must_have_terms": _as_list(raw.get("must_have_terms")) or _as_list(task.get("must_have_terms")),
                 "forbidden_terms": _as_list(raw.get("forbidden_terms")) or _as_list(task.get("forbidden_terms")),
                 "source_priority": _as_list(raw.get("source_priority")) or _as_list(task.get("source_priority")),
+                "topic_anchor_terms": topic_anchor_terms,
+                "topic_anchor_status": raw.get("topic_anchor_status") or task.get("topic_anchor_status"),
                 "search_task": task,
             }
         )
@@ -2031,6 +2307,21 @@ def _topic_anchor_groups(task: Dict[str, Any], options: Optional[Dict[str, Any]]
         ]
     )
     groups: List[List[str]] = []
+    for term in _as_list(task.get("topic_anchor_terms")):
+        text = str(term or "").strip()
+        if not text:
+            continue
+        variants = [text]
+        if text.startswith("中国") and len(text) > 2:
+            variants.append(text[2:])
+        if text.startswith("国内") and len(text) > 2:
+            variants.append(text[2:])
+        group: List[str] = []
+        for variant in variants:
+            if variant and variant not in group:
+                group.append(variant)
+        if group:
+            groups.append(group)
     if re.search(r"\bAI\b|人工智能|大模型|生成式|AIGC", topic_text, re.I):
         groups.append(["人工智能", "ai", "aigc", "大模型", "生成式ai", "生成式人工智能"])
     if re.search(r"中国|国内", topic_text, re.I):

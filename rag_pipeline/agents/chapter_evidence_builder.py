@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from rag_pipeline.contracts.quality_gate_policy import advisory_weight_mode
+
 
 CORE_LIMIT = 6
 SUPPORT_LIMIT = 8
@@ -19,6 +21,14 @@ EVIDENCE_LAYER_KEYS = (
     "counter_evidence",
     "directional_evidence",
     "sample_evidence",
+)
+STALE_CHAPTER_EVIDENCE_KEYS = (
+    *EVIDENCE_LAYER_KEYS,
+    "table_evidence",
+    "clue_evidence",
+    "appendix_evidence",
+    "evidence_items",
+    "evidence_counts",
 )
 
 CHAPTER_MATCH_MIN_SCORE = 18
@@ -62,6 +72,57 @@ GENERIC_ENGLISH_CHAPTER_TERMS = {
     "that",
 }
 
+GENERIC_REPORT_TOPIC_TERMS = {
+    *GENERIC_CHAPTER_TERMS,
+    "中国",
+    "全球",
+    "国内",
+    "海外",
+    "行业",
+    "产业",
+    "市场",
+    "规模",
+    "需求",
+    "供给",
+    "发展",
+    "趋势",
+    "机会",
+    "风险",
+    "商业化",
+    "落地",
+    "现状",
+    "政策",
+    "报告",
+    "分析",
+    "研究",
+}
+
+REPORT_TOPIC_DOMAIN_SUFFIXES = (
+    "固态电池",
+    "半固态电池",
+    "全固态电池",
+    "低空经济",
+    "跨境电商",
+    "人工智能",
+    "智能体",
+    "供应链",
+    "半导体",
+    "机器人",
+    "新能源",
+    "大模型",
+    "电池",
+    "经济",
+    "芯片",
+    "光伏",
+    "储能",
+    "汽车",
+    "农机",
+    "医疗",
+    "养老",
+    "教育",
+    "算力",
+)
+
 
 BAD_FACT_PATTERNS = [
     r"^\s*-?\d{2,6}(?:\.\d+)?\s*(?:$|[;,\.\u3002\uff1b\uff0c])",
@@ -97,6 +158,23 @@ BAD_FACT_PATTERNS = [
 ]
 
 
+MIXED_SOURCE_OR_DIAGNOSTIC_FRAGMENT_RE = re.compile(
+    r"\[PDF\]|"
+    r"\u4e0a\u5e02\u516c\u53f8\s*\d{4}\s*\u5e74\s*\u5e74\u5ea6\u8d22\u52a1\u62a5\u544a|"
+    r"(?:\u6309\u671f\u62ab\u9732|\u4e3b\u677f|\u521b\u4e1a\u677f|\u79d1\u521b\u677f|\u5317\u4ea4\u6240|\u5ba1\u8ba1\u610f\u89c1).{0,120}\u5e74\u5ea6\u8d22\s*\u52a1\s*\u62a5\s*\u544a|"
+    r"\u5e74\u5ea6\u8d22\s*\u52a1\s*\u62a5\s*\u544a.{0,120}(?:\u6309\u671f\u62ab\u9732|\u4e3b\u677f|\u521b\u4e1a\u677f|\u79d1\u521b\u677f|\u5317\u4ea4\u6240|\u5ba1\u8ba1\u610f\u89c1)|"
+    r"\u4f1a\u8ba1\u76d1\u7ba1\u62a5\u544a|"
+    r"A\s*\u80a1\u5e02\u573a\u5171|"
+    r"\u4e3b\u677f.*\u521b\u4e1a\u677f.*\u79d1\u521b\u677f.*\u5317\u4ea4\u6240|"
+    r"\u975e\u6807\u51c6\u5ba1\u8ba1\u610f\u89c1|"
+    r"\u5185\u5bb9\u8bf4\u660e\s*[:\uff1a].{0,80}\u8be5\u6765\u6e90\u8865\u5145|"
+    r"\u53ef\u6838\u9a8c\u7f51\u9875\u7ebf\u7d22\u5982\u4e0b|"
+    r"\u6b63\u6587\u5224\u65ad\u5e94\u4ee5\u6765\u6e90\u8d28\u91cf|"
+    r"\u5173\u952e\u4f9d\u636e\s*[:\uff1a]",
+    re.I | re.S,
+)
+
+
 LOW_QUALITY_SOURCE_PATTERNS = [
     r"twitter\.com|x\.com|instagram\.com|facebook\.com",
     r"baike\.baidu\.com|baijiahao\.baidu\.com",
@@ -113,6 +191,17 @@ def _as_list(value: Any) -> List[Any]:
     if isinstance(value, dict) and isinstance(value.get("sample"), list):
         return list(value.get("sample") or [])
     return list(value) if isinstance(value, list) else []
+
+
+def _unique_texts(values: Iterable[Any]) -> List[str]:
+    result: List[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in seen:
+            seen.add(text)
+            result.append(text)
+    return result
 
 
 def _compact(value: Any, max_chars: int = 320) -> str:
@@ -140,6 +229,10 @@ def _bad_fact_text(text: str) -> bool:
     if not str(text or "").strip():
         return True
     return any(re.search(pattern, text, flags=re.I) for pattern in BAD_FACT_PATTERNS)
+
+
+def _mixed_source_or_diagnostic_fragment(text: str) -> bool:
+    return bool(MIXED_SOURCE_OR_DIAGNOSTIC_FRAGMENT_RE.search(str(text or "")))
 
 
 def _navigation_or_search_text(text: Any) -> bool:
@@ -217,7 +310,7 @@ def _distill_fact(item: Dict[str, Any], *, max_chars: int = 220) -> str:
     seen = set()
     for part in re.split(r"[。；;\n]+", fact):
         part = _compact(part.strip(), max_chars)
-        if not part or _bad_fact_text(part):
+        if not part or _bad_fact_text(part) or _mixed_source_or_diagnostic_fragment(part):
             continue
         if len(part) > 80 and re.search(r"登录|首页|上一篇|下一篇|分享到|Product|Solutions|Resources", part, flags=re.I):
             continue
@@ -248,6 +341,7 @@ _UNIT_DISPLAY_MAP = {
 _INTERNAL_METRIC_NAME_RE = re.compile(
     r"^(?:source_check|status|http_status|response_code|qualitative_fact|"
     r"technology_product|official_data|customer_case|filing|case|counter|support|metric|"
+    r"数据指标|定性事实|"
     r"事实|关键事实|竞争对比|政策目标|政策监管|技术产业链|数字数据|发展趋势|资本事件|数据点)$",
     re.I,
 )
@@ -541,6 +635,7 @@ def _public_fact_quality(item: Dict[str, Any]) -> Dict[str, Any]:
     url = _source_url(item)
     host = _source_host(url)
     traceable = _traceable(item)
+    advisory_mode = advisory_weight_mode()
     rejection: List[str] = []
     downgrade: List[str] = []
     if not distilled:
@@ -568,14 +663,21 @@ def _public_fact_quality(item: Dict[str, Any]) -> Dict[str, Any]:
         downgrade.append("source_identity_bad")
     if _low_quality_source(item):
         downgrade.append("low_quality_source")
-    if _topic_relevance(item) == "weak":
+    if _topic_relevance(item) == "weak" and not advisory_mode:
         rejection.append("weak_topic_relevance")
-    if level == "D":
+    elif _topic_relevance(item) == "weak" and advisory_mode:
+        downgrade.append("topic_relevance_to_be_weighted_by_model")
+    if level == "D" and not advisory_mode:
         rejection.append("source_level_d")
+    elif level == "D" and advisory_mode:
+        downgrade.append("source_level_advisory_only")
     if not traceable:
         rejection.append("not_traceable")
     if host and re.search(r"(?:twitter|x|instagram|facebook|baike|baijiahao|csdn|cnblogs|juejin)\.", host, flags=re.I):
-        rejection.append("blocked_host")
+        if advisory_mode:
+            downgrade.append("weak_host_advisory_only")
+        else:
+            rejection.append("blocked_host")
     fact_card = _public_fact_card(item, distilled) if not rejection else {}
     if fact_card and downgrade:
         if "invalid_metric" in downgrade or "no_subject_or_scope" in downgrade:
@@ -598,7 +700,7 @@ def _public_fact_quality(item: Dict[str, Any]) -> Dict[str, Any]:
     if not fact_card:
         rejection.append("fact_card_missing")
     eligible = not rejection and bool(fact_card)
-    eligible_for_citation = bool(eligible and traceable and level in {"A", "B", "C"})
+    eligible_for_citation = bool(eligible and traceable and (advisory_mode or level in {"A", "B", "C"}))
     return {
         "eligible_for_report": eligible,
         "eligible_for_citation": eligible_for_citation,
@@ -960,6 +1062,136 @@ def _chapter_terms(chapter: Dict[str, Any]) -> List[str]:
     return list(terms)
 
 
+def _add_report_topic_term(terms: set[str], value: Any) -> None:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        return
+    lowered = text.lower()
+    if lowered not in GENERIC_REPORT_TOPIC_TERMS and lowered not in GENERIC_ENGLISH_CHAPTER_TERMS:
+        if re.search(r"[a-z0-9\u4e00-\u9fff]", lowered, flags=re.I):
+            terms.add(lowered)
+    for token in re.findall(r"\bAI\s*Agent\b|[A-Za-z][A-Za-z0-9+.-]{2,}|[\u4e00-\u9fff]{2,}", text, flags=re.I):
+        token = token.strip().lower()
+        if token in GENERIC_REPORT_TOPIC_TERMS or token in GENERIC_ENGLISH_CHAPTER_TERMS:
+            continue
+        if len(token) <= 16:
+            terms.add(token)
+        if re.search(r"[\u4e00-\u9fff]", token):
+            for suffix in REPORT_TOPIC_DOMAIN_SUFFIXES:
+                if suffix in token:
+                    terms.add(suffix.lower())
+                    before = token.split(suffix, 1)[0]
+                    if before:
+                        scoped = f"{before[-4:]}{suffix}".lower()
+                        if scoped not in GENERIC_REPORT_TOPIC_TERMS:
+                            terms.add(scoped)
+                    if suffix == "低空经济":
+                        terms.add("低空")
+            for size in range(4, 9):
+                if len(token) < size:
+                    continue
+                for start in range(0, len(token) - size + 1):
+                    piece = token[start : start + size]
+                    if piece in GENERIC_REPORT_TOPIC_TERMS:
+                        continue
+                    if any(suffix in piece for suffix in REPORT_TOPIC_DOMAIN_SUFFIXES):
+                        terms.add(piece.lower())
+
+
+def _report_topic_terms(report_blueprint: Dict[str, Any], evidence_package: Dict[str, Any]) -> List[str]:
+    terms: set[str] = set()
+
+    def add_from_mapping(mapping: Dict[str, Any]) -> None:
+        for key in ("topic_anchor_terms", "report_topic_terms"):
+            for value in _as_list(mapping.get(key)):
+                _add_report_topic_term(terms, value)
+        for key in ("query", "research_object", "topic", "title", "report_title"):
+            _add_report_topic_term(terms, mapping.get(key))
+
+    add_from_mapping(_as_dict(report_blueprint))
+    add_from_mapping(_as_dict(evidence_package))
+    metadata = _as_dict(evidence_package.get("metadata"))
+    add_from_mapping(metadata)
+    for key in ("research_plan", "normalized_research_plan", "plan"):
+        add_from_mapping(_as_dict(evidence_package.get(key)))
+        add_from_mapping(_as_dict(metadata.get(key)))
+    return sorted(
+        terms,
+        key=lambda term: (0 if re.search(r"[\u4e00-\u9fff]", term) else 1, -len(term), term),
+    )[:40]
+
+
+def _report_topic_text(item: Dict[str, Any]) -> str:
+    source = _as_dict(item.get("source"))
+    return " ".join(
+        str(value or "")
+        for value in (
+            item.get("fact"),
+            item.get("distilled_fact"),
+            item.get("clean_fact"),
+            item.get("content"),
+            item.get("summary"),
+            item.get("title"),
+            item.get("source_title"),
+            item.get("metric"),
+            item.get("indicator"),
+            item.get("source_url"),
+            item.get("url"),
+            source.get("title"),
+            source.get("url"),
+        )
+    )
+
+
+def _report_topic_matches(item: Dict[str, Any], report_terms: Sequence[str]) -> List[str]:
+    if not report_terms:
+        return []
+    evidence_key = _text_key(_report_topic_text(item))
+    matches: List[str] = []
+    for term in report_terms:
+        if not _report_topic_term_can_anchor(term):
+            continue
+        term_key = _text_key(term)
+        if term_key and term_key in evidence_key:
+            matches.append(str(term))
+    return matches
+
+
+def _report_topic_term_can_anchor(term: Any) -> bool:
+    key = _text_key(term)
+    if not key:
+        return False
+    generic = {
+        "\u7ecf\u6d4e",
+        "\u653f\u7b56",
+        "\u5546\u4e1a\u5316",
+        "\u673a\u4f1a",
+        "\u98ce\u9669",
+        "\u5f71\u54cd",
+        "\u884c\u4e1a",
+        "\u4ea7\u4e1a",
+        "\u5e02\u573a",
+        "\u53d1\u5c55",
+        "\u7814\u7a76",
+        "\u5206\u6790",
+    }
+    if key in generic:
+        return False
+    if re.search(r"[\u4e00-\u9fff]", key):
+        return len(key) >= 3 or key in {"\u4f4e\u7a7a"}
+    return len(key) >= 4 or key in {"ai"}
+
+
+def _report_topic_relevance_rejection_reason(item: Dict[str, Any], report_terms: Sequence[str]) -> str:
+    if not report_terms or _report_topic_matches(item, report_terms):
+        return ""
+    if str(item.get("task_acceptance_reason") or "").strip() == "topic_anchor_missing":
+        return "report_topic_anchor_missing"
+    if str(item.get("semantic_status") or "").strip().lower() in {"weak_relevance", "off_topic", "rejected"}:
+        return "report_topic_anchor_missing"
+    return "report_topic_anchor_missing"
+
+
 def _with_binding(item: Dict[str, Any], *, reason: str, score: int, chapter_id: str) -> Dict[str, Any]:
     copied = dict(item)
     copied["binding_reason"] = reason
@@ -980,14 +1212,44 @@ def _chapter_identity(chapter: Dict[str, Any], index: int) -> Tuple[str, str, st
     return chapter_id, title, question
 
 
-def _diagnostic_payload(evidence_analysis_by_chapter: Dict[str, Any], chapter_id: str, title: str) -> Dict[str, Any]:
-    for key in (chapter_id, title):
+def _chapter_aliases(chapter: Dict[str, Any], chapter_id: str, title: str, question: str) -> List[str]:
+    aliases: List[str] = []
+    for value in (
+        chapter_id,
+        title,
+        question,
+        chapter.get("plan_chapter_id"),
+        chapter.get("source_plan_chapter_id"),
+        chapter.get("original_chapter_id"),
+    ):
+        text = str(value or "").strip()
+        if text and text not in aliases:
+            aliases.append(text)
+    for key in ("chapter_id_aliases", "source_plan_chapter_ids", "plan_chapter_ids", "source_chapter_ids"):
+        for value in _as_list(chapter.get(key)):
+            text = str(value or "").strip()
+            if text and text not in aliases:
+                aliases.append(text)
+    return aliases
+
+
+def _diagnostic_payload(
+    evidence_analysis_by_chapter: Dict[str, Any],
+    chapter_id: str,
+    title: str,
+    aliases: Sequence[str] = (),
+) -> Dict[str, Any]:
+    for key in _unique_texts([chapter_id, title, *list(aliases)]):
         payload = _as_dict(evidence_analysis_by_chapter.get(key))
         if payload:
             return payload
     title_key = _text_key(title)
+    alias_keys = [_text_key(alias) for alias in aliases if _text_key(alias)]
     for key, payload in evidence_analysis_by_chapter.items():
-        if title_key and (_text_key(key) in title_key or title_key in _text_key(key)):
+        key_text = _text_key(key)
+        if title_key and (key_text in title_key or title_key in key_text):
+            return _as_dict(payload)
+        if any(alias_key and (alias_key == key_text or alias_key in key_text or key_text in alias_key) for alias_key in alias_keys):
             return _as_dict(payload)
     return {}
 
@@ -999,10 +1261,18 @@ def _refs_from_diagnostics(payload: Dict[str, Any]) -> List[str]:
     return refs
 
 
-def _item_chapter_score(item: Dict[str, Any], chapter: Dict[str, Any], chapter_id: str, title: str, terms: Sequence[str]) -> int:
+def _item_chapter_score(
+    item: Dict[str, Any],
+    chapter: Dict[str, Any],
+    chapter_id: str,
+    title: str,
+    terms: Sequence[str],
+    aliases: Sequence[str] = (),
+) -> int:
     score = 0
     dim = str(item.get("chapter_id") or item.get("dimension") or item.get("hypothesis_id") or item.get("dimension_id") or "").strip()
-    if dim == chapter_id:
+    alias_set = {str(alias or "").strip() for alias in [chapter_id, *list(aliases)] if str(alias or "").strip()}
+    if dim in alias_set:
         score += 100
     dim_key = _text_key(dim)
     title_key = _text_key(title)
@@ -1067,15 +1337,36 @@ def _chapter_relevance_rejection_reason(item: Dict[str, Any], terms: Sequence[st
     return ""
 
 
-def _filter_chapter_relevant_items(items: Sequence[Dict[str, Any]], terms: Sequence[str]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def _filter_chapter_relevant_items(
+    items: Sequence[Dict[str, Any]],
+    terms: Sequence[str],
+    report_terms: Sequence[str],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     kept: List[Dict[str, Any]] = []
     rejected: List[Dict[str, Any]] = []
     for item in items:
-        reason = _chapter_relevance_rejection_reason(item, terms)
+        report_reason = _report_topic_relevance_rejection_reason(item, report_terms)
+        chapter_reason = _chapter_relevance_rejection_reason(item, terms)
+        reason = report_reason
+        if not reason and chapter_reason:
+            # If a fact clearly matches the report-level object, keep it as
+            # analysis material even when it does not match the current plan
+            # chapter's long wording. The later claim-first recomposer can move
+            # it to a better chapter; hard-dropping it here recreates the old
+            # "plan chapter fill-in" failure mode.
+            if _report_topic_matches(item, report_terms):
+                copied = dict(item)
+                copied["chapter_relevance_status"] = "weak_chapter_match"
+                copied["chapter_relevance_warning"] = chapter_reason
+                kept.append(copied)
+                continue
+            reason = chapter_reason
         if reason:
             copied = dict(item)
             copied["chapter_relevance_status"] = "rejected"
             copied["chapter_relevance_rejection_reason"] = reason
+            if reason == "report_topic_anchor_missing":
+                copied["report_topic_terms"] = list(report_terms)[:12]
             rejected.append(copied)
         else:
             kept.append(item)
@@ -1268,7 +1559,7 @@ def _existing_chapters(report_blueprint: Dict[str, Any], existing: Sequence[Dict
         if not isinstance(chapter, dict):
             continue
         chapter_id, title, question = _chapter_identity(chapter, index)
-        payload = existing_by_id.get(chapter_id, {})
+        payload = {**dict(chapter), **existing_by_id.get(chapter_id, {})}
         payload.update({"chapter_id": chapter_id, "chapter_title": title, "chapter_question": question})
         chapters.append(payload)
     if chapters:
@@ -1304,11 +1595,13 @@ def build_chapter_evidence_packages_from_evidence_package(
     chapters = _existing_chapters(_as_dict(report_blueprint), list(existing_chapter_evidence_packages or []))
     if not chapters:
         return []
+    report_terms = _report_topic_terms(_as_dict(report_blueprint), evidence_package)
     result: List[Dict[str, Any]] = []
     for index, chapter in enumerate(chapters, start=1):
         chapter = dict(chapter)
         chapter_id, title, question = _chapter_identity(chapter, index)
-        diagnostics = _diagnostic_payload(evidence_analysis_by_chapter, chapter_id, title)
+        chapter_aliases = _chapter_aliases(chapter, chapter_id, title, question)
+        diagnostics = _diagnostic_payload(evidence_analysis_by_chapter, chapter_id, title, aliases=chapter_aliases)
         resolved: List[Dict[str, Any]] = []
         unresolved_refs: List[str] = []
         for ref in _refs_from_diagnostics(diagnostics):
@@ -1321,7 +1614,7 @@ def build_chapter_evidence_packages_from_evidence_package(
         scored = [
             (score, _with_binding(item, reason=_binding_reason(score), score=score, chapter_id=chapter_id))
             for item in seeds
-            for score in [_item_chapter_score(item, chapter, chapter_id, title, terms)]
+            for score in [_item_chapter_score(item, chapter, chapter_id, title, terms, aliases=chapter_aliases)]
             if score >= CHAPTER_MATCH_MIN_SCORE
         ]
         scored.sort(key=lambda pair: pair[0], reverse=True)
@@ -1330,7 +1623,7 @@ def build_chapter_evidence_packages_from_evidence_package(
             for item in _items_from_existing_chapter(chapter, chapter_id, source_lookup)
         ]
         matched_before_relevance = _dedupe_items([*resolved, *existing_items, *[item for _, item in scored]])
-        matched, chapter_relevance_rejected = _filter_chapter_relevant_items(matched_before_relevance, terms)
+        matched, chapter_relevance_rejected = _filter_chapter_relevant_items(matched_before_relevance, terms, report_terms)
         layered = _layer_evidence(matched)
         chapter_analysis = _chapter_analysis_from_fact_cards(chapter, layered)
         hydrated_count = sum(len(layered.get(key, [])) for key in EVIDENCE_LAYER_KEYS)
@@ -1363,6 +1656,7 @@ def build_chapter_evidence_packages_from_evidence_package(
             "eligible_citation_count": eligible_citation_count,
             "binding_reasons": binding_reasons,
             "layer_counts": layer_counts,
+            "report_topic_terms": report_terms[:12],
         }
         metadata = _as_dict(chapter.get("metadata"))
         metadata["chapter_evidence_rebuilt"] = True
@@ -1378,6 +1672,8 @@ def build_chapter_evidence_packages_from_evidence_package(
         metadata["existing_chapter_evidence_count"] = len(existing_items)
         metadata["matched_evidence_count"] = len(matched)
         metadata["chapter_relevance_rejected_count"] = len(chapter_relevance_rejected)
+        metadata["report_topic_terms"] = report_terms[:12]
+        metadata["chapter_id_aliases"] = chapter_aliases
         metadata["chapter_relevance_rejected_refs"] = [
             str(item.get("evidence_id") or item.get("ref") or item.get("id") or _evidence_ref(item)).strip()
             for item in chapter_relevance_rejected
@@ -1396,12 +1692,15 @@ def build_chapter_evidence_packages_from_evidence_package(
         metadata["unresolved_evidence_refs"] = unresolved_refs
         metadata["evidence_binding_counts"] = layer_counts
         metadata["evidence_binding_funnel"] = binding_funnel
+        for stale_key in STALE_CHAPTER_EVIDENCE_KEYS:
+            chapter.pop(stale_key, None)
         chapter.update(layered)
         chapter.update(
             {
                 "chapter_id": chapter_id,
                 "chapter_title": title,
                 "chapter_question": question,
+                "chapter_id_aliases": chapter_aliases,
                 "metadata": metadata,
                 "unresolved_evidence_refs": unresolved_refs,
                 "hydrated_evidence": bool(hydrated_count),
@@ -1413,6 +1712,10 @@ def build_chapter_evidence_packages_from_evidence_package(
                 "counter_evidence_count": len(layered["counter_evidence"]),
                 "case_evidence_count": len(layered["case_evidence"]),
                 "directional_evidence_count": len(layered["directional_evidence"]),
+                "evidence_counts": {
+                    **{key: len(_as_list(layered.get(key))) for key in EVIDENCE_LAYER_KEYS},
+                    "evidence_items": hydrated_count,
+                },
                 "unresolved_evidence_ref_count": len(unresolved_refs),
                 "evidence_binding_funnel": binding_funnel,
                 "public_fact_filter_summary": chapter_public_filter_summary,

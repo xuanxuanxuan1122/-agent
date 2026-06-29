@@ -12,7 +12,17 @@ from urllib.parse import urlparse
 from ..config.search_config import build_llm_config_for_task, build_llm_config_from_profile
 from ..search.memory import call_openai_compatible_json, llm_config_is_ready, normalize_llm_config
 from rag_pipeline.contracts.public_text_guard import public_text_quality
+from rag_pipeline.contracts.quality_gate_policy import public_signal_mode
 from rag_pipeline.contracts.repair_dispatcher import rejected_span_repair_summary
+
+try:  # Observability must never make extraction unavailable.
+    from rag_pipeline.observability.probe_api import emit_transform as _probe_emit_transform
+    from rag_pipeline.observability.probe_context import current_probe_context_from_env as _current_probe_context_from_env
+    from rag_pipeline.observability.data_root_hygiene import inspect_source_hygiene as _inspect_source_hygiene
+except Exception:  # pragma: no cover - optional diagnostics only.
+    _probe_emit_transform = None
+    _current_probe_context_from_env = None
+    _inspect_source_hygiene = None
 
 
 SCHEMA_VERSION = "readpage_fact_card_v2"
@@ -37,7 +47,14 @@ INTERNAL_OR_CLAIM_PATTERNS = re.compile(
 
 NAVIGATION_PATTERNS = re.compile(
     r"(skip to (?:content|main content)|login|sign in|privacy policy|terms of use|cookie|subscribe|"
-    r"\u9996\u9875|\u767b\u5f55|\u6ce8\u518c|\u9690\u79c1|\u7248\u6743|\u4e0b\u8f7d|\u539f\u6587\u94fe\u63a5|\u76ee\u5f55)",
+    r"\u9996\u9875|\u767b\u5f55|\u6ce8\u518c|\u9690\u79c1|\u7248\u6743|\u4e0b\u8f7d|\u539f\u6587\u94fe\u63a5|\u76ee\u5f55|"
+    r"\u6570\u636e\u4e2d\u5fc3|\u5168\u7403\u8d22\u7ecf\u5feb\u8baf|\u8d22\u7ecf\u5feb\u8baf|"
+    r"\u884c\u60c5\u4e2d\u5fc3|Choice\s*\u6570\u636e|\u4e1c\u65b9\u8d22\u5bcc|\u81ea\u9009\u80a1|\u80a1\u5427)",
+    re.I,
+)
+MARKDOWN_LINK_CLUSTER_RE = re.compile(
+    r"(?:\[[^\]]{0,80}\]\((?:https?:)?//[^)]+|/[^)]+\).*){2,}"
+    r"|/newstatic/images/logo|(?:^|/|\\)logo\.(?:gif|png|jpg|jpeg|webp|svg)\b",
     re.I,
 )
 
@@ -56,6 +73,8 @@ ERROR_PAGE_PATTERNS = re.compile(
     r"|contact the site owner"
     r"|http error \d"
     r"|took too long to respond"
+    r"|your connection is not private"
+    r"|attackers might be trying to steal"
     r"|can['’]?t be reached"
     r"|verify (?:you are|you['’]?re) (?:a )?human"
     r"|checking your browser before"
@@ -181,6 +200,80 @@ def reset_budget(run_id: Optional[str] = None) -> None:
     _RUN_BUDGET_STATE.pop(key, None)
 
 
+def _emit_fact_extractor_probe(
+    result: Dict[str, Any],
+    *,
+    task: Dict[str, Any],
+    selected_page_count: int,
+    raw_page_count: Optional[int] = None,
+    page_results: Optional[Sequence[Dict[str, Any]]] = None,
+) -> None:
+    """Emit a diagnostic-only runtime probe for fact extraction.
+
+    This deliberately does not return or mutate pipeline data. The probe is a
+    sidecar health signal for tracing where evidence is lost.
+    """
+
+    if _probe_emit_transform is None or _current_probe_context_from_env is None:
+        return
+    try:
+        probe = _current_probe_context_from_env()
+        if probe is None:
+            return
+        fact_cards = [item for item in _as_list(result.get("fact_cards")) if isinstance(item, dict)]
+        requirement_filled = sum(1 for item in fact_cards if str(item.get("requirement_id") or "").strip())
+        source_filled = sum(1 for item in fact_cards if str(item.get("source_ref") or item.get("source_url") or "").strip())
+        search_task_id = str(task.get("task_id") or task.get("search_task_id") or "").strip()
+        status = str(result.get("status") or "")
+        source_hygiene = _inspect_source_hygiene(page_results or _as_list(result.get("source_pages") or result.get("page_results") or task.get("page_results"))) if _inspect_source_hygiene else {}
+        source_dirty_count = int(source_hygiene.get("dirty_item_count") or 0) if isinstance(source_hygiene, dict) else 0
+        source_reason_counts = dict(source_hygiene.get("reason_counts") or {}) if isinstance(source_hygiene, dict) else {}
+        _probe_emit_transform(
+            probe,
+            stage="fact_extractor",
+            module="readpage_fact_extractor_agent",
+            input_count=selected_page_count if raw_page_count is None else raw_page_count,
+            output_count=int(result.get("fact_card_count") or len(fact_cards)),
+            drop_count=int(result.get("rejected_span_count") or 0) + int(result.get("llm_error_count") or 0),
+            status="ok" if status in {"success", "partial_budget_exhausted"} else "warning",
+            reason_counts={
+                "rejected_span": int(result.get("rejected_span_count") or 0),
+                "invalid_metric": int(result.get("invalid_metric_count") or 0),
+                "llm_error": int(result.get("llm_error_count") or 0),
+                "budget_exhausted": 1 if result.get("budget_exhausted") else 0,
+                "fallback_used": 1 if result.get("fallback_used") else 0,
+                "no_readpage_text": 1 if status == "no_readpage_text" else 0,
+                "source_dirty_item": source_dirty_count,
+                **{f"source_{key}": value for key, value in source_reason_counts.items()},
+            },
+            id_coverage={
+                "requirement_id": (requirement_filled / len(fact_cards)) if fact_cards else (1.0 if str(task.get("requirement_id") or "").strip() else 0.0),
+                "search_task_id": 1.0 if search_task_id else 0.0,
+                "source_id": (source_filled / len(fact_cards)) if fact_cards else 0.0,
+            },
+            cache={"cache_hit_count": int(result.get("cache_hit_count") or 0)},
+            metrics={
+                "attempted": int(result.get("attempted") or 0),
+                "selected_page_count": max(0, int(selected_page_count or 0)),
+                "success_count": int(result.get("success_count") or 0),
+                "budget_used": int(result.get("budget_used") or 0),
+                "budget_limit": int(result.get("budget_limit") or 0),
+            },
+            diagnostics={
+                "requirement_id": task.get("requirement_id") or "",
+                "search_task_id": search_task_id,
+                "gap_id": task.get("gap_id") or "",
+                "proof_role": task.get("proof_role") or task.get("evidence_type") or "",
+                "fallback_used": bool(result.get("fallback_used")),
+                "budget_exhausted": bool(result.get("budget_exhausted")),
+                "status": status,
+                "source_root_hygiene": source_hygiene,
+            },
+        )
+    except Exception:
+        return
+
+
 def _evict_old_budget_keys() -> None:
     """Prune the in-memory budget map when too many run_ids have accumulated.
 
@@ -246,6 +339,40 @@ def _cache_key(page: Dict[str, Any], *, proof_role: str, query: str) -> str:
     return _hash_text(f"{SCHEMA_VERSION}|{url}|{text_hash}|{role}|{query_hash}")
 
 
+def _chunk_enabled() -> bool:
+    return _env_flag("READPAGE_FACT_EXTRACTOR_CHUNK_ENABLED", True)
+
+
+def _chunk_trigger_chars() -> int:
+    return _env_int("READPAGE_FACT_EXTRACTOR_CHUNK_TRIGGER_CHARS", 1800, min_value=500, max_value=30_000)
+
+
+def _chunk_max_chars() -> int:
+    return _env_int("READPAGE_FACT_EXTRACTOR_CHUNK_MAX_CHARS", 1800, min_value=500, max_value=12_000)
+
+
+def _chunk_max_fact_cards() -> int:
+    return _env_int("READPAGE_FACT_EXTRACTOR_CHUNK_MAX_FACT_CARDS", 3, min_value=1, max_value=12)
+
+
+def _chunk_max_fact_chars() -> int:
+    return _env_int("READPAGE_FACT_EXTRACTOR_CHUNK_MAX_FACT_CHARS", 220, min_value=80, max_value=600)
+
+
+def _max_chunks_per_page() -> int:
+    return _env_int("READPAGE_FACT_EXTRACTOR_MAX_CHUNKS_PER_PAGE", 3, min_value=1, max_value=12)
+
+
+def _chunk_cache_key(page: Dict[str, Any], chunk: Dict[str, Any], *, proof_role: str, query: str) -> str:
+    url = _source_url(page)
+    page_hash = _hash_text(_page_text(page))[:20]
+    chunk_hash = _hash_text(str(chunk.get("chunk_text") or ""))[:20]
+    role = re.sub(r"[^A-Za-z0-9_-]+", "_", str(proof_role or "unknown"))[:40]
+    query_hash = _hash_text(query)[:12]
+    chunk_index = str(chunk.get("chunk_index") or "")
+    return _hash_text(f"{SCHEMA_VERSION}|chunk|{url}|{page_hash}|{chunk_hash}|{chunk_index}|{role}|{query_hash}")
+
+
 def _load_cache(key: str) -> Optional[Dict[str, Any]]:
     if not _env_flag("READPAGE_FACT_EXTRACTOR_CACHE_ENABLED", True):
         return None
@@ -295,13 +422,16 @@ def _system_prompt() -> str:
         "claim_strength_hint. Metric cards must include metric, value, unit, period or time_or_scope, and source. "
         "If any search_task.required_fields cannot be filled from the current page text and source metadata, reject the span. "
         "Counter evidence cards must be allowed only as counter/risk evidence, not as support for positive strong claims. "
-        "Reject navigation, login, download notices, SEO text, search-result summaries, social/wiki/forum text, "
-        "HTTP error pages, marketing copy without traceable facts, and diagnostic phrases such as evidence is insufficient or suggest repair."
+        "Reject navigation, login, download notices, SEO text, search-result summaries, "
+        "HTTP error pages, marketing copy without traceable facts, and diagnostic phrases such as evidence is insufficient or suggest repair. "
+        "When a chunk object is supplied, return no more than chunk.max_fact_cards fact cards, keep each distilled_fact within chunk.max_fact_chars characters, "
+        "and prioritize complete metrics, orders/contracts, customer deployments, policy targets, and concrete risk constraints. "
+        "When public-signal mode is enabled, social/wiki/forum excerpts may be extracted only as traceable directional signals, not strong facts."
     )
 
 
 def _user_payload(*, query: str, page: Dict[str, Any], search_task: Dict[str, Any], max_chars: int) -> Dict[str, Any]:
-    return {
+    payload = {
         "schema_version": SCHEMA_VERSION,
         "query": query,
         "search_task": {
@@ -332,6 +462,17 @@ def _user_payload(*, query: str, page: Dict[str, Any], search_task: Dict[str, An
         },
         "page_text": _compact_text(_page_text(page), max_chars=max_chars),
     }
+    if page.get("_chunk_index") is not None:
+        payload["chunk"] = {
+            "chunk_index": page.get("_chunk_index"),
+            "chunk_heading": page.get("_chunk_heading") or "",
+            "chunk_text_chars": len(_page_text(page)),
+            "max_fact_cards": _chunk_max_fact_cards(),
+            "max_fact_chars": _chunk_max_fact_chars(),
+            "max_rejected_spans": 3,
+            "instruction": "extract facts only from this chunk; do not infer from omitted page sections",
+        }
+    return payload
 
 
 def _normalize_affinity(value: Any, fact_type: str, proof_role: str) -> List[str]:
@@ -365,13 +506,247 @@ def _looks_bad_text(text: str) -> bool:
         return True
     if STRUCTURAL_MARKUP_RE.search(value):
         return True
+    if MARKDOWN_LINK_CLUSTER_RE.search(value):
+        return True
     if INSTITUTIONAL_BOILERPLATE_RE.search(value):
         return True
-    if NAVIGATION_PATTERNS.search(value) and len(value) < 120:
+    if NAVIGATION_PATTERNS.search(value) and (len(value) < 260 or MARKDOWN_LINK_CLUSTER_RE.search(value)):
         return True
     if re.search(r"^\s*(?:https?://|www\.)", value, flags=re.I):
         return True
+    if re.search(r"^\s*[-*]?\s*\[[^\]]+\]\((?:https?:)?//[^)]+\)\s*$", value, flags=re.I):
+        return True
     return False
+
+
+FALLBACK_METRIC_SIGNAL_RE = re.compile(
+    r"\d+(?:,\d{3})*(?:\.\d+)?\s*(?:"
+    r"%|percent|percentage points?|"
+    r"billion yuan|million yuan|trillion yuan|billion usd|million usd|usd|"
+    r"\u4e07\u4ebf\u5143|\u4ebf\u5143|\u4e07\u5143|\u4ebf\u7f8e\u5143|\u4e07\u7f8e\u5143|"
+    r"\u4e07\u53f0|\u53f0|\u5bb6|\u8d77|\u4e2a"
+    r")",
+    re.I,
+)
+
+
+FALLBACK_TOPIC_SIGNAL_RE = re.compile(
+    r"market size|market scale|forecast|predict|growth|financing|deployment|policy|"
+    r"\u5e02\u573a\u89c4\u6a21|\u9884\u6d4b|\u540c\u6bd4|\u589e\u957f|\u878d\u8d44|"
+    r"\u653f\u7b56|\u884c\u52a8\u65b9\u6848|\u5e94\u7528\u573a\u666f|\u4ea7\u4e1a\u94fe|"
+    r"\u4e0a\u5e02\u4f01\u4e1a|\u4ea7\u503c|\u8ba2\u5355",
+    re.I,
+)
+
+
+FALLBACK_TABLE_OR_HEADER_RE = re.compile(
+    r"(?:\|[-:\s]{2,}\|)|"
+    r"(?:证券研究报告|行业研究[·・]|核心观点|优于大市|维持评级|证券分析师|"
+    r"投资评级|评级说明|分析师声明|免责声明)",
+    re.I,
+)
+
+
+def _looks_bad_fallback_candidate(text: str) -> bool:
+    value = str(text or "").strip()
+    if not value:
+        return True
+    pipe_count = value.count("|")
+    if pipe_count >= 4:
+        return True
+    if FALLBACK_TABLE_OR_HEADER_RE.search(value):
+        return True
+    if len(value) > 180 and pipe_count >= 2:
+        return True
+    compact = re.sub(r"\s+", "", value)
+    if compact and compact.count("?") >= max(6, len(compact) // 4):
+        return True
+    return False
+
+
+def _fallback_candidate_score(text: str, *, proof_role: str, position: int) -> int:
+    score = 0
+    if FALLBACK_METRIC_SIGNAL_RE.search(text):
+        score += 8
+    if FALLBACK_TOPIC_SIGNAL_RE.search(text):
+        score += 4
+    if str(proof_role or "").strip().lower() == "metric" and FALLBACK_METRIC_SIGNAL_RE.search(text):
+        score += 4
+    if re.search(r"(?:19|20)\d{2}", text):
+        score += 2
+    length = len(text)
+    if 50 <= length <= 260:
+        score += 2
+    if re.search(r"!\[[^\]]*\]\(|\[[^\]]+\]\(https?://|https?://", text, flags=re.I):
+        score -= 6
+    if _looks_bad_fallback_candidate(text):
+        score -= 20
+    if NAVIGATION_PATTERNS.search(text):
+        score -= 4
+    if MARKDOWN_LINK_CLUSTER_RE.search(text):
+        score -= 20
+    return score - min(position, 20)
+
+
+def _fallback_candidate_sentences(text: str, *, proof_role: str) -> List[str]:
+    candidates = re.split(r"(?<=[。！？!?])\s*|(?<=[銆傦紒锛?!?])\s+|\n+", text)
+    scored: List[tuple[int, int, str]] = []
+    for position, sentence in enumerate(candidates):
+        cleaned = _compact_text(sentence, max_chars=220)
+        if _looks_bad_fallback_candidate(cleaned):
+            continue
+        if _looks_bad_text(cleaned):
+            continue
+        if public_text_quality(cleaned).get("severity") == "reject":
+            continue
+        scored.append((_fallback_candidate_score(cleaned, proof_role=proof_role, position=position), position, cleaned))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [item[2] for item in scored]
+
+
+_CHUNK_HEADING_RE = re.compile(r"^\s*(?:#{1,6}\s+.+|\*\*[^*\n]{2,120}\*\*)\s*$")
+
+
+def _clean_chunk_heading(value: str) -> str:
+    heading = re.sub(r"^\s*#{1,6}\s*", "", str(value or "")).strip()
+    heading = re.sub(r"^\*\*|\*\*$", "", heading).strip()
+    return _compact_text(heading, max_chars=120)
+
+
+def _flush_chunk(chunks: List[Dict[str, Any]], *, lines: List[str], heading: str, position: int, proof_role: str) -> None:
+    text = _compact_text("\n".join(line for line in lines if str(line or "").strip()), max_chars=_chunk_max_chars())
+    if not text or _looks_bad_text(text):
+        return
+    score = _fallback_candidate_score(text, proof_role=proof_role, position=position)
+    if heading and re.search(r"(market|size|scale|metric|data|revenue|growth|case|risk|policy|trend|规模|市场|数据|增速|案例|风险|政策|趋势)", heading, flags=re.I):
+        score += 5
+    chunks.append(
+        {
+            "chunk_index": 0,
+            "chunk_heading": heading,
+            "chunk_text": text,
+            "chunk_score": score,
+            "source_position": position,
+        }
+    )
+
+
+def _split_page_into_chunks(page: Dict[str, Any], *, proof_role: str) -> List[Dict[str, Any]]:
+    text = _page_text(page)
+    if not text:
+        return []
+    max_chars = _chunk_max_chars()
+    chunks: List[Dict[str, Any]] = []
+    buffer: List[str] = []
+    heading = ""
+    position = 0
+    for raw_line in text.splitlines():
+        line = str(raw_line or "").strip()
+        if not line:
+            continue
+        is_heading = bool(_CHUNK_HEADING_RE.match(line))
+        if is_heading and buffer:
+            _flush_chunk(chunks, lines=buffer, heading=heading, position=position, proof_role=proof_role)
+            position += 1
+            buffer = []
+        if is_heading:
+            heading = _clean_chunk_heading(line)
+            buffer.append(line)
+        else:
+            buffer.append(line)
+        if len("\n".join(buffer)) >= max_chars:
+            _flush_chunk(chunks, lines=buffer, heading=heading, position=position, proof_role=proof_role)
+            position += 1
+            buffer = []
+    if buffer:
+        _flush_chunk(chunks, lines=buffer, heading=heading, position=position, proof_role=proof_role)
+    if not chunks:
+        compact = _compact_text(text, max_chars=max_chars)
+        if compact and not _looks_bad_text(compact):
+            chunks.append(
+                {
+                    "chunk_index": 0,
+                    "chunk_heading": str(page.get("title") or ""),
+                    "chunk_text": compact,
+                    "chunk_score": _fallback_candidate_score(compact, proof_role=proof_role, position=0),
+                    "source_position": 0,
+                }
+            )
+    chunks.sort(key=lambda item: (-int(item.get("chunk_score") or 0), int(item.get("source_position") or 0)))
+    selected = chunks[: _max_chunks_per_page()]
+    for index, chunk in enumerate(selected, start=1):
+        chunk["chunk_index"] = index
+    return selected
+
+
+def _chunk_page_for_llm(page: Dict[str, Any], chunk: Dict[str, Any]) -> Dict[str, Any]:
+    chunk_page = dict(page)
+    chunk_page["content"] = str(chunk.get("chunk_text") or "")
+    chunk_page["mainText"] = str(chunk.get("chunk_text") or "")
+    chunk_page["_chunk_index"] = chunk.get("chunk_index")
+    chunk_page["_chunk_heading"] = chunk.get("chunk_heading") or ""
+    return chunk_page
+
+
+def _apply_chunk_metadata(payload: Dict[str, Any], chunk: Dict[str, Any]) -> Dict[str, Any]:
+    chunk_index = int(chunk.get("chunk_index") or 0)
+    chunk_heading = str(chunk.get("chunk_heading") or "")
+    chunk_text = str(chunk.get("chunk_text") or "")
+    cards = [item for item in _as_list(payload.get("fact_cards")) if isinstance(item, dict)][:_chunk_max_fact_cards()]
+    payload["fact_cards"] = cards
+    for card in cards:
+        card["chunk_index"] = chunk_index
+        card["chunk_heading"] = chunk_heading
+        card["extraction_mode"] = "chunk_llm"
+        span = _compact_text(
+            card.get("distilled_fact") or card.get("fact") or card.get("action_or_signal") or chunk_text,
+            max_chars=_chunk_max_fact_chars(),
+        )
+        card["chunk_evidence_span"] = span
+        evidence_id = str(card.get("evidence_id") or "").strip()
+        if evidence_id and not re.search(r"-C\d{2}$", evidence_id):
+            card["evidence_id"] = f"{evidence_id}-C{chunk_index:02d}"
+            card["ref"] = card["evidence_id"]
+        public_card = _as_dict(card.get("public_fact_card"))
+        if public_card:
+            public_card.update(
+                {
+                    "chunk_index": chunk_index,
+                    "chunk_heading": chunk_heading,
+                    "chunk_evidence_span": span,
+                    "extraction_mode": "chunk_llm",
+                }
+            )
+            if card.get("evidence_id"):
+                public_card["evidence_id"] = card.get("evidence_id")
+                public_card["ref"] = card.get("ref")
+            card["public_fact_card"] = public_card
+        quality = _as_dict(card.get("public_fact_quality"))
+        if isinstance(quality.get("public_fact_card"), dict):
+            quality["public_fact_card"] = copy.deepcopy(public_card or card)
+            card["public_fact_quality"] = quality
+    return payload
+
+
+def _dedupe_fact_cards(cards: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen: set[str] = set()
+    deduped: List[Dict[str, Any]] = []
+    for card in cards:
+        key = _hash_text(
+            "|".join(
+                [
+                    str(card.get("source_url") or card.get("source_ref") or ""),
+                    str(card.get("distilled_fact") or card.get("fact") or ""),
+                    str(card.get("value") or ""),
+                    str(card.get("period") or card.get("time_or_scope") or ""),
+                ]
+            ).lower()
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(card)
+    return deduped
 
 
 def _metric_missing_fields(card: Dict[str, Any], required_fields: Optional[Sequence[Any]] = None) -> List[str]:
@@ -589,7 +964,7 @@ def _validated_card(
         rejected.append(_rejection("missing_source_ref", card))
     if card_source_url:
         host = urlparse(card_source_url).netloc.lower()
-        if LOW_QUALITY_HOST_RE.search(host):
+        if LOW_QUALITY_HOST_RE.search(host) and not public_signal_mode():
             rejected.append(_rejection("low_quality_source", card))
         if re.search(r"example\.(?:com|gov|org)", card_source_url, flags=re.I):
             rejected.append(_rejection("fake_or_placeholder_source", card))
@@ -605,7 +980,16 @@ def _validated_card(
             rejected.append({**_rejection("metric_missing_scope_or_period", card), "missing_fields": missing})
     required_source_levels = {str(item or "").strip().upper() for item in _as_list(task.get("required_source_level") or task.get("min_source_level")) if str(item or "").strip()}
     if required_source_levels and card["source_level"] not in required_source_levels:
-        rejected.append({**_rejection("source_level_below_required", card), "required_source_level": sorted(required_source_levels)})
+        card["source_level_gap"] = {
+            "required": sorted(required_source_levels),
+            "actual": card["source_level"],
+        }
+        card["claim_strength_hint"] = "directional"
+        card["allowed_use"] = "directional_signal"
+        card["evidence_use_level"] = "directional_signal"
+        card["limitation_boundary"] = _as_list(card.get("limitation_boundary")) + [
+            "来源等级低于任务偏好，只能作为方向性信号，不能单独支撑强结论。"
+        ]
     if card.get("source_title_url_mismatch_suspected"):
         rejected.append(_rejection("source_mismatch", card))
 
@@ -703,6 +1087,16 @@ def _cacheable_extractor_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _store_fallback_cache_if_useful(key: str, payload: Dict[str, Any]) -> None:
+    if not _env_flag("READPAGE_FACT_EXTRACTOR_CACHE_FALLBACK_ENABLED", True):
+        return
+    if not _as_list(payload.get("fact_cards")):
+        return
+    cache_payload = _cacheable_extractor_payload(payload)
+    cache_payload["cache_origin"] = "fallback_fact_extractor"
+    _store_cache(key, cache_payload)
+
+
 def validate_extracted_fact_payload(
     payload: Dict[str, Any],
     *,
@@ -744,6 +1138,92 @@ def validate_extracted_fact_payload(
     }
 
 
+def _extract_fact_cards_from_chunks(
+    *,
+    config: Dict[str, Any],
+    query: str,
+    page: Dict[str, Any],
+    search_task: Dict[str, Any],
+    proof_role: str,
+    max_chars: int,
+    result: Dict[str, Any],
+    trigger_reason: str,
+) -> Dict[str, Any]:
+    chunks = _split_page_into_chunks(page, proof_role=proof_role)
+    if not chunks:
+        return {"fact_cards": [], "rejected_spans": [], "invalid_metric_count": 0}
+    result["chunk_mode_used"] = True
+    result["chunk_trigger_reason"] = str(result.get("chunk_trigger_reason") or trigger_reason)
+    result["chunk_count"] += len(chunks)
+    collected_cards: List[Dict[str, Any]] = []
+    collected_rejected: List[Dict[str, Any]] = []
+    invalid_metric_count = 0
+    for chunk in chunks:
+        result["chunk_attempted"] += 1
+        chunk_page = _chunk_page_for_llm(page, chunk)
+        chunk_key = _chunk_cache_key(page, chunk, proof_role=proof_role, query=query)
+        cached = _load_cache(chunk_key)
+        if cached:
+            result["chunk_cache_hit_count"] += 1
+            validated = validate_extracted_fact_payload(
+                _as_dict(cached),
+                source_url=_source_url(page),
+                source_ref=_source_ref(page),
+                source_level=_source_level(page),
+                verification_status=_verification_status(page),
+                proof_role=proof_role,
+                chapter_id=str(search_task.get("chapter_id") or search_task.get("dimension_id") or ""),
+                search_task=search_task,
+            )
+            validated = _apply_chunk_metadata(validated, chunk)
+        else:
+            consumed_budget, budget_exhausted = _try_consume_budget()
+            if not consumed_budget:
+                result["budget_exhausted"] = bool(budget_exhausted)
+                break
+            try:
+                response = call_openai_compatible_json(
+                    config=config,
+                    system_prompt=_system_prompt(),
+                    user_payload=_user_payload(
+                        query=query,
+                        page=chunk_page,
+                        search_task=search_task,
+                        max_chars=min(max_chars, _chunk_max_chars()),
+                    ),
+                )
+                payload = _as_dict(response.get("payload"))
+                validated = validate_extracted_fact_payload(
+                    payload,
+                    source_url=_source_url(page),
+                    source_ref=_source_ref(page),
+                    source_level=_source_level(page),
+                    verification_status=_verification_status(page),
+                    proof_role=proof_role,
+                    chapter_id=str(search_task.get("chapter_id") or search_task.get("dimension_id") or ""),
+                    search_task=search_task,
+                )
+                validated = _apply_chunk_metadata(validated, chunk)
+                _store_cache(chunk_key, _cacheable_extractor_payload(validated))
+            except Exception as exc:
+                result["llm_error_count"] += 1
+                result["errors"].append(str(exc))
+                continue
+        cards = [item for item in _as_list(validated.get("fact_cards")) if isinstance(item, dict)]
+        rejected = [item for item in _as_list(validated.get("rejected_spans")) if isinstance(item, dict)]
+        if cards:
+            result["chunk_success_count"] += 1
+            result["chunk_fact_card_count"] += len(cards)
+            collected_cards.extend(cards)
+        collected_rejected.extend(rejected)
+        invalid_metric_count += int(validated.get("invalid_metric_count") or 0)
+    return {
+        "fact_cards": _dedupe_fact_cards(collected_cards),
+        "rejected_spans": collected_rejected,
+        "invalid_metric_count": invalid_metric_count,
+    }
+
+
 def _fallback_subject_from_sentence(sentence: str) -> str:
     value = _compact_text(sentence, max_chars=80)
     value = re.sub(r"^[#\s]+", "", value)
@@ -763,12 +1243,8 @@ def _fallback_fact_cards_from_page(page: Dict[str, Any], *, search_task: Dict[st
     text = _page_text(page)
     source_url = _source_url(page)
     source_ref = _source_ref(page)
-    candidates = re.split(r"(?<=[。！？.!?])\s+|\n+", text)
     payload_cards: List[Dict[str, Any]] = []
-    for sentence in candidates:
-        cleaned = _compact_text(sentence, max_chars=220)
-        if _looks_bad_text(cleaned):
-            continue
+    for cleaned in _fallback_candidate_sentences(text, proof_role=proof_role):
         subject = _fallback_subject_from_sentence(cleaned)
         payload_cards.append(
             {
@@ -791,6 +1267,56 @@ def _fallback_fact_cards_from_page(page: Dict[str, Any], *, search_task: Dict[st
             break
     return validate_extracted_fact_payload(
         {"fact_cards": payload_cards},
+        source_url=source_url,
+        source_ref=source_ref,
+        source_level=_source_level(page),
+        verification_status=_verification_status(page),
+        proof_role=proof_role,
+        chapter_id=str(search_task.get("chapter_id") or search_task.get("dimension_id") or ""),
+        search_task=search_task,
+    )
+
+
+def _zero_valid_fallback_fact_cards_from_page(page: Dict[str, Any], *, search_task: Dict[str, Any], proof_role: str) -> Dict[str, Any]:
+    fallback = _fallback_fact_cards_from_page(page, search_task=search_task, proof_role=proof_role)
+    if _as_list(fallback.get("fact_cards")):
+        return fallback
+    text = _page_text(page)
+    source_url = _source_url(page)
+    source_ref = _source_ref(page)
+    sentence = ""
+    for candidate in re.split(r"(?<=[。！？!?])\s*|\n+", text):
+        cleaned = _compact_text(candidate, max_chars=260)
+        if (
+            cleaned
+            and not _looks_bad_fallback_candidate(cleaned)
+            and not _looks_bad_text(cleaned)
+            and public_text_quality(cleaned).get("severity") != "reject"
+        ):
+            sentence = cleaned
+            break
+    if not sentence:
+        sentence = _compact_text(text, max_chars=260)
+    if not sentence or _looks_bad_fallback_candidate(sentence) or _looks_bad_text(sentence):
+        return fallback
+    raw_card = {
+        "subject": _fallback_subject_from_sentence(sentence) or str(page.get("title") or proof_role or "source fact")[:80],
+        "action_or_signal": sentence,
+        "variable": str(proof_role or "case"),
+        "time_or_scope": "",
+        "distilled_fact": sentence,
+        "fact_type": str(proof_role or "case"),
+        "source_url": source_url,
+        "source_ref": source_ref,
+        "source_level": _source_level(page),
+        "source_verification_status": _verification_status(page),
+        "proof_role": proof_role,
+        "block_affinity": _normalize_affinity([], proof_role, proof_role),
+        "claim_strength_hint": "directional",
+        "extraction_mode": "zero_valid_rule_fallback",
+    }
+    return validate_extracted_fact_payload(
+        {"fact_cards": [raw_card]},
         source_url=source_url,
         source_ref=source_ref,
         source_level=_source_level(page),
@@ -825,6 +1351,15 @@ def extract_fact_cards_from_pages(
         "cache_hit_count": 0,
         "llm_error_count": 0,
         "fallback_used": False,
+        "zero_valid_fallback_used": False,
+        "whole_page_failed": False,
+        "chunk_mode_used": False,
+        "chunk_trigger_reason": "",
+        "chunk_count": 0,
+        "chunk_attempted": 0,
+        "chunk_success_count": 0,
+        "chunk_fact_card_count": 0,
+        "chunk_cache_hit_count": 0,
         "fact_cards": [],
         "rejected_spans": [],
         "rejected_span_repair_summary": {},
@@ -836,9 +1371,11 @@ def extract_fact_cards_from_pages(
     }
     if not selected_pages:
         result["status"] = "no_readpage_text"
+        _emit_fact_extractor_probe(result, task=task, selected_page_count=0, raw_page_count=len(page_results or []), page_results=page_results)
         return result
     if not enabled:
         result["status"] = "disabled"
+        _emit_fact_extractor_probe(result, task=task, selected_page_count=len(selected_pages), raw_page_count=len(page_results or []), page_results=page_results)
         return result
 
     config = _build_llm_config()
@@ -862,44 +1399,89 @@ def extract_fact_cards_from_pages(
             )
         else:
             if ready:
-                consumed_budget, budget_exhausted = _try_consume_budget()
-                if not consumed_budget:
-                    result["budget_exhausted"] = bool(budget_exhausted)
-                    validated = _fallback_fact_cards_from_page(page, search_task=task, proof_role=proof_role)
-                    result["fallback_used"] = True
-                    cards = _as_list(validated.get("fact_cards"))
-                    if cards:
-                        result["success_count"] += 1
-                        result["fact_cards"].extend([item for item in cards if isinstance(item, dict)])
-                    rejected = [item for item in _as_list(validated.get("rejected_spans")) if isinstance(item, dict)]
-                    result["rejected_spans"].extend(rejected)
-                    result["invalid_metric_count"] += int(validated.get("invalid_metric_count") or 0)
-                    continue
-                try:
-                    response = call_openai_compatible_json(
+                validated: Optional[Dict[str, Any]] = None
+                tried_chunk = False
+                if _chunk_enabled() and len(_page_text(page)) >= _chunk_trigger_chars():
+                    tried_chunk = True
+                    chunk_validated = _extract_fact_cards_from_chunks(
                         config=config,
-                        system_prompt=_system_prompt(),
-                        user_payload=_user_payload(query=query, page=page, search_task=task, max_chars=max_chars),
-                    )
-                    payload = _as_dict(response.get("payload"))
-                    validated = validate_extracted_fact_payload(
-                        payload,
-                        source_url=_source_url(page),
-                        source_ref=_source_ref(page),
-                        source_level=_source_level(page),
-                        verification_status=_verification_status(page),
-                        proof_role=proof_role,
-                        chapter_id=str(task.get("chapter_id") or task.get("dimension_id") or ""),
+                        query=query,
+                        page=page,
                         search_task=task,
+                        proof_role=proof_role,
+                        max_chars=max_chars,
+                        result=result,
+                        trigger_reason="page_too_long",
                     )
-                    _store_cache(key, _cacheable_extractor_payload(validated))
-                except Exception as exc:
-                    result["llm_error_count"] += 1
-                    result["errors"].append(str(exc))
-                    validated = _fallback_fact_cards_from_page(page, search_task=task, proof_role=proof_role)
-                    result["fallback_used"] = True
+                    if _as_list(chunk_validated.get("fact_cards")):
+                        validated = chunk_validated
+                if validated is None:
+                    consumed_budget, budget_exhausted = _try_consume_budget()
+                    if not consumed_budget:
+                        result["budget_exhausted"] = bool(budget_exhausted)
+                        validated = _fallback_fact_cards_from_page(page, search_task=task, proof_role=proof_role)
+                        _store_fallback_cache_if_useful(key, validated)
+                        result["fallback_used"] = True
+                        cards = _as_list(validated.get("fact_cards"))
+                        if cards:
+                            result["success_count"] += 1
+                            result["fact_cards"].extend([item for item in cards if isinstance(item, dict)])
+                        rejected = [item for item in _as_list(validated.get("rejected_spans")) if isinstance(item, dict)]
+                        result["rejected_spans"].extend(rejected)
+                        result["invalid_metric_count"] += int(validated.get("invalid_metric_count") or 0)
+                        continue
+                    try:
+                        response = call_openai_compatible_json(
+                            config=config,
+                            system_prompt=_system_prompt(),
+                            user_payload=_user_payload(query=query, page=page, search_task=task, max_chars=max_chars),
+                        )
+                        payload = _as_dict(response.get("payload"))
+                        validated = validate_extracted_fact_payload(
+                            payload,
+                            source_url=_source_url(page),
+                            source_ref=_source_ref(page),
+                            source_level=_source_level(page),
+                            verification_status=_verification_status(page),
+                            proof_role=proof_role,
+                            chapter_id=str(task.get("chapter_id") or task.get("dimension_id") or ""),
+                            search_task=task,
+                        )
+                        if not _as_list(validated.get("fact_cards")) and _env_flag("READPAGE_FACT_EXTRACTOR_ZERO_VALID_FALLBACK_ENABLED", True):
+                            fallback_validated = _zero_valid_fallback_fact_cards_from_page(page, search_task=task, proof_role=proof_role)
+                            if _as_list(fallback_validated.get("fact_cards")):
+                                validated = fallback_validated
+                                _store_fallback_cache_if_useful(key, validated)
+                                result["fallback_used"] = True
+                                result["zero_valid_fallback_used"] = True
+                            else:
+                                _store_cache(key, _cacheable_extractor_payload(validated))
+                        else:
+                            _store_cache(key, _cacheable_extractor_payload(validated))
+                    except Exception as exc:
+                        result["llm_error_count"] += 1
+                        result["whole_page_failed"] = True
+                        result["errors"].append(str(exc))
+                        if _chunk_enabled() and not tried_chunk and len(_page_text(page)) >= _chunk_trigger_chars():
+                            chunk_validated = _extract_fact_cards_from_chunks(
+                                config=config,
+                                query=query,
+                                page=page,
+                                search_task=task,
+                                proof_role=proof_role,
+                                max_chars=max_chars,
+                                result=result,
+                                trigger_reason="llm_error",
+                            )
+                            if _as_list(chunk_validated.get("fact_cards")):
+                                validated = chunk_validated
+                        if validated is None:
+                            validated = _fallback_fact_cards_from_page(page, search_task=task, proof_role=proof_role)
+                            _store_fallback_cache_if_useful(key, validated)
+                            result["fallback_used"] = True
             else:
                 validated = _fallback_fact_cards_from_page(page, search_task=task, proof_role=proof_role)
+                _store_fallback_cache_if_useful(key, validated)
                 result["fallback_used"] = True
         cards = _as_list(validated.get("fact_cards"))
         if cards:
@@ -908,6 +1490,22 @@ def extract_fact_cards_from_pages(
         rejected = [item for item in _as_list(validated.get("rejected_spans")) if isinstance(item, dict)]
         result["rejected_spans"].extend(rejected)
         result["invalid_metric_count"] += int(validated.get("invalid_metric_count") or 0)
+    if (
+        not result["fact_cards"]
+        and ready
+        and _env_flag("READPAGE_FACT_EXTRACTOR_ZERO_VALID_FALLBACK_ENABLED", True)
+    ):
+        for page in selected_pages:
+            fallback_validated = _zero_valid_fallback_fact_cards_from_page(page, search_task=task, proof_role=proof_role)
+            cards = [item for item in _as_list(fallback_validated.get("fact_cards")) if isinstance(item, dict)]
+            if not cards:
+                continue
+            result["fact_cards"].extend(cards)
+            result["success_count"] += 1
+            result["fallback_used"] = True
+            result["zero_valid_fallback_used"] = True
+            result["invalid_metric_count"] += int(fallback_validated.get("invalid_metric_count") or 0)
+            break
     result["fact_card_count"] = len(result["fact_cards"])
     result["rejected_span_count"] = len(result["rejected_spans"])
     result["rejected_span_repair_summary"] = rejected_span_repair_summary(
@@ -921,4 +1519,5 @@ def extract_fact_cards_from_pages(
         result["status"] = "budget_exhausted"
     else:
         result["status"] = "success" if result["fact_card_count"] else ("fallback_empty" if result["fallback_used"] else "no_valid_fact_cards")
+    _emit_fact_extractor_probe(result, task=task, selected_page_count=len(selected_pages), raw_page_count=len(page_results or []), page_results=page_results)
     return result

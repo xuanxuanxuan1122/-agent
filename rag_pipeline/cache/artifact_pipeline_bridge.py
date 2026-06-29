@@ -3,14 +3,47 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
+import threading
+from collections import OrderedDict
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from rag_pipeline.contracts.claim_roles import classify_claim_unit_roles
 from rag_pipeline.contracts.ref_normalizer import normalize_claim_refs
 from rag_pipeline.contracts.section_audit import audit_section_claim_roles
 from rag_pipeline.runtime_cache import json_safe_default
 
+from .artifact_paths import env_flag
 from .artifact_store import ArtifactStore
+
+
+# Per-run content-hash guard so the SAME writer package is not re-walked and
+# re-upserted when nothing changed. The heavy ingest fires several times per run
+# (preflight gap sync, post-QA repair rounds, writer sync, final sync); loop
+# call sites in particular re-fire on iterations that did not change the
+# package. Keyed by (ledger_path, run_id); bounded LRU so a long-lived process
+# serving many reports does not grow without bound. Process-local, which is
+# correct: all syncs for one run happen in one process.
+_INGEST_GUARD_LOCK = threading.Lock()
+_INGEST_GUARD_MAX_KEYS = 512
+_LAST_INGEST_HASH: "OrderedDict[Tuple[str, str], str]" = OrderedDict()
+_LAST_INGEST_SUMMARY: "OrderedDict[Tuple[str, str], Dict[str, Any]]" = OrderedDict()
+
+
+def _ingest_guard_remember(key: Tuple[str, str], content_hash: str, summary: Dict[str, Any]) -> None:
+    with _INGEST_GUARD_LOCK:
+        for store_map, value in ((_LAST_INGEST_HASH, content_hash), (_LAST_INGEST_SUMMARY, dict(summary))):
+            store_map[key] = value
+            store_map.move_to_end(key)
+            while len(store_map) > _INGEST_GUARD_MAX_KEYS:
+                store_map.popitem(last=False)
+
+
+def _ingest_guard_hit(key: Tuple[str, str], content_hash: str) -> Optional[Dict[str, Any]]:
+    with _INGEST_GUARD_LOCK:
+        if _LAST_INGEST_HASH.get(key) != content_hash:
+            return None
+        _LAST_INGEST_HASH.move_to_end(key)
+        return dict(_LAST_INGEST_SUMMARY.get(key) or {})
 
 
 FACT_LIST_KEYS = (
@@ -351,16 +384,35 @@ def record_stage_snapshot_artifact(
 ) -> Dict[str, Any]:
     storage_uri = _text(snapshot_result.get("full_payload_path"))
     status = "validated" if snapshot_result.get("stored") else "snapshot_failed"
+    # The snapshot file already holds the (often multi-MB) payload and the
+    # manifest already knows its byte size; pass both so record_artifact stores
+    # the pointer row without re-serializing the payload. The hash keys off the
+    # storage location (stable per run+stage), which is all a pointer row needs.
+    storage_bytes = _int_value(snapshot_result.get("full_payload_bytes")) if storage_uri else 0
+    content_hash = _json_hash(storage_uri) if storage_uri and storage_bytes > 0 else ""
+    # When the full payload was deliberately skipped (replayable-only mode), do
+    # NOT re-inline it into the ledger — that would just move the multi-MB write
+    # from the snapshot file into the DB. Record the compact summary instead.
+    record_payload: Any = payload
+    if not storage_uri and _text(snapshot_result.get("full_payload_skipped")):
+        record_payload = {
+            "stage_name": stage_name,
+            "full_payload_skipped": _text(snapshot_result.get("full_payload_skipped")),
+            "output_summary": _as_dict(snapshot_result.get("output_summary")),
+        }
     result = store.record_artifact(
         run_id=run_id,
         stage=stage_name,
         artifact_type=stage_name,
-        payload=payload,
+        payload=record_payload,
         status=status,
         storage_uri=storage_uri,
+        storage_bytes=storage_bytes,
+        content_hash=content_hash,
         lineage={
             "stage_snapshot": True,
             "replayable": bool(snapshot_result.get("replayable")),
+            "full_payload_skipped": _text(snapshot_result.get("full_payload_skipped")),
             "manifest_path": _text(snapshot_result.get("manifest_path")),
             "reason": _text(snapshot_result.get("reason")),
         },
@@ -486,6 +538,67 @@ def _infer_requirement_ids(
 
 
 def ingest_writer_package_artifacts(
+    store: ArtifactStore,
+    *,
+    run_id: str,
+    writer_package: Dict[str, Any],
+    writer_report: Optional[Dict[str, Any]] = None,
+    final_audit_result: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Ingest a full writer package into the artifact ledger in ONE transaction.
+
+    Two layers keep this cheap when it fires repeatedly per run:
+
+    * **Dedupe guard** — if the exact same package (writer_package +
+      writer_report + final_audit_result) was already ingested for this run, the
+      walk + upserts are skipped entirely (the upserts are idempotent, so
+      re-ingesting identical content is pure overhead). Disable with
+      ``ARTIFACT_LEDGER_DEDUPE_INGEST=0``.
+    * **Single transaction** — when it does run, all per-row ``upsert_*`` /
+      ``add_lineage_edge`` writes share one connection and commit once (see
+      :meth:`ArtifactStore.transaction`) instead of a fresh connection
+      (+PRAGMAs) and commit per row.
+    """
+    dedupe = env_flag("ARTIFACT_LEDGER_DEDUPE_INGEST", True)
+    guard_key: Optional[Tuple[str, str]] = None
+    content_hash = ""
+    if dedupe:
+        try:
+            guard_key = (str(getattr(store, "path", "")), str(run_id))
+            content_hash = _json_hash(
+                {
+                    "writer_package": writer_package,
+                    "writer_report": writer_report or {},
+                    "final_audit_result": final_audit_result or {},
+                }
+            )
+        except Exception:  # fail-open: a hashing problem must never block ingest
+            guard_key, content_hash = None, ""
+        if guard_key is not None and content_hash:
+            cached = _ingest_guard_hit(guard_key, content_hash)
+            if cached is not None:
+                cached["skipped_unchanged"] = True
+                try:
+                    cached["lineage_edge_total"] = store.count_lineage_edges(run_id)
+                except Exception:
+                    pass
+                return cached
+
+    with store.transaction():
+        summary = _ingest_writer_package_artifacts(
+            store,
+            run_id=run_id,
+            writer_package=writer_package,
+            writer_report=writer_report,
+            final_audit_result=final_audit_result,
+        )
+
+    if guard_key is not None and content_hash:
+        _ingest_guard_remember(guard_key, content_hash, summary)
+    return summary
+
+
+def _ingest_writer_package_artifacts(
     store: ArtifactStore,
     *,
     run_id: str,

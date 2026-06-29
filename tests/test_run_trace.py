@@ -236,3 +236,14 @@ def test_write_run_trace_from_package_extracts_core_pipeline_events(tmp_path, mo
     assert public_gate_event["drop_count"] == 3
     assert public_gate_event["reason_counts"]["evidence_processing_language"] == 1
     assert (tmp_path / "run-3.trace_summary.md").exists()
+    assert result["stage_probe_enabled"] is True
+    assert result["stage_probe_path"].endswith("run-3.stage_probe.jsonl")
+    assert result["dataflow_summary_path"].endswith("run-3.dataflow_summary.md")
+    assert result["module_probe_path"].endswith("run-3.module_probe.jsonl")
+    assert result["lineage_graph_path"].endswith("run-3.lineage_graph.json")
+    assert result["health_metrics_path"].endswith("run-3.health_metrics.json")
+    assert (tmp_path / "run-3.stage_probe.jsonl").exists()
+    assert (tmp_path / "run-3.dataflow_summary.md").exists()
+    assert (tmp_path / "run-3.module_probe.jsonl").exists()
+    assert (tmp_path / "run-3.lineage_graph.json").exists()
+    assert (tmp_path / "run-3.health_metrics.json").exists()

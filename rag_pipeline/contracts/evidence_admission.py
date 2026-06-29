@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List
 
+from rag_pipeline.contracts.quality_gate_policy import advisory_weight_mode
+
 
 PUBLISHABLE_SOURCE_LEVELS = {"A", "B"}
 REJECT_STATUSES = {"rejected", "stale", "superseded", "invalid", "error"}
@@ -112,6 +114,7 @@ def decide_evidence_admission(fact_card: Dict[str, Any]) -> Dict[str, Any]:
     source_level = _source_level(card)
     verification_status = _verification_status(card)
     allowed_use = _allowed_use(card)
+    advisory_mode = advisory_weight_mode()
     proof_role = _proof_role(card)
     page_status = _text(card.get("page_status") or card.get("readpage_status")).lower()
     reasons: List[str] = []
@@ -121,7 +124,7 @@ def decide_evidence_admission(fact_card: Dict[str, Any]) -> Dict[str, Any]:
         reasons.append(f"status_{status}")
     if verification_status in BAD_PAGE_STATUSES or page_status in BAD_PAGE_STATUSES:
         reasons.append("page_not_usable")
-    if allowed_use in {"appendix_only", "clue"}:
+    if allowed_use in {"appendix_only", "clue"} and not advisory_mode:
         reasons.append(f"allowed_use_{allowed_use}")
 
     metric_missing: List[str] = []
@@ -135,6 +138,11 @@ def decide_evidence_admission(fact_card: Dict[str, Any]) -> Dict[str, Any]:
         verdict = "reject"
         public_use = "not_allowed"
         confidence = 0.95
+    elif advisory_mode:
+        verdict = "publishable"
+        public_use = "writing"
+        reasons.append("advisory_weight_only")
+        confidence = 0.65
     elif "allowed_use_appendix_only" in reasons or allowed_use == "appendix_only":
         verdict = "appendix_only"
         public_use = "appendix_only"

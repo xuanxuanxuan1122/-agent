@@ -11,6 +11,11 @@ from urllib.parse import urlparse
 
 from rag_pipeline.runtime_cache import json_safe_default
 
+try:  # Cache preflight diagnostics must never block imports in standalone mode.
+    from rag_pipeline.observability.data_root_hygiene import inspect_source_identity_hygiene
+except Exception:  # pragma: no cover - optional diagnostics only.
+    inspect_source_identity_hygiene = None  # type: ignore
+
 
 SCHEMA_VERSION = 1
 DEFAULT_CACHE_PATH = "output/cache/topic_bundles"
@@ -484,6 +489,11 @@ def validate_bundle_assets(
             reasons.append("source_title_url_mismatch")
             polluted = True
             break
+    if inspect_source_identity_hygiene is not None:
+        identity_hygiene = inspect_source_identity_hygiene(registry)
+        if int(_as_dict(identity_hygiene).get("dirty_item_count") or 0) > 0:
+            reasons.append("source_identity_polluted")
+            polluted = True
     evidence_items = _full_evidence_items(package) + _iter_chapter_evidence_items(chapters)
     full_ref_values = set()
     for item in _full_evidence_items(package):

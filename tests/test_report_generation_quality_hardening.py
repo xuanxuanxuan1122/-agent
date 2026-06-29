@@ -113,6 +113,20 @@ def test_public_sanitizer_is_diagnostic_only_by_default(monkeypatch):
     assert cleaned == markdown
 
 
+def test_finalize_public_report_enforces_public_sanitizer_at_publish_boundary():
+    markdown = (
+        "# 报告\n\n"
+        "## 1. 行情判断\n"
+        "证据不足，不能作为确定性结论，但价格和库存已经出现方向性变化。"
+    )
+
+    cleaned = full_report.finalize_public_report(markdown)
+
+    assert "## 1. 行情判断" in cleaned
+    assert "价格和库存已经出现方向性变化" in cleaned
+    assert "证据不足" not in cleaned
+
+
 def test_deterministic_audit_blocks_missing_appendix_and_title_only_source():
     missing_appendix = run_deterministic_audit(
         report_markdown="# 报告\n\n正文引用来源[1]。",
@@ -258,3 +272,38 @@ def test_reformatter_fallback_uses_distinct_writer_path():
     assert '"fallback_output_path"' in source
     assert '"fallback_draft_path"' in source
     assert "clean_report_written = bool(" in source
+
+
+def test_public_sanitizer_removes_template_scaffold_and_truncated_headings():
+    template = (
+        "\u5bf9\u201c\u5e02\u573a\u9700\u6c42\u201d\u8fd9\u4e00\u5224\u65ad\u800c\u8a00"
+        "\uff0c\u5173\u952e\u4e0d\u53ea\u662f\u4e8b\u5b9e\u662f\u5426\u51fa\u73b0"
+        "\uff0c\u800c\u662f\u5b83\u5982\u4f55\u6539\u53d8\u9700\u6c42\u5151\u73b0\u3002"
+        "\u5982\u679c\u628a\u5b83\u653e\u5728\u62a5\u544a\u4e3b\u7ebf\u4e2d"
+        "\uff0c\u8f83\u7a33\u59a5\u7684\u5199\u6cd5\u662f\u5148\u786e\u8ba4\u4e8b\u5b9e\u80fd\u591f\u652f\u6491\u7684\u6700\u4f4e\u7ed3\u8bba\u3002"
+        "\u56e0\u6b64\uff0c\u8fd9\u4e00\u6bb5\u66f4\u9002\u5408\u4f5c\u4e3a\u6709\u8fb9\u754c\u7684\u5206\u6790\u4fe1\u53f7\u6765\u4f7f\u7528"
+        "\uff0c\u907f\u514d\u5355\u4e00\u6750\u6599\u627f\u62c5\u8fc7\u5f3a\u7ed3\u8bba\u3002"
+    )
+    markdown = (
+        "# Report\n\n"
+        "## \u6838\u5fc3\u89c2\u70b9\u4e0e\u4e3b\u8981\u7ed3\u8bba\n"
+        "- \u673a\u4f1a\u5224\u65ad\uff1a\u5e02\u573a\u89c4\u6a21\u9884\u6d4b\u663e\u793a\u9700\u6c42\u6b63\u5728\u6269\u5f20\u3002\n"
+        "- \u673a\u4f1a\u5224\u65ad\uff1a\u5df2\u6709\u4f01\u4e1a\u8ba2\u5355\u548c\u573a\u666f\u843d\u5730\u4fe1\u53f7\u3002[1]\n\n"
+        "## 1. \u9700\u6c42\u9a8c\u8bc1\n"
+        "### 2025\u5e74\u4f4e\u7a7a\u7ecf\u6d4e\u89c4\u6a21\u9884\u8ba1\u8fbe8519\u4ebf\u5143\u5e76\u4e8e2026\u5e74. . . \uff0842\uff09\n"
+        "\u5e02\u573a\u9884\u6d4b\u63d0\u4f9b\u4e86\u9700\u6c42\u6269\u5f20\u7684\u65b9\u5411\u6027\u4fe1\u53f7\u3002[1]"
+        + template
+        + "\n\n## \u6765\u6e90\u9644\u5f55\n- [1] Source | https://example.com/source\n"
+    )
+
+    cleaned = sanitize_public_markdown(markdown, mode="enforce")
+    body = cleaned.split("## \u6765\u6e90\u9644\u5f55", 1)[0]
+
+    assert ". . ." not in body
+    assert "\uff0842\uff09" not in body
+    assert "\u5173\u952e\u4e0d\u53ea\u662f\u4e8b\u5b9e\u662f\u5426\u51fa\u73b0" not in body
+    assert "\u8f83\u7a33\u59a5\u7684\u5199\u6cd5" not in body
+    assert "\u66f4\u9002\u5408\u4f5c\u4e3a\u6709\u8fb9\u754c\u7684\u5206\u6790\u4fe1\u53f7" not in body
+    assert "\u5e02\u573a\u9884\u6d4b\u63d0\u4f9b\u4e86\u9700\u6c42\u6269\u5f20" in body
+    assert "\u5e02\u573a\u89c4\u6a21\u9884\u6d4b\u663e\u793a\u9700\u6c42\u6b63\u5728\u6269\u5f20" not in body
+    assert "\u5df2\u6709\u4f01\u4e1a\u8ba2\u5355\u548c\u573a\u666f\u843d\u5730\u4fe1\u53f7\u3002[1]" in body

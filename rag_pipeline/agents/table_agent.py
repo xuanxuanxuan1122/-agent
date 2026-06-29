@@ -541,7 +541,7 @@ def _row_claim(item: Dict[str, Any], *, subject: str, signal: str, boundary: str
     if level == "C" and allowed_use == "directional_signal" and not item.get("appendix_only"):
         return f"{subject}只能作为方向性信号使用；表内依据是{signal_text}，后续需要连续指标或A/B来源校准。"
     if level in {"C", "D"} or item.get("appendix_only"):
-        return f"{subject}的证据等级偏弱，表内只保留为背景线索；可用边界是{boundary_text}。"
+        return f"{subject}的证据等级偏弱，表内只保留为辅助信息；可用边界是{boundary_text}。"
     if table_type == "risk_register":
         trigger = _compact(item.get("trigger") or fact or signal_text, 90)
         return f"{subject}的风险触发点是{trigger}；如果该信号兑现，应先降级判断再安排缓释动作。"

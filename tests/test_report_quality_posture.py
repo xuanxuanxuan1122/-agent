@@ -52,7 +52,9 @@ WRITING_BUDGET_KEYS = [
     "REPORT_TARGET_BODY_CHARS",
     "REPORT_TARGET_BODY_CHARS_BLOCKING",
     "REPORT_COMPOSER_TARGET_SECTION_CHARS",
+    "REPORT_ENABLE_RENDERER_TEMPLATE_EXPANSION",
     "REPORT_RENDER_MIN_SECTION_CHARS",
+    "REPORT_BLUEPRINT_SOURCE",
 ]
 
 DEEPSEEK_QUALITY_MODEL_KEYS = [
@@ -95,16 +97,19 @@ def _clear_posture_env(monkeypatch):
         monkeypatch.delenv(key, raising=False)
 
 
-def test_high_quality_posture_keeps_high_cost_search_expansion_disabled(monkeypatch):
+def test_high_quality_posture_enables_front_chain_search_feedback(monkeypatch):
     _clear_posture_env(monkeypatch)
 
     posture = full_report.apply_report_quality_posture("high")
 
     assert posture["mode"] == "high"
-    for key in HIGH_COST_POSTURE_KEYS:
-        assert os.environ[key] == "false"
-    assert posture["disabled"]["query_rewrite"] is True
-    assert posture["disabled"]["self_refine"] is True
+    assert os.environ["IQS_ENABLE_LLM_QUERY_REWRITE"] == "true"
+    assert os.environ["IQS_ENABLE_SELF_REFINE"] == "true"
+    assert os.environ["FULL_REPORT_IQS_ENABLE_SELF_REFINE"] == "true"
+    assert os.environ["REPORT_CONTINUOUS_EVIDENCE_LOOP"] == "true"
+    assert posture["disabled"]["query_rewrite"] is False
+    assert posture["disabled"]["self_refine"] is False
+    assert posture["disabled"]["continuous_loop"] is False
 
 
 def test_high_quality_posture_increases_evidence_search_and_analysis_capacity(monkeypatch):
@@ -114,7 +119,7 @@ def test_high_quality_posture_increases_evidence_search_and_analysis_capacity(mo
     options = full_report.full_report_iqs_options()
 
     assert posture["mode"] == "high"
-    assert options["enable_self_refine"] is False
+    assert options["enable_self_refine"] is True
     assert options["max_queries"] >= 4
     assert options["max_search_tasks"] >= 32
     assert options["results_per_query"] >= 80
@@ -128,7 +133,7 @@ def test_high_quality_posture_increases_evidence_search_and_analysis_capacity(mo
     assert posture["evidence_depth"]["llm_analysis_max_facts_per_chapter"] == os.environ["BRAIN_LLM_ANALYSIS_MAX_FACTS_PER_CHAPTER"]
 
 
-def test_high_quality_posture_enables_quality_writing_without_hard_longform_target(monkeypatch):
+def test_high_quality_posture_enables_quality_writing_with_public_digest_target(monkeypatch):
     _clear_posture_env(monkeypatch)
 
     posture = full_report.apply_report_quality_posture("high")
@@ -141,10 +146,14 @@ def test_high_quality_posture_enables_quality_writing_without_hard_longform_targ
     assert int(os.environ["REPORT_BODY_REWRITE_MAX_ELAPSED_SECONDS"]) >= 900
     assert os.environ["REPORT_ENABLE_LLM_CHAPTER_NARRATIVE"] == "true"
     assert int(os.environ["REPORT_CHAPTER_NARRATIVE_MAX_CHAPTERS"]) >= 12
-    assert int(os.environ["REPORT_TARGET_BODY_CHARS"]) == 0
+    assert int(os.environ["REPORT_TARGET_BODY_CHARS"]) >= 12000
     assert os.environ["REPORT_TARGET_BODY_CHARS_BLOCKING"] == "false"
-    assert int(os.environ["REPORT_COMPOSER_TARGET_SECTION_CHARS"]) >= 450
-    assert int(os.environ["REPORT_RENDER_MIN_SECTION_CHARS"]) == 0
+    assert os.environ["REPORT_ENABLE_PUBLIC_EVIDENCE_DIGEST"] == "true"
+    assert int(os.environ["REPORT_BODY_REWRITE_MIN_ACCEPT_CHARS"]) >= 260
+    assert int(os.environ["REPORT_COMPOSER_TARGET_SECTION_CHARS"]) >= 800
+    assert os.environ["REPORT_ENABLE_RENDERER_TEMPLATE_EXPANSION"] == "false"
+    assert int(os.environ["REPORT_RENDER_MIN_SECTION_CHARS"]) >= 400
+    assert os.environ["REPORT_BLUEPRINT_SOURCE"] == "claim_first"
 
 
 def test_high_quality_posture_routes_quality_models_to_deepseek_and_web_search_to_qwen(monkeypatch):
@@ -212,7 +221,29 @@ def test_quality_posture_preserves_explicit_user_env(monkeypatch):
     assert posture["preserved_explicit"]["IQS_ENABLE_LLM_QUERY_REWRITE"] == "true"
     assert os.environ["FULL_REPORT_IQS_MAX_SEARCH_TASKS"] == "12"
     assert posture["preserved_explicit"]["FULL_REPORT_IQS_MAX_SEARCH_TASKS"] == "12"
-    assert os.environ["IQS_ENABLE_SELF_REFINE"] == "false"
+    assert os.environ["IQS_ENABLE_SELF_REFINE"] == "true"
+
+
+def test_high_quality_posture_overrides_stale_disabled_feature_flags(monkeypatch):
+    _clear_posture_env(monkeypatch)
+    monkeypatch.setenv("IQS_ENABLE_LLM_QUERY_REWRITE", "0")
+    monkeypatch.setenv("IQS_ENABLE_SELF_REFINE", "0")
+    monkeypatch.setenv("FULL_REPORT_IQS_ENABLE_SELF_REFINE", "false")
+    monkeypatch.setenv("REPORT_CONTINUOUS_EVIDENCE_LOOP", "false")
+    monkeypatch.setenv("BRAIN_ENABLE_POST_QA_REPAIR", "false")
+
+    posture = full_report.apply_report_quality_posture("high")
+
+    assert os.environ["IQS_ENABLE_LLM_QUERY_REWRITE"] == "true"
+    assert os.environ["IQS_ENABLE_SELF_REFINE"] == "true"
+    assert os.environ["FULL_REPORT_IQS_ENABLE_SELF_REFINE"] == "true"
+    assert os.environ["REPORT_CONTINUOUS_EVIDENCE_LOOP"] == "true"
+    assert os.environ["BRAIN_ENABLE_POST_QA_REPAIR"] == "true"
+    assert posture["disabled"]["query_rewrite"] is False
+    assert posture["disabled"]["self_refine"] is False
+    assert posture["disabled"]["continuous_loop"] is False
+    assert posture["overridden_disabled_features"]["IQS_ENABLE_LLM_QUERY_REWRITE"] == "0"
+    assert posture["overridden_disabled_features"]["BRAIN_ENABLE_POST_QA_REPAIR"] == "false"
 
 
 def test_longform_target_upgrades_balanced_mode_to_high_writing_path():
@@ -227,7 +258,7 @@ def test_balanced_mode_stays_balanced_without_longform_target():
     assert mode == "balanced"
 
 
-def test_strict_research_posture_is_the_only_mode_that_allows_search_expansion(monkeypatch):
+def test_strict_research_posture_keeps_front_chain_feedback_enabled(monkeypatch):
     _clear_posture_env(monkeypatch)
 
     posture = full_report.apply_report_quality_posture("strict_research")
@@ -235,5 +266,6 @@ def test_strict_research_posture_is_the_only_mode_that_allows_search_expansion(m
     assert posture["mode"] == "strict_research"
     assert os.environ["IQS_ENABLE_LLM_QUERY_REWRITE"] == "true"
     assert os.environ["FULL_REPORT_IQS_ENABLE_SELF_REFINE"] == "true"
-    assert os.environ["REPORT_CONTINUOUS_EVIDENCE_LOOP"] == "false"
+    assert os.environ["REPORT_CONTINUOUS_EVIDENCE_LOOP"] == "true"
     assert posture["disabled"]["query_rewrite"] is False
+

@@ -101,6 +101,39 @@ def test_full_report_source_registry_merge_does_not_let_compact_registry_hide_ev
     assert any("EV-2" in (source.get("evidence_refs") or []) for source in merged)
 
 
+def test_regenerated_writer_report_replaces_stale_qa_results():
+    writer_report = regenerate_report_from_package._regenerated_writer_report(
+        package={
+            "writer_report": {
+                "report_status": "formal_scored",
+                "qa_result": {"passed": False, "quality_findings": [{"type": "old_blocker"}]},
+                "validation": {"passed": False},
+                "quality_findings": [{"type": "old_blocker"}],
+            }
+        },
+        writer_output={"source_registry": [{"ref": "[1]", "url": "https://example.org"}]},
+        markdown="# Fresh\n\nBody [1]",
+        structured_analysis={"claim_units": []},
+        chapter_evidence_packages=[],
+        argument_units=[],
+        chapter_packages=[],
+        micro_layouts=[],
+        table_packages=[],
+        render_artifacts={"payload_mode": "full"},
+        qa_result={
+            "passed": True,
+            "quality_score": 72,
+            "quality_findings": [{"type": "new_warning", "finding_category": "readability_finding"}],
+            "review_suggestions": [{"issue_type": "new_warning"}],
+        },
+    )
+
+    assert writer_report["qa_result"]["passed"] is True
+    assert writer_report["validation"]["passed"] is True
+    assert writer_report["quality_findings"] == [{"type": "new_warning", "finding_category": "readability_finding"}]
+    assert writer_report["review_suggestions"] == [{"issue_type": "new_warning"}]
+
+
 def test_quality_mode_replay_reruns_analysis_with_llm_and_enables_rewrite(tmp_path, monkeypatch):
     monkeypatch.setenv("STAGE_SNAPSHOT_CACHE_ENABLED", "true")
     monkeypatch.setenv("STAGE_SNAPSHOT_CACHE_PATH", str(tmp_path / "snapshots"))
@@ -205,6 +238,7 @@ def test_quality_mode_replay_reruns_analysis_with_llm_and_enables_rewrite(tmp_pa
                 "chapter_narrative_max_chapters": os.environ.get("REPORT_CHAPTER_NARRATIVE_MAX_CHAPTERS"),
                 "target_body_chars": os.environ.get("REPORT_TARGET_BODY_CHARS"),
                 "composer_target_chars": os.environ.get("REPORT_COMPOSER_TARGET_SECTION_CHARS"),
+                "blueprint_source": os.environ.get("REPORT_BLUEPRINT_SOURCE"),
                 "render_min_section_chars": os.environ.get("REPORT_RENDER_MIN_SECTION_CHARS"),
                 "qa_profile": os.environ.get("RAG_MODEL_QA_PROFILE"),
                 "query_rewrite_profile": os.environ.get("RAG_MODEL_QUERY_REWRITE_PROFILE"),
@@ -261,12 +295,13 @@ def test_quality_mode_replay_reruns_analysis_with_llm_and_enables_rewrite(tmp_pa
     assert calls[0]["rewrite_max_sections"] == "24"
     assert calls[0]["rewrite_max_elapsed"] == "900"
     assert calls[0]["rewrite_max_expansion_ratio"] == "5.0"
-    assert calls[0]["rewrite_target_chars"] == "650"
+    assert calls[0]["rewrite_target_chars"] == "850"
     assert calls[0]["chapter_narrative_enabled"] == "true"
     assert calls[0]["chapter_narrative_max_chapters"] == "12"
-    assert calls[0]["target_body_chars"] == "0"
-    assert calls[0]["composer_target_chars"] == "550"
-    assert calls[0]["render_min_section_chars"] == "0"
+    assert calls[0]["target_body_chars"] == "24000"
+    assert calls[0]["composer_target_chars"] == "850"
+    assert calls[0]["blueprint_source"] == "claim_first"
+    assert calls[0]["render_min_section_chars"] == "420"
     assert calls[0]["qa_profile"] == "deepseek-v4-pro"
     assert calls[0]["query_rewrite_profile"] == "qwen"
     assert calls[0]["llm_config"]

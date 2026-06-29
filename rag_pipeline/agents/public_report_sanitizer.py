@@ -8,6 +8,43 @@ from typing import Dict, List
 PUBLIC_EV_ID_PATTERN = r"(?<![A-Za-z0-9_])EV-\d+(?:-[A-Za-z0-9]+)?"
 
 
+HARD_INDUSTRY_TEMPLATE_REPLACEMENTS = (
+    ("订单规模", "可复核规模"),
+    ("订单落地", "执行验证"),
+    ("订单兑现", "结果验证"),
+    ("订单和运营频次", "持续行动"),
+    ("后续订单", "后续可复核材料"),
+    ("订单", "可复核材料"),
+    ("客户付费转化", "持续使用转化"),
+    ("客户付费意愿", "持续使用意愿"),
+    ("客户付费", "持续使用"),
+    ("商业化节奏", "推进情况"),
+    ("商业化速度", "推进速度"),
+    ("商业化判断", "主题判断"),
+    ("商业化能力", "执行能力"),
+    ("示范项目", "早期样本"),
+    ("规模化部署", "更广泛应用"),
+    ("部署节奏", "推进节奏"),
+    ("出货/部署", "相关进展"),
+    ("出货量", "数量"),
+    ("出货", "数量"),
+)
+
+
+def remove_hard_industry_templates(text: str) -> str:
+    """Remove fixed commercialization/shipment templates from public prose.
+
+    These phrases are useful for some industry-analysis prompts, but they must not be
+    injected as a universal fallback. If a later LLM chooses a domain-specific angle it
+    should do so from evidence, not from these canned bridges.
+    """
+    cleaned = str(text or "")
+    for old, new in HARD_INDUSTRY_TEMPLATE_REPLACEMENTS:
+        cleaned = cleaned.replace(old, new)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    return cleaned.strip()
+
+
 INTERNAL_GAP_PATTERNS = [
     r"证据不足",
     r"暂无可核验数据",
@@ -80,6 +117,14 @@ INTERNAL_GAP_PATTERNS = [
     r"成为影响本章判断的核心变量",
     r"放回章节问题看",
     r"不能只依赖单点事实",
+    r"话题热度推进",
+    r"可核验内容适合",
+    r"可复核内容适合",
+    r"局部变化的入口",
+    r"暂时缺少覆盖的外推",
+    r"待验证问题处理",
+    r"相邻来源重复情况",
+    r"结论强度才",
 ]
 INTERNAL_GAP_PATTERNS.extend(
     [
@@ -97,6 +142,31 @@ INTERNAL_GAP_PATTERNS.extend(
         r"机制拆解",
         r"反证边界",
         r"决策含义[:：]",
+    ]
+)
+
+
+INTERNAL_GAP_PATTERNS.extend(
+    [
+        r"\bdiagnostic_only\b",
+        r"\bscore_gap\b",
+        r"\bmissing_proof_standard\b",
+        r"\brepair_task_seed\b",
+        r"\bsearch_more\b",
+        r"\breanalyze_existing\b",
+        r"\brecompose_outline\b",
+        r"\brewrite_with_caveat\b",
+        r"\bmust_not_render\b",
+        r"\breview_suggestion\b",
+        r"\bpublic_text_allowed\s*=\s*false\b",
+        r"\bsource_check\b",
+        r"\bsemantic_judge\b",
+        r"\bexecutor_should_decide\b",
+        "\u8865\u8bc1\u5efa\u8bae",
+        "\u5ba1\u67e5\u5efa\u8bae",
+        "\u5185\u90e8\u8bca\u65ad",
+        "\u4ec5\u4f9b\u8bca\u65ad",
+        "\u4e0d\u5f97\u8fdb\u5165\u6b63\u6587",
     ]
 )
 
@@ -207,6 +277,14 @@ STRICT_PUBLICATION_BLOCKERS = [
 
 
 PUBLIC_BODY_REWRITES = [
+    (r"这些信号仍受来源覆盖范围和公开披露充分性的限制，应作为方向性观察进入正文。?", "公开披露通常更容易呈现已经启动的事项，实际进展仍会受到资金、审批、执行成本和使用门槛的共同影响。"),
+    (r"后续应继续观察同类主体、同类场景和相同口径信息是否重复出现。?", "判断重点转向主体行动是否持续、场景是否扩大、影响路径是否更清晰。"),
+    (r"以及后续判断需要继续观察哪些约束条件，而不是被简单处理成孤立材料。?", "并进一步解释这些变化如何影响相关主体、组织安排和后续决策。"),
+    (r"方向性观察进入正文", "早期产业信号"),
+    (r"方向性观察", "阶段性判断"),
+    (r"后续变化交叉验证", "后续变化"),
+    (r"后续是否重复出现", "是否转化为持续行动"),
+    (r"现有材料能够覆盖", "公开信息呈现"),
     (r"\u76f8\u5173\u6750\u6599\u6307\u5411", "\u76f8\u5173\u4e8b\u5b9e\u6307\u5411"),
     (r"\u8fd9\u4e9b\u6750\u6599\u5171\u540c\u6307\u5411", "\u8fd9\u7ec4\u4e8b\u5b9e\u652f\u6491\u7684\u5224\u65ad\u662f"),
     (r"\u8fd9\u4e9b\u4fe1\u606f\u5171\u540c\u63cf\u7ed8", "\u8fd9\u7ec4\u4e8b\u5b9e\u652f\u6491\u7684\u5224\u65ad\u662f"),
@@ -331,6 +409,10 @@ def rewrite_internal_gap_language(text: str) -> str:
         value = re.sub(pattern, replacement, value, flags=re.I)
     for pattern, replacement in PUBLIC_BODY_REWRITES:
         value = re.sub(pattern, replacement, value, flags=re.I)
+    # Drop dangling cross-references whose referent was stripped during cleaning,
+    # e.g. "（参见）" / "（详见 ）" / empty "（）". Parentheses that still carry a
+    # real referent such as "（参见图3）" are left untouched.
+    value = re.sub(r"[（(]\s*(?:参见|详见|另见|参阅|见)?\s*[）)]", "", value)
     value = re.sub(r"[ \t]{2,}", " ", value)
     return value.strip()
 
@@ -359,6 +441,7 @@ PUBLIC_NARRATIVE_BLOCK_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"来源多为[ABCD]级|来源多为B级或C级|可靠性中等|时效性有限", "evidence_repair_signal"),
     (r"证据主要集中在[^。；;\n]{1,80}少数行业|缺乏明确案例", "evidence_repair_signal"),
     (r"待验证方向|尚不足以支撑强结论", "fallback_claim_language"),
+    (r"可核验内容适合|可复核内容适合|局部变化的入口|暂时缺少覆盖的外推|待验证问题处理|相邻来源重复情况", "review_style_bridge_language"),
     (r"这张表显示|后续影响\s*[:：]|使用边界\s*[:：]|表内信号", "diagnostic_table_commentary"),
     (r"需要按连续指标|避免把单点信号直接外推|更适合作为背景条件|结论强度取决", "analysis_scaffold_language"),
 )
@@ -372,7 +455,7 @@ _PUBLIC_NARRATIVE_RETITLE_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"^(#{1,4})\s*本节指标观察\s*$"), r"\1 指标信号是否一致"),
     (re.compile(r"^(#{1,4})\s*本节市场观察\s*$"), r"\1 市场信号是否成立"),
     (re.compile(r"^(#{1,4})\s*事实依据\s*$"), r"\1 产业信号"),
-    (re.compile(r"^(#{1,4})\s*商业化证据\s*$"), r"\1 商业化进展"),
+    (re.compile(r"^(#{1,4})\s*商业化证据\s*$"), r"\1 进展与约束"),
 )
 
 
@@ -411,7 +494,7 @@ def _line_without_public_narrative_leak(line: str) -> str:
     if re.search(r"正文需要|观察顺序|原文核验|后续观察本章|可用事实主要包括", raw):
         return ""
     if re.search(
-        r"事实锚点|事实起点|后续重点跟踪|这些事实来自不同类型来源|来源集中、口径不一致|待验证方向|尚不足以支撑强结论",
+        r"事实锚点|事实起点|后续重点跟踪|这些事实来自不同类型来源|来源集中、口径不一致|待验证方向|尚不足以支撑强结论|可核验内容适合|可复核内容适合|局部变化的入口|暂时缺少覆盖的外推|待验证问题处理|相邻来源重复情况",
         raw,
     ):
         return ""
@@ -630,7 +713,7 @@ def normalize_public_text_artifacts(markdown: str) -> str:
 PUBLIC_INTERNAL_TERM_REWRITES = (
     ("market metric", "市场指标"),
     ("risk boundary", "风险边界"),
-    ("deployment depth", "部署深度"),
+    ("deployment depth", "使用深度"),
     ("competitive position", "竞争位置"),
     ("technical maturity", "技术成熟度"),
     ("commercialization", "商业化"),
@@ -707,6 +790,150 @@ _STANDALONE_PLACEHOLDER_RE = re.compile(
 _ORPHAN_KEY_DATA_BULLET_RE = re.compile(
     r"^\s*[-*]\s*[A-Za-z一-鿿]+\s*[；;,，]\s*\d{4}\s*年?\s*$"
 )
+
+_DIRTY_PUBLIC_SPAN_PATTERNS = [
+    # Upstream metric extraction can combine an ordinal/table label, a bare
+    # year/id, and a value into prose such as
+    # "（二）AI 物业经理智能体建设单位的成本在2000为70%...".
+    # Remove only the bad span so useful case facts in the same paragraph stay.
+    re.compile(
+        r"(?:（[一二三四五六七八九十]+）)?"
+        r"[^。；;\n]{0,90}"
+        r"(?:成本|价格|收入|市场规模|数据指标|定性事实|关键指标)"
+        r"[^。；;\n]{0,30}在\d{3,4}为[^。；;\n]{1,40}"
+        r"，这一指标用于判断市场空间和兑现节奏[。；;]?\s*"
+    ),
+    # Source-page headings copied into the body, e.g.
+    # "转化愿景为现实：AI在采购中的应用场景 引言".
+    re.compile(r"[^。；;\n]{0,80}[:：][^。；;\n]{0,120}\s+引言\s*"),
+]
+
+_DIRTY_PUBLIC_SPAN_REWRITES = [
+    (
+        re.compile(r"这个反向样本提示([^。；;\n]{1,40})仍可能改变结论强度，需要把商业化判断限制在已验证场景内[。；;]?"),
+        r"这一风险会降低\1相关判断的确定性。",
+    ),
+    (re.compile(r"(市场规模|收入|订单|客户数量|客户规模)为达"), r"\1达"),
+]
+
+_NAMED_SOURCE_CLAIM_RULES = [
+    {
+        "claim_marker": re.compile(r"(?:Gartner|高德纳|炒作周期)", re.I),
+        "source_marker": re.compile(r"(?:Gartner|高德纳|gartner\.com)", re.I),
+        "sentence": re.compile(r"[^。；;\n]*(?:Gartner|高德纳|炒作周期)[^。；;\n]*(?:[。；;]|$)", re.I),
+        "heading": re.compile(r"(?m)^\s*#{1,4}\s*[^。\n]*(?:Gartner|高德纳|炒作周期)[^\n]*$"),
+    },
+]
+
+_PUBLIC_TEMPLATE_SCAFFOLD_PATTERNS = (
+    re.compile(
+        r"\u5bf9\u201c[^\u201d]{1,180}\u201d\u8fd9\u4e00\u5224\u65ad\u800c\u8a00"
+        r"\uff0c?\u5173\u952e\u4e0d\u53ea\u662f\u4e8b\u5b9e\u662f\u5426\u51fa\u73b0"
+        r"[^。！？；;\n]{0,240}[。！？；;]?"
+    ),
+    re.compile(
+        r"\u5982\u679c\u628a\u5b83\u653e\u5728\u62a5\u544a\u4e3b\u7ebf\u4e2d"
+        r"[^。！？；;\n]{0,240}[。！？；;]?"
+    ),
+    re.compile(
+        r"\u8fd9\u79cd\u5904\u7406\u65b9\u5f0f\u53ef\u4ee5\u8ba9\u8bfb\u8005"
+        r"[^。！？；;\n]{0,260}[。！？；;]?"
+    ),
+    re.compile(
+        r"\u56e0\u6b64\uff0c?\u8fd9\u4e00\u6bb5\u66f4\u9002\u5408\u4f5c\u4e3a"
+        r"\u6709\u8fb9\u754c\u7684\u5206\u6790\u4fe1\u53f7[^。！？；;\n]{0,260}[。！？；;]?"
+    ),
+    re.compile(
+        r"\u4f18\u5148\u9a8c\u8bc1\u5173\u952e\u6765\u6e90\u3001"
+        r"\u6307\u6807\u53e3\u5f84\u548c\u53cd\u5411\u6837\u672c"
+        r"[^。！？；;\n]{0,160}[。！？；;]?"
+    ),
+)
+
+_UNCITED_CORE_VIEW_HARD_FACT_RE = re.compile(
+    r"\d|%|\uff05|"
+    r"\u4ebf\u5143|\u4e07\u4ebf|\u4e07\u5143|\u5e02\u573a\u89c4\u6a21|"
+    r"\u9884\u8ba1|\u9884\u6d4b|\u8fbe|\u8d85\u8fc7|\u7a81\u7834|"
+    r"\u589e\u957f|\u589e\u901f|\u51fa\u8d27|\u8ba2\u5355|\u5ba2\u6237|"
+    r"\u653f\u7b56|\u53d1\u5e03|\u5370\u53d1|\u51fa\u53f0|"
+    r"\u4e0a\u5e02\u516c\u53f8|\u8d22\u62a5|\u516c\u544a|"
+    r"\u539f\u6cb9|\u80fd\u6e90|IMF|Gartner|IDC|Statista",
+    re.I,
+)
+
+
+def _remove_dirty_public_spans(text: str) -> str:
+    cleaned = str(text or "")
+    for pattern in _DIRTY_PUBLIC_SPAN_PATTERNS:
+        cleaned = pattern.sub("", cleaned)
+    for pattern, replacement in _DIRTY_PUBLIC_SPAN_REWRITES:
+        cleaned = pattern.sub(replacement, cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\s+([。；;，,])", r"\1", cleaned)
+    return cleaned
+
+
+def _remove_public_template_scaffold(text: str) -> str:
+    cleaned = str(text or "")
+    for pattern in _PUBLIC_TEMPLATE_SCAFFOLD_PATTERNS:
+        cleaned = pattern.sub("", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\s+([。！？；;])", r"\1", cleaned)
+    return cleaned
+
+
+def _clean_truncated_public_headings(text: str) -> str:
+    result: List[str] = []
+    for line in str(text or "").splitlines():
+        if re.match(r"^\s*#{1,4}\s+", line):
+            line = re.sub(r"\s*(?:\.\s*){3,}.*$", "", line).rstrip()
+            line = re.sub(r"\s*\(\d{1,4}\)\s*$", "", line).rstrip()
+            line = re.sub(r"\s*\uff08\d{1,4}\uff09\s*$", "", line).rstrip()
+        result.append(line)
+    return "\n".join(result)
+
+
+def _drop_uncited_core_view_bullets(text: str) -> str:
+    result: List[str] = []
+    in_core = False
+    for line in str(text or "").splitlines():
+        stripped = line.strip()
+        if re.match(r"^##\s+", stripped):
+            in_core = bool(
+                re.search(
+                    r"\u6838\u5fc3\u89c2\u70b9|\u4e3b\u8981\u7ed3\u8bba|key\s+judgments?|executive\s+summary",
+                    stripped,
+                    re.I,
+                )
+            )
+        elif re.match(r"^#{1,4}\s+", stripped):
+            in_core = False
+        if (
+            in_core
+            and re.match(r"^[-*]\s+", stripped)
+            and not re.search(r"\[\d{1,5}\]", stripped)
+            and _UNCITED_CORE_VIEW_HARD_FACT_RE.search(stripped)
+        ):
+            continue
+        result.append(line)
+    return "\n".join(result)
+
+
+def _remove_unbacked_named_source_claims(body: str, appendix: str) -> str:
+    cleaned = str(body or "")
+    source_text = str(appendix or "")
+    for rule in _NAMED_SOURCE_CLAIM_RULES:
+        if not rule["claim_marker"].search(cleaned):
+            continue
+        if rule["source_marker"].search(source_text):
+            continue
+        heading_pattern = rule.get("heading")
+        if heading_pattern is not None:
+            cleaned = heading_pattern.sub("", cleaned)
+        cleaned = rule["sentence"].sub("", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned
 
 
 def _drop_trailing_blank(out: List[str]) -> None:
@@ -799,12 +1026,56 @@ def _public_sanitizer_mutation_mode() -> str:
     return "diagnostic_only"
 
 
+def _repair_count_metric_labeled_as_cost(text: str) -> str:
+    """Fix extraction/rendering artifacts where a count is mislabeled as cost.
+
+    Keep real cost claims intact. The rewrite only fires when the value uses a
+    count-like unit ("家", "企业", "单位") that cannot be a monetary cost.
+    """
+
+    repaired = str(text or "")
+    repaired = re.sub(
+        r"成本方面，\s*(相关企业数量已(?:超|超过)\s*\d+(?:\.\d+)?\s*家)",
+        r"参与主体方面，\1",
+        repaired,
+    )
+    repaired = re.sub(
+        r"成本维度上，\s*(参与企业(?:已)?(?:超|超过)\s*\d+(?:\.\d+)?\s*家)",
+        r"参与主体维度上，\1",
+        repaired,
+    )
+    repaired = re.sub(
+        r"成本(?:已)?(超|超过)\s*(\d+(?:\.\d+)?\s*家)",
+        r"参与企业\1\2",
+        repaired,
+    )
+    repaired = re.sub(
+        r"[（(]\s*成本\s*[:：]\s*((?:超|超过)?\s*\d+(?:\.\d+)?\s*家)\s*[）)]",
+        "",
+        repaired,
+    )
+    repaired = repaired.replace("高参与成本可能", "合规成本或参与门槛可能")
+    return repaired
+
+
 def sanitize_public_markdown(markdown: str, *, mode: str | None = None) -> str:
     effective_mode = str(mode or _public_sanitizer_mutation_mode()).strip().lower()
     if effective_mode not in {"enforce", "strict", "repair_publication", "mutate", "clean"}:
         return str(markdown or "")
     body, appendix = _split_source_appendix(str(markdown or ""))
-    text = rewrite_internal_public_terms(normalize_public_text_artifacts(body))
+    normalized_body = normalize_public_text_artifacts(body)
+    normalized_appendix = normalize_public_text_artifacts(appendix)
+    text = rewrite_internal_public_terms(
+        _clean_truncated_public_headings(
+            _drop_uncited_core_view_bullets(
+                _remove_public_template_scaffold(
+                    _remove_dirty_public_spans(
+                        _remove_unbacked_named_source_claims(normalized_body, normalized_appendix)
+                    )
+                )
+            )
+        )
+    )
     text = _strip_diagnostic_tables(text)
     schema_like_bullet_re = re.compile(r"(?m)^\s*[-*]\s*[^。；;\n]{1,16}[；;][^。；;\n]{0,16}[；;][^。；;\n]{0,50}\s*$")
     blocks = re.split(r"\n(?=#{1,4}\s+)", text)
@@ -820,6 +1091,7 @@ def sanitize_public_markdown(markdown: str, *, mode: str | None = None) -> str:
     cleaned = "\n".join(kept)
     for _ in range(3):
         before = cleaned
+        cleaned = _repair_count_metric_labeled_as_cost(cleaned)
         cleaned = _drop_publication_blocker_lines(cleaned)
         cleaned = schema_like_bullet_re.sub("", cleaned)
         cleaned = rewrite_internal_gap_language(cleaned)
@@ -840,9 +1112,9 @@ def sanitize_public_markdown(markdown: str, *, mode: str | None = None) -> str:
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
         if cleaned == before:
             break
-    appendix = rewrite_internal_public_terms(normalize_public_text_artifacts(
-        remove_empty_headings(_drop_publication_blocker_lines(appendix, strict_only=True)).strip()
-    ))
+    appendix = rewrite_internal_public_terms(
+        remove_empty_headings(_drop_publication_blocker_lines(normalized_appendix, strict_only=True)).strip()
+    )
     if appendix:
         return (cleaned + "\n\n" + appendix).strip() if cleaned else appendix
     return cleaned

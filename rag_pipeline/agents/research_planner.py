@@ -115,6 +115,31 @@ Additional required planning layer:
 """.strip()
 
 
+RESEARCH_PLANNER_COMPACT_SYSTEM = """
+You are a research planning agent. Return only valid compact JSON.
+Do not write the report. Do not include search_tasks. Do not include long explanations.
+Preserve the user's exact research topic terms in research_object and global_required_terms; never replace a Chinese topic with another industry, translation guess, or example topic.
+Keep chapters to 4-6 items and evidence_goals to at most 4 per chapter.
+Each chapter must include chapter_id, chapter_title, and core_question.
+Each evidence_goal must include goal_id, chapter_id, proof_role, required_fields, and lane_targets.
+Use proof_role values: support, metric, case, counter, filing, source_check, technology_product.
+Return this schema only:
+{
+  "query": "...",
+  "research_type": "...",
+  "report_family": "industry_deep_report|briefing_note|policy_impact_report|dynamic_research_report",
+  "research_object": "...",
+  "core_question": "...",
+  "hypotheses": [{"hypothesis_id": "H1", "statement": "..."}],
+  "chapters": [{"chapter_id": "ch_01", "chapter_title": "...", "core_question": "..."}],
+  "evidence_goals": [{"goal_id": "...", "chapter_id": "ch_01", "proof_role": "metric", "required_fields": [], "lane_targets": []}],
+  "global_required_terms": [],
+  "global_forbidden_terms": [],
+  "quality_rules": {}
+}
+""".strip()
+
+
 def _as_dict(value: Any) -> Dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
 
@@ -126,8 +151,60 @@ def _env_flag(name: str, default: bool) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_int(name: str, default: int, *, min_value: int = 0, max_value: int = 1_000_000) -> int:
+    try:
+        value = int(str(os.getenv(name, str(default))).strip())
+    except (TypeError, ValueError):
+        value = default
+    return min(max_value, max(min_value, value))
+
+
 def _llm_config() -> Dict[str, Any]:
-    return dict(build_llm_config_for_task("planning"))
+    return _planner_llm_config()
+
+
+def _planner_llm_config(llm_config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    config = _as_dict(llm_config) or dict(build_llm_config_for_task("planning"))
+    min_output_tokens = _env_int(
+        "REPORT_PLANNING_MAX_OUTPUT_TOKENS",
+        8192,
+        min_value=2048,
+        max_value=64000,
+    )
+    try:
+        configured_output_tokens = int(config.get("max_output_tokens") or 0)
+    except (TypeError, ValueError):
+        configured_output_tokens = 0
+    if configured_output_tokens < min_output_tokens:
+        config["max_output_tokens"] = min_output_tokens
+    return config
+
+
+def _planner_failure_reason(error: Any, diagnostic: Dict[str, Any]) -> str:
+    finish_reason = str(diagnostic.get("finish_reason") or "").strip().lower()
+    error_text = str(error or diagnostic.get("error") or "").strip().lower()
+    if finish_reason == "length":
+        return "json_truncated"
+    if "not valid json" in error_text or "json" in error_text:
+        return "invalid_json"
+    if error_text:
+        return "llm_error"
+    return "unknown"
+
+
+def _planner_payload(
+    *,
+    query: str,
+    article_brief: Optional[Dict[str, Any]],
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    payload = {
+        "query": query,
+        "article_brief": _as_dict(article_brief),
+        "current_year": datetime.now().year,
+    }
+    payload.update(_as_dict(extra))
+    return payload
 
 
 def _research_subject(query: str) -> str:
@@ -250,29 +327,133 @@ def _llm_research_plan(
     article_brief: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     if not _env_flag("BRAIN_ENABLE_LLM_RESEARCH_PLANNER", False):
-        return {}
-    config = _as_dict(llm_config) or _llm_config()
+        return {
+            "_planner_llm_degraded": True,
+            "_planner_degraded_reason": "llm_disabled",
+            "_planning_status": "fallback_seed",
+        }
+    config = _planner_llm_config(llm_config)
     if not llm_config_is_ready(config):
-        return {}
+        return {
+            "_planner_llm_degraded": True,
+            "_planner_degraded_reason": "llm_config_unavailable",
+            "_planning_status": "fallback_seed",
+        }
+
+    def call_compact_planner(
+        *,
+        status: str,
+        mode: str,
+        extra_payload: Optional[Dict[str, Any]] = None,
+        previous_diagnostic: Optional[Dict[str, Any]] = None,
+        previous_reason: str = "",
+    ) -> Dict[str, Any]:
+        response = call_openai_compatible_json(
+            config=config,
+            system_prompt=RESEARCH_PLANNER_COMPACT_SYSTEM,
+            user_payload=_planner_payload(query=query, article_brief=article_brief, extra=extra_payload),
+        )
+        payload = _as_dict(response.get("payload"))
+        payload["_planner_llm_degraded"] = False
+        payload["_planning_status"] = status
+        payload["_planner_mode"] = mode
+        if previous_reason:
+            payload["_planner_degraded_reason"] = f"compact_retry_after_{previous_reason}"
+        diagnostic = _as_dict(previous_diagnostic)
+        if diagnostic:
+            payload["_planner_finish_reason"] = str(diagnostic.get("finish_reason") or "").strip()
+        llm_call = _as_dict(response.get("llm_call"))
+        if diagnostic:
+            llm_call = {
+                **llm_call,
+                "previous_planner_error": {
+                    "reason": previous_reason,
+                    "finish_reason": str(diagnostic.get("finish_reason") or "").strip(),
+                    "error": str(diagnostic.get("error") or "")[:500],
+                },
+            }
+        payload["_planner_llm_call"] = llm_call
+        return payload
+
+    if _env_flag("REPORT_PLANNING_COMPACT_FIRST", True):
+        try:
+            return call_compact_planner(
+                status="ok",
+                mode="compact_first",
+                extra_payload={"compact_first": True},
+            )
+        except Exception as exc:
+            diagnostic = _as_dict(getattr(exc, "diagnostic", {}))
+            reason = _planner_failure_reason(str(exc), diagnostic)
+            if reason in {"json_truncated", "invalid_json"} and _env_flag("REPORT_PLANNING_COMPACT_RETRY", True):
+                try:
+                    return call_compact_planner(
+                        status="repaired",
+                        mode="compact_retry",
+                        extra_payload={
+                            "compact_retry": True,
+                            "previous_error": {
+                                "reason": reason,
+                                "finish_reason": str(diagnostic.get("finish_reason") or "").strip(),
+                            },
+                        },
+                        previous_diagnostic=diagnostic,
+                        previous_reason=reason,
+                    )
+                except Exception:
+                    logger.exception("Compact-first LLM research planner retry failed", extra={"query": query})
+            else:
+                logger.exception("Compact-first LLM research planner failed", extra={"query": query})
+            return {
+                "_planner_llm_degraded": True,
+                "_planner_llm_error": str(exc),
+                "_planner_degraded_reason": reason,
+                "_planner_finish_reason": str(diagnostic.get("finish_reason") or "").strip(),
+                "_planning_status": "fallback_seed",
+                "_planner_mode": "compact_first",
+                "_planner_llm_call": diagnostic,
+            }
+
     try:
         response = call_openai_compatible_json(
             config=config,
             system_prompt=RESEARCH_PLANNER_SYSTEM,
-            user_payload={
-                "query": query,
-                "article_brief": _as_dict(article_brief),
-                "current_year": datetime.now().year,
-            },
+            user_payload=_planner_payload(query=query, article_brief=article_brief),
         )
     except Exception as exc:
-        logger.exception("LLM research planner failed", extra={"query": query})
+        diagnostic = _as_dict(getattr(exc, "diagnostic", {}))
+        reason = _planner_failure_reason(str(exc), diagnostic)
+        if reason in {"json_truncated", "invalid_json"} and _env_flag("REPORT_PLANNING_COMPACT_RETRY", True):
+            try:
+                return call_compact_planner(
+                    status="repaired",
+                    mode="compact_retry",
+                    extra_payload={
+                        "compact_retry": True,
+                        "previous_error": {
+                            "reason": reason,
+                            "finish_reason": str(diagnostic.get("finish_reason") or "").strip(),
+                        },
+                    },
+                    previous_diagnostic=diagnostic,
+                    previous_reason=reason,
+                )
+            except Exception:
+                logger.exception("Compact LLM research planner retry failed", extra={"query": query})
+        else:
+            logger.exception("LLM research planner failed", extra={"query": query})
         return {
             "_planner_llm_degraded": True,
             "_planner_llm_error": str(exc),
-            "_planner_llm_call": _as_dict(getattr(exc, "diagnostic", {})),
+            "_planner_degraded_reason": reason,
+            "_planner_finish_reason": str(diagnostic.get("finish_reason") or "").strip(),
+            "_planning_status": "fallback_seed",
+            "_planner_llm_call": diagnostic,
         }
     payload = _as_dict(response.get("payload"))
     payload["_planner_llm_degraded"] = False
+    payload["_planning_status"] = "ok"
+    payload["_planner_mode"] = "full"
     payload["_planner_llm_call"] = _as_dict(response.get("llm_call"))
     return payload
 
@@ -292,7 +473,11 @@ def run_research_planner_agent(
         problem_framing = {}
     raw_llm_plan = _llm_research_plan(query, llm_config, brief)
     llm_plan = normalize_research_plan(raw_llm_plan, query=query)
-    if (llm_plan.get("chapters") or llm_plan.get("dimensions")) and llm_plan.get("search_tasks"):
+    used_llm_plan = bool(
+        (llm_plan.get("chapters") or llm_plan.get("dimensions"))
+        and (llm_plan.get("search_tasks") or llm_plan.get("evidence_goals") or llm_plan.get("hypotheses"))
+    )
+    if used_llm_plan:
         plan = normalize_research_plan(apply_problem_framing(llm_plan, problem_framing), query=query)
     else:
         plan = normalize_research_plan(_dynamic_seed_plan(query, problem_framing, brief), query=query)
@@ -309,11 +494,32 @@ def run_research_planner_agent(
     profile = select_report_profile(query, plan)
     llm_call = _as_dict(raw_llm_plan.get("_planner_llm_call"))
     llm_degraded = bool(raw_llm_plan.get("_planner_llm_degraded"))
+    planner_finish_reason = str(raw_llm_plan.get("_planner_finish_reason") or llm_call.get("finish_reason") or "").strip()
+    planner_degraded_reason = str(raw_llm_plan.get("_planner_degraded_reason") or "").strip()
+    planner_mode = str(raw_llm_plan.get("_planner_mode") or "").strip()
+    planning_status = str(raw_llm_plan.get("_planning_status") or "").strip()
+    raw_planning_status = str(raw_llm_plan.get("_planning_status") or "").strip()
+    if not used_llm_plan:
+        planning_status = "fallback_seed"
+        if not planner_degraded_reason:
+            planner_degraded_reason = "llm_incomplete" if raw_llm_plan else "llm_disabled"
+        llm_degraded = True
+    elif raw_planning_status == "repaired":
+        planning_status = "repaired"
+        llm_degraded = False
+    elif not planning_status:
+        planning_status = "ok"
     plan = {
         **plan,
         "report_family": profile.get("name") or plan.get("report_family"),
         "report_profile": profile.get("name"),
         "planner_llm_degraded": llm_degraded,
+        "planning_status": planning_status,
+        "planner_degraded_reason": planner_degraded_reason,
+        "planner_finish_reason": planner_finish_reason,
+        "planner_mode": planner_mode,
+        "allow_search": bool(plan.get("chapters") or plan.get("dimensions") or plan.get("evidence_goals")),
+        "allow_full_report": planning_status in {"ok", "repaired"},
         "planner_llm_call": llm_call,
         "llm_calls": [llm_call] if llm_call else [],
         "layout_intent": {

@@ -12,17 +12,62 @@ from urllib.parse import urlparse
 from rag_pipeline.cache.evidence_cache import store_evidence_from_package
 from rag_pipeline.cache.trusted_source_cache import store_trusted_sources_from_package
 
+try:  # Runtime probes are diagnostic-only and must never block merging.
+    from rag_pipeline.observability.probe_api import emit_transform as _probe_emit_transform
+    from rag_pipeline.observability.probe_context import current_probe_context_from_env as _current_probe_context_from_env
+    from rag_pipeline.observability.data_root_hygiene import (
+        inspect_cache_hygiene as _inspect_cache_hygiene,
+        inspect_evidence_analysis_hygiene as _inspect_evidence_analysis_hygiene,
+    )
+except Exception:  # pragma: no cover - optional diagnostics only.
+    _probe_emit_transform = None
+    _current_probe_context_from_env = None
+    _inspect_cache_hygiene = None
+    _inspect_evidence_analysis_hygiene = None
+
 try:
-    from rag_pipeline.contracts.evidence_quality import apply_evidence_quality_contract, infer_claim_type
-    from rag_pipeline.contracts.quality_gate_policy import quality_gates_isolated
+    from rag_pipeline.contracts.evidence_quality import (
+        BLOCKING_CONTENT_SHAPE_ISSUES,
+        NON_CLAIM_ALLOWED_USES,
+        NON_CLAIM_ANALYSIS_READINESS,
+        apply_evidence_quality_contract,
+        evidence_content_shape_issues,
+        infer_claim_type,
+    )
+    from rag_pipeline.contracts.quality_gate_policy import advisory_weight_mode, public_signal_mode, quality_gates_isolated
 except Exception:  # pragma: no cover - direct script mode fallback
+    BLOCKING_CONTENT_SHAPE_ISSUES = {"pdf_table_or_header_fragment", "browser_or_login_fragment"}  # type: ignore
+    NON_CLAIM_ALLOWED_USES = {  # type: ignore
+        "rejected",
+        "not_allowed",
+        "not_for_writing",
+        "diagnostic_only",
+        "appendix_only",
+        "clue_only",
+        "clue",
+        "search_only",
+    }
+    NON_CLAIM_ANALYSIS_READINESS = {"blocked", "followup_only", "clue_only", "diagnostic_only"}  # type: ignore
     apply_evidence_quality_contract = None  # type: ignore
+    evidence_content_shape_issues = None  # type: ignore
     infer_claim_type = None  # type: ignore
     def quality_gates_isolated(default: bool = False) -> bool:  # type: ignore
+        return default
+    def public_signal_mode(default: bool = False) -> bool:  # type: ignore
+        return default
+    def advisory_weight_mode(default: bool = False) -> bool:  # type: ignore
         return default
 
 
 MERGER_NAME = "evidence_merger"
+LINEAGE_KEYS = (
+    "requirement_id",
+    "evidence_requirement_id",
+    "search_task_id",
+    "source_id",
+    "run_source_id",
+    "gap_id",
+)
 
 INDUSTRY_DIMENSIONS = [
     "综合研究问题",
@@ -188,7 +233,7 @@ EVIDENCE_ROLES = {
 REJECTED_STATUSES = {"rejected", "spam", "irrelevant", "blacklisted", "exclude"}
 REJECTED_ROLES = {"rejected", "spam", "irrelevant", "blacklisted", "exclude"}
 QUALITATIVE_KEEP_RE = re.compile(
-    r"认证|客户|订单|中标|公告|试点|示范|补贴|目录|量产|投产|扩产|供货|合作|政策|标准|审批|注册|招股书|年报|财报|专利|论文|签约|采购|入围|供应链|验证",
+    r"认证|客户|订单|中标|公告|试点|示范|补贴|目录|量产|投产|扩产|供货|合作|政策|标准|审批|注册|招股书|年报|财报|专利|论文|签约|采购|入围|供应链|验证|开发者|生态|社区|插件|API|SDK|文档|开源|GitHub|集成|应用商店|marketplace",
     re.I,
 )
 CONTAMINATION_TEXT_PATTERNS = [
@@ -294,6 +339,30 @@ def should_discard_evidence(fact_dict: Dict[str, Any]) -> bool:
     return False
 
 
+_GENERIC_VALUE_METRIC_RE = re.compile(
+    r"^(?:data\s*indicator|metric|indicator|value|number|fact|"
+    r"数据指标|定性事实|关键事实|指标|数值)$",
+    re.I,
+)
+
+
+def _explicit_value_is_artifact(*, metric: Any, value: Any, content: Any, source: Dict[str, Any]) -> bool:
+    value_text = re.sub(r"\s+", "", str(value or "").strip())
+    if not re.fullmatch(r"\d{5,}", value_text):
+        return False
+    metric_text = re.sub(r"\s+", "", str(metric or "").strip())
+    content_text = str(content or "")
+    source_url = str(source.get("url") or source.get("source_url") or "")
+    source_doc = str(source.get("document_id") or source.get("doc_id") or "")
+    if value_text in re.sub(r"\D+", "", source_url) or value_text in source_doc:
+        return True
+    if not _GENERIC_VALUE_METRIC_RE.search(metric_text):
+        return False
+    if value_text not in re.sub(r"\D+", "", content_text):
+        return False
+    return bool(re.search(r"\b(?:url|detail|page|report|file|doc|id|编号|文档|文件|页面)\b", content_text, re.I))
+
+
 def _clean_fact_description(evidence: Dict[str, Any]) -> str:
     content = _clean_evidence_content(evidence.get("content"), max_chars=520)
     metric = _clean_metric_name(evidence.get("metric"), content)
@@ -354,6 +423,8 @@ def _analysis_input_for_evidence(evidence: Dict[str, Any], *, fact_text: Any = "
         "source_level": str(evidence.get("source_level") or "").strip(),
         "evidence_role": str(evidence.get("evidence_role") or "").strip(),
         "allowed_use": str(evidence.get("allowed_use") or "").strip(),
+        "analysis_readiness": str(evidence.get("analysis_readiness") or _as_dict(evidence.get("evidence_card")).get("analysis_readiness") or "").strip(),
+        "content_shape_issues": _content_shape_issues_for(evidence),
         "quality_gate_observations": _as_list(evidence.get("quality_gate_observations")),
         "evidence_card": _as_dict(evidence.get("evidence_card")),
         "semantic_status": str(evidence.get("semantic_status") or "").strip(),
@@ -367,6 +438,10 @@ def _analysis_input_for_evidence(evidence: Dict[str, Any], *, fact_text: Any = "
         "analysis_lens": _analysis_lens_for_dimension(dimension),
         "task": {
             "task_id": str(evidence.get("task_id") or "").strip(),
+            "requirement_id": str(evidence.get("requirement_id") or _as_dict(evidence.get("lineage")).get("requirement_id") or "").strip(),
+            "search_task_id": str(evidence.get("search_task_id") or _as_dict(evidence.get("lineage")).get("search_task_id") or "").strip(),
+            "source_id": str(evidence.get("source_id") or _as_dict(evidence.get("lineage")).get("source_id") or "").strip(),
+            "gap_id": str(evidence.get("gap_id") or _as_dict(evidence.get("lineage")).get("gap_id") or "").strip(),
             "dimension_id": str(evidence.get("dimension_id") or "").strip(),
             "dimension_name": str(evidence.get("dimension_name") or "").strip(),
             "evidence_goal": str(evidence.get("evidence_goal") or "").strip(),
@@ -388,6 +463,91 @@ def _as_dict(value: Any) -> Dict[str, Any]:
 
 def _as_list(value: Any) -> List[Any]:
     return list(value) if isinstance(value, list) else []
+
+
+def _emit_evidence_merger_probe(package: Dict[str, Any], *, input_count: int) -> None:
+    """Record the evidence-pool to analysis-ready funnel as a sidecar event."""
+
+    if _probe_emit_transform is None or _current_probe_context_from_env is None:
+        return
+    try:
+        probe = _current_probe_context_from_env()
+        if probe is None:
+            return
+        summary = _as_dict(package.get("summary"))
+        health = _as_dict(package.get("evidence_health_summary"))
+        analysis_ready = [item for item in _as_list(package.get("analysis_ready_evidence")) if isinstance(item, dict)]
+        requirement_filled = sum(1 for item in analysis_ready if str(item.get("requirement_id") or "").strip())
+        source_filled = sum(
+            1
+            for item in analysis_ready
+            if str(
+                item.get("source_id")
+                or item.get("source_ref")
+                or item.get("source_url")
+                or _as_dict(item.get("source")).get("url")
+                or _as_dict(item.get("source")).get("title")
+                or ""
+            ).strip()
+        )
+        clean_fact_count = int(summary.get("clean_fact_count") or health.get("clean_fact_count") or 0)
+        analysis_ready_count = int(summary.get("analysis_ready_count") or health.get("analysis_ready_count") or len(analysis_ready))
+        rejected_count = int(summary.get("rejected_count") or health.get("semantic_rejected_count") or 0)
+        appendix_only_count = int(summary.get("appendix_only_count") or health.get("appendix_only_count") or 0)
+        evidence_hygiene = _inspect_evidence_analysis_hygiene(analysis_ready) if _inspect_evidence_analysis_hygiene else {}
+        cache_payload = _as_dict(_as_dict(package.get("metadata")).get("evidence_cache_store"))
+        cache_hygiene = _inspect_cache_hygiene(cache_payload) if _inspect_cache_hygiene else {}
+        merge_diagnostics = _as_dict(_as_dict(package.get("metadata")).get("merge_diagnostics"))
+        evidence_dirty_count = int(evidence_hygiene.get("dirty_item_count") or 0) if isinstance(evidence_hygiene, dict) else 0
+        evidence_reason_counts = dict(evidence_hygiene.get("reason_counts") or {}) if isinstance(evidence_hygiene, dict) else {}
+        cache_reason_counts = dict(cache_hygiene.get("reason_counts") or {}) if isinstance(cache_hygiene, dict) else {}
+        _probe_emit_transform(
+            probe,
+            stage="evidence_merger",
+            module="evidence_merger",
+            input_count=max(0, int(input_count or 0)),
+            output_count=analysis_ready_count,
+            drop_count=max(0, clean_fact_count - analysis_ready_count) + rejected_count,
+            status="ok" if analysis_ready_count > 0 else "warning",
+            reason_counts={
+                "rejected": rejected_count,
+                "appendix_only": appendix_only_count,
+                "clean_not_analysis_ready": max(0, clean_fact_count - analysis_ready_count),
+                "health_inconsistent": 1 if health.get("inconsistent") else 0,
+                "evidence_dirty_item": evidence_dirty_count,
+                **{f"evidence_{key}": value for key, value in evidence_reason_counts.items()},
+                **cache_reason_counts,
+            },
+            id_coverage={
+                "requirement_id": (requirement_filled / len(analysis_ready)) if analysis_ready else 0.0,
+                "source_id": (source_filled / len(analysis_ready)) if analysis_ready else 0.0,
+                "evidence_id": (
+                    sum(1 for item in analysis_ready if str(item.get("evidence_id") or item.get("ref") or "").strip()) / len(analysis_ready)
+                )
+                if analysis_ready
+                else 0.0,
+            },
+            cache=cache_payload,
+            metrics={
+                "evidence_count": int(summary.get("evidence_count") or health.get("normalized_evidence_count") or 0),
+                "clean_fact_count": clean_fact_count,
+                "analysis_ready_ab_count": int(summary.get("analysis_ready_ab_count") or 0),
+                "analysis_ready_metric_count": int(summary.get("analysis_ready_metric_count") or 0),
+                "evidence_gap_count": int(summary.get("evidence_gap_count") or 0),
+            },
+            diagnostics={
+                "ready_for_analysis": bool(summary.get("ready_for_analysis")),
+                "delivery_tier": summary.get("delivery_tier") or health.get("delivery_tier") or "",
+                "clean_fact_count": clean_fact_count,
+                "analysis_ready_count": analysis_ready_count,
+                "health_inconsistent": bool(health.get("inconsistent")),
+                "evidence_root_hygiene": evidence_hygiene,
+                "cache_root_hygiene": cache_hygiene,
+                "merge_diagnostics": merge_diagnostics,
+            },
+        )
+    except Exception:
+        return
 
 
 def _source_scalar(value: Any) -> str:
@@ -489,6 +649,9 @@ def _evidence_card_for(evidence: Dict[str, Any]) -> Dict[str, Any]:
     elif level in {"A", "B"} and role in {"core", "supporting"} and semantic_status not in REJECTED_STATUSES:
         allowed_use = "supporting"
         inference_distance = "medium"
+    elif level == "D" and public_signal_mode() and semantic_status not in REJECTED_STATUSES:
+        allowed_use = "directional_signal"
+        inference_distance = "high"
     elif level == "C" and semantic_status not in REJECTED_STATUSES and not evidence.get("appendix_only"):
         allowed_use = "directional_signal"
         inference_distance = "high"
@@ -577,6 +740,8 @@ def _task_payload_from_item(item: Dict[str, Any], research_plan: Optional[Dict[s
             "must_have_terms": _as_list(item.get("must_have_terms")),
             "forbidden_terms": _as_list(item.get("forbidden_terms")),
             "source_priority": _as_list(item.get("source_priority")),
+            "topic_anchor_terms": _as_list(item.get("topic_anchor_terms")) or _as_list(item.get("topic_terms")),
+            "topic_terms": _as_list(item.get("topic_terms")),
             "hypothesis_id": item.get("hypothesis_id"),
             "hypothesis_statement": item.get("hypothesis_statement"),
             "proof_role": item.get("proof_role"),
@@ -585,20 +750,94 @@ def _task_payload_from_item(item: Dict[str, Any], research_plan: Optional[Dict[s
             "claim_type": item.get("claim_type"),
             "conclusion_type": item.get("conclusion_type"),
             "counter_evidence": item.get("counter_evidence"),
+            "requirement_id": item.get("requirement_id"),
+            "evidence_requirement_id": item.get("evidence_requirement_id"),
+            "search_task_id": item.get("search_task_id"),
+            "source_id": item.get("source_id"),
+            "run_source_id": item.get("run_source_id"),
+            "gap_id": item.get("gap_id"),
         }
     cleaned: Dict[str, Any] = {}
     for key, value in task.items():
         if value is None or value == "" or value == []:
             continue
         cleaned[key] = value
+    if not cleaned.get("topic_anchor_terms") and cleaned.get("topic_terms"):
+        cleaned["topic_anchor_terms"] = _as_list(cleaned.get("topic_terms"))
     if plan:
         if plan.get("research_object") and not cleaned.get("research_object"):
             cleaned["research_object"] = plan.get("research_object")
         if plan.get("global_required_terms") and not cleaned.get("global_required_terms"):
             cleaned["global_required_terms"] = _as_list(plan.get("global_required_terms"))
+        if plan.get("topic_anchor_terms") and not cleaned.get("topic_anchor_terms"):
+            cleaned["topic_anchor_terms"] = _as_list(plan.get("topic_anchor_terms"))
+        if plan.get("topic_anchor_status") and not cleaned.get("topic_anchor_status"):
+            cleaned["topic_anchor_status"] = plan.get("topic_anchor_status")
+        if plan.get("topic_anchor_required") is not None and cleaned.get("topic_anchor_required") is None:
+            cleaned["topic_anchor_required"] = plan.get("topic_anchor_required")
         if plan.get("query") and not cleaned.get("plan_query"):
             cleaned["plan_query"] = plan.get("query")
+    lineage = _as_dict(item.get("lineage"))
+    for key in LINEAGE_KEYS:
+        if not cleaned.get(key):
+            cleaned[key] = item.get(key) or lineage.get(key)
     return cleaned
+
+
+def _same_source_url(left: Any, right: Any) -> bool:
+    left_text = _first_source_scalar(left).strip().rstrip("/").lower()
+    right_text = _first_source_scalar(right).strip().rstrip("/").lower()
+    return bool(left_text and right_text and left_text == right_text)
+
+
+def _lineage_payload(item: Dict[str, Any], task_payload: Dict[str, Any], source: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+    lineage = _as_dict(item.get("lineage"))
+    search_task = _as_dict(item.get("search_task"))
+    source_payload = _as_dict(source)
+
+    def first(*values: Any) -> str:
+        for value in values:
+            text = _source_scalar(value)
+            if text:
+                return text
+        return ""
+
+    requirement_id = first(
+        item.get("requirement_id"),
+        item.get("evidence_requirement_id"),
+        task_payload.get("requirement_id"),
+        task_payload.get("evidence_requirement_id"),
+        search_task.get("requirement_id"),
+        search_task.get("evidence_requirement_id"),
+        lineage.get("requirement_id"),
+        lineage.get("evidence_requirement_id"),
+    )
+    search_task_id = first(
+        item.get("search_task_id"),
+        task_payload.get("search_task_id"),
+        search_task.get("search_task_id"),
+        item.get("task_id"),
+        task_payload.get("task_id"),
+        search_task.get("task_id"),
+        lineage.get("search_task_id"),
+    )
+    source_id = first(
+        item.get("source_id"),
+        item.get("run_source_id"),
+        source_payload.get("id"),
+        source_payload.get("source_id"),
+        source_payload.get("ref"),
+        lineage.get("source_id"),
+        lineage.get("run_source_id"),
+    )
+    gap_id = first(item.get("gap_id"), task_payload.get("gap_id"), search_task.get("gap_id"), lineage.get("gap_id"))
+    return {
+        "requirement_id": requirement_id,
+        "search_task_id": search_task_id,
+        "source_id": source_id,
+        "gap_id": gap_id,
+        "run_source_id": first(item.get("run_source_id"), task_payload.get("run_source_id"), source_id),
+    }
 
 
 def _dynamic_dimension_from_item(item: Dict[str, Any], research_plan: Optional[Dict[str, Any]] = None) -> str:
@@ -1143,6 +1382,18 @@ def _unit_family(value: Any, unit_key: Any = "") -> str:
 
 
 def _metric_kind(metric: Any, content: Any = "", dimension: Any = "") -> str:
+    metric_only = str(metric or "")
+    if metric_only:
+        if re.search(r"市场规模|市场空间|TAM|SAM|SOM|规模", metric_only, re.I):
+            return "market_size"
+        if re.search(r"CAGR|复合增速|复合增长率|增速|同比|环比|增长率|下降率|渗透率", metric_only, re.I):
+            return "growth"
+        if re.search(r"市占率|市场份额|份额|占比|比例|比重|CR3|CR5|集中度", metric_only, re.I):
+            return "share"
+        if re.search(r"出货|销量|交付|部署|装机|保有量|应用.*台", metric_only):
+            return "shipment"
+        if re.search(r"营收|收入|净利润|利润|毛利|现金流|亏损", metric_only):
+            return "financial"
     text = " ".join([str(metric or ""), str(content or ""), str(dimension or "")])
     if re.search(r"CAGR|复合增速|复合增长率", text, re.I):
         return "growth"
@@ -1167,7 +1418,7 @@ def _metric_kind(metric: Any, content: Any = "", dimension: Any = "") -> str:
 
 def _validate_metric_semantics(metric: Any, value: Any, content: Any, dimension: Any, unit_key: Any = "") -> Dict[str, Any]:
     kind = _metric_kind(metric, content, dimension)
-    family = _unit_family(value, unit_key)
+    family = _unit_family(" ".join([str(value or ""), str(content or "")]), unit_key)
     metric_text = str(metric or "").strip()
 
     if kind in {"growth", "share"} and family not in {"percent", "ratio"}:
@@ -1245,30 +1496,86 @@ def _infer_metric(text: Any, fallback: str = "") -> str:
 def _source_from_raw_point(point: Dict[str, Any], fallback_source: Dict[str, Any]) -> Dict[str, Any]:
     point_source = _source_mapping(point.get("source"))
     fallback_source = _source_mapping(fallback_source)
-    source_url = _first_source_scalar(point.get("source_url"), point.get("url"), point_source.get("url"), point.get("source"), fallback_source.get("url"), fallback_source.get("source_url"))
-    title = _first_source_scalar(point.get("source_title"), point.get("source_name"), point_source.get("title"), fallback_source.get("title"), point.get("source"))
+    source_url = _first_source_scalar(
+        point.get("source_url"),
+        point.get("url"),
+        point_source.get("url"),
+        point.get("source"),
+        fallback_source.get("url"),
+        fallback_source.get("source_url"),
+    )
+    fallback_url = _first_source_scalar(fallback_source.get("url"), fallback_source.get("source_url"))
+    same_as_fallback = bool(source_url and fallback_url and _same_source_url(source_url, fallback_url))
+    can_inherit_fallback_metadata = bool((not source_url) or same_as_fallback)
+    explicit_title = _first_source_scalar(point.get("source_title"), point.get("source_name"), point_source.get("title"))
+    title = explicit_title or (
+        _first_source_scalar(fallback_source.get("title"), point.get("source"))
+        if can_inherit_fallback_metadata
+        else _domain(source_url)
+    )
     publisher = _first_source_scalar(
         point.get("publisher"),
         point.get("source_publisher"),
         point_source.get("publisher"),
         point_source.get("organization"),
-        fallback_source.get("publisher"),
-        fallback_source.get("organization"),
-        fallback_source.get("source"),
+        *((
+            fallback_source.get("publisher"),
+            fallback_source.get("organization"),
+            fallback_source.get("source"),
+        ) if can_inherit_fallback_metadata else ()),
     )
-    return {
+    source_type = _first_source_scalar(
+        point.get("source_type"),
+        point.get("type"),
+        point_source.get("source_type"),
+        *((
+            fallback_source.get("source_type"),
+            fallback_source.get("type"),
+        ) if can_inherit_fallback_metadata else ()),
+    )
+    source = {
         "title": title or "未命名来源",
         "url": source_url,
-        "date": _first_source_scalar(point.get("date"), point.get("period"), point_source.get("date"), fallback_source.get("date")),
+        "date": _first_source_scalar(
+            point.get("date"),
+            point.get("period"),
+            point_source.get("date"),
+            *((fallback_source.get("date"),) if can_inherit_fallback_metadata else ()),
+        ),
         "quote": _compact_text(point.get("evidence") or fallback_source.get("quote") or "", max_chars=420),
-        "source_type": _first_source_scalar(point.get("source_type"), point.get("type"), point_source.get("source_type"), fallback_source.get("source_type"), fallback_source.get("type")),
+        "source_type": source_type,
         "publisher": publisher,
         "source": publisher,
-        "document_id": _first_source_scalar(point.get("document_id"), point.get("doc_id"), point_source.get("document_id"), fallback_source.get("document_id"), fallback_source.get("doc_id")),
-        "page_ref": _first_source_scalar(point.get("page_ref"), point_source.get("page_ref"), fallback_source.get("page_ref")),
-        "source_verification_status": _first_source_scalar(point.get("source_verification_status"), point_source.get("source_verification_status"), fallback_source.get("source_verification_status")),
-        "source_verified": bool(point.get("source_verified") or fallback_source.get("source_verified")),
+        "document_id": _first_source_scalar(
+            point.get("document_id"),
+            point.get("doc_id"),
+            point_source.get("document_id"),
+            *((fallback_source.get("document_id"), fallback_source.get("doc_id")) if can_inherit_fallback_metadata else ()),
+        ),
+        "page_ref": _first_source_scalar(
+            point.get("page_ref"),
+            point_source.get("page_ref"),
+            *((fallback_source.get("page_ref"),) if can_inherit_fallback_metadata else ()),
+        ),
+        "source_verification_status": _first_source_scalar(
+            point.get("source_verification_status"),
+            point_source.get("source_verification_status"),
+            *((fallback_source.get("source_verification_status"),) if can_inherit_fallback_metadata else ()),
+        ),
+        "source_verified": bool(point.get("source_verified") or (fallback_source.get("source_verified") if can_inherit_fallback_metadata else False)),
     }
+    if source_url and fallback_url and not same_as_fallback and not explicit_title:
+        source.update(
+            {
+                "source_title_url_mismatch_suspected": True,
+                "source_title_missing": True,
+                "source_binding_fuzzy": True,
+                "source_binding": "raw_point_url_without_title",
+                "fallback_source_url": fallback_url,
+                "fallback_source_title": _first_source_scalar(fallback_source.get("title")),
+            }
+        )
+    return source
 
 
 def _citation_ids_from_text(text: str) -> List[str]:
@@ -1501,6 +1808,39 @@ GENERIC_GOAL_TOKENS = {
 }
 
 
+LOCAL_RELEVANCE_GENERIC_TERMS = {
+    "数据",
+    "统计",
+    "口径",
+    "来源",
+    "权威",
+    "报告",
+    "研究",
+    "市场",
+    "规模",
+    "行业",
+    "官方",
+    "原文",
+    "公告",
+    "分析",
+    "趋势",
+    "影响",
+    "专业",
+    "要求",
+    "基础",
+    "工具",
+    "source",
+    "official",
+    "data",
+    "report",
+    "market",
+    "industry",
+    "analysis",
+    "trend",
+    "impact",
+}
+
+
 def _term_in_text(term: str, text: str) -> bool:
     term = str(term or "").strip().lower()
     if not term:
@@ -1508,6 +1848,200 @@ def _term_in_text(term: str, text: str) -> bool:
     if re.fullmatch(r"[a-z0-9]{1,3}", term):
         return bool(re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", text, re.I))
     return term in text
+
+
+def _compact_relevance_token(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value or "").strip().lower())
+
+
+def _add_local_relevance_term(terms: List[str], seen: set[str], value: Any) -> None:
+    term = _compact_relevance_token(value).strip(" _-:：,，.;；。()（）[]【】")
+    if not term:
+        return
+    if term in LOCAL_RELEVANCE_GENERIC_TERMS:
+        return
+    if re.fullmatch(r"\d+(?:\.\d+)?%?", term):
+        return
+    if len(term) < 2 and term not in {"ai"}:
+        return
+    if term not in seen:
+        seen.add(term)
+        terms.append(term)
+
+
+def _local_relevance_terms_from_text(value: Any, *, max_terms: int = 60) -> List[str]:
+    text = str(value or "").strip().lower()
+    if not text:
+        return []
+    terms: List[str] = []
+    seen: set[str] = set()
+    split_text = re.sub(r"[\s,，;；。:：/\\|()（）\[\]【】《》\"'“”‘’、]+", " ", text)
+    split_text = re.sub(
+        r"(?:正在被|正在|需要|区分|以及|通过|由于|对于|关于|围绕|进入|成为|"
+        r"的|和|与|及|或|在|被|对|从|向|中|上|下|为|是|了)",
+        " ",
+        split_text,
+    )
+    for token in re.findall(r"[a-z][a-z0-9_+\-]{1,}", split_text, re.I):
+        token = token.lower()
+        if len(token) >= 4 or token in {"ai", "rpa", "erp", "bi", "aigc"}:
+            _add_local_relevance_term(terms, seen, token)
+        if len(terms) >= max_terms:
+            return terms
+    for chunk in re.findall(r"[\u4e00-\u9fff]{2,}", split_text):
+        if 2 <= len(chunk) <= 12:
+            _add_local_relevance_term(terms, seen, chunk)
+        for n in (4, 3, 2):
+            if len(chunk) < n:
+                continue
+            for index in range(0, len(chunk) - n + 1):
+                _add_local_relevance_term(terms, seen, chunk[index : index + n])
+                if len(terms) >= max_terms:
+                    return terms
+        if len(terms) >= max_terms:
+            return terms
+    return terms
+
+
+def _task_local_relevance_terms(task: Dict[str, Any]) -> List[str]:
+    values: List[Any] = [
+        task.get("dimension_name"),
+        task.get("evidence_goal"),
+        task.get("targets_gap"),
+        task.get("chapter_title"),
+        task.get("chapter_question"),
+        task.get("query"),
+        task.get("research_object"),
+    ]
+    values.extend(_as_list(task.get("must_have_terms")))
+    values.extend(_as_list(task.get("topic_anchor_terms")))
+    terms: List[str] = []
+    seen: set[str] = set()
+    for value in values:
+        for term in _local_relevance_terms_from_text(value):
+            _add_local_relevance_term(terms, seen, term)
+            if len(terms) >= 80:
+                return terms
+    return terms
+
+
+def _local_task_relevance_matches(task: Dict[str, Any], content_text: str) -> List[str]:
+    text = str(content_text or "").lower()
+    if not text:
+        return []
+    matched: List[str] = []
+    for term in _task_local_relevance_terms(task):
+        if _term_in_text(term, text):
+            matched.append(term)
+        if len(matched) >= 12:
+            break
+    if len(matched) >= 2:
+        return matched
+    if matched and any(len(term) >= 4 and term not in LOCAL_RELEVANCE_GENERIC_TERMS for term in matched):
+        return matched
+    return []
+
+
+def _local_topic_anchor_terms_from_groups(groups: Sequence[Sequence[Any]]) -> set[str]:
+    terms: List[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for value in group:
+            for term in _local_relevance_terms_from_text(value):
+                _add_local_relevance_term(terms, seen, term)
+    return set(terms)
+
+
+def _append_topic_group(groups: List[List[str]], candidates: Iterable[Any]) -> None:
+    group: List[str] = []
+    seen: set[str] = set()
+    for raw in candidates:
+        term = str(raw or "").strip().lower()
+        if not term:
+            continue
+        compact = re.sub(r"\s+", "", term)
+        if not compact or compact in seen:
+            continue
+        seen.add(compact)
+        group.append(term)
+    if group and not any(set(group) == set(existing) for existing in groups):
+        groups.append(group)
+
+
+GEOGRAPHIC_SCOPE_TOPIC_TERMS = {
+    "中国",
+    "国内",
+    "我国",
+    "境内",
+    "全国",
+    "china",
+    "chinese",
+}
+
+
+def _is_geographic_scope_topic_group(group: Sequence[Any]) -> bool:
+    terms = {str(term or "").strip().lower() for term in group if str(term or "").strip()}
+    return bool(terms) and terms.issubset(GEOGRAPHIC_SCOPE_TOPIC_TERMS)
+
+
+def _topic_anchor_variants_from_term(term: Any) -> List[str]:
+    text = str(term or "").strip()
+    if not text:
+        return []
+    compact = re.sub(r"\s+", "", text)
+    variants: List[str] = [text]
+    candidates = [compact]
+    if compact.startswith("中国"):
+        candidates.append(compact.removeprefix("中国"))
+    for candidate in list(candidates):
+        for delimiter in ("是否", "能否", "哪些", "什么", "如何", "有没有", "是不是", "由", "在"):
+            if delimiter in candidate:
+                prefix = candidate.split(delimiter, 1)[0].strip("，,；;：:。")
+                if 2 <= len(prefix) <= 24:
+                    variants.append(prefix)
+        if candidate.endswith("产业链") and len(candidate) > len("产业链") + 1:
+            variants.append(candidate.removesuffix("产业链"))
+        if "产业链" in candidate:
+            prefix = candidate.split("产业链", 1)[0] + "产业链"
+            if 2 <= len(prefix) <= 24:
+                variants.append(prefix)
+            core = prefix.removesuffix("产业链")
+            if 2 <= len(core) <= 24:
+                variants.append(core)
+    if "低空经济" in compact:
+        variants.extend(["低空经济", "低空经济产业链"])
+    return variants
+
+
+def _add_dynamic_topic_anchor_groups(groups: List[List[str]], task: Dict[str, Any]) -> None:
+    explicit_terms = _as_list(task.get("topic_anchor_terms"))
+    if not explicit_terms:
+        return
+    for raw in explicit_terms:
+        term = str(raw or "").strip()
+        if not term:
+            continue
+        compact = re.sub(r"\s+", "", term).lower()
+        if compact in {"\u4e2d\u56fd", "\u56fd\u5185", "\u6211\u56fd", "\u5883\u5185", "\u5168\u56fd", "china", "chinese"}:
+            _append_topic_group(groups, ["\u4e2d\u56fd", "\u56fd\u5185", "\u6211\u56fd", "\u5883\u5185", "\u5168\u56fd", "china", "chinese"])
+            continue
+        variants: List[str] = _topic_anchor_variants_from_term(term)
+        if "\u4e2d\u56fd" in term:
+            _append_topic_group(groups, ["\u4e2d\u56fd", "\u56fd\u5185", "\u6211\u56fd", "\u5883\u5185", "\u5168\u56fd", "china", "chinese"])
+            core = term.replace("\u4e2d\u56fd", "").strip()
+            if core:
+                variants.append(core)
+        if any(marker in term for marker in ("\u56fa\u6001\u7535\u6c60", "\u5168\u56fa\u6001\u7535\u6c60", "\u534a\u56fa\u6001\u7535\u6c60")):
+            variants.extend(
+                [
+                    "\u56fa\u6001\u7535\u6c60",
+                    "\u5168\u56fa\u6001\u7535\u6c60",
+                    "\u534a\u56fa\u6001\u7535\u6c60",
+                    "solid-state battery",
+                    "solid state battery",
+                ]
+            )
+        _append_topic_group(groups, variants)
 
 
 def _topic_anchor_groups(task: Dict[str, Any]) -> List[List[str]]:
@@ -1521,10 +2055,11 @@ def _topic_anchor_groups(task: Dict[str, Any]) -> List[List[str]]:
         ]
     )
     groups: List[List[str]] = []
+    _add_dynamic_topic_anchor_groups(groups, task)
     if re.search(r"\bAI\b|人工智能|大模型|生成式|AIGC", topic_text, re.I):
         groups.append(["人工智能", "ai", "aigc", "大模型", "生成式ai", "生成式人工智能"])
     if re.search(r"中国|国内", topic_text, re.I):
-        groups.append(["中国", "国内", "china", "chinese"])
+        _append_topic_group(groups, ["中国", "国内", "我国", "境内", "全国", "china", "chinese"])
     if re.search(r"新能源汽车|新能源车|动力电池|锂电", topic_text):
         groups.append(["新能源汽车", "新能源车", "动力电池", "锂电"])
     if re.search(r"半导体|芯片|集成电路", topic_text, re.I):
@@ -1589,6 +2124,7 @@ def _report_topic_hit(task: Dict[str, Any], readable_text: str) -> bool:
     text = str(readable_text or "").lower()
     compact_text = re.sub(r"\s+", "", text)
     topic_terms: List[str] = []
+    topic_terms.extend(str(item or "") for item in _as_list(task.get("topic_anchor_terms")))
     topic_terms.extend(str(item or "") for item in _as_list(task.get("global_required_terms")))
     topic_terms.extend(
         str(task.get(key) or "")
@@ -1676,6 +2212,15 @@ def task_acceptance_filter(evidence: Dict[str, Any], task: Dict[str, Any]) -> Di
         ]
     )
     source = _as_dict(evidence.get("source"))
+    content_readable_text = " ".join(
+        [
+            str(evidence.get("content") or ""),
+            str(evidence.get("clean_content") or ""),
+            str(evidence.get("clean_fact") or ""),
+            str(evidence.get("metric") or ""),
+            str(evidence.get("value") or ""),
+        ]
+    ).lower()
     evidence_text = " ".join(
         [
             evidence_text,
@@ -1718,7 +2263,12 @@ def task_acceptance_filter(evidence: Dict[str, Any], task: Dict[str, Any]) -> Di
     has_number = bool(re.search(r"\d", str(evidence.get("content") or evidence.get("value") or "")))
     source_priority_hit = _source_priority_matches(source_priority, source, evidence.get("source_level"))
     missing_topic_groups = _missing_topic_anchor_groups(task, readable_text)
+    hard_missing_topic_groups = [
+        group for group in missing_topic_groups if not _is_geographic_scope_topic_group(group)
+    ]
+    content_topic_hit = _report_topic_hit(task, content_readable_text)
     report_topic_hit = _report_topic_hit(task, readable_text)
+    source_only_topic_match = bool(report_topic_hit and not content_topic_hit)
 
     score = 0.0
     score += 0.40 * must_ratio
@@ -1730,15 +2280,41 @@ def task_acceptance_filter(evidence: Dict[str, Any], task: Dict[str, Any]) -> Di
         score += 0.15
     if forbidden_hit:
         score -= 0.45
+    if source_only_topic_match:
+        score = min(score, 0.34)
     score = max(0.0, min(1.0, score))
-    if missing_topic_groups:
+    if hard_missing_topic_groups:
+        local_matched_terms = _local_task_relevance_matches(task, content_readable_text)
+        missing_anchor_terms = _local_topic_anchor_terms_from_groups(hard_missing_topic_groups)
+        if local_matched_terms and not any(term in missing_anchor_terms for term in local_matched_terms):
+            local_matched_terms = []
+        if local_matched_terms and not source_only_topic_match and not forbidden_hit:
+            return {
+                "accepted": True,
+                "relevance_score": round(max(score, 0.43), 4),
+                "role_hint": "bounded_context",
+                "reason": "local_task_relevance_pass",
+                "matched_terms": matched_must,
+                "local_matched_terms": local_matched_terms,
+                "missing_topic_groups": hard_missing_topic_groups,
+                "soft_missing_topic_groups": [
+                    group for group in missing_topic_groups if _is_geographic_scope_topic_group(group)
+                ],
+                "content_topic_hit": content_topic_hit,
+                "source_only_topic_match": source_only_topic_match,
+            }
         return {
             "accepted": False,
             "relevance_score": round(min(score, 0.2), 4),
             "role_hint": "rejected",
             "reason": "topic_anchor_missing",
             "matched_terms": matched_must,
-            "missing_topic_groups": missing_topic_groups,
+            "missing_topic_groups": hard_missing_topic_groups,
+            "soft_missing_topic_groups": [
+                group for group in missing_topic_groups if _is_geographic_scope_topic_group(group)
+            ],
+            "content_topic_hit": content_topic_hit,
+            "source_only_topic_match": source_only_topic_match,
         }
     if forbidden_hit:
         return {
@@ -1747,10 +2323,13 @@ def task_acceptance_filter(evidence: Dict[str, Any], task: Dict[str, Any]) -> Di
             "role_hint": "rejected",
             "reason": "forbidden_terms_hit",
             "matched_terms": matched_must,
+            "content_topic_hit": content_topic_hit,
+            "source_only_topic_match": source_only_topic_match,
         }
     if (
         _can_use_chapter_or_report_relevance(evidence, task, source)
         and report_topic_hit
+        and not source_only_topic_match
         and (source_priority_hit or _role_source_fit(evidence.get("proof_role"), evidence.get("evidence_type"), source))
     ):
         return {
@@ -1759,6 +2338,8 @@ def task_acceptance_filter(evidence: Dict[str, Any], task: Dict[str, Any]) -> Di
             "role_hint": "bounded_context",
             "reason": "chapter_or_report_relevance_pass",
             "matched_terms": matched_must,
+            "content_topic_hit": content_topic_hit,
+            "source_only_topic_match": source_only_topic_match,
         }
     threshold = 0.42
     if must_terms and not matched_must and not (dimension_hit or goal_hit):
@@ -1770,6 +2351,8 @@ def task_acceptance_filter(evidence: Dict[str, Any], task: Dict[str, Any]) -> Di
             "role_hint": "candidate",
             "reason": "task_relevance_pass",
             "matched_terms": matched_must,
+            "content_topic_hit": content_topic_hit,
+            "source_only_topic_match": source_only_topic_match,
         }
     return {
         "accepted": False,
@@ -1777,6 +2360,8 @@ def task_acceptance_filter(evidence: Dict[str, Any], task: Dict[str, Any]) -> Di
         "role_hint": "weak_clue",
         "reason": "low_task_relevance_keep_as_clue",
         "matched_terms": matched_must,
+        "content_topic_hit": content_topic_hit,
+        "source_only_topic_match": source_only_topic_match,
     }
 
 
@@ -1811,8 +2396,15 @@ def _build_evidence(
     # into fake metric values attached to otherwise good qualitative facts.
     normalized_value, unit_key = _numeric_norm(value)
     task_payload = _task_payload_from_item(item, research_plan)
+    lineage = _lineage_payload(item, task_payload, source)
     evidence = {
         "evidence_id": evidence_id,
+        "requirement_id": lineage.get("requirement_id"),
+        "search_task_id": lineage.get("search_task_id"),
+        "source_id": lineage.get("source_id"),
+        "run_source_id": lineage.get("run_source_id"),
+        "gap_id": lineage.get("gap_id"),
+        "lineage": lineage,
         "dimension": dimension,
         "content": _compact_text(_strip_document_noise(content), max_chars=900),
         "metric": metric,
@@ -1822,6 +2414,11 @@ def _build_evidence(
         "numeric_value": normalized_value,
         "numeric_unit": unit_key,
         "unit": _clean_unit_text(item.get("unit") or item.get("numeric_unit") or unit_key),
+        # Audit trail for how the raw point was bound to its source
+        # (citation_id vs fuzzy text match); set by the brain raw-point
+        # extractor and consumed by source-mismatch diagnostics downstream.
+        "source_binding": str(item.get("source_binding") or "").strip(),
+        "source_binding_fuzzy": bool(item.get("source_binding_fuzzy")),
         "source": {
             "title": str(source.get("title") or "未命名来源").strip(),
             "url": _first_source_scalar(source.get("url"), source.get("source_url")),
@@ -1858,6 +2455,18 @@ def _build_evidence(
         evidence.update(
             {
                 "task_id": task_payload.get("task_id"),
+                "requirement_id": lineage.get("requirement_id") or task_payload.get("requirement_id") or task_payload.get("evidence_requirement_id"),
+                "search_task_id": lineage.get("search_task_id") or task_payload.get("search_task_id") or task_payload.get("task_id"),
+                "source_id": lineage.get("source_id") or task_payload.get("source_id"),
+                "run_source_id": lineage.get("run_source_id") or task_payload.get("run_source_id"),
+                "gap_id": lineage.get("gap_id") or task_payload.get("gap_id"),
+                "lineage": {
+                    **lineage,
+                    "requirement_id": lineage.get("requirement_id") or task_payload.get("requirement_id") or task_payload.get("evidence_requirement_id") or "",
+                    "search_task_id": lineage.get("search_task_id") or task_payload.get("search_task_id") or task_payload.get("task_id") or "",
+                    "source_id": lineage.get("source_id") or task_payload.get("source_id") or "",
+                    "gap_id": lineage.get("gap_id") or task_payload.get("gap_id") or "",
+                },
                 "chapter_id": task_payload.get("chapter_id"),
                 "chapter_title": task_payload.get("chapter_title"),
                 "chapter_question": task_payload.get("chapter_question"),
@@ -1879,6 +2488,9 @@ def _build_evidence(
                 "search_task": task_payload,
                 "research_object": task_payload.get("research_object"),
                 "global_required_terms": _as_list(task_payload.get("global_required_terms")),
+                "topic_anchor_terms": _as_list(task_payload.get("topic_anchor_terms")),
+                "topic_anchor_status": task_payload.get("topic_anchor_status"),
+                "topic_anchor_required": task_payload.get("topic_anchor_required"),
             }
         )
     semantic = _validate_metric_semantics(
@@ -1894,8 +2506,44 @@ def _build_evidence(
     evidence["metric_kind"] = semantic.get("metric_kind") or "unknown"
     evidence["semantic_status"] = semantic.get("status") or "ok"
     if str(evidence["semantic_status"]).strip().lower() == "exclude":
-        evidence["semantic_status"] = "rejected"
+        if advisory_weight_mode() or public_signal_mode() or quality_gates_isolated():
+            evidence["semantic_status"] = "metric_incomplete"
+            evidence["metric_semantic_observation"] = {
+                "status": "exclude",
+                "reason": semantic.get("reason") or "",
+                "metric_kind": semantic.get("metric_kind") or "unknown",
+                "diagnostic_only": True,
+                "must_not_render": True,
+                "public_text_allowed": False,
+            }
+            observations = _as_list(evidence.get("quality_gate_observations"))
+            observations.append(
+                {
+                    "type": "metric_semantic_gap_observed",
+                    "reason": semantic.get("reason") or "",
+                    "metric_kind": semantic.get("metric_kind") or "unknown",
+                    "suggested_action": "treat_as_directional_or_qualitative_signal",
+                    "diagnostic_only": True,
+                    "must_not_render": True,
+                    "public_text_allowed": False,
+                }
+            )
+            evidence["quality_gate_observations"] = observations
+        else:
+            evidence["semantic_status"] = "rejected"
     evidence["semantic_reason"] = semantic.get("reason") or ""
+    if _explicit_value_is_artifact(
+        metric=evidence.get("metric"),
+        value=evidence.get("value"),
+        content=evidence.get("content"),
+        source=evidence.get("source"),
+    ):
+        evidence["value"] = ""
+        evidence["numeric_value"] = None
+        evidence["numeric_unit"] = ""
+        evidence["unit"] = ""
+        evidence["semantic_status"] = "rejected"
+        evidence["semantic_reason"] = "explicit_value_artifact"
     evidence["source_level"] = _source_level_for_evidence(evidence)
     verification_status = _source_verification_status_for(evidence, evidence.get("source"))
     evidence["source_verification_status"] = verification_status
@@ -1932,7 +2580,10 @@ def _build_evidence(
     evidence["task_accepted"] = bool(task_acceptance.get("accepted"))
     evidence["task_acceptance_reason"] = str(task_acceptance.get("reason") or "")
     evidence["task_matched_terms"] = list(task_acceptance.get("matched_terms") or [])
+    evidence["local_task_matched_terms"] = list(task_acceptance.get("local_matched_terms") or [])
     evidence["task_role_hint"] = str(task_acceptance.get("role_hint") or "")
+    evidence["content_topic_hit"] = bool(task_acceptance.get("content_topic_hit"))
+    evidence["source_only_topic_match"] = bool(task_acceptance.get("source_only_topic_match"))
     if str(evidence.get("semantic_status") or "").strip().lower() in REJECTED_STATUSES:
         evidence["evidence_role"] = "rejected"
     elif task_payload and not evidence["task_accepted"]:
@@ -1945,11 +2596,11 @@ def _build_evidence(
             evidence["semantic_status"] = "weak_relevance"
             evidence["semantic_reason"] = reason
             evidence["evidence_role"] = "clue"
-            evidence["appendix_only"] = True
+            evidence["appendix_only"] = False if advisory_weight_mode() else True
             evidence["followup_seed"] = True
     else:
         evidence["evidence_role"] = _assign_evidence_role(evidence)
-    if evidence.get("evidence_role") == "clue":
+    if evidence.get("evidence_role") == "clue" and not advisory_weight_mode():
         evidence.setdefault("appendix_only", True)
         evidence.setdefault("followup_seed", True)
     elif evidence.get("evidence_role") == "appendix":
@@ -1963,25 +2614,41 @@ def _build_evidence(
     source_level = str(evidence.get("source_level") or "").strip().upper()
     role = _canonical_role(evidence.get("evidence_role"))
     if source_level == "D":
-        evidence["evidence_role"] = "clue" if role != "rejected" else "rejected"
-        evidence["appendix_only"] = role != "rejected"
-        evidence["enterprise_usable"] = False
-        evidence["followup_seed"] = role != "rejected"
-        evidence["usage_tier"] = "clue_low_quality" if role != "rejected" else "rejected"
+        if (public_signal_mode() or advisory_weight_mode()) and role != "rejected":
+            evidence["evidence_role"] = "supporting"
+            evidence["appendix_only"] = False
+            evidence["enterprise_usable"] = True
+            evidence["followup_seed"] = False
+            evidence["usage_tier"] = "advisory_weight" if advisory_weight_mode() else "public_signal"
+            evidence["can_support_claim_if_corrobated"] = True
+        else:
+            evidence["evidence_role"] = "clue" if role != "rejected" else "rejected"
+            evidence["appendix_only"] = role != "rejected"
+            evidence["enterprise_usable"] = False
+            evidence["followup_seed"] = role != "rejected"
+            evidence["usage_tier"] = "clue_low_quality" if role != "rejected" else "rejected"
     elif source_level == "C" and role != "rejected":
-        if _strict_quality_mode():
-            evidence["evidence_role"] = "clue"
-            role = "clue"
-        confidence = float(evidence.get("confidence") or 0.0)
-        directional = (
-            (not _strict_quality_mode())
-            and confidence >= _directional_c_min_confidence()
-            and str(evidence.get("semantic_status") or "").strip().lower() not in {"weak", "weak_relevance", "appendix"}
-        )
-        evidence["appendix_only"] = not directional
-        evidence["enterprise_usable"] = directional
-        evidence["can_support_claim_if_corrobated"] = not _strict_quality_mode()
-        evidence["usage_tier"] = "directional_signal" if directional else "appendix_or_corroboration"
+        if advisory_weight_mode():
+            evidence["appendix_only"] = False
+            evidence["enterprise_usable"] = True
+            evidence["can_support_claim_if_corrobated"] = True
+            evidence["usage_tier"] = "advisory_weight"
+            role = "supporting"
+            evidence["evidence_role"] = "supporting"
+        else:
+            if _strict_quality_mode():
+                evidence["evidence_role"] = "clue"
+                role = "clue"
+            confidence = float(evidence.get("confidence") or 0.0)
+            directional = (
+                (not _strict_quality_mode())
+                and confidence >= _directional_c_min_confidence()
+                and str(evidence.get("semantic_status") or "").strip().lower() not in {"weak", "weak_relevance", "appendix"}
+            )
+            evidence["appendix_only"] = not directional
+            evidence["enterprise_usable"] = directional
+            evidence["can_support_claim_if_corrobated"] = not _strict_quality_mode()
+            evidence["usage_tier"] = "directional_signal" if directional else "appendix_or_corroboration"
     elif role in {"core", "supporting"}:
         evidence["appendix_only"] = False
         evidence["enterprise_usable"] = True
@@ -2000,6 +2667,7 @@ def _build_evidence(
             evidence,
             strict_quality=_strict_quality_mode(),
             directional_c_min_confidence=_directional_c_min_confidence(),
+            public_signal=public_signal_mode(),
         )
     if original_proof_role and refined_proof_role != original_proof_role:
         evidence["original_proof_role"] = original_proof_role
@@ -2152,6 +2820,11 @@ def normalize_evidence_items(
     normalized: List[Dict[str, Any]] = []
     filtered_noise = 0
     raw_count = 0
+    skipped_answer_line_count = 0
+    skip_answer_lines_with_raw_points = _as_bool(
+        os.getenv("EVIDENCE_MERGER_SKIP_ANSWER_LINES_WHEN_RAW_POINTS"),
+        True,
+    )
     score_candidates = list(_iter_retrieval_score_candidates(evidence_pool))
     source_pool_rerank_input_count = len(score_candidates)
     source_pool_rerank_score_count = sum(1 for item in score_candidates if _has_explicit_rerank_score(item))
@@ -2222,7 +2895,11 @@ def normalize_evidence_items(
             )
 
         answer = str(item.get("answer") or "").strip()
-        for line_index, line in enumerate(_iter_answer_lines(answer), start=1):
+        answer_lines = list(_iter_answer_lines(answer))
+        if raw_points and skip_answer_lines_with_raw_points:
+            skipped_answer_line_count += len(answer_lines)
+            continue
+        for line_index, line in enumerate(answer_lines, start=1):
             if raw_points and not _citation_ids_from_text(line):
                 continue
             source = _source_from_item(item, citation_text=line)
@@ -2270,6 +2947,8 @@ def normalize_evidence_items(
         "source_pool_rerank_score_count": source_pool_rerank_score_count,
         "source_pool_rerank_returned_count": source_pool_rerank_returned_count,
         "source_candidate_count": source_candidate_count,
+        "skipped_answer_line_count": skipped_answer_line_count,
+        "skip_answer_lines_with_raw_points": skip_answer_lines_with_raw_points,
     }
     return normalized, metadata
 
@@ -2330,19 +3009,110 @@ def _clean_fact_key(fact: Dict[str, Any]) -> str:
     return "|".join([str(fact.get("dimension") or ""), description[:160], source_key])
 
 
+def _lineage_value(
+    item: Dict[str, Any],
+    lineage: Dict[str, Any],
+    search_task: Dict[str, Any],
+    *keys: str,
+) -> str:
+    for key in keys:
+        for payload in (item, lineage, search_task):
+            value = _as_dict(payload).get(key)
+            if str(value or "").strip():
+                return str(value).strip()
+    return ""
+
+
+def _fallback_requirement_id(chapter_id: Any, proof_role: Any, analysis_role: Any = "") -> str:
+    chapter = str(chapter_id or "").strip()
+    if not chapter:
+        return ""
+    role = str(proof_role or analysis_role or "support").strip().lower()
+    role = re.sub(r"[^a-z0-9_]+", "_", role)
+    role = re.sub(r"_+", "_", role).strip("_")
+    role = role or "support"
+    if re.fullmatch(r"ch_\d{1,3}", chapter):
+        return f"{chapter}_{role}"
+    # Non-canonical chapter id (e.g. the chapter question text carried from a
+    # web/followup lane whose search task lacked a requirement_id) still yields a
+    # deterministic per-chapter requirement id, so its facts/claims are not
+    # spuriously flagged as missing_requirement_ids and demoted to directional.
+    digest = hashlib.sha1(chapter.encode("utf-8")).hexdigest()[:8]
+    return f"ch_{digest}_{role}"
+
+
+def _analysis_role_from_lineage(item: Dict[str, Any], search_task: Dict[str, Any]) -> str:
+    evidence_card = _as_dict(item.get("evidence_card"))
+    for value in (
+        item.get("analysis_role"),
+        evidence_card.get("analysis_role"),
+        search_task.get("analysis_role"),
+        item.get("proof_role"),
+        evidence_card.get("proof_role"),
+        search_task.get("proof_role"),
+        item.get("evidence_type"),
+        search_task.get("evidence_type"),
+    ):
+        text = str(value or "").strip().lower()
+        if text:
+            return text
+    return ""
+
+
 def build_clean_facts(evidence_items: Sequence[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
     buckets: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for item in evidence_items:
         if not isinstance(item, dict):
             continue
         if str(item.get("semantic_status") or "").strip().lower() in REJECTED_STATUSES:
-            continue
+            exclusion_reason = _analysis_ready_exclusion_reason(item)
+            if not exclusion_reason:
+                continue
+            item = {**item, "analysis_ready_exclusion_reason": exclusion_reason}
         if should_discard_evidence(item):
-            continue
+            exclusion_reason = _analysis_ready_exclusion_reason(item)
+            if not exclusion_reason:
+                continue
+            item = {**item, "analysis_ready_exclusion_reason": exclusion_reason}
         fact_text = str(item.get("clean_fact") or _clean_fact_description(item)).strip()
         if not fact_text:
             continue
         source = _as_dict(item.get("source"))
+        search_task = _as_dict(item.get("search_task"))
+        base_lineage = _as_dict(item.get("lineage"))
+        chapter_id = _lineage_value(item, base_lineage, search_task, "chapter_id", "dimension_id")
+        requirement_id = _lineage_value(item, base_lineage, search_task, "requirement_id", "evidence_requirement_id", "slot_id")
+        search_task_id = _lineage_value(item, base_lineage, search_task, "search_task_id", "task_id", "id")
+        source_id = _lineage_value(item, base_lineage, search_task, "source_id", "source_ref", "canonical_source_id")
+        run_source_id = _lineage_value(item, base_lineage, search_task, "run_source_id")
+        gap_id = _lineage_value(item, base_lineage, search_task, "gap_id")
+        hypothesis_id = _lineage_value(item, base_lineage, search_task, "hypothesis_id")
+        proof_role = _lineage_value(item, base_lineage, search_task, "proof_role")
+        analysis_role = _analysis_role_from_lineage(item, search_task)
+        requirement_id_inferred = False
+        if not requirement_id:
+            fallback_requirement_id = _fallback_requirement_id(chapter_id, proof_role, analysis_role)
+            if fallback_requirement_id:
+                requirement_id = fallback_requirement_id
+                requirement_id_inferred = True
+        lineage = {
+            **base_lineage,
+            **{
+                key: value
+                for key, value in {
+                    "chapter_id": chapter_id,
+                    "requirement_id": requirement_id,
+                    "search_task_id": search_task_id,
+                    "source_id": source_id,
+                    "run_source_id": run_source_id,
+                    "gap_id": gap_id,
+                    "hypothesis_id": hypothesis_id,
+                    "proof_role": proof_role,
+                    "analysis_role": analysis_role,
+                }.items()
+                if value
+            },
+        }
         clean_source = {
             "title": str(source.get("title") or "未命名来源").strip(),
             "url": _first_source_scalar(source.get("url"), source.get("source_url")),
@@ -2352,12 +3122,26 @@ def build_clean_facts(evidence_items: Sequence[Dict[str, Any]]) -> Tuple[List[Di
             "source": _first_source_scalar(source.get("source"), source.get("publisher"), source.get("organization")),
             "document_id": _first_source_scalar(source.get("document_id"), source.get("doc_id")),
             "page_ref": _first_source_scalar(source.get("page_ref")),
+            "source_title_url_mismatch_suspected": bool(source.get("source_title_url_mismatch_suspected")),
+            "source_title_missing": bool(source.get("source_title_missing")),
+            "source_binding_fuzzy": bool(source.get("source_binding_fuzzy")),
+            "source_binding": str(source.get("source_binding") or item.get("source_binding") or "").strip(),
+            "fallback_source_url": _first_source_scalar(source.get("fallback_source_url")),
+            "fallback_source_title": _first_source_scalar(source.get("fallback_source_title")),
         }
         _copy_retrieval_score_fields(clean_source, source, item)
         fact = {
             "evidence_id": item.get("evidence_id"),
+            "chapter_id": chapter_id,
+            "requirement_id": requirement_id,
+            "search_task_id": search_task_id,
+            "source_id": source_id,
+            "run_source_id": run_source_id,
+            "gap_id": gap_id,
+            "lineage": lineage,
             "dimension": item.get("dimension"),
             "fact": fact_text,
+            "raw_metric": str(item.get("metric") or item.get("metric_name") or item.get("indicator") or "").strip(),
             "metric": _clean_metric_name(item.get("metric"), item.get("clean_content") or item.get("content")),
             "value": _clean_value_text(item.get("value")),
             "period": str(item.get("period") or _clean_fact_period(item) or "").strip(),
@@ -2377,9 +3161,10 @@ def build_clean_facts(evidence_items: Sequence[Dict[str, Any]]) -> Tuple[List[Di
             "dimension_id": str(item.get("dimension_id") or "").strip(),
             "dimension_name": str(item.get("dimension_name") or "").strip(),
             "evidence_goal": str(item.get("evidence_goal") or "").strip(),
-            "hypothesis_id": str(item.get("hypothesis_id") or "").strip(),
+            "hypothesis_id": hypothesis_id,
             "hypothesis_statement": str(item.get("hypothesis_statement") or "").strip(),
-            "proof_role": str(item.get("proof_role") or "").strip(),
+            "proof_role": proof_role,
+            "analysis_role": analysis_role,
             "proof_standard": str(item.get("proof_standard") or "").strip(),
             "evidence_type": str(item.get("evidence_type") or "").strip(),
             "claim_type": str(item.get("claim_type") or item.get("conclusion_type") or "").strip(),
@@ -2392,20 +3177,34 @@ def build_clean_facts(evidence_items: Sequence[Dict[str, Any]]) -> Tuple[List[Di
             "task_term_score": item.get("task_term_score") or source.get("task_term_score"),
             "task_accepted": item.get("task_accepted"),
             "task_acceptance_reason": str(item.get("task_acceptance_reason") or "").strip(),
+            "local_task_matched_terms": _as_list(item.get("local_task_matched_terms")),
+            "content_topic_hit": bool(item.get("content_topic_hit")),
+            "source_only_topic_match": bool(item.get("source_only_topic_match")),
             "appendix_only": bool(item.get("appendix_only")),
             "enterprise_usable": bool(item.get("enterprise_usable")),
             "followup_seed": bool(item.get("followup_seed")),
             "can_support_claim_if_corrobated": bool(item.get("can_support_claim_if_corrobated")),
+            "requirement_id_inferred": requirement_id_inferred,
+            "requirement_id_source": "chapter_proof_role_fallback" if requirement_id_inferred else "",
             "allowed_use": str(item.get("allowed_use") or _as_dict(item.get("evidence_card")).get("allowed_use") or "").strip(),
+            "search_task": search_task,
             "evidence_card": _as_dict(item.get("evidence_card")),
             "source_subtier": str(item.get("source_subtier") or "").strip(),
             "evidence_grade_note": str(item.get("evidence_grade_note") or "").strip(),
             "usage_tier": str(item.get("usage_tier") or "").strip(),
             "quality_gate_observations": _as_list(item.get("quality_gate_observations")),
+            "analysis_ready_exclusion_reason": str(item.get("analysis_ready_exclusion_reason") or "").strip(),
         }
+        fact["content_shape_issues"] = _content_shape_issues_for({**item, **fact})
         fact["analysis_input"] = _analysis_input_for_evidence({**item, **fact}, fact_text=fact_text)
-        if should_discard_evidence(fact):
-            continue
+        exclusion_reason = fact.get("analysis_ready_exclusion_reason") or _analysis_ready_exclusion_reason(fact)
+        if exclusion_reason:
+            _mark_fact_diagnostic_only(fact, str(exclusion_reason))
+        elif should_discard_evidence(fact):
+            exclusion_reason = fact.get("analysis_ready_exclusion_reason") or _analysis_ready_exclusion_reason(fact)
+            if not exclusion_reason:
+                continue
+            _mark_fact_diagnostic_only(fact, str(exclusion_reason))
         buckets[_clean_fact_key(fact)].append(fact)
 
     facts: List[Dict[str, Any]] = []
@@ -2469,6 +3268,10 @@ def _clean_chapter_fact(fact: Dict[str, Any]) -> Dict[str, Any]:
         "source": _first_source_scalar(source.get("source"), source.get("publisher"), source.get("organization")),
         "document_id": _first_source_scalar(source.get("document_id"), source.get("doc_id")),
         "page_ref": _first_source_scalar(source.get("page_ref")),
+        "source_title_url_mismatch_suspected": bool(source.get("source_title_url_mismatch_suspected")),
+        "source_title_missing": bool(source.get("source_title_missing")),
+        "source_binding_fuzzy": bool(source.get("source_binding_fuzzy")),
+        "source_binding": str(source.get("source_binding") or fact.get("source_binding") or "").strip(),
     }
     _copy_retrieval_score_fields(clean_source, source, fact)
     cleaned = {
@@ -2509,6 +3312,8 @@ def _clean_chapter_fact(fact: Dict[str, Any]) -> Dict[str, Any]:
         "web_rerank_rank": fact.get("web_rerank_rank") or source.get("web_rerank_rank"),
         "task_term_score": fact.get("task_term_score") or source.get("task_term_score"),
         "task_acceptance_reason": str(fact.get("task_acceptance_reason") or "").strip(),
+        "content_topic_hit": bool(fact.get("content_topic_hit")),
+        "source_only_topic_match": bool(fact.get("source_only_topic_match")),
         "appendix_only": bool(fact.get("appendix_only")),
         "enterprise_usable": bool(fact.get("enterprise_usable")),
         "followup_seed": bool(fact.get("followup_seed")),
@@ -2629,6 +3434,12 @@ def _isolate_evidence_quality_gate(evidence: Dict[str, Any]) -> Dict[str, Any]:
         return evidence
     if not str(evidence.get("fact") or evidence.get("clean_fact") or evidence.get("content") or "").strip():
         return evidence
+    reason_text = " ".join(
+        str(evidence.get(key) or "").strip().lower()
+        for key in ("task_acceptance_reason", "semantic_reason", "analysis_ready_exclusion_reason")
+    )
+    if "topic_anchor_missing" in reason_text or "no_topic_anchor" in reason_text:
+        return evidence
     if recall_first and _source_is_excluded_from_recall(evidence):
         return evidence
     observations = list(_as_list(evidence.get("quality_gate_observations")))
@@ -2650,10 +3461,24 @@ def _isolate_evidence_quality_gate(evidence: Dict[str, Any]) -> Dict[str, Any]:
     allowed_use = str(evidence.get("allowed_use") or _as_dict(evidence.get("evidence_card")).get("allowed_use") or "").strip()
     if allowed_use in {"", "appendix_only", "clue", "rejected"}:
         evidence["allowed_use"] = "supporting_context"
+        evidence["analysis_readiness"] = "directional_ready"
         card = dict(_as_dict(evidence.get("evidence_card")))
         card["allowed_use"] = "supporting_context"
+        card["analysis_readiness"] = "directional_ready"
         card["analysis_eligible"] = True
         evidence["evidence_card"] = card
+    elif allowed_use in {"supporting_context", "directional_signal"}:
+        readiness = str(
+            evidence.get("analysis_readiness")
+            or _as_dict(evidence.get("evidence_card")).get("analysis_readiness")
+            or ""
+        ).strip().lower()
+        if readiness in NON_CLAIM_ANALYSIS_READINESS:
+            evidence["analysis_readiness"] = "directional_ready"
+            card = dict(_as_dict(evidence.get("evidence_card")))
+            card["analysis_readiness"] = "directional_ready"
+            card["analysis_eligible"] = True
+            evidence["evidence_card"] = card
     return evidence
 
 
@@ -2731,6 +3556,116 @@ def build_filter_funnel(
     funnel["after_content_cleaning_count"] = len([item for item in clean_evidence_list if isinstance(item, dict)])
     funnel["analysis_ready_count"] = len([item for item in analysis_ready_evidence if isinstance(item, dict)])
     return funnel
+
+
+def _merge_diagnostic_sample(item: Dict[str, Any]) -> Dict[str, Any]:
+    source = _as_dict(item.get("source"))
+    return {
+        "evidence_id": str(item.get("evidence_id") or item.get("ref") or item.get("id") or "").strip(),
+        "role": _canonical_role(item.get("evidence_role") or item.get("role")),
+        "semantic_status": str(item.get("semantic_status") or "").strip(),
+        "semantic_reason": str(item.get("semantic_reason") or item.get("task_acceptance_reason") or "").strip(),
+        "analysis_ready_exclusion_reason": str(
+            item.get("analysis_ready_exclusion_reason") or _analysis_ready_exclusion_reason(item) or ""
+        ).strip(),
+        "allowed_use": str(item.get("allowed_use") or _as_dict(item.get("evidence_card")).get("allowed_use") or "").strip(),
+        "analysis_readiness": str(
+            item.get("analysis_readiness") or _as_dict(item.get("evidence_card")).get("analysis_readiness") or ""
+        ).strip(),
+        "task_relevance_score": item.get("task_relevance_score"),
+        "requirement_id": str(item.get("requirement_id") or _as_dict(item.get("lineage")).get("requirement_id") or "").strip(),
+        "search_task_id": str(item.get("search_task_id") or _as_dict(item.get("lineage")).get("search_task_id") or "").strip(),
+        "fact": _compact_text(item.get("fact") or item.get("clean_fact") or item.get("content"), max_chars=260),
+        "metric": str(item.get("metric") or "").strip(),
+        "value": str(item.get("value") or "").strip(),
+        "source": {
+            "title": _compact_text(source.get("title"), max_chars=140),
+            "url": _compact_text(source.get("url") or source.get("source_url"), max_chars=180),
+            "source_type": str(source.get("source_type") or "").strip(),
+            "source_level": str(item.get("source_level") or source.get("source_level") or "").strip(),
+        },
+        "content_shape_issues": _content_shape_issues_for(item),
+    }
+
+
+def _reason_key_for_rejected_item(item: Dict[str, Any]) -> str:
+    for value in (
+        item.get("semantic_reason"),
+        item.get("task_acceptance_reason"),
+        item.get("analysis_ready_exclusion_reason"),
+        _analysis_ready_exclusion_reason(item),
+    ):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return "unknown"
+
+
+def build_merge_diagnostics(
+    metadata: Dict[str, Any],
+    *,
+    evidence_items: Sequence[Dict[str, Any]],
+    clean_evidence_list: Sequence[Dict[str, Any]],
+    analysis_ready_evidence: Sequence[Dict[str, Any]],
+    filter_funnel: Dict[str, Any],
+    max_samples: int = 12,
+) -> Dict[str, Any]:
+    rejected_items = [
+        item
+        for item in list(evidence_items or [])
+        if isinstance(item, dict)
+        and (
+            _canonical_role(item.get("evidence_role") or item.get("role")) == "rejected"
+            or str(item.get("semantic_status") or "").strip().lower() in REJECTED_STATUSES
+        )
+    ]
+    ready_ids = {
+        str(item.get("evidence_id") or item.get("ref") or item.get("id") or "").strip()
+        for item in list(analysis_ready_evidence or [])
+        if isinstance(item, dict)
+    }
+    clean_not_ready = [
+        item
+        for item in list(clean_evidence_list or [])
+        if isinstance(item, dict)
+        and str(item.get("evidence_id") or item.get("ref") or item.get("id") or "").strip() not in ready_ids
+    ]
+    clean_not_ready_reasons: Dict[str, int] = {}
+    for item in clean_not_ready:
+        reason = (
+            str(item.get("analysis_ready_exclusion_reason") or "").strip()
+            or _analysis_ready_exclusion_reason(item)
+            or _non_claim_status_reason(item)
+            or "not_selected_for_analysis"
+        )
+        clean_not_ready_reasons[reason] = clean_not_ready_reasons.get(reason, 0) + 1
+    rejected_reasons: Dict[str, int] = {}
+    for item in rejected_items:
+        reason = _reason_key_for_rejected_item(item)
+        rejected_reasons[reason] = rejected_reasons.get(reason, 0) + 1
+    return {
+        "schema_version": "merge_diagnostics_v1",
+        "source_pool_count": int(_as_dict(metadata).get("source_pool_count") or 0),
+        "source_pool_filter_reasons": _as_dict(_as_dict(metadata).get("source_pool_filter_reasons")),
+        "raw_evidence_count": int(_as_dict(metadata).get("raw_evidence_count") or 0),
+        "normalized_count": int(_as_dict(metadata).get("normalized_count") or len(list(evidence_items or []))),
+        "deduped_count": len([item for item in list(evidence_items or []) if isinstance(item, dict)]),
+        "clean_fact_count": len([item for item in list(clean_evidence_list or []) if isinstance(item, dict)]),
+        "analysis_ready_count": len([item for item in list(analysis_ready_evidence or []) if isinstance(item, dict)]),
+        "filter_funnel": {
+            "role_distribution": _as_dict(filter_funnel.get("role_distribution")),
+            "reject_reasons": _as_dict(filter_funnel.get("reject_reasons")),
+            "task_accepted_count": int(filter_funnel.get("task_accepted_count") or 0),
+            "task_weak_clue_count": int(filter_funnel.get("task_weak_clue_count") or 0),
+            "semantic_rejected_count": int(filter_funnel.get("semantic_rejected_count") or 0),
+            "analysis_ready_count": int(filter_funnel.get("analysis_ready_count") or 0),
+        },
+        "rejected_reason_counts": rejected_reasons,
+        "clean_not_analysis_ready_reason_counts": clean_not_ready_reasons,
+        "rejected_samples": [_merge_diagnostic_sample(item) for item in rejected_items[:max_samples]],
+        "clean_not_analysis_ready_samples": [_merge_diagnostic_sample(item) for item in clean_not_ready[:max_samples]],
+        "analysis_ready_samples": [_merge_diagnostic_sample(item) for item in list(analysis_ready_evidence or [])[:max_samples] if isinstance(item, dict)],
+    }
 
 
 def _has_explicit_rerank_score(item: Any) -> bool:
@@ -3102,6 +4037,12 @@ def _build_source_registry(clean_evidence_list: Sequence[Dict[str, Any]]) -> Lis
                 "source_verified": bool(traceability.get("source_verified")),
                 "has_source_ref": bool(traceability.get("has_source_ref")),
                 "fake_or_placeholder_source": fake_source,
+                "source_title_url_mismatch_suspected": bool(source.get("source_title_url_mismatch_suspected")),
+                "source_title_missing": bool(source.get("source_title_missing")),
+                "source_binding_fuzzy": bool(source.get("source_binding_fuzzy")),
+                "source_binding": str(source.get("source_binding") or fact.get("source_binding") or "").strip(),
+                "fallback_source_url": _first_source_scalar(source.get("fallback_source_url")),
+                "fallback_source_title": _first_source_scalar(source.get("fallback_source_title")),
                 "evidence_refs": [],
                 "evidence_count": 0,
             }
@@ -3112,12 +4053,20 @@ def _build_source_registry(clean_evidence_list: Sequence[Dict[str, Any]]) -> Lis
             entry["evidence_refs"].append(evidence_ref)
         entry["evidence_count"] = int(entry.get("evidence_count") or 0) + 1
         fact["source_ref"] = entry["ref"]
+        fact["source_id"] = str(fact.get("source_id") or entry["id"] or "").strip()
+        fact.setdefault("lineage", {})
+        if isinstance(fact["lineage"], dict):
+            fact["lineage"].setdefault("source_id", fact["source_id"])
         source["ref"] = entry["ref"]
         source["id"] = entry["id"]
         source["traceability_status"] = entry["traceability_status"]
         source["source_verification_status"] = entry.get("source_verification_status")
         source["source_verified"] = bool(entry.get("source_verified"))
         source["fake_or_placeholder_source"] = bool(entry.get("fake_or_placeholder_source"))
+        source["source_title_url_mismatch_suspected"] = bool(entry.get("source_title_url_mismatch_suspected"))
+        source["source_title_missing"] = bool(entry.get("source_title_missing"))
+        source["source_binding_fuzzy"] = bool(entry.get("source_binding_fuzzy"))
+        source["source_binding"] = entry.get("source_binding") or source.get("source_binding")
         fact["source_verification_status"] = entry.get("source_verification_status")
         fact["source_verified"] = bool(entry.get("source_verified"))
         fact["source"] = source
@@ -3217,6 +4166,12 @@ def _raw_data_points_for_package(clean_evidence_list: Sequence[Dict[str, Any]], 
         points.append(
             {
                 "evidence_id": fact.get("evidence_id"),
+                "requirement_id": fact.get("requirement_id") or _as_dict(fact.get("lineage")).get("requirement_id"),
+                "search_task_id": fact.get("search_task_id") or _as_dict(fact.get("lineage")).get("search_task_id"),
+                "source_id": fact.get("source_id") or _as_dict(fact.get("lineage")).get("source_id") or _as_dict(fact.get("source")).get("id"),
+                "run_source_id": fact.get("run_source_id") or _as_dict(fact.get("lineage")).get("run_source_id"),
+                "gap_id": fact.get("gap_id") or _as_dict(fact.get("lineage")).get("gap_id"),
+                "lineage": _as_dict(fact.get("lineage")),
                 "chapter_id": fact.get("chapter_id") or fact.get("hypothesis_id") or fact.get("dimension_id"),
                 "dimension": fact.get("dimension") or fact.get("dimension_name"),
                 "metric": fact.get("metric"),
@@ -3464,14 +4419,45 @@ def _evidence_analysis_contract_for(fact: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _display_metric_value_for_public_payload(fact: Dict[str, Any]) -> str:
+    explicit = str(fact.get("value") or "").strip()
+    if explicit:
+        return explicit
+    text = " ".join(
+        str(value or "")
+        for value in (
+            fact.get("fact"),
+            fact.get("clean_fact"),
+            fact.get("content"),
+        )
+    )
+    for match in NUMERIC_RE.finditer(text):
+        unit = str(match.group("unit") or "").strip()
+        if unit:
+            return str(match.group("number") or "").strip()
+    return ""
+
+
 def _public_fact_payload(fact: Dict[str, Any]) -> Dict[str, Any]:
     analysis_contract = _evidence_analysis_contract_for(fact)
+    lineage = _as_dict(fact.get("lineage"))
+    search_task = _as_dict(fact.get("search_task"))
     return {
         "evidence_id": str(fact.get("evidence_id") or "").strip(),
+        "chapter_id": str(fact.get("chapter_id") or lineage.get("chapter_id") or search_task.get("chapter_id") or "").strip(),
+        "requirement_id": str(fact.get("requirement_id") or lineage.get("requirement_id") or search_task.get("requirement_id") or search_task.get("evidence_requirement_id") or search_task.get("slot_id") or "").strip(),
+        "search_task_id": str(fact.get("search_task_id") or lineage.get("search_task_id") or search_task.get("task_id") or search_task.get("id") or "").strip(),
+        "source_id": str(fact.get("source_id") or lineage.get("source_id") or _as_dict(fact.get("source")).get("id") or "").strip(),
+        "run_source_id": str(fact.get("run_source_id") or lineage.get("run_source_id") or "").strip(),
+        "gap_id": str(fact.get("gap_id") or lineage.get("gap_id") or search_task.get("gap_id") or "").strip(),
+        "hypothesis_id": str(fact.get("hypothesis_id") or lineage.get("hypothesis_id") or search_task.get("hypothesis_id") or "").strip(),
+        "lineage": lineage,
         "dimension": str(fact.get("dimension") or "").strip(),
         "fact": str(fact.get("fact") or "").strip(),
         "metric": str(fact.get("metric") or "").strip(),
-        "value": str(fact.get("value") or "").strip(),
+        "value": _display_metric_value_for_public_payload(fact),
+        "unit": str(fact.get("unit") or fact.get("numeric_unit") or "").strip(),
+        "numeric_unit": str(fact.get("numeric_unit") or fact.get("unit") or "").strip(),
         "period": str(fact.get("period") or "").strip(),
         "source": _as_dict(fact.get("source")),
         "confidence": _clip(fact.get("confidence"), 0.0),
@@ -3481,11 +4467,12 @@ def _public_fact_payload(fact: Dict[str, Any]) -> Dict[str, Any]:
         "source_tier": str(fact.get("source_tier") or _as_dict(fact.get("evidence_card")).get("source_tier") or "").strip(),
         "evidence_role": _canonical_role(fact.get("evidence_role")),
         "allowed_use": str(fact.get("allowed_use") or _as_dict(fact.get("evidence_card")).get("allowed_use") or "").strip(),
-        "proof_role": str(fact.get("proof_role") or _as_dict(fact.get("evidence_card")).get("proof_role") or _as_dict(fact.get("search_task")).get("proof_role") or "").strip().lower(),
-        "evidence_type": str(fact.get("evidence_type") or _as_dict(fact.get("evidence_card")).get("evidence_type") or _as_dict(fact.get("search_task")).get("evidence_type") or "").strip(),
+        "analysis_role": str(fact.get("analysis_role") or _as_dict(fact.get("evidence_card")).get("analysis_role") or search_task.get("analysis_role") or fact.get("proof_role") or search_task.get("proof_role") or "").strip().lower(),
+        "proof_role": str(fact.get("proof_role") or _as_dict(fact.get("evidence_card")).get("proof_role") or search_task.get("proof_role") or "").strip().lower(),
+        "evidence_type": str(fact.get("evidence_type") or _as_dict(fact.get("evidence_card")).get("evidence_type") or search_task.get("evidence_type") or "").strip(),
         "claim_type": str(fact.get("claim_type") or fact.get("conclusion_type") or _as_dict(fact.get("evidence_card")).get("claim_type") or "").strip(),
         "conclusion_type": str(fact.get("conclusion_type") or fact.get("claim_type") or _as_dict(fact.get("evidence_card")).get("conclusion_type") or "").strip(),
-        "proof_standard": str(fact.get("proof_standard") or _as_dict(fact.get("search_task")).get("proof_standard") or "").strip(),
+        "proof_standard": str(fact.get("proof_standard") or search_task.get("proof_standard") or "").strip(),
         "evidence_fit_score": fact.get("evidence_fit_score") or _as_dict(fact.get("evidence_card")).get("evidence_fit_score"),
         "metric_proof_gaps": _as_list(fact.get("metric_proof_gaps") or _as_dict(fact.get("evidence_card")).get("metric_proof_gaps")),
         "analysis_readiness": str(fact.get("analysis_readiness") or _as_dict(fact.get("evidence_card")).get("analysis_readiness") or "").strip(),
@@ -3509,11 +4496,185 @@ def _public_fact_payload(fact: Dict[str, Any]) -> Dict[str, Any]:
         "enterprise_usable": bool(fact.get("enterprise_usable")),
         "followup_seed": bool(fact.get("followup_seed")),
         "can_support_claim_if_corrobated": bool(fact.get("can_support_claim_if_corrobated")),
+        "requirement_id_inferred": bool(fact.get("requirement_id_inferred")),
+        "requirement_id_source": str(fact.get("requirement_id_source") or "").strip(),
         "usage_tier": str(fact.get("usage_tier") or "").strip(),
         "quality_gate_observations": _as_list(fact.get("quality_gate_observations")),
+        "content_shape_issues": _content_shape_issues_for(fact),
         **analysis_contract,
         "analysis_input": _as_dict(fact.get("analysis_input")) or _analysis_input_for_evidence(fact, fact_text=fact.get("fact")),
     }
+
+
+ANALYSIS_READY_PAGE_SHELL_RE = re.compile(
+    r"(skip\s+to\s+content|login|sign\s+in|cookie|privacy\s+policy|terms\s+of\s+use|"
+    r"please\s+enable\s+javascript|checking\s+your\s+browser|request\s+a\s+demo|book\s+a\s+demo)",
+    re.I,
+)
+
+
+def _content_shape_issues_for(fact: Dict[str, Any]) -> List[str]:
+    issues = [
+        str(issue or "").strip()
+        for issue in _as_list(fact.get("content_shape_issues") or _as_dict(fact.get("evidence_card")).get("content_shape_issues"))
+        if str(issue or "").strip()
+    ]
+    if evidence_content_shape_issues is not None:
+        for issue in evidence_content_shape_issues(fact):
+            if issue and issue not in issues:
+                issues.append(issue)
+    for value in (
+        fact.get("raw_metric"),
+        fact.get("original_metric"),
+        fact.get("metric_name"),
+        fact.get("indicator"),
+        fact.get("metric"),
+    ):
+        if _is_generic_metric_label(value) and "generic_metric_name" not in issues:
+            issues.append("generic_metric_name")
+    return issues
+
+
+def _is_generic_metric_label(value: Any) -> bool:
+    text = re.sub(r"\s+", "", str(value or "").strip()).lower()
+    if not text:
+        return False
+    generic_names = {re.sub(r"\s+", "", str(item or "").strip()).lower() for item in GENERIC_METRIC_NAMES}
+    if text in generic_names:
+        return True
+    return bool(_GENERIC_VALUE_METRIC_RE.search(text))
+
+
+def _source_traceable_for_fact(fact: Dict[str, Any]) -> bool:
+    source = _as_dict(fact.get("source"))
+    return bool(
+        str(fact.get("source_url") or source.get("url") or source.get("source_url") or "").strip()
+        or str(fact.get("source_id") or source.get("document_id") or source.get("doc_id") or source.get("page_ref") or "").strip()
+    )
+
+
+def _value_carries_unit(value: Any, unit: Any) -> bool:
+    value_text = str(value or "").strip()
+    unit_text = str(unit or "").strip()
+    if unit_text and unit_text.lower() not in {"unknown", "none", "null", "n/a"}:
+        return True
+    return bool(re.search(r"\d\s*(?:%|％|亿|万|千|元|美元|台|套|件|家|人|个|吨|GWh|MWh|kWh|GW|MW|KW)", value_text, re.I))
+
+
+def _generic_metric_has_complete_metric_fields(fact: Dict[str, Any]) -> bool:
+    value = _clean_value_text(fact.get("value"))
+    if not re.search(r"\d", value):
+        return False
+    period = str(fact.get("period") or _as_dict(fact.get("source")).get("date") or "").strip()
+    if not period:
+        return False
+    if not _value_carries_unit(value, fact.get("unit") or fact.get("numeric_unit")):
+        return False
+    return _source_traceable_for_fact(fact)
+
+
+def _generic_metric_has_meaningful_qualitative_fact(fact: Dict[str, Any]) -> bool:
+    text = _clean_evidence_content(
+        fact.get("fact") or fact.get("clean_fact") or fact.get("content") or fact.get("clean_content"),
+        max_chars=520,
+    )
+    compact = re.sub(r"\s+", "", text)
+    if len(compact) < 32:
+        return False
+    value = _clean_value_text(fact.get("value"))
+    metric_labels = [
+        re.sub(r"\s+", "", str(value or "").strip()).lower()
+        for value in (fact.get("raw_metric"), fact.get("original_metric"), fact.get("metric"), fact.get("metric_name"))
+        if str(value or "").strip()
+    ]
+    compact_lower = compact.lower()
+    for metric in metric_labels:
+        if metric and re.fullmatch(rf"{re.escape(metric)}[-+]?\d+(?:\.\d+)?%?", compact_lower):
+            return False
+    if value and re.fullmatch(rf"(?:{'|'.join(re.escape(item) for item in metric_labels if item)})?{re.escape(value.lower())}", compact_lower):
+        return False
+    if re.search(r"https?://|www\.|/detail/|/detail\\.", text, re.I) and len(compact) < 80:
+        return False
+    return bool(re.search(r"[A-Za-z\u4e00-\u9fff]", text))
+
+
+def _generic_metric_exclusion_reason(fact: Dict[str, Any]) -> str:
+    if "generic_metric_name" not in _content_shape_issues_for(fact):
+        return ""
+    if _generic_metric_has_complete_metric_fields(fact):
+        return ""
+    if _generic_metric_has_meaningful_qualitative_fact(fact):
+        return ""
+    return "generic_metric_field_artifact"
+
+
+def _analysis_ready_exclusion_reason(fact: Dict[str, Any]) -> str:
+    for issue in _content_shape_issues_for(fact):
+        if issue in BLOCKING_CONTENT_SHAPE_ISSUES:
+            return issue
+    generic_reason = _generic_metric_exclusion_reason(fact)
+    if generic_reason:
+        return generic_reason
+    if (
+        fact.get("source_only_topic_match")
+        and str(fact.get("task_acceptance_reason") or "").strip() == "low_task_relevance_keep_as_clue"
+    ):
+        return "source_only_topic_match"
+    source = _as_dict(fact.get("source"))
+    if fact.get("source_title_url_mismatch_suspected") or source.get("source_title_url_mismatch_suspected"):
+        return "source_identity_mismatch"
+    if (fact.get("source_binding_fuzzy") or source.get("source_binding_fuzzy")) and (
+        fact.get("source_title_missing") or source.get("source_title_missing")
+    ):
+        return "source_identity_fuzzy_missing_title"
+    text = " ".join(
+        str(value or "")
+        for value in (
+            fact.get("fact"),
+            fact.get("clean_fact"),
+            fact.get("content"),
+            fact.get("evidence"),
+            source.get("title"),
+            source.get("url"),
+            fact.get("source_title"),
+            fact.get("source_url"),
+        )
+    )
+    if ANALYSIS_READY_PAGE_SHELL_RE.search(text):
+        return "web_chrome_or_login"
+    metric = re.sub(r"\s+", "", str(fact.get("metric") or fact.get("metric_name") or "").strip()).lower()
+    value = str(fact.get("value") or "").strip()
+    if metric in {"source_check", "http_status", "response_code", "status_code"} and value:
+        return "internal_metric_artifact"
+    return ""
+
+
+def _non_claim_status_reason(fact: Dict[str, Any]) -> str:
+    allowed = str(fact.get("allowed_use") or _as_dict(fact.get("evidence_card")).get("allowed_use") or "").strip().lower()
+    if allowed in NON_CLAIM_ALLOWED_USES:
+        return f"allowed_use:{allowed}"
+    readiness = str(fact.get("analysis_readiness") or _as_dict(fact.get("evidence_card")).get("analysis_readiness") or "").strip().lower()
+    if readiness in NON_CLAIM_ANALYSIS_READINESS:
+        return f"analysis_readiness:{readiness}"
+    return ""
+
+
+def _mark_fact_diagnostic_only(fact: Dict[str, Any], reason: str) -> None:
+    fact["analysis_ready_exclusion_reason"] = reason
+    fact["allowed_use"] = "diagnostic_only"
+    fact["analysis_readiness"] = "clue_only"
+    fact["public_text_allowed"] = False
+    observations = _as_list(fact.get("quality_gate_observations"))
+    observations.append(
+        {
+            "type": "analysis_ready_excluded",
+            "reason": reason,
+            "diagnostic_only": True,
+            "must_not_render": True,
+            "public_text_allowed": False,
+        }
+    )
+    fact["quality_gate_observations"] = observations
 
 
 def _chapter_key_for_fact(fact: Dict[str, Any]) -> str:
@@ -4359,6 +5520,12 @@ def _is_context_support_candidate(fact: Dict[str, Any]) -> bool:
     semantic_status = str(fact.get("semantic_status") or "").strip().lower()
     if role == "rejected" or semantic_status in REJECTED_STATUSES:
         return False
+    reason_text = " ".join(
+        str(fact.get(key) or "").strip().lower()
+        for key in ("task_acceptance_reason", "semantic_reason", "analysis_ready_exclusion_reason")
+    )
+    if "topic_anchor_missing" in reason_text or "no_topic_anchor" in reason_text:
+        return False
     level = str(fact.get("source_level") or "").strip().upper()
     if level not in {"A", "B"}:
         return False
@@ -4557,24 +5724,33 @@ def build_evidence_package(
     source_registry = _build_source_registry(clean_evidence_list)
     chapter_evidence = build_chapter_evidence(clean_evidence_list, chapter_dim_mapping=chapter_dim_mapping)
     analysis_ready_observe_only = quality_gates_isolated()
-    analysis_ready_evidence = [
-        _public_fact_payload(fact)
-        for fact in clean_evidence_list
-        if str(fact.get("fact") or "").strip()
-        and (
-            (
-                _canonical_role(fact.get("evidence_role")) != "rejected"
-                and str(fact.get("semantic_status") or "").strip().lower() not in REJECTED_STATUSES
-            )
-            if analysis_ready_observe_only
-            else (
+    analysis_ready_evidence: List[Dict[str, Any]] = []
+    for fact in clean_evidence_list:
+        if not str(fact.get("fact") or "").strip():
+            continue
+        exclusion_reason = _analysis_ready_exclusion_reason(fact)
+        if exclusion_reason:
+            _mark_fact_diagnostic_only(fact, exclusion_reason)
+            continue
+        non_claim_reason = _non_claim_status_reason(fact)
+        if non_claim_reason:
+            if not fact.get("analysis_ready_exclusion_reason"):
+                fact["analysis_ready_exclusion_reason"] = non_claim_reason
+            continue
+        if analysis_ready_observe_only:
+            eligible = _canonical_role(fact.get("evidence_role")) != "rejected" and str(fact.get("semantic_status") or "").strip().lower() not in REJECTED_STATUSES
+        else:
+            analysis_allowed_uses = {"core_claim", "supporting", "supporting_context", ""}
+            if advisory_weight_mode() or public_signal_mode():
+                analysis_allowed_uses.add("directional_signal")
+            eligible = (
                 _canonical_role(fact.get("evidence_role")) in {"core", "supporting"}
                 and not fact.get("appendix_only")
                 and str(fact.get("allowed_use") or _as_dict(fact.get("evidence_card")).get("allowed_use") or "")
-                in {"core_claim", "supporting", "supporting_context", ""}
+                in analysis_allowed_uses
             )
-        )
-    ]
+        if eligible:
+            analysis_ready_evidence.append(_public_fact_payload(fact))
     rerank_diagnostics = build_rerank_diagnostics(
         _as_dict(metadata),
         evidence_items=evidence_items,
@@ -4592,6 +5768,13 @@ def build_evidence_package(
         _as_dict(metadata),
         evidence_items=evidence_items,
         clean_evidence_list=clean_evidence_list,
+    )
+    merge_diagnostics = build_merge_diagnostics(
+        _as_dict(metadata),
+        evidence_items=evidence_items,
+        clean_evidence_list=clean_evidence_list,
+        analysis_ready_evidence=analysis_ready_evidence,
+        filter_funnel=filter_funnel,
     )
     evidence_analysis_by_chapter = _evidence_analysis_by_chapter(clean_evidence_list)
     evidence_gap_ledger = _evidence_gap_ledger_from_analysis(evidence_analysis_by_chapter)
@@ -4792,8 +5975,9 @@ def build_evidence_package(
             "rerank_diagnostics": rerank_diagnostics,
             "evidence_health_summary": evidence_health_summary,
             "evidence_preflight_summary": evidence_preflight_summary,
-            "source_registry_summary": _source_registry_summary(source_registry),
             **dict(metadata or {}),
+            "source_registry_summary": _source_registry_summary(source_registry),
+            "merge_diagnostics": merge_diagnostics,
         },
     }
 
@@ -4849,6 +6033,7 @@ def merge_evidence_package(
     package.setdefault("metadata", {})
     package["metadata"]["evidence_cache_store"] = cache_summary
     package["metadata"]["trusted_source_cache_store"] = trusted_source_cache_summary
+    _emit_evidence_merger_probe(package, input_count=len(source_pool))
     return package
 
 

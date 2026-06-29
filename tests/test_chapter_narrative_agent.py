@@ -1,7 +1,14 @@
 import copy
 
+import pytest
+
 from rag_pipeline.agents.chapter_narrative_agent import run_chapter_narrative
 from rag_pipeline.agents.final_writer_agent import run_final_writer_agent
+
+
+@pytest.fixture(autouse=True)
+def _clear_body_rewrite_min_accept_chars(monkeypatch):
+    monkeypatch.delenv("REPORT_BODY_REWRITE_MIN_ACCEPT_CHARS", raising=False)
 
 
 def _section(section_id: str = "s1", *, paragraph: str | None = None):
@@ -295,6 +302,56 @@ def test_chapter_narrative_tries_fallback_config_after_primary_error(monkeypatch
     assert diagnostics["fallback_model_used_count"] == 1
     assert models == ["bad-primary", "fallback-model"]
     assert rewritten[0]["chapter_narrative_status"] == "rewritten"
+
+
+def test_chapter_narrative_records_underlying_llm_error_detail(monkeypatch):
+    monkeypatch.setenv("REPORT_ENABLE_LLM_CHAPTER_NARRATIVE", "true")
+    monkeypatch.setenv("REPORT_CHAPTER_NARRATIVE_MIN_EVIDENCE_SECTIONS", "1")
+    monkeypatch.setenv("REPORT_CHAPTER_NARRATIVE_CACHE_ENABLED", "false")
+    monkeypatch.setenv("REPORT_CHAPTER_NARRATIVE_FALLBACK_PROFILES", "")
+    monkeypatch.setenv("REPORT_BODY_REWRITE_FALLBACK_PROFILES", "")
+    monkeypatch.setattr("rag_pipeline.agents.chapter_narrative_agent.llm_config_is_ready", lambda config: True)
+
+    def fake_call(**kwargs):
+        raise RuntimeError("deepseek-v4-pro HTTP 429 rate limit")
+
+    monkeypatch.setattr("rag_pipeline.agents.chapter_narrative_agent.call_openai_compatible_json", fake_call)
+    chapters = [_chapter(_section("s1"), _section("s2"))]
+
+    rewritten, diagnostics = run_chapter_narrative(
+        chapter_packages=chapters,
+        report_blueprint={},
+        llm_config={"url": "https://llm.test", "api_key": "key", "model": "deepseek-v4-pro"},
+        quality_context={"final_analysis_source": "llm_partial_merged"},
+    )
+
+    assert rewritten == chapters
+    assert diagnostics["fallback_count"] == 1
+    assert diagnostics["failure_reasons"]["llm_error:RuntimeError"] == 1
+    assert any("HTTP 429 rate limit" in sample["message"] for sample in diagnostics["failure_error_samples"])
+
+
+def test_chapter_narrative_failure_reason_includes_underlying_error_message(monkeypatch):
+    monkeypatch.setenv("REPORT_ENABLE_LLM_CHAPTER_NARRATIVE", "true")
+    monkeypatch.setenv("REPORT_CHAPTER_NARRATIVE_MIN_EVIDENCE_SECTIONS", "1")
+    monkeypatch.setenv("REPORT_CHAPTER_NARRATIVE_CACHE_ENABLED", "false")
+    monkeypatch.setenv("REPORT_CHAPTER_NARRATIVE_FALLBACK_PROFILES", "")
+    monkeypatch.setenv("REPORT_BODY_REWRITE_FALLBACK_PROFILES", "")
+    monkeypatch.setattr("rag_pipeline.agents.chapter_narrative_agent.llm_config_is_ready", lambda config: True)
+
+    def fake_call(**kwargs):
+        raise RuntimeError("qwen output_too_short after validation")
+
+    monkeypatch.setattr("rag_pipeline.agents.chapter_narrative_agent.call_openai_compatible_json", fake_call)
+
+    _, diagnostics = run_chapter_narrative(
+        chapter_packages=[_chapter(_section("s1"), _section("s2"))],
+        report_blueprint={},
+        llm_config={"url": "https://llm.test", "api_key": "key", "model": "qwen3.6-plus"},
+        quality_context={"final_analysis_source": "llm_partial_merged"},
+    )
+
+    assert any("output_too_short" in reason for reason in diagnostics["failure_reasons"])
 
 
 def test_chapter_narrative_skips_non_quality_paths(monkeypatch):

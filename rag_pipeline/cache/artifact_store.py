@@ -6,6 +6,7 @@ import os
 import sqlite3
 import threading
 from collections import deque
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -29,6 +30,36 @@ from .artifact_paths import (
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _parse_iso_ts(value: Any) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+# Tables whose rows are scoped to a single run_id and are safe to delete on
+# retention. The canonical ``sources`` table is intentionally excluded: rows
+# there are deduped across runs by canonical_source_id, so deleting them could
+# orphan another run's run_sources reference.
+_RUN_SCOPED_TABLES = (
+    "evidence_requirements",
+    "run_sources",
+    "artifacts",
+    "fact_cards",
+    "claim_units",
+    "sections",
+    "score_gaps",
+    "lineage_edges",
+    "runs",
+)
 
 
 def _json_dumps(value: Any) -> str:
@@ -116,6 +147,68 @@ def _enforced_section_status(status: str, *, claim_ids: Sequence[Any], used_fact
     return status
 
 
+class _TxConn:
+    """Proxy over a shared connection used inside :meth:`ArtifactStore.transaction`.
+
+    Lets a method's ``with self._connect() as conn: ... conn.commit()`` body run
+    against the open transaction's connection without committing or closing it:
+    ``commit()`` is a no-op (the transaction commits once at the end) and
+    ``__exit__`` neither commits nor closes. Every other attribute/method
+    delegates to the real :class:`sqlite3.Connection`.
+    """
+
+    __slots__ = ("_conn",)
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def __enter__(self) -> "_TxConn":
+        return self
+
+    def __exit__(self, *exc: Any) -> bool:
+        return False
+
+    def commit(self) -> None:  # outer transaction owns the single commit
+        return None
+
+    def close(self) -> None:  # outer transaction owns the close
+        return None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conn, name)
+
+
+class _ClosingConn:
+    """Context-manager proxy that closes sqlite connections on ``with`` exit.
+
+    ``sqlite3.Connection`` commits or rolls back when used as a context manager
+    but intentionally leaves the file handle open. ArtifactStore methods use
+    ``with self._connect()`` heavily, so wrap raw connections to preserve the
+    commit/rollback semantics and also release the Windows file handle.
+    """
+
+    __slots__ = ("_conn",)
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def __enter__(self) -> "_ClosingConn":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        try:
+            if exc_type is None:
+                self._conn.commit()
+            else:
+                self._conn.rollback()
+        finally:
+            self._conn.close()
+        return False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conn, name)
+
+
 class ArtifactStore:
     def __init__(
         self,
@@ -133,11 +226,50 @@ class ArtifactStore:
         )
         self._init_lock = threading.Lock()
         self._initialized = False
+        self._tx = threading.local()
 
     def enabled(self) -> bool:
         return env_flag("ARTIFACT_LEDGER_ENABLED", True)
 
+    @contextmanager
+    def transaction(self):
+        """Run many writes/reads on a single connection in one transaction.
+
+        Bulk ingest paths (``ingest_writer_package_artifacts``) wrap their work
+        in ``with store.transaction():`` so the hundreds of per-row
+        ``upsert_*`` / ``add_lineage_edge`` calls share one connection and one
+        commit instead of opening a fresh connection (+PRAGMAs) and committing
+        per row.
+
+        While a transaction is open, ``_connect()`` hands every method a
+        :class:`_TxConn` proxy over the shared connection whose ``commit()`` is
+        a no-op and whose ``with``-exit does not close it — so the methods'
+        existing ``with self._connect() as conn: ... conn.commit()`` bodies need
+        no changes. Reentrant: a nested ``transaction()`` reuses the outer
+        connection and lets the outermost scope commit. Reads inside the
+        transaction see the uncommitted writes because they share the
+        connection.
+        """
+        self._ensure_schema()
+        if getattr(self._tx, "conn", None) is not None:
+            yield self._tx.conn
+            return
+        conn = self._connect()
+        self._tx.conn = conn
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._tx.conn = None
+            conn.close()
+
     def _connect(self) -> sqlite3.Connection:
+        active = getattr(self._tx, "conn", None)
+        if active is not None:
+            return _TxConn(active)  # type: ignore[return-value]
         self.path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(self.path), timeout=10.0)
         conn.row_factory = sqlite3.Row
@@ -150,7 +282,7 @@ class ArtifactStore:
         except sqlite3.OperationalError:
             conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
-        return conn
+        return _ClosingConn(conn)  # type: ignore[return-value]
 
     def sqlite_journal_mode(self) -> str:
         self._ensure_schema()
@@ -604,11 +736,21 @@ class ArtifactStore:
         input_hash: str = "",
         output_hash: str = "",
         storage_uri: str = "",
+        storage_bytes: int = 0,
+        content_hash: str = "",
         lineage: Optional[Dict[str, Any]] = None,
     ) -> ArtifactWriteResult:
         self._ensure_schema()
-        encoded = _json_dumps(payload).encode("utf-8")
-        output = output_hash or _hash_payload(payload)
+        # Serialize the payload at most once. A pointer artifact (``storage_uri``
+        # set — e.g. a stage snapshot already written to disk) skips
+        # serialization entirely when the caller supplies the hash + size, so a
+        # multi-MB payload is not re-encoded twice just to record a pointer row.
+        payload_str: Optional[str] = None
+        if storage_uri and (output_hash or content_hash) and int(storage_bytes or 0) > 0:
+            output = output_hash or content_hash
+        else:
+            payload_str = _json_dumps(payload)
+            output = output_hash or content_hash or _hash_text(payload_str)
         artifact_id = "ART-" + _hash_payload(
             {
                 "run_id": run_id,
@@ -625,17 +767,25 @@ class ArtifactStore:
         )[:24]
         payload_json = ""
         stored_uri = storage_uri
-        storage_bytes = 0
+        out_bytes = max(0, int(storage_bytes or 0))
         inline = False
         if storage_uri:
-            storage_bytes = len(encoded)
-        elif len(encoded) <= self.inline_max_bytes:
-            payload_json = _json_dumps(payload)
-            inline = True
+            if out_bytes <= 0:
+                if payload_str is None:
+                    payload_str = _json_dumps(payload)
+                out_bytes = len(payload_str.encode("utf-8"))
         else:
-            object_info = self._write_object(run_id=run_id, stage=stage, artifact_id=artifact_id, payload=payload)
-            stored_uri = object_info["storage_uri"]
-            storage_bytes = int(object_info["bytes"])
+            if payload_str is None:
+                payload_str = _json_dumps(payload)
+            out_bytes = len(payload_str.encode("utf-8"))
+            if out_bytes <= self.inline_max_bytes:
+                payload_json = payload_str
+                inline = True
+            else:
+                object_info = self._write_object(run_id=run_id, stage=stage, artifact_id=artifact_id, payload=payload)
+                stored_uri = object_info["storage_uri"]
+                out_bytes = int(object_info["bytes"])
+        storage_bytes = out_bytes
         now = _now_iso()
         with self._connect() as conn:
             conn.execute(
@@ -691,7 +841,7 @@ class ArtifactStore:
             payload_inline=inline,
             storage_uri=stored_uri,
             output_hash=output,
-            bytes=len(encoded),
+            bytes=storage_bytes,
         )
 
     def get_artifact(self, artifact_id: str) -> Dict[str, Any]:
@@ -1155,6 +1305,97 @@ class ArtifactStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(encoded)
         return {"storage_uri": str(path), "content_hash": _hash_payload(payload), "bytes": len(encoded)}
+
+    def list_run_ids(self, *, newest_first: bool = True) -> List[Dict[str, Any]]:
+        self._ensure_schema()
+        order = "DESC" if newest_first else "ASC"
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT run_id, created_at FROM runs ORDER BY datetime(created_at) {order}, run_id {order}"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _delete_run_rows(self, conn: sqlite3.Connection, run_id: str) -> None:
+        for table in _RUN_SCOPED_TABLES:
+            conn.execute(f"DELETE FROM {table} WHERE run_id=?", (run_id,))
+
+    def purge_run(self, run_id: str) -> Dict[str, Any]:
+        """Delete every run-scoped row for ``run_id`` (one transaction)."""
+        if not self.enabled():
+            return {"status": "disabled", "run_id": run_id}
+        with self.transaction() as conn:
+            self._delete_run_rows(conn, run_id)
+        return {"status": "purged", "run_id": run_id}
+
+    def prune_runs(
+        self,
+        *,
+        max_runs: Optional[int] = None,
+        max_age_days: Optional[int] = None,
+        keep_run_id: str = "",
+    ) -> Dict[str, Any]:
+        """Drop rows for the oldest runs so the ledger does not grow forever.
+
+        Keeps the newest ``max_runs`` runs (by ``created_at``) and drops any run
+        older than ``max_age_days`` (``0`` disables that limit). ``keep_run_id``
+        is never dropped. Row deletes let SQLite reuse the freed pages, so file
+        size plateaus near steady state without a (costly) ``VACUUM`` — enable
+        ``ARTIFACT_LEDGER_VACUUM_ON_PRUNE=1`` to also shrink the file on disk.
+        """
+        if not self.enabled():
+            return {"status": "disabled", "deleted_count": 0}
+        max_runs = env_int("ARTIFACT_LEDGER_RETENTION_MAX_RUNS", 200, min_value=0) if max_runs is None else max(0, int(max_runs))
+        max_age_days = env_int("ARTIFACT_LEDGER_RETENTION_MAX_AGE_DAYS", 0, min_value=0) if max_age_days is None else max(0, int(max_age_days))
+        if max_runs <= 0 and max_age_days <= 0:
+            return {"status": "disabled", "deleted_count": 0}
+        rows = self.list_run_ids(newest_first=True)
+        now = datetime.now(timezone.utc)
+        victims: List[str] = []
+        kept = 0
+        for row in rows:
+            run_id = str(row.get("run_id") or "")
+            if not run_id or (keep_run_id and run_id == keep_run_id):
+                continue
+            kept += 1
+            over_count = max_runs > 0 and kept > max_runs
+            too_old = False
+            if max_age_days > 0:
+                ts = _parse_iso_ts(row.get("created_at"))
+                too_old = ts is not None and (now - ts).total_seconds() > max_age_days * 86400
+            if over_count or too_old:
+                victims.append(run_id)
+                kept -= 1
+        if not victims:
+            return {"status": "pruned", "deleted_count": 0, "kept_count": kept}
+        with self.transaction() as conn:
+            for run_id in victims:
+                self._delete_run_rows(conn, run_id)
+        result: Dict[str, Any] = {
+            "status": "pruned",
+            "deleted_count": len(victims),
+            "kept_count": kept,
+            "deleted": victims[:50],
+        }
+        if env_flag("ARTIFACT_LEDGER_VACUUM_ON_PRUNE", False):
+            result["vacuumed"] = self.vacuum()
+        return result
+
+    def vacuum(self) -> bool:
+        """Rebuild the database file to reclaim disk space. Runs on its own
+        autocommit connection (``VACUUM`` cannot run inside a transaction)."""
+        if not self.enabled():
+            return False
+        self._ensure_schema()
+        try:
+            conn = sqlite3.connect(str(self.path), timeout=30.0)
+            conn.isolation_level = None
+            try:
+                conn.execute("VACUUM")
+            finally:
+                conn.close()
+            return True
+        except sqlite3.Error:
+            return False
 
 
 def default_artifact_store() -> ArtifactStore:

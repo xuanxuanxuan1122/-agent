@@ -25,6 +25,8 @@ from rag_pipeline.agents.report_health import build_report_health_card
 from rag_pipeline.agents.summary_quality import sanitize_summary_judgments
 from rag_pipeline.contracts.quality_gate import build_quality_gate_state
 from rag_pipeline.contracts.quality_gate_policy import quality_gates_isolated
+from rag_pipeline.observability.probe_api import emit_stage_snapshot
+from rag_pipeline.observability.probe_context import ProbeContext, activate_probe_context_env, create_probe_context
 from rag_pipeline.observability.run_trace import write_run_trace_from_package
 
 
@@ -339,6 +341,28 @@ def write_stage_snapshot_safe(
         }
 
 
+def emit_runtime_stage_snapshot_probe_safe(
+    probe_context: Optional[ProbeContext],
+    *,
+    stage_name: str,
+    payload: Any,
+    snapshot_result: Optional[Dict[str, Any]] = None,
+    summary: Optional[Dict[str, Any]] = None,
+    diagnostics: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    try:
+        return emit_stage_snapshot(
+            probe_context,
+            stage_name=stage_name,
+            payload=payload,
+            snapshot_result=snapshot_result,
+            summary=summary,
+            diagnostics=diagnostics,
+        )
+    except Exception as exc:  # pragma: no cover - runtime probe must never block report delivery.
+        return {"enabled": bool(probe_context), "emitted": False, "error": str(exc)}
+
+
 def init_artifact_ledger_run_safe(
     *,
     run_id: str,
@@ -367,6 +391,32 @@ def init_artifact_ledger_run_safe(
         }
     except Exception as exc:  # pragma: no cover - artifact ledger must never block report delivery.
         return None, {"enabled": True, "status": "init_failed", "error": str(exc)}
+
+
+def prune_run_scoped_caches_safe(run_id: str) -> Dict[str, Any]:
+    """Reclaim space from the per-run caches (stage snapshots + artifact ledger)
+    so they do not grow without bound. The current ``run_id`` is always kept.
+    Fully fail-open and gated by ``CACHE_RETENTION_ENABLED`` (default on);
+    tune via ``STAGE_SNAPSHOT_RETENTION_MAX_RUNS`` / ``ARTIFACT_LEDGER_RETENTION_MAX_RUNS``
+    (and the matching ``*_MAX_AGE_DAYS``)."""
+    if not env_flag("CACHE_RETENTION_ENABLED", True):
+        return {"enabled": False}
+    result: Dict[str, Any] = {"enabled": True}
+    try:
+        from rag_pipeline.cache.stage_snapshot_cache import prune_stage_snapshots
+
+        result["stage_snapshots"] = prune_stage_snapshots(keep_run_id=run_id)
+    except Exception as exc:  # pragma: no cover - retention must never block report delivery.
+        result["stage_snapshots"] = {"error": str(exc)}
+    try:
+        from rag_pipeline.cache.artifact_store import default_artifact_store
+
+        store = default_artifact_store()
+        if store.enabled():
+            result["artifact_ledger"] = store.prune_runs(keep_run_id=run_id)
+    except Exception as exc:  # pragma: no cover - retention must never block report delivery.
+        result["artifact_ledger"] = {"error": str(exc)}
+    return result
 
 
 def record_stage_snapshot_artifact_safe(
@@ -534,7 +584,7 @@ def finalize_formal_report(markdown: str) -> str:
         cleaned = _filter_existing_executive_summary_block(finalize_public_report(text))
         return renumber_formal_chapter_headings(strip_formal_report_private_sentences(cleaned))
     except ValueError:
-        cleaned = sanitize_public_markdown(text)
+        cleaned = sanitize_public_markdown(text, mode="enforce")
         for _ in range(8):
             blockers = find_publication_blockers(cleaned)
             if not blockers:
@@ -545,7 +595,7 @@ def finalize_formal_report(markdown: str) -> str:
                 for line_no, line in enumerate(cleaned.splitlines(), start=1)
                 if line_no not in blocked_lines
             )
-            cleaned = sanitize_public_markdown(cleaned)
+            cleaned = sanitize_public_markdown(cleaned, mode="enforce")
         cleaned = _filter_existing_executive_summary_block(cleaned)
         return renumber_formal_chapter_headings(strip_formal_report_private_sentences(cleaned)).strip()
 
@@ -697,6 +747,17 @@ def append_final_audit_note(markdown: str, final_audit_result: Dict[str, Any]) -
     if not note or not text or "## 最终审查补充" in text:
         return text
     return f"{text}\n\n{note}".strip()
+
+
+def _load_final_audit_runner():
+    try:
+        from .final_audit_agent import run_final_audit
+
+        return run_final_audit
+    except ImportError:
+        from rag_pipeline.flows.report.final_audit_agent import run_final_audit
+
+        return run_final_audit
 
 
 def _score_from_writer_report(writer_report: Dict[str, Any]) -> Any:
@@ -3301,7 +3362,7 @@ def clean_report_blocked_reason(
 
 
 def finalize_public_report(markdown: str) -> str:
-    cleaned = sanitize_public_markdown(str(markdown or ""))
+    cleaned = sanitize_public_markdown(str(markdown or ""), mode="enforce")
     for _ in range(3):
         blockers = find_publication_blockers(cleaned)
         if not blockers:
@@ -3312,7 +3373,7 @@ def finalize_public_report(markdown: str) -> str:
             for line_no, line in enumerate(cleaned.splitlines(), start=1)
             if line_no not in blocked_lines
         )
-        cleaned = sanitize_public_markdown(cleaned)
+        cleaned = sanitize_public_markdown(cleaned, mode="enforce")
     remaining = find_publication_blockers(cleaned)
     if remaining:
         sample = "; ".join(str(item.get("text") or "")[:80] for item in remaining[:3])
@@ -3535,6 +3596,22 @@ def apply_llm_profile_to_environment(profile: str) -> None:
         os.environ.pop(disable_thinking_env, None)
 
 
+def apply_selected_profile_to_task_model_routing(profile: str, *, force: bool = False) -> Dict[str, str]:
+    selected = str(profile or "").strip()
+    if not selected or not force:
+        return {}
+    if env_flag("REPORT_PRESERVE_TASK_MODEL_ROUTING", False):
+        return {}
+    previous: Dict[str, str] = {}
+    for key in REPORT_MODEL_ROUTING_DEFAULTS:
+        old_value = os.environ.get(key, "")
+        if old_value == selected:
+            continue
+        previous[key] = old_value
+        os.environ[key] = selected
+    return previous
+
+
 def select_llm_profile(args: argparse.Namespace) -> str:
     selected = str(
         args.llm_profile
@@ -3632,13 +3709,18 @@ HIGH_WRITING_QUALITY_DEFAULTS = {
     "REPORT_BODY_REWRITE_MAX_ELAPSED_SECONDS": "900",
     "REPORT_BODY_REWRITE_CONCURRENCY": "3",
     "REPORT_BODY_REWRITE_MAX_EXPANSION_RATIO": "5.0",
-    "REPORT_BODY_REWRITE_TARGET_SECTION_CHARS": "650",
+    "REPORT_BODY_REWRITE_TARGET_SECTION_CHARS": "850",
+    "REPORT_BODY_REWRITE_MIN_ACCEPT_CHARS": "420",
     "REPORT_ENABLE_LLM_CHAPTER_NARRATIVE": "true",
     "REPORT_CHAPTER_NARRATIVE_MAX_CHAPTERS": "12",
-    "REPORT_TARGET_BODY_CHARS": "0",
+    "REPORT_TARGET_BODY_CHARS": "24000",
     "REPORT_TARGET_BODY_CHARS_BLOCKING": "false",
-    "REPORT_COMPOSER_TARGET_SECTION_CHARS": "550",
-    "REPORT_RENDER_MIN_SECTION_CHARS": "0",
+    "REPORT_ENABLE_PUBLIC_EVIDENCE_DIGEST": "true",
+    "REPORT_PUBLIC_EVIDENCE_DIGEST_MAX_SECTIONS_PER_CHAPTER": "3",
+    "REPORT_COMPOSER_TARGET_SECTION_CHARS": "850",
+    "REPORT_ENABLE_RENDERER_TEMPLATE_EXPANSION": "false",
+    "REPORT_RENDER_MIN_SECTION_CHARS": "420",
+    "REPORT_BLUEPRINT_SOURCE": "claim_first",
 }
 
 
@@ -3706,6 +3788,41 @@ def _apply_env_defaults(defaults: Dict[str, str]) -> tuple[Dict[str, str], Dict[
     return applied, preserved
 
 
+DISABLED_ENV_VALUES = {"", "0", "false", "no", "off", "disabled"}
+
+
+def _env_value_is_disabled(value: Any) -> bool:
+    return str(value or "").strip().lower() in DISABLED_ENV_VALUES
+
+
+def _apply_quality_env_defaults(
+    defaults: Dict[str, str],
+    *,
+    force_enable_keys: Optional[set[str]] = None,
+) -> tuple[Dict[str, str], Dict[str, str], Dict[str, str]]:
+    applied: Dict[str, str] = {}
+    preserved: Dict[str, str] = {}
+    overridden_disabled: Dict[str, str] = {}
+    force_enable_keys = force_enable_keys or set()
+    for key, value in defaults.items():
+        if key in os.environ:
+            existing = os.environ[key]
+            if (
+                key in force_enable_keys
+                and str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+                and _env_value_is_disabled(existing)
+            ):
+                overridden_disabled[key] = existing
+                os.environ[key] = value
+                applied[key] = value
+                continue
+            preserved[key] = existing
+            continue
+        os.environ[key] = value
+        applied[key] = value
+    return applied, preserved, overridden_disabled
+
+
 def _apply_model_routing_defaults(defaults: Dict[str, str]) -> tuple[Dict[str, str], Dict[str, str], Dict[str, str], Dict[str, str]]:
     applied: Dict[str, str] = {}
     preserved: Dict[str, str] = {}
@@ -3748,15 +3865,39 @@ def apply_report_quality_posture(mode: str = "") -> Dict[str, Any]:
             "IQS_ENABLE_SELF_REFINE": "true",
             "FULL_REPORT_IQS_ENABLE_SELF_REFINE": "true",
             "BRAIN_AGENT_TEXT_SELF_REFINE": "false",
-            "REPORT_CONTINUOUS_EVIDENCE_LOOP": "false",
+            "REPORT_CONTINUOUS_EVIDENCE_LOOP": "true",
         }
         evidence_defaults = STRICT_RESEARCH_EVIDENCE_DEPTH_DEFAULTS
     else:
-        defaults = {key: "false" for key in HIGH_COST_SEARCH_FLAGS}
+        defaults = {
+            "IQS_ENABLE_LLM_QUERY_REWRITE": "true",
+            "IQS_ENABLE_SELF_REFINE": "true",
+            "FULL_REPORT_IQS_ENABLE_SELF_REFINE": "true",
+            "BRAIN_AGENT_TEXT_SELF_REFINE": "false",
+            "REPORT_CONTINUOUS_EVIDENCE_LOOP": "true",
+        } if normalized == "high" else {key: "false" for key in HIGH_COST_SEARCH_FLAGS}
         evidence_defaults = HIGH_EVIDENCE_DEPTH_DEFAULTS if normalized == "high" else {}
 
     writing_defaults = HIGH_WRITING_QUALITY_DEFAULTS if normalized in {"high", "strict_research"} else {}
-    applied, preserved = _apply_env_defaults({**defaults, **evidence_defaults, **writing_defaults})
+    force_feature_enable = (
+        normalized in {"high", "strict_research"}
+        and str(os.environ.get("REPORT_QUALITY_PRESERVE_DISABLED_FEATURES") or "").strip().lower()
+        not in {"1", "true", "yes", "on"}
+    )
+    force_enable_keys = {
+        "IQS_ENABLE_LLM_QUERY_REWRITE",
+        "IQS_ENABLE_SELF_REFINE",
+        "FULL_REPORT_IQS_ENABLE_SELF_REFINE",
+        "REPORT_CONTINUOUS_EVIDENCE_LOOP",
+        "BRAIN_ENABLE_LLM_EVIDENCE_ANALYSIS",
+        "BRAIN_ENABLE_POST_QA_REPAIR",
+        "REPORT_ENABLE_LLM_BODY_REWRITE",
+        "REPORT_ENABLE_LLM_CHAPTER_NARRATIVE",
+    } if force_feature_enable else set()
+    applied, preserved, overridden_disabled = _apply_quality_env_defaults(
+        {**defaults, **evidence_defaults, **writing_defaults},
+        force_enable_keys=force_enable_keys,
+    )
     model_applied, model_preserved, replaced_removed_models, overridden_models = _apply_model_routing_defaults(REPORT_MODEL_ROUTING_DEFAULTS)
     applied.update(model_applied)
     preserved.update(model_preserved)
@@ -3777,6 +3918,7 @@ def apply_report_quality_posture(mode: str = "") -> Dict[str, Any]:
         "mode": normalized,
         "applied_defaults": applied,
         "preserved_explicit": preserved,
+        "overridden_disabled_features": overridden_disabled,
         "disabled": disabled,
         "query_rewrite_max_calls": os.environ.get("QUERY_REWRITE_MAX_CALLS_PER_REPORT", "4"),
         "query_rewrite_max_input_chars": os.environ.get("QUERY_REWRITE_MAX_INPUT_CHARS", "6000"),
@@ -4010,6 +4152,73 @@ def _topic_cache_blueprint_from_chapters(query: str, chapter_evidence_packages: 
     }
 
 
+def _attach_blueprint_refresh_to_evidence_package(
+    *,
+    report_blueprint: Dict[str, Any],
+    evidence_package: Dict[str, Any],
+    phase: str,
+    writer_started: bool = False,
+) -> Dict[str, Any]:
+    if not as_dict(report_blueprint) or not isinstance(evidence_package, dict):
+        return {}
+    try:
+        from rag_pipeline.agents.blueprint_refresh import attach_staged_blueprint_refresh
+
+        return attach_staged_blueprint_refresh(
+            report_blueprint=report_blueprint,
+            evidence_package=evidence_package,
+            phase=phase,
+            writer_started=writer_started,
+        )
+    except Exception as exc:  # pragma: no cover - diagnostics must never block report generation.
+        evidence_package.setdefault("metadata", {})["blueprint_refresh_error"] = str(exc)
+        return {"schema_version": "staged_blueprint_refresh_v1", "status": "error", "error": str(exc)}
+
+
+def _attach_curated_evidence(evidence_package: Dict[str, Any]) -> Dict[str, Any]:
+    package = dict(as_dict(evidence_package))
+    if not env_flag("REPORT_EVIDENCE_CURATOR_ENABLED", True):
+        return package
+    try:
+        from rag_pipeline.cache.analysis_memory_cache import build_analysis_shards, persist_analysis_memory_cache
+        from rag_pipeline.agents.evidence_curator_agent import curate_evidence_batch
+        from rag_pipeline.agents.evidence_inventory_agent import build_evidence_inventory
+    except Exception as exc:  # pragma: no cover - curator must never block report runs.
+        package.setdefault("metadata", {})["evidence_curator_error"] = str(exc)
+        return package
+
+    candidates = (
+        as_list(package.get("analysis_ready_evidence"))
+        + as_list(package.get("clean_evidence_list"))
+        + as_list(package.get("supporting_evidence"))
+    )
+    curated = curate_evidence_batch(
+        [item for item in candidates if isinstance(item, dict)],
+        query=str(package.get("query") or ""),
+        max_items=env_int("REPORT_EVIDENCE_CURATOR_MAX_ITEMS", 240, min_value=20, max_value=1000),
+    )
+    package["curated_evidence"] = curated
+    inventory = build_evidence_inventory(curated, query=str(package.get("query") or ""))
+    package["evidence_inventory"] = inventory
+    analysis_shards = build_analysis_shards(package)
+    package["analysis_shards"] = analysis_shards
+    package.setdefault("metadata", {})["curated_evidence_count"] = int(curated.get("curated_evidence_count") or 0)
+    package["metadata"]["dirty_blocked_count"] = int(curated.get("dirty_blocked_count") or 0)
+    package["metadata"]["evidence_inventory_count"] = int(inventory.get("inventory_count") or 0)
+    run_id = str(
+        package.get("run_id")
+        or package.get("stage_snapshot_run_id")
+        or os.getenv("REPORT_STAGE_SNAPSHOT_RUN_ID")
+        or ""
+    ).strip()
+    if run_id and env_flag("REPORT_ANALYSIS_MEMORY_CACHE_ENABLED", True):
+        try:
+            package["analysis_memory_cache"] = persist_analysis_memory_cache(package, run_id=run_id)
+        except Exception as exc:  # pragma: no cover - cache persistence must never block report generation.
+            package.setdefault("metadata", {})["analysis_memory_cache_error"] = str(exc)
+    return package
+
+
 def _topic_cache_preflight_for_query(query: str) -> Dict[str, Any]:
     try:
         from rag_pipeline.cache.topic_bundle_cache import load_topic_bundle, preflight_topic_bundle
@@ -4080,6 +4289,7 @@ def _run_topic_bundle_cached_flow(query: str, cache_context: Dict[str, Any]) -> 
     )
     if source_registry and not as_list(evidence_package.get("source_registry")):
         evidence_package["source_registry"] = source_registry
+    evidence_package = _attach_curated_evidence(evidence_package)
     report_blueprint = as_dict(inputs.get("report_blueprint"))
     existing_chapter_packages = as_list(inputs.get("chapter_evidence_packages"))
     if not report_blueprint:
@@ -4096,11 +4306,24 @@ def _run_topic_bundle_cached_flow(query: str, cache_context: Dict[str, Any]) -> 
     else:
         chapter_evidence_packages = existing_chapter_packages
     evidence_package["chapter_evidence_packages"] = chapter_evidence_packages
+    _attach_blueprint_refresh_to_evidence_package(
+        report_blueprint=report_blueprint,
+        evidence_package=evidence_package,
+        phase="post_evidence_merge",
+        writer_started=False,
+    )
 
     structured_analysis = as_dict(inputs.get("structured_analysis"))
     analysis_state: Dict[str, Any] = {}
     if not structured_analysis:
-        analysis_state = run_analysis_agent(evidence_package, query=query)
+        analysis_llm_config: Dict[str, Any] = {}
+        try:
+            from rag_pipeline.config.search_config import build_llm_config_for_task
+
+            analysis_llm_config = dict(build_llm_config_for_task("claim_build"))
+        except Exception:
+            analysis_llm_config = {}
+        analysis_state = run_analysis_agent(evidence_package, query=query, llm_config=analysis_llm_config)
         structured_analysis = as_dict(analysis_state.get("structured_analysis"))
     else:
         analysis_state = {"structured_analysis": structured_analysis, "errors": [], "metadata": {"source": "topic_bundle_cache"}}
@@ -4302,6 +4525,12 @@ def _run_fail_open_rebuild_from_package(
         source_registry=source_registry,
     )
     evidence_package["chapter_evidence_packages"] = chapter_evidence_packages
+    _attach_blueprint_refresh_to_evidence_package(
+        report_blueprint=report_blueprint,
+        evidence_package=evidence_package,
+        phase="post_evidence_merge",
+        writer_started=False,
+    )
     # The deadline usually fires after run_analysis_agent has already produced
     # usable LLM claims on the main path (the timeout is discovered between
     # analysis and writer). Re-running analysis here would burn post-deadline
@@ -4325,7 +4554,7 @@ def _run_fail_open_rebuild_from_package(
                 try:
                     from rag_pipeline.config.search_config import build_llm_config_for_task
 
-                    llm_config = dict(build_llm_config_for_task("decision"))
+                    llm_config = dict(build_llm_config_for_task("claim_build"))
                 except Exception:
                     llm_config = {}
             fail_open_llm_budget = 0.0
@@ -4627,6 +4856,16 @@ def main() -> int:
     if high_quality_mode:
         _apply_env_defaults(HIGH_WRITING_QUALITY_DEFAULTS)
     selected_llm_profile = select_llm_profile(args)
+    task_routing_overrides = apply_selected_profile_to_task_model_routing(
+        selected_llm_profile,
+        force=bool(args.llm_profile) or env_flag("REPORT_ROUTE_TASK_MODELS_TO_EXECUTION_PROFILE", False),
+    )
+    if task_routing_overrides:
+        quality_posture["execution_profile_model_overrides"] = task_routing_overrides
+        quality_posture["model_routing"] = {
+            key: os.environ.get(key, "")
+            for key in REPORT_MODEL_ROUTING_DEFAULTS
+        }
     progress_enabled = (not args.no_progress_bar) and env_flag("REPORT_PROGRESS_BAR", True)
     global QUIET_STAGE_LOGS
     QUIET_STAGE_LOGS = bool(progress_enabled and not args.verbose_progress)
@@ -4655,6 +4894,8 @@ def main() -> int:
 
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_id = f"{run_timestamp}_{safe_filename(query)}"
+    runtime_probe_context = create_probe_context(run_id=run_id)
+    activate_probe_context_env(runtime_probe_context)
     stage_snapshot_index: List[Dict[str, Any]] = []
     artifact_ledger_store, artifact_ledger_status = init_artifact_ledger_run_safe(
         run_id=run_id,
@@ -4665,12 +4906,23 @@ def main() -> int:
             "current_query_terms": ["news", "policy", "finance", "funding", "current", "latest"],
         },
     )
+    cache_retention_status = prune_run_scoped_caches_safe(run_id)
+    if cache_retention_status.get("enabled"):
+        artifact_ledger_status["cache_retention"] = cache_retention_status
 
     def record_stage_snapshot(stage_name: str, payload: Any, *, summary: Optional[Dict[str, Any]] = None, diagnostics: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         result = write_stage_snapshot_safe(
             run_id=run_id,
             stage_name=stage_name,
             payload=payload,
+            summary=summary,
+            diagnostics=diagnostics,
+        )
+        runtime_probe_result = emit_runtime_stage_snapshot_probe_safe(
+            runtime_probe_context,
+            stage_name=stage_name,
+            payload=payload,
+            snapshot_result=result,
             summary=summary,
             diagnostics=diagnostics,
         )
@@ -4693,6 +4945,12 @@ def main() -> int:
             }
             if artifact_ledger_artifact:
                 snapshot_entry["artifact_ledger"] = artifact_ledger_artifact
+            if runtime_probe_result:
+                snapshot_entry["runtime_probe"] = {
+                    "emitted": bool(runtime_probe_result.get("emitted")),
+                    "path": runtime_probe_result.get("path") or "",
+                    "error": runtime_probe_result.get("error") or "",
+                }
             stage_snapshot_index.append(
                 snapshot_entry
             )
@@ -4988,6 +5246,30 @@ def main() -> int:
     )
     if chapter_evidence_payload and not as_list(evidence_package_payload.get("chapter_evidence_packages")):
         evidence_package_payload["chapter_evidence_packages"] = chapter_evidence_payload
+    chapter_recomposition_payload = (
+        as_dict(writer_report.get("chapter_recomposition"))
+        or as_dict(render_artifacts.get("chapter_recomposition"))
+    )
+    claim_clusters_payload = (
+        as_list(writer_report.get("claim_clusters"))
+        or as_list(render_artifacts.get("claim_clusters"))
+    )
+    final_chapters_payload = (
+        as_list(writer_report.get("final_chapters"))
+        or as_list(render_artifacts.get("final_chapters"))
+    )
+    plan_blueprint_payload = (
+        as_dict(writer_report.get("plan_blueprint"))
+        or as_dict(render_artifacts.get("plan_blueprint"))
+    )
+    if chapter_recomposition_payload and not as_dict(writer_report.get("chapter_recomposition")):
+        writer_report["chapter_recomposition"] = chapter_recomposition_payload
+    if claim_clusters_payload and not as_list(writer_report.get("claim_clusters")):
+        writer_report["claim_clusters"] = claim_clusters_payload
+    if final_chapters_payload and not as_list(writer_report.get("final_chapters")):
+        writer_report["final_chapters"] = final_chapters_payload
+    if plan_blueprint_payload and not as_dict(writer_report.get("plan_blueprint")):
+        writer_report["plan_blueprint"] = plan_blueprint_payload
     writer_package_payload = {
         "query": query,
         "report_execution_mode": writer_report.get("report_execution_mode") or report_execution_mode,
@@ -5001,7 +5283,14 @@ def main() -> int:
         "structured_analysis": as_dict(render_artifacts.get("structured_analysis"))
         or as_dict(state_dict.get("structured_analysis"))
         or as_dict(raw_output.get("structured_analysis")),
-        "report_blueprint": as_dict(state_dict.get("report_blueprint")) or as_dict(raw_output.get("report_blueprint")),
+        "report_blueprint": as_dict(writer_report.get("report_blueprint"))
+        or as_dict(render_artifacts.get("report_blueprint"))
+        or as_dict(state_dict.get("report_blueprint"))
+        or as_dict(raw_output.get("report_blueprint")),
+        "plan_blueprint": plan_blueprint_payload,
+        "chapter_recomposition": chapter_recomposition_payload,
+        "claim_clusters": claim_clusters_payload,
+        "final_chapters": final_chapters_payload,
         "chapter_evidence_packages": chapter_evidence_payload,
         "micro_layouts": as_list(render_artifacts.get("micro_layouts")) or as_list(state_dict.get("micro_layouts")) or as_list(raw_output.get("micro_layouts")),
         "table_packages": as_list(render_artifacts.get("table_packages")) or as_list(state_dict.get("table_packages")) or as_list(raw_output.get("table_packages")),
@@ -5069,9 +5358,12 @@ def main() -> int:
         record_stage_snapshot(stage_name, payload)
     writer_package_payload["stage_snapshot_run_id"] = run_id
     writer_package_payload["stage_snapshot_index"] = list(stage_snapshot_index)
+    writer_package_payload["runtime_probe_live_path"] = str(runtime_probe_context.live_path)
     writer_report["stage_snapshot_run_id"] = run_id
     writer_report["stage_snapshot_index"] = list(stage_snapshot_index)
+    writer_report["runtime_probe_live_path"] = str(runtime_probe_context.live_path)
     state_dict["stage_snapshot_run_id"] = run_id
+    state_dict["runtime_probe_live_path"] = str(runtime_probe_context.live_path)
     artifact_ledger_sync = sync_artifact_ledger_package_safe(
         artifact_ledger_store,
         run_id=run_id,
@@ -5455,7 +5747,7 @@ def main() -> int:
     final_audit_candidate = bool(report_markdown and not writer_not_ready)
     if final_audit_candidate:
         try:
-            from .final_audit_agent import run_final_audit
+            run_final_audit = _load_final_audit_runner()
 
             audit_target = "Clean report" if clean_report_written else ("Writer fallback report" if fallback_report_written else "Formal report")
             log(f"[5.5/6] FinalAuditAgent 审查 {audit_target}")
@@ -5671,6 +5963,11 @@ def main() -> int:
             writer_package_payload["run_trace"] = run_trace_result
             writer_report["run_trace_path"] = str(run_trace_result.get("trace_path") or "")
             writer_report["run_trace_summary_path"] = str(run_trace_result.get("summary_path") or "")
+            writer_report["stage_probe_path"] = str(run_trace_result.get("stage_probe_path") or "")
+            writer_report["dataflow_summary_path"] = str(run_trace_result.get("dataflow_summary_path") or "")
+            writer_report["module_probe_path"] = str(run_trace_result.get("module_probe_path") or "")
+            writer_report["lineage_graph_path"] = str(run_trace_result.get("lineage_graph_path") or "")
+            writer_report["health_metrics_path"] = str(run_trace_result.get("health_metrics_path") or "")
             writer_package_payload["writer_report"] = writer_report
             state_dict["writer_report"] = writer_report
     except Exception as trace_exc:  # pragma: no cover - trace must never block report delivery.
@@ -5744,6 +6041,19 @@ def main() -> int:
         log(f"  - Run Trace JSONL: {run_trace_result.get('trace_path')}", force=True)
     if as_dict(run_trace_result).get("summary_path"):
         log(f"  - Run Trace Summary: {run_trace_result.get('summary_path')}", force=True)
+    if as_dict(run_trace_result).get("stage_probe_path"):
+        log(f"  - Stage Probe JSONL: {run_trace_result.get('stage_probe_path')}", force=True)
+    if as_dict(run_trace_result).get("dataflow_summary_path"):
+        log(f"  - Dataflow Summary: {run_trace_result.get('dataflow_summary_path')}", force=True)
+    if as_dict(run_trace_result).get("module_probe_path"):
+        log(f"  - Module Probe JSONL: {run_trace_result.get('module_probe_path')}", force=True)
+    if as_dict(run_trace_result).get("lineage_graph_path"):
+        log(f"  - Lineage Graph JSON: {run_trace_result.get('lineage_graph_path')}", force=True)
+    if as_dict(run_trace_result).get("health_metrics_path"):
+        log(f"  - Health Metrics JSON: {run_trace_result.get('health_metrics_path')}", force=True)
+    runtime_probe_live_path = str(writer_report.get("runtime_probe_live_path") or state_dict.get("runtime_probe_live_path") or "")
+    if runtime_probe_live_path:
+        log(f"  - Runtime Probe Live JSONL: {runtime_probe_live_path}", force=True)
 
     if errors:
         log("[WARN] 运行中存在非致命错误/降级：", force=True)

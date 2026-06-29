@@ -37,6 +37,75 @@ def test_claim_without_affinity_falls_back_to_integrated_signal():
     assert "integrated_signal" in claim_supported_block_types(claim)
 
 
+def test_claim_builder_uses_required_refs_for_facts_and_citations(monkeypatch):
+    monkeypatch.setenv("REPORT_TEMPLATE_FALLBACKS", "0")
+    package = {
+        "chapter_id": "ch_01",
+        "chapter_title": "\u4f4e\u7a7a\u7ecf\u6d4e\u653f\u7b56\u4e0e\u65e0\u4eba\u673a\u914d\u9001",
+        "core_evidence": [
+            {
+                "ref": "EV-policy",
+                "evidence_id": "EV-policy",
+                "source_ref": "[1]",
+                "source_level": "A",
+                "public_fact_quality": {
+                    "eligible_for_report": True,
+                    "public_fact_card": {
+                        "fact": "\u4f4e\u7a7a\u4fdd\u9669\u4f53\u7cfb\u653f\u7b56\u5c06\u65e0\u4eba\u9a7e\u9a76\u822a\u7a7a\u5668\u8d23\u4efb\u4fdd\u9669\u4f5c\u4e3a\u5236\u5ea6\u5efa\u8bbe\u65b9\u5411\u3002",
+                        "source_ref": "[1]",
+                        "fact_type": "source_check",
+                    },
+                },
+            },
+            {
+                "ref": "EV-case",
+                "evidence_id": "EV-case",
+                "source_ref": "[8]",
+                "source_level": "C",
+                "public_fact_quality": {
+                    "eligible_for_report": True,
+                    "public_fact_card": {
+                        "fact": "\u4f5b\u5c71\u5e02\u6210\u7acb\u4f4e\u7a7a\u7ecf\u6d4e\u53d1\u5c55\u6709\u9650\u516c\u53f8\uff0c\u4ee5\u5e02\u573a\u5316\u8fd0\u4f5c\u63a8\u52a8\u4f4e\u7a7a\u7ecf\u6d4e\u4ea7\u4e1a\u53d1\u5c55\u3002",
+                        "source_ref": "[8]",
+                        "fact_type": "case",
+                    },
+                },
+            },
+        ],
+    }
+    layouts = [
+        {
+            "chapter_id": "ch_01",
+            "sections": [
+                {
+                    "section_id": "ch_01_b1",
+                    "section_title": "\u5e02\u573a\u9700\u6c42\u662f\u5426\u5df2\u7ecf\u51fa\u73b0",
+                    "block_type": "integrated_signal",
+                    "output_type": "integrated_signal",
+                    "section_role": "integrated_signal",
+                    "required_evidence_refs": ["EV-case"],
+                }
+            ],
+        }
+    ]
+
+    units = run_claim_builder_agent(
+        chapter_evidence_packages=[package],
+        micro_layouts=layouts,
+        structured_analysis={},
+    )
+
+    assert units
+    unit = units[0]
+    assert unit["public_render"] is True
+    assert unit["omit_from_report"] is False
+    assert "\u4f5b\u5c71\u5e02" in unit["claim"]
+    assert "\u4f4e\u7a7a\u4fdd\u9669" not in unit["claim"]
+    assert unit["evidence_refs"] == ["[8]"]
+    assert "\u66f4\u9002\u5408\u8bf4\u660e" not in unit["claim"]
+    assert "\u5c40\u90e8\u6d41\u7a0b" not in unit["claim"]
+
+
 def test_match_claims_to_blocks_is_one_to_one_and_uses_fallback():
     claims = [
         _claim(evidence_refs=["EV-1"], block_affinity=["case_comparison"]),
@@ -235,6 +304,77 @@ def test_claim_builder_prefers_llm_claim_over_chapter_analysis_fallback():
     assert units[0]["source_support_map"] == {"claim": ["EV-1"], "mechanism": ["EV-1"], "boundary": ["EV-1"]}
 
 
+def test_claim_builder_does_not_repeat_chapter_analysis_fallback_after_matched_claim():
+    claim = _claim(
+        claim_id="claim_ch01_only",
+        chapter_id="ch_01",
+        claim="The low-altitude economy market-size signal is already sufficient for one section.",
+        block_affinity=["case_comparison"],
+        fact_type="case",
+        evidence_refs=["EV-1"],
+        used_fact_refs=["EV-1"],
+        evidence_basis=["A traceable source reports a low-altitude economy market-size signal."],
+        supporting_facts=["A traceable source reports a low-altitude economy market-size signal."],
+        reasoning="The signal supports one bounded market-size section, not repeated layout filler.",
+        mechanism="Market-size evidence can anchor a single commercialisation argument.",
+        claim_strength="directional",
+        analysis_role="directional",
+        source_support_map={"claim": ["EV-1"], "mechanism": ["EV-1"], "boundary": ["EV-1"]},
+    )
+    units = run_claim_builder_agent(
+        chapter_evidence_packages=[
+            {
+                "chapter_id": "ch_01",
+                "chapter_title": "Market signal",
+                "chapter_question": "How strong is the market-size signal?",
+                "chapter_analysis": {"claim_strength": "directional"},
+                "case_evidence": [
+                    {
+                        "evidence_id": "EV-1",
+                        "source_ref": "[1]",
+                        "public_fact_card": {
+                            "fact": "A traceable source reports a low-altitude economy market-size signal.",
+                            "fact_type": "case",
+                            "block_affinity": ["case_comparison"],
+                            "source_ref": "[1]",
+                        },
+                    }
+                ],
+            }
+        ],
+        micro_layouts=[
+            {
+                "chapter_id": "ch_01",
+                "sections": [
+                    {
+                        "section_id": "ch_01_s1",
+                        "section_title": "Market signal",
+                        "block_type": "case_comparison",
+                        "output_type": "case_comparison",
+                    },
+                    {
+                        "section_id": "ch_01_s2",
+                        "section_title": "Commercialisation signal",
+                        "block_type": "case_comparison",
+                        "output_type": "case_comparison",
+                    },
+                    {
+                        "section_id": "ch_01_s3",
+                        "section_title": "Player layout signal",
+                        "block_type": "case_comparison",
+                        "output_type": "case_comparison",
+                    },
+                ],
+            }
+        ],
+        structured_analysis={"claim_units": [claim]},
+    )
+
+    public_units = [unit for unit in units if unit.get("public_render")]
+    assert [unit.get("claim_id") for unit in public_units] == ["claim_ch01_only"]
+    assert len({_normalize for _normalize in (unit.get("claim") for unit in public_units)}) == 1
+
+
 def test_claim_builder_emits_multiple_public_llm_claims_per_chapter(monkeypatch):
     monkeypatch.setenv("REPORT_EXTRA_LLM_CLAIMS_PER_CHAPTER", "4")
     claims = [
@@ -417,6 +557,63 @@ def test_claim_builder_matches_llm_claim_to_package_by_evidence_ref_when_chapter
     assert units
     assert units[0]["claim_id"] == "claim_ch01_by_ref"
     assert units[0]["chapter_id"] == "demand_validation"
+
+
+def test_claim_builder_does_not_move_claim_to_other_existing_chapter_by_shared_ref():
+    claims = [
+        _claim(
+            claim_id="claim_ch01",
+            chapter_id="ch_01",
+            claim="Chapter one should keep its own claim.",
+            evidence_refs=["EV-SHARED"],
+            used_fact_refs=["EV-SHARED"],
+            evidence_basis=["Shared evidence can appear in more than one package."],
+            supporting_facts=["Shared evidence can appear in more than one package."],
+        ),
+        _claim(
+            claim_id="claim_ch04",
+            chapter_id="ch_04",
+            claim="Chapter four should not be rendered as a chapter one extra.",
+            evidence_refs=["EV-SHARED"],
+            used_fact_refs=["EV-SHARED"],
+            evidence_basis=["Shared evidence can appear in more than one package."],
+            supporting_facts=["Shared evidence can appear in more than one package."],
+        ),
+    ]
+    common_fact = {
+        "evidence_id": "EV-SHARED",
+        "source_ref": "[1]",
+        "public_fact_card": {
+            "fact": "Shared evidence can appear in more than one package.",
+            "fact_type": "case",
+            "block_affinity": ["case_comparison"],
+            "source_ref": "[1]",
+        },
+    }
+
+    units = run_claim_builder_agent(
+        chapter_evidence_packages=[
+            {"chapter_id": "ch_01", "chapter_title": "Chapter one", "case_evidence": [common_fact]},
+            {"chapter_id": "ch_04", "chapter_title": "Chapter four", "case_evidence": [common_fact]},
+        ],
+        micro_layouts=[
+            {
+                "chapter_id": "ch_01",
+                "sections": [{"section_id": "ch_01_s1", "block_type": "case_comparison"}],
+            },
+            {
+                "chapter_id": "ch_04",
+                "sections": [{"section_id": "ch_04_s1", "block_type": "case_comparison"}],
+            },
+        ],
+        structured_analysis={"claim_units": claims},
+    )
+
+    public_units = [unit for unit in units if unit.get("public_render")]
+    by_claim = {unit.get("claim_id"): unit for unit in public_units}
+    assert by_claim["claim_ch01"]["chapter_id"] == "ch_01"
+    assert by_claim["claim_ch04"]["chapter_id"] == "ch_04"
+    assert [unit.get("claim_id") for unit in public_units].count("claim_ch04") == 1
 
 
 def test_claim_builder_renders_leftover_llm_claim_as_integrated_signal():

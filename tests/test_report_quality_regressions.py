@@ -6,6 +6,7 @@ from rag_pipeline.agents.analytics.evidence_utils import evidence_subject, is_va
 from rag_pipeline.agents.analytics.investor_insight_agent import _collect_rows as _collect_investor_rows
 from rag_pipeline.agents.analytics.market_analytics_agent import _derive_cagr, run_market_analytics_agent
 from rag_pipeline.agents.analysis_agent import run_analysis_agent
+from rag_pipeline.agents.writer_agent_clean import _claim_review_followups_from_action_plan
 from rag_pipeline.agents.brain_agent import (
     _dedupe_followup_tasks,
     _followup_signal_diagnostics,
@@ -45,7 +46,7 @@ from rag_pipeline.agents import brain_agent as brain_agent_module
 from rag_pipeline.agents import evidence_merger as evidence_merger_module
 from rag_pipeline.agents import web_analysis_agent as web_analysis_agent_module
 from rag_pipeline.agents.claim_builder_agent import run_claim_builder_agent
-from rag_pipeline.agents.evidence_binder import run_evidence_binder
+from rag_pipeline.agents.evidence_binder import SourceRegistry, normalize_and_register_sources, run_evidence_binder
 from rag_pipeline.agents.evidence_merger import merge_evidence_package
 from rag_pipeline.agents.final_writer_agent import run_final_writer_agent
 from rag_pipeline.agents.qa_agent import run_qa_agent
@@ -62,6 +63,9 @@ from rag_pipeline.agents.research_proof_registry import mandatory_proof_checks, 
 from rag_pipeline.agents.table_agent import _row_for_item, _row_has_valid_leading_cell, _subject, run_table_agent
 from rag_pipeline.agents.public_report_sanitizer import sanitize_public_markdown
 from rag_pipeline.agents.writer_agent_clean import (
+    _analysis_blueprint_from_claim_units,
+    _hydrate_duplicate_evidence_sources,
+    _sync_chapter_section_refs_from_argument_units,
     _normalize_public_packages_for_contract,
     _qa_has_pending_repair,
     _writer_ready_for_final,
@@ -94,6 +98,52 @@ LONG_AI_CHAPTER_TITLE = (
     "\uff0c\u4f46\u589e\u957f\u8d28\u91cf\u9700\u8981\u6309\u7ec6\u5206"
     "\u573a\u666f\u9a8c\u8bc1"
 )
+
+
+def test_claim_review_action_plan_becomes_repair_followups():
+    action_plan = {
+        "schema_version": "claim_review_action_plan_v1",
+        "actions": [
+            {
+                "chapter_id": "ch_01",
+                "claim_id": "CL-1",
+                "claim": "The AI Agent industry is entering broad enterprise adoption.",
+                "issue_type": "single_source_industry_generalization",
+                "recommended_action": "needs_corroboration",
+                "repair_priority": {
+                    "gap_id": "GAP-1",
+                    "gap_type": "single_source_industry_generalization",
+                    "required_fields": ["second_independent_source"],
+                    "source_ids": ["SRC-1"],
+                    "evidence_refs": ["EV-1"],
+                },
+            },
+            {
+                "chapter_id": "ch_02",
+                "claim_id": "CL-2",
+                "claim": "Unsupported claim.",
+                "issue_type": "llm_claim_semantic_judge_unsupported",
+                "recommended_action": "repair_before_publication",
+                "repair_priority": {"gap_id": "GAP-2", "gap_type": "claim_semantic_support_mismatch"},
+            },
+            {
+                "chapter_id": "ch_03",
+                "claim_id": "CL-3",
+                "claim": "Partial claim.",
+                "issue_type": "llm_claim_semantic_judge_partial",
+                "recommended_action": "cautious_with_boundary",
+            },
+        ],
+    }
+
+    followups = _claim_review_followups_from_action_plan(action_plan)
+
+    assert [item["gap_id"] for item in followups] == ["GAP-1", "GAP-2"]
+    assert followups[0]["source"] == "claim_review_action_plan"
+    assert followups[0]["diagnostic_only"] is True
+    assert followups[0]["executor_should_decide"] is True
+    assert followups[0]["allowed_for_writing"] is False
+    assert followups[0]["must_not_render"] is True
 
 
 def test_entity_subject_rejects_dirty_titles_and_long_fallback():
@@ -793,6 +843,40 @@ def test_planner_contract_quality_hints_do_not_hard_block_clean_report():
     assert "weak_min_ab_sources" in warning_types
 
 
+def test_claim_first_blueprint_contract_does_not_require_plan_only_fields():
+    blueprint = {
+        "blueprint_role": "final_outline",
+        "final_outline_locked": True,
+        "layout_strategy": {
+            "source": "claim_first_recomposer",
+            "plan_chapters_are_research_reference": True,
+        },
+        "chapters": [
+            {
+                "chapter_id": "CH_market",
+                "chapter_title": "Market Space and Commercialization Pace",
+                "chapter_question": "Market Space and Commercialization Pace",
+                "core_question": "Market Space and Commercialization Pace",
+                "chapter_role": "claim_driven_final_chapter",
+                "claim_ids": ["CL1"],
+                "fact_ids": ["F1"],
+                "source_ids": ["S1"],
+                "writing_mode": "core_chapter",
+                "layout_policy": {"preferred_blocks": ["claim_argument"]},
+            }
+        ],
+    }
+
+    result = validate_report_blueprint(blueprint)
+    warning_types = {item["type"] for item in result["warnings"]}
+
+    assert result["passed"] is True
+    assert "missing_report_shell" not in warning_types
+    assert "missing_required_evidence_mix" not in warning_types
+    assert "weak_min_total_sources" not in warning_types
+    assert "weak_min_ab_sources" not in warning_types
+
+
 def test_argument_unit_counter_and_actionable_are_advisory_not_blocking():
     result = validate_argument_units(
         [
@@ -1139,7 +1223,227 @@ def test_source_registry_utilities_keep_refs_consistent():
     assert [source["title"] for source in sources[:3]] == ["three", "one", "two"]
 
 
-def test_package_claim_gate_blocks_decision_ready_claim_without_ab_source():
+def test_evidence_binder_preserves_top_level_source_url_for_traceable_fact_cards():
+    registry = SourceRegistry()
+    normalize_and_register_sources(
+        [
+            {
+                "evidence_id": "RFC-SRC-policy-x-policy-1",
+                "fact": "Longgang released an embodied robotics action plan.",
+                "source": "https://www.lg.gov.cn/gkmlpt/content/12/12189/post_12189917.html",
+                "source_url": "https://www.lg.gov.cn/gkmlpt/content/12/12189/post_12189917.html",
+                "url": "https://www.lg.gov.cn/gkmlpt/content/12/12189/post_12189917.html",
+                "source_level": "A",
+                "allowed_use": "supporting",
+                "chapter_id": "CH_policy",
+                "requirement_id": "REQ_policy",
+            }
+        ],
+        registry,
+    )
+
+    assert registry.sources
+    assert registry.sources[0]["url"] == "https://www.lg.gov.cn/gkmlpt/content/12/12189/post_12189917.html"
+    assert registry.sources[0]["title"] != registry.sources[0]["url"]
+
+
+def test_writer_syncs_argument_refs_back_to_chapter_sections_before_qa():
+    chapters = [
+        {
+            "chapter_id": "ch_01",
+            "sections": [
+                {
+                    "section_id": "ch_01_s1",
+                    "claim": "Policy creates a directional adoption signal.",
+                }
+            ],
+        }
+    ]
+    units = [
+        {
+            "chapter_id": "ch_01",
+            "section_id": "ch_01_s1",
+            "claim": "Policy creates a directional adoption signal.",
+            "supporting_evidence": ["[1]", "EV-001"],
+            "source_quality": {"claim_ab_count": 1},
+        }
+    ]
+
+    synced = _sync_chapter_section_refs_from_argument_units(chapters, units)
+
+    section = synced[0]["sections"][0]
+    assert section["evidence_refs"] == ["[1]", "EV-001"]
+    assert section["source_quality"] == {"claim_ab_count": 1}
+
+
+def test_writer_hydrates_duplicate_evidence_rows_that_lost_source_binding():
+    packages = [
+        {
+            "chapter_id": "ch_01",
+            "core_evidence": [
+                {
+                    "evidence_id": "EV-001",
+                    "fact": "Policy asks for more than 1000 robotics deployments.",
+                    "source_ref": "[1]",
+                    "source_refs": ["[1]"],
+                    "source": {"title": "Official", "url": "https://example.gov/policy"},
+                    "source_level": "A",
+                },
+                {
+                    "evidence_id": "EV-019",
+                    "fact": "Policy asks for more than 1000 robotics deployments.",
+                },
+            ],
+        }
+    ]
+
+    hydrated = _hydrate_duplicate_evidence_sources(packages)
+
+    duplicate = hydrated[0]["core_evidence"][1]
+    assert duplicate["source_ref"] == "[1]"
+    assert duplicate["source"]["url"] == "https://example.gov/policy"
+
+
+def test_qa_source_depth_gap_is_advisory_by_default(monkeypatch):
+    monkeypatch.delenv("REPORT_QUALITY_MODE", raising=False)
+    monkeypatch.delenv("QA_SOURCE_DEPTH_BLOCKING", raising=False)
+    monkeypatch.setenv("QA_MIN_PASS_SCORE", "0")
+    qa = run_qa_agent(
+        report_markdown=(
+            "# Report\n\n"
+            "## Market signal\n"
+            "Public media evidence supports a directional adoption signal [1].\n\n"
+            "## Sources\n"
+            "- [1] Media source | https://example.org/media"
+        ),
+        report_blueprint={"report_family": "industry_deep_report"},
+        chapter_packages=[
+            {
+                "chapter_id": "ch_01",
+                "chapter_title": "Market signal",
+                "sections": [
+                    {
+                        "section_id": "ch_01_s1",
+                        "claim": "Public media evidence supports a directional adoption signal.",
+                        "reasoning": "Because the source shows a market signal.",
+                        "counter_evidence": "The signal may not generalize.",
+                        "actionable": "Track additional independent sources.",
+                        "evidence_refs": ["[1]"],
+                    }
+                ],
+                "evidence_quality_summary": {
+                    "source_level_distribution": {"B": 1},
+                    "core_ab_source_count": 0,
+                },
+            }
+        ],
+    )
+
+    assert qa["passed"] is True
+    assert not any(
+        item.get("type") == "deep_report_blocking_gap"
+        and item.get("detail", {}).get("type") == "public_chapter_without_ab_sources"
+        for item in qa["errors"]
+    )
+    assert any(
+        item.get("type") == "deep_report_blocking_gap"
+        and item.get("detail", {}).get("type") == "public_chapter_without_ab_sources"
+        and item.get("qa_category") == "readability_finding"
+        for item in qa["warnings"]
+    )
+
+
+def test_writer_can_build_blueprint_from_analysis_claim_chapters():
+    blueprint = _analysis_blueprint_from_claim_units(
+        structured_analysis={
+            "claim_units": [
+                {"chapter_id": "CH_policy", "claim": "Policy signal", "requirement_ids": ["REQ_policy"]},
+                {"chapter_id": "CH_case", "claim": "Case signal", "requirement_ids": ["REQ_case"]},
+            ]
+        },
+        evidence_package={
+            "fact_cards": [
+                {"chapter_id": "CH_policy", "requirement_id": "REQ_policy", "distilled_fact": "Policy fact"},
+                {"chapter_id": "CH_case", "requirement_id": "REQ_case", "distilled_fact": "Case fact"},
+            ]
+        },
+        query="Embodied robotics report",
+    )
+
+    chapter_ids = [chapter["chapter_id"] for chapter in blueprint["chapters"]]
+    assert chapter_ids == ["CH_policy", "CH_case"]
+    assert blueprint["layout_strategy"]["source"] == "analysis_claim_units"
+
+
+def test_claim_builder_assigns_stable_id_to_analysis_claim_unit_without_id():
+    units = run_claim_builder_agent(
+        chapter_evidence_packages=[
+            {
+                "chapter_id": "CH_policy",
+                "chapter_title": "Policy",
+                "chapter_question": "Policy",
+                "core_evidence": [
+                    {
+                        "evidence_id": "EV-001",
+                        "ref": "EV-001",
+                        "source_ref": "[1]",
+                        "fact": "Policy creates a deployment signal.",
+                    }
+                ],
+                "evidence_items": [
+                    {
+                        "evidence_id": "EV-001",
+                        "ref": "EV-001",
+                        "source_ref": "[1]",
+                        "fact": "Policy creates a deployment signal.",
+                    }
+                ],
+            }
+        ],
+        structured_analysis={
+            "claim_units": [
+                {
+                    "chapter_id": "CH_policy",
+                    "claim": "Policy creates a deployment signal.",
+                    "evidence_refs": ["EV-001"],
+                }
+            ]
+        },
+    )
+
+    assert units
+    assert units[0]["claim_id"]
+    assert units[0]["section_id"].startswith("CH_policy")
+
+
+def test_package_claim_gate_warns_decision_ready_claim_without_ab_source_in_balanced_mode(monkeypatch):
+    monkeypatch.setenv("REPORT_QUALITY_MODE", "balanced")
+    result = validate_argument_units(
+        [
+            {
+                "question": "Where is the opportunity?",
+                "claim": "The opportunity is already decision-ready.",
+                "reasoning": "because the signal maps to demand",
+                "counter_evidence": "opposite evidence could narrow it",
+                "actionable": "track conversion and orders",
+                "evidence_refs": ["[1]"],
+                "claim_status": "decision_ready",
+                "source_quality": {
+                    "claim_ab_count": 0,
+                    "ab_count": 0,
+                    "allowed_use_distribution": {"directional_signal": 1},
+                },
+            }
+        ]
+    )
+
+    assert result["passed"] is True
+    assert not any(item["type"] == "core_claim_without_ab_source" for item in result["errors"])
+    assert any(item["type"] == "core_claim_without_ab_source" for item in result["warnings"])
+
+
+def test_package_claim_gate_blocks_decision_ready_claim_without_ab_source_in_strict_mode(monkeypatch):
+    monkeypatch.setenv("REPORT_QUALITY_MODE", "strict")
     result = validate_argument_units(
         [
             {
@@ -1228,6 +1532,65 @@ def test_claim_builder_downgrades_decision_claim_without_ab_source():
     assert units[0]["claim_downgraded_reason"] == "decision_ready_without_ab_source"
     result = validate_argument_units(units)
     assert not any(item["type"] == "core_claim_without_ab_source" for item in result["errors"])
+
+
+def test_claim_builder_applies_claim_review_strength_suggestion_without_rendering_diagnostics():
+    units = run_claim_builder_agent(
+        chapter_evidence_packages=[
+            {
+                "chapter_id": "ch_01",
+                "chapter_title": "Opportunity",
+                "chapter_question": "Where is the opportunity?",
+                "core_evidence": [
+                    {
+                        "source_ref": "[1]",
+                        "source_level": "B",
+                        "allowed_use": "supporting",
+                        "evidence_role": "supporting",
+                        "fact": "A traceable source says enterprise AI Agent deployments are increasing.",
+                    }
+                ],
+            }
+        ],
+        structured_analysis={
+            "claim_units": [
+                {
+                    "claim_id": "CL-1",
+                    "chapter_id": "ch_01",
+                    "question": "Where is the opportunity?",
+                    "claim": "The AI Agent industry is entering a broad enterprise adoption cycle.",
+                    "reasoning": "because a traceable source shows deployment momentum",
+                    "counter_evidence": "opposite evidence could narrow it",
+                    "actionable": "track conversion and orders",
+                    "evidence_refs": ["[1]"],
+                    "evidence_basis": ["A traceable source says enterprise AI Agent deployments are increasing."],
+                    "claim_status": "decision_ready",
+                    "claim_strength": "moderate",
+                    "claim_review_suggestions": [
+                        {
+                            "issue_type": "single_source_industry_generalization",
+                            "suggested_claim_strength": "directional",
+                            "suggested_evidence_use_level": "directional_signal",
+                            "suggested_writing_permission": "cautious_with_boundary",
+                            "reason": "industry-level generalization is currently supported by only one independent source",
+                            "must_not_render": True,
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+
+    assert units[0]["claim_strength"] == "directional"
+    assert units[0]["claim_status"] == "directional"
+    assert units[0]["quality_status"] == "directional_with_boundary"
+    assert units[0]["claim_downgraded_reason"] == "claim_review_suggested_directional"
+    public_text = "\n".join(
+        str(units[0].get(key) or "")
+        for key in ("claim", "reasoning", "counter_evidence", "actionable")
+    )
+    assert "single_source_industry_generalization" not in public_text
+    assert "industry-level generalization is currently supported" not in public_text
 
 
 def test_claim_builder_keeps_decision_claim_with_ab_source():
@@ -1447,12 +1810,29 @@ def test_lane_early_stop_requires_quality_threshold(monkeypatch):
         {
             "key_sources": [{"title": "official filing", "url": "https://example.gov/a", "source_type": "official"}],
             "page_results": [{"title": "official filing", "url": "https://example.gov/a", "source_type": "official"}],
-            "task_result": {"task": {"chapter_id": "ch_01", "proof_role": "metric"}},
+            "raw_data_points": [
+                {
+                    "evidence": "AI Agent shipments reached 10 units in 2026.",
+                    "metric": "shipments",
+                    "value": "10",
+                    "source": "official",
+                    "search_task": {"topic_anchor_terms": ["AI Agent"]},
+                }
+            ],
+            "task_result": {"task": {"chapter_id": "ch_01", "proof_role": "metric", "topic_anchor_terms": ["AI Agent"]}},
         },
         {
-            "raw_data_points": [{"metric": "shipments", "value": "10", "source": "official"}],
+            "raw_data_points": [
+                {
+                    "evidence": "AI Agent adoption rate reached 12% in 2026.",
+                    "metric": "adoption",
+                    "value": "12%",
+                    "source": "official",
+                    "search_task": {"topic_anchor_terms": ["AI Agent"]},
+                }
+            ],
             "page_results": [{"title": "annual report", "url": "https://example.gov/b", "source_type": "official"}],
-            "task_result": {"task": {"chapter_id": "ch_02", "proof_role": "source_check"}},
+            "task_result": {"task": {"chapter_id": "ch_02", "proof_role": "source_check", "topic_anchor_terms": ["AI Agent"]}},
         },
     ]
 
@@ -1460,6 +1840,36 @@ def test_lane_early_stop_requires_quality_threshold(monkeypatch):
 
     assert decision["early_stopped"] is True
     assert decision["early_stop_reason"] in {"ab_source_and_metric_found", "enough_ab_sources"}
+    assert decision["topic_raw_data_point_count"] == 2
+
+
+def test_lane_early_stop_requires_topic_raw_points(monkeypatch):
+    monkeypatch.setenv("BRAIN_IQS_LANE_EARLY_STOP_ENABLED", "true")
+    monkeypatch.setenv("BRAIN_IQS_LANE_EARLY_STOP_MIN_SECONDS", "0")
+    payloads = [
+        {
+            "key_sources": [{"title": "AI Agent market report", "url": "https://example.gov/a", "source_type": "official"}],
+            "page_results": [{"title": "AI Agent market report", "url": "https://example.gov/a", "source_type": "official"}],
+            "raw_data_points": [
+                {"evidence": "Micro-short drama output value reached 336.2 billion yuan.", "metric": "output", "value": "336.2", "source": "official"}
+            ],
+            "task_result": {"task": {"chapter_id": "ch_01", "proof_role": "metric", "topic_anchor_terms": ["AI Agent"]}},
+        },
+        {
+            "key_sources": [{"title": "AI Agent annual report", "url": "https://example.gov/b", "source_type": "official"}],
+            "page_results": [{"title": "AI Agent annual report", "url": "https://example.gov/b", "source_type": "official"}],
+            "raw_data_points": [
+                {"evidence": "Battery shipments reached 10 GWh.", "metric": "shipments", "value": "10", "source": "official"}
+            ],
+            "task_result": {"task": {"chapter_id": "ch_02", "proof_role": "source_check", "topic_anchor_terms": ["AI Agent"]}},
+        },
+    ]
+
+    decision = _lane_early_stop_decision(payloads, started_at=0)
+
+    assert decision["early_stopped"] is False
+    assert decision["ab_source_count"] >= 2
+    assert decision["topic_raw_data_point_count"] == 0
 
 
 def test_high_value_repair_selector_keeps_core_tasks_and_skips_length(monkeypatch):
@@ -3216,6 +3626,85 @@ def test_balanced_qa_does_not_block_body_length_or_soft_evidence_gaps(monkeypatc
     assert any(item.get("type") == "missing_proof_standard" for item in qa["deep_evaluation"]["required_followups"])
     assert any(item.get("type") == "report_body_below_target_chars" for item in qa["advisory_followups"])
     assert any(item.get("type") == "missing_proof_standard" for item in qa["advisory_followups"])
+
+
+def test_public_signal_qa_keeps_evidence_depth_gaps_as_suggestions_by_default(monkeypatch):
+    monkeypatch.setenv("REPORT_EVIDENCE_MODE", "public_signal")
+    monkeypatch.setenv("REPORT_QUALITY_MODE", "high")
+    payload = _minimal_publishable_qa_payload()
+    payload["report_markdown"] += "\n\n## Sources\n- [1] Public source | https://example.org/source\n"
+
+    qa = run_qa_agent(**payload)
+
+    assert qa["passed"] is True
+    assert qa["repair_required"] is False
+    assert qa["blocking_followups"] == []
+    assert qa["deep_evaluator_blocking"] is False
+    assert not any(item.get("type") == "deep_report_blocking_gap" for item in qa["errors"])
+    assert any(item.get("type") == "missing_proof_standard" for item in qa["advisory_followups"])
+    assert any(item.get("type") == "search_tasks_dropped" for item in qa["advisory_followups"])
+    assert any(
+        item.get("type") == "deep_report_blocking_gap"
+        and item.get("detail", {}).get("type") in {"missing_proof_standards", "search_tasks_dropped"}
+        for item in qa["warnings"]
+    )
+    assert not any(
+        item.get("finding_category") == "clean_blocker"
+        and (
+            item.get("detail", {}).get("type") in {
+                "missing_proof_standards",
+                "search_tasks_dropped",
+                "page_results_zero",
+            }
+            or item.get("type") == "package_contract"
+        )
+        for item in qa["quality_findings"]
+    )
+
+
+def test_public_signal_publishable_evidence_gate_is_advisory(monkeypatch):
+    monkeypatch.setenv("REPORT_EVIDENCE_MODE", "public_signal")
+    monkeypatch.setenv("REPORT_QUALITY_MODE", "high")
+    payload = _minimal_publishable_qa_payload()
+    payload["report_blueprint"] = {"report_family": "industry_deep_report"}
+    payload["report_markdown"] += "\n\n## Sources\n- [1] Public source | https://example.org/source\n"
+    payload["evidence_health_summary"] = {
+        "analysis_ready_count": 20,
+        "publishable_evidence_gate_passed": False,
+    }
+
+    qa = run_qa_agent(**payload)
+
+    assert qa["passed"] is True
+    assert not any(item.get("type") == "publishable_evidence_gate_failed" for item in qa["errors"])
+    assert any(
+        item.get("type") == "publishable_evidence_gate_failed"
+        and item.get("qa_category") == "readability_finding"
+        for item in qa["warnings"]
+    )
+    assert not any(
+        item.get("type") == "publishable_evidence_gate_failed"
+        and item.get("finding_category") == "clean_blocker"
+        for item in qa["quality_findings"]
+    )
+
+
+def test_public_signal_soft_argument_fields_do_not_fail_report(monkeypatch):
+    monkeypatch.setenv("REPORT_EVIDENCE_MODE", "public_signal")
+    monkeypatch.setenv("REPORT_QUALITY_MODE", "high")
+    payload = _minimal_publishable_qa_payload()
+    payload["report_blueprint"] = {"report_family": "industry_deep_report"}
+    payload["report_markdown"] += "\n\n## Sources\n- [1] Public source | https://example.org/source\n"
+    payload["chapter_packages"][0]["sections"][0].pop("reasoning")
+    payload["chapter_packages"][0]["sections"][0].pop("counter_evidence")
+    payload["chapter_packages"][0]["sections"][0].pop("actionable")
+
+    qa = run_qa_agent(**payload)
+
+    assert qa["passed"] is True
+    assert qa["repair_required"] is False
+    assert any(item.get("type") == "argument_unit_soft_missing_fields" for item in qa["warnings"])
+    assert not qa["blocking_followups"]
 
 
 def test_balanced_qa_treats_section_reasoning_fields_as_soft(monkeypatch):

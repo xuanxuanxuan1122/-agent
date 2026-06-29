@@ -22,6 +22,9 @@ def pytest_sessionstart(session):
     os.environ["REPORT_ENABLE_LLM_REWRITE"] = "false"
     os.environ["REPORT_ENABLE_FINAL_AUDIT"] = "0"
     os.environ["BRAIN_ENABLE_POST_QA_REPAIR"] = "false"
+    os.environ["REPORT_EVIDENCE_MODE"] = "strict_research"
+    os.environ["REPORT_ADVISORY_WEIGHT_MODE"] = "false"
+    os.environ["REPORT_PUBLIC_SIGNAL_MODE"] = "false"
     os.environ.setdefault("REPORT_BLOCK_ON_QA_FAILURE", "false")
     os.environ.setdefault("REPORT_WRITE_CLEAN_REPORT", "false")
 

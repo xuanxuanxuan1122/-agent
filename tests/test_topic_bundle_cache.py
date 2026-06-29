@@ -122,6 +122,30 @@ def test_fake_or_title_only_bundle_is_polluted(tmp_path, monkeypatch):
     assert "title_only_source" in preflight["reasons"] or "fake_or_placeholder_source" in preflight["reasons"]
 
 
+def test_source_identity_polluted_bundle_is_not_reusable(tmp_path, monkeypatch):
+    monkeypatch.setenv("TOPIC_BUNDLE_CACHE_PATH", str(tmp_path))
+    package = _base_evidence_package()
+    package["source_registry"] = [
+        {"ref": "S1", "title": "CAICT AI Agent Technical Development Report", "url": "https://www.caict.ac.cn/report.pdf"},
+        {"ref": "S2", "title": "CAICT AI Agent Technical Development Report", "url": "https://data.beijing.gov.cn/report.html"},
+        {"ref": "S3", "title": "CAICT AI Agent Technical Development Report", "url": "https://blog.example.net/copied"},
+    ]
+
+    store_topic_bundle(
+        query="identity polluted topic",
+        evidence_package=package,
+        structured_analysis={},
+        chapter_evidence_packages=_chapter_packages(),
+    )
+
+    preflight = preflight_topic_bundle(load_topic_bundle("identity polluted topic"), query="identity polluted topic")
+
+    assert preflight["status"] == "polluted"
+    assert preflight["seedable"] is False
+    assert preflight["usable_for_skip_search"] is False
+    assert "source_identity_polluted" in preflight["reasons"]
+
+
 def test_count_only_chapter_package_is_partial_not_usable(tmp_path, monkeypatch):
     monkeypatch.setenv("TOPIC_BUNDLE_CACHE_PATH", str(tmp_path))
     monkeypatch.setenv("TOPIC_BUNDLE_CACHE_REQUIRE_HYDRATED_EVIDENCE", "true")

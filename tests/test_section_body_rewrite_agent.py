@@ -1,9 +1,16 @@
+import pytest
+
 from rag_pipeline.agents.section_body_rewrite_agent import (
     body_rewrite_enabled,
     body_rewrite_max_sections,
     rewrite_section_body,
     rewrite_sections_for_report,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clear_body_rewrite_min_accept_chars(monkeypatch):
+    monkeypatch.delenv("REPORT_BODY_REWRITE_MIN_ACCEPT_CHARS", raising=False)
 
 
 def _section():
@@ -40,7 +47,7 @@ def test_body_rewrite_max_sections_has_quality_mode_floor(monkeypatch):
     monkeypatch.setenv("REPORT_BODY_REWRITE_MAX_SECTIONS", "12")
     monkeypatch.setenv("REPORT_REPLAY_EXECUTION_MODE", "quality_llm_replay")
 
-    assert body_rewrite_max_sections() == 24
+    assert body_rewrite_max_sections() == 40
 
 
 def test_rewrite_section_body_accepts_valid_llm_output(monkeypatch, tmp_path):
@@ -105,6 +112,91 @@ def test_rewrite_section_body_rejects_missing_refs(monkeypatch, tmp_path):
     assert result["status"] == "rejected"
     assert result["paragraph"] == _section()["paragraph"]
     assert result["failure_reason"] == "missing_required_refs"
+
+
+def test_rewrite_section_body_rejected_polluted_original_falls_back_to_clean_claim(monkeypatch, tmp_path):
+    monkeypatch.setenv("REPORT_ENABLE_LLM_BODY_REWRITE", "true")
+    monkeypatch.setenv("REPORT_BODY_REWRITE_CACHE_ENABLED", "false")
+    monkeypatch.setenv("REPORT_BODY_REWRITE_CACHE_PATH", str(tmp_path))
+    monkeypatch.setattr(
+        "rag_pipeline.agents.section_body_rewrite_agent.llm_config_is_ready",
+        lambda config: True,
+    )
+    section = _section()
+    section["claim"] = "Humanoid robot deployment remains an early directional signal [1]."
+    section["paragraph"] = section["claim"]
+    section["composed_paragraph"] = (
+        "Humanoid robot deployment remains an early directional signal. "
+        "\u5e02\u573a\u89c4\u6a21: \u8fbe1540\u4ebf\u7f8e\u5143\u3002"
+        "\u5b83\u5bf9\u5e94\u7684\u5173\u952e\u53d8\u91cf\u662f\u6280\u672f\u6210\u719f\u5ea6\uff0c"
+        "\u4f1a\u5f71\u54cd\u5de5\u5177\u8c03\u7528\u3001\u6743\u9650\u3001\u5b89\u5168\u548c\u90e8\u7f72\u7a33\u5b9a\u6027\u3002"
+    )
+    section["render_blocks"] = [{"type": "paragraph", "text": section["composed_paragraph"]}]
+    monkeypatch.setattr(
+        "rag_pipeline.agents.section_body_rewrite_agent.call_openai_compatible_json",
+        lambda **kwargs: {
+            "payload": {
+                "paragraph": "Too short.",
+                "used_fact_refs": ["EV-1"],
+                "citation_refs": ["[1]"],
+            }
+        },
+    )
+
+    result = rewrite_section_body(
+        section=section,
+        facts=_facts(),
+        chapter_question="Can humanoid robots commercialize?",
+        llm_config={"url": "https://llm.test", "api_key": "key", "model": "mock-model"},
+    )
+
+    assert result["status"] == "rejected"
+    assert result["failure_reason"] == "output_too_short"
+    assert result["paragraph"] == section["claim"]
+    assert "\u5e02\u573a\u89c4\u6a21:" not in result["paragraph"]
+    assert "\u5de5\u5177\u8c03\u7528" not in result["paragraph"]
+
+
+def test_rewrite_sections_applies_clean_fallback_when_rejected_original_is_polluted(monkeypatch, tmp_path):
+    monkeypatch.setenv("REPORT_ENABLE_LLM_BODY_REWRITE", "true")
+    monkeypatch.setenv("REPORT_BODY_REWRITE_CACHE_ENABLED", "false")
+    monkeypatch.setenv("REPORT_BODY_REWRITE_CACHE_PATH", str(tmp_path))
+    monkeypatch.setattr(
+        "rag_pipeline.agents.section_body_rewrite_agent.llm_config_is_ready",
+        lambda config: True,
+    )
+    monkeypatch.setattr(
+        "rag_pipeline.agents.section_body_rewrite_agent.call_openai_compatible_json",
+        lambda **kwargs: {
+            "payload": {
+                "paragraph": "Too short.",
+                "used_fact_refs": ["EV-1"],
+                "citation_refs": ["[1]"],
+            }
+        },
+    )
+    polluted = _section()
+    polluted["claim"] = "Humanoid robot deployment remains an early directional signal [1]."
+    polluted["paragraph"] = polluted["claim"]
+    polluted["composed_paragraph"] = (
+        "\u5e02\u573a\u89c4\u6a21: \u8fbe1540\u4ebf\u7f8e\u5143\u3002"
+        "\u5b83\u5bf9\u5e94\u7684\u5173\u952e\u53d8\u91cf\u662f\u6280\u672f\u6210\u719f\u5ea6\uff0c"
+        "\u4f1a\u5f71\u54cd\u5de5\u5177\u8c03\u7528\u3001\u6743\u9650\u3001\u5b89\u5168\u548c\u90e8\u7f72\u7a33\u5b9a\u6027\u3002"
+    )
+    polluted["render_blocks"] = [{"type": "paragraph", "text": polluted["composed_paragraph"]}]
+
+    chapters, diagnostics = rewrite_sections_for_report(
+        chapter_packages=[{"chapter_id": "ch_01", "chapter_question": "Can humanoid robots commercialize?", "sections": [polluted]}],
+        llm_config={"url": "https://llm.test", "api_key": "key", "model": "mock-model"},
+        max_llm_calls=1,
+    )
+
+    section = chapters[0]["sections"][0]
+    assert diagnostics["rejected_count"] == 1
+    assert section["body_rewrite_status"] == "rejected"
+    assert section["claim"] == polluted["claim"]
+    assert section["render_blocks"][0]["text"] == polluted["claim"]
+    assert "\u5e02\u573a\u89c4\u6a21:" not in section["render_blocks"][0]["text"]
 
 
 def test_rewrite_section_body_rejects_extra_refs(monkeypatch, tmp_path):
@@ -174,6 +266,37 @@ def test_rewrite_section_body_accepts_shorter_safe_polished_paragraph(monkeypatc
     assert "repeatable operating workflows" in result["paragraph"]
 
 
+def test_rewrite_section_body_rejects_short_output_when_min_accept_chars_is_raised(monkeypatch, tmp_path):
+    monkeypatch.setenv("REPORT_ENABLE_LLM_BODY_REWRITE", "true")
+    monkeypatch.setenv("REPORT_BODY_REWRITE_CACHE_ENABLED", "false")
+    monkeypatch.setenv("REPORT_BODY_REWRITE_CACHE_PATH", str(tmp_path))
+    monkeypatch.setenv("REPORT_BODY_REWRITE_MIN_ACCEPT_CHARS", "260")
+    monkeypatch.setattr(
+        "rag_pipeline.agents.section_body_rewrite_agent.llm_config_is_ready",
+        lambda config: True,
+    )
+    monkeypatch.setattr(
+        "rag_pipeline.agents.section_body_rewrite_agent.call_openai_compatible_json",
+        lambda **kwargs: {
+            "payload": {
+                "paragraph": "Salesforce disclosed customer-service workflow deployment and operating workflow demand [1].",
+                "used_fact_refs": ["EV-1"],
+                "citation_refs": ["[1]"],
+            }
+        },
+    )
+
+    result = rewrite_section_body(
+        section=_section(),
+        facts=_facts(),
+        chapter_question="Can AI agents convert into workflow deployment?",
+        llm_config={"url": "https://llm.test", "api_key": "key", "model": "mock-model"},
+    )
+
+    assert result["status"] == "rejected"
+    assert result["failure_reason"] == "output_too_short"
+
+
 def test_rewrite_section_body_rejects_new_numbers(monkeypatch, tmp_path):
     monkeypatch.setenv("REPORT_ENABLE_LLM_BODY_REWRITE", "true")
     monkeypatch.setenv("REPORT_BODY_REWRITE_CACHE_ENABLED", "false")
@@ -202,6 +325,45 @@ def test_rewrite_section_body_rejects_new_numbers(monkeypatch, tmp_path):
 
     assert result["status"] == "rejected"
     assert result["failure_reason"] == "new_numeric_claim"
+
+
+def test_rewrite_sections_for_report_records_rejection_samples(monkeypatch, tmp_path):
+    monkeypatch.setenv("REPORT_ENABLE_LLM_BODY_REWRITE", "true")
+    monkeypatch.setenv("REPORT_BODY_REWRITE_CACHE_ENABLED", "false")
+    monkeypatch.setenv("REPORT_BODY_REWRITE_CACHE_PATH", str(tmp_path))
+    monkeypatch.setattr(
+        "rag_pipeline.agents.section_body_rewrite_agent.llm_config_is_ready",
+        lambda config: True,
+    )
+    monkeypatch.setattr(
+        "rag_pipeline.agents.section_body_rewrite_agent.call_openai_compatible_json",
+        lambda **kwargs: {
+            "payload": {
+                "paragraph": "Salesforce deployments show workflow demand grew by 30% [1].",
+                "used_fact_refs": ["EV-1"],
+                "citation_refs": ["[1]"],
+            }
+        },
+    )
+
+    _rewritten, diagnostics = rewrite_sections_for_report(
+        chapter_packages=[
+            {
+                "chapter_id": "ch_01",
+                "chapter_title": "Workflow deployment",
+                "sections": [_section()],
+            }
+        ],
+        llm_config={"url": "https://llm.test", "api_key": "key", "model": "mock-model"},
+        max_llm_calls=1,
+    )
+
+    assert diagnostics["rejected_count"] == 1
+    assert diagnostics["failure_reasons"]["new_numeric_claim"] == 1
+    assert diagnostics["failure_samples"][0]["section_id"] == "s1"
+    assert diagnostics["failure_samples"][0]["chapter_id"] == "ch_01"
+    assert diagnostics["failure_samples"][0]["reason"] == "new_numeric_claim"
+    assert "30%" in diagnostics["failure_samples"][0]["candidate_excerpt"]
 
 
 def test_rewrite_section_body_rejects_internal_diagnostics(monkeypatch, tmp_path):

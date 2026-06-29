@@ -194,6 +194,105 @@ def _distinctive_cache_terms(terms: Sequence[str]) -> set[str]:
     return distinctive
 
 
+_GENERIC_TOPIC_ANCHORS = {
+    "中国",
+    "国内",
+    "我国",
+    "全国",
+    "产业链",
+    "行业",
+    "市场",
+    "商业化",
+    "机会",
+    "风险",
+    "分析",
+    "报告",
+    "官方",
+    "数据",
+}
+
+
+def _topic_anchor_variants(value: Any) -> List[str]:
+    text = str(value or "").strip()
+    if not text:
+        return []
+    compact = re.sub(r"\s+", "", text).lower()
+    variants = [compact]
+    if compact.startswith("中国"):
+        variants.append(compact.removeprefix("中国"))
+    for candidate in list(variants):
+        for delimiter in ("是否", "能否", "哪些", "什么", "如何", "有没有", "是不是", "由", "在"):
+            if delimiter in candidate:
+                prefix = candidate.split(delimiter, 1)[0].strip("，,；;：:。")
+                if prefix:
+                    variants.append(prefix)
+        if "产业链" in candidate:
+            prefix = candidate.split("产业链", 1)[0] + "产业链"
+            variants.append(prefix)
+            variants.append(prefix.removesuffix("产业链"))
+    if "低空经济" in compact:
+        variants.extend(["低空经济", "低空经济产业链"])
+    deduped: List[str] = []
+    for item in variants:
+        token = str(item or "").strip().lower()
+        if not token or token in _GENERIC_TOPIC_ANCHORS:
+            continue
+        if len(token) < 2:
+            continue
+        if token not in deduped:
+            deduped.append(token)
+    return deduped
+
+
+def _task_topic_anchors(task: Dict[str, Any]) -> List[str]:
+    values: List[Any] = []
+    values.extend(_as_list(task.get("topic_anchor_terms")))
+    values.extend(_as_list(task.get("topic_terms")))
+    values.extend(_as_list(task.get("global_required_terms")))
+    values.extend(
+        [
+            task.get("research_object"),
+            task.get("plan_query"),
+            task.get("report_query"),
+            task.get("query"),
+            task.get("targets_gap"),
+            task.get("evidence_goal"),
+            task.get("chapter_title"),
+            task.get("chapter_question"),
+            task.get("dimension_name"),
+        ]
+    )
+    anchors: List[str] = []
+    for value in values:
+        for variant in _topic_anchor_variants(value):
+            if variant not in anchors:
+                anchors.append(variant)
+    return anchors
+
+
+def _entry_matches_topic_anchor(entry: Dict[str, Any], anchors: Sequence[str]) -> bool:
+    if not anchors:
+        return True
+    haystack = re.sub(
+        r"\s+",
+        "",
+        " ".join(
+            str(item or "").lower()
+            for item in [
+                entry.get("topic_key"),
+                entry.get("title"),
+                entry.get("publisher"),
+                entry.get("source_url"),
+                entry.get("fact_description"),
+                entry.get("metric_name"),
+                " ".join(_as_list(entry.get("topic_terms"))),
+                " ".join(_as_list(entry.get("supported_chapters"))),
+            ]
+        ),
+    )
+    return any(anchor and anchor in haystack for anchor in anchors)
+
+
 def _domain(url: str) -> str:
     try:
         return urlparse(url).netloc.lower().removeprefix("www.")
@@ -525,9 +624,11 @@ def lookup_trusted_sources(
         task.get("proof_standard"),
     ]
     values.extend(_as_list(task.get("topic_terms")))
+    values.extend(_as_list(task.get("topic_anchor_terms")))
     terms = list(dict.fromkeys(token for value in values for token in _tokenize(value)))[:80]
     if not terms:
         return []
+    topic_anchors = _task_topic_anchors(task)
     levels = [str(item).strip().upper() for item in (min_source_level if isinstance(min_source_level, (list, tuple, set)) else [min_source_level]) if str(item).strip()]
     minimum_rank = min((_SOURCE_LEVEL_RANK.get(level, 0) for level in levels), default=_SOURCE_LEVEL_RANK["B"])
     required = {str(item).strip().lower() for item in list(required_fields or []) if str(item).strip()}
@@ -549,6 +650,8 @@ def lookup_trusted_sources(
         if _is_fake_or_placeholder(source, str(entry.get("fact_description") or "")):
             continue
         if _looks_like_error_or_page_shell(entry.get("fact_description"), title=entry.get("title")):
+            continue
+        if topic_anchors and not _entry_matches_topic_anchor(entry, topic_anchors):
             continue
         if "source" in required and not str(entry.get("source_url") or "").strip():
             continue

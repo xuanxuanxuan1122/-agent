@@ -135,6 +135,66 @@ def test_task_query_plan_metric_queries_use_contract_fields():
     assert any(any(term in item["text"] for term in ("官方", "统计", "report", "annual report", "survey")) for item in plan)
 
 
+def test_llm_query_rewrite_preserves_topic_anchor(monkeypatch):
+    _ready_query_rewrite(monkeypatch)
+    captured = {}
+    search_task = {
+        "task_id": "task-low-altitude",
+        "requirement_id": "H1_metric",
+        "gap_id": "GAP-low-altitude",
+        "query": "中国低空经济 市场规模 official",
+        "proof_role": "metric",
+        "required_fields": ["metric", "value", "unit", "period", "source"],
+        "topic_anchor_terms": ["中国低空经济"],
+        "topic_anchor_status": "ok",
+        "must_have_terms": ["中国低空经济", "市场规模"],
+    }
+
+    def fake_call(**kwargs):
+        captured["payload"] = kwargs["user_payload"]
+        return {"payload": {"queries": [{"text": "市场规模 official statistics 2026", "intent": "data"}]}}
+
+    monkeypatch.setattr(web, "call_openai_compatible_json", fake_call)
+
+    plan = web.build_llm_query_plan(
+        "中国低空经济商业化",
+        {"run_id": "test-run", "search_task": search_task},
+        search_task=search_task,
+    )
+
+    assert captured["payload"]["search_task"]["topic_anchor_terms"] == ["中国低空经济"]
+    assert plan
+    assert "低空经济" in plan[0]["text"]
+    assert plan[0]["topic_anchor_terms"] == ["中国低空经济"]
+
+
+def test_task_acceptance_filter_rejects_missing_topic_anchor():
+    search_task = {
+        "task_id": "task-low-altitude",
+        "query": "中国低空经济 市场规模 official",
+        "must_have_terms": ["市场规模"],
+        "topic_anchor_terms": ["中国低空经济"],
+        "source_priority": ["official"],
+    }
+    off_topic = {
+        "title": "中国供应链市场规模统计报告",
+        "snippet": "官方统计显示供应链数字化市场规模持续增长。",
+        "url": "https://example.org/report",
+    }
+    on_topic = {
+        "title": "中国低空经济市场规模统计报告",
+        "snippet": "报告披露低空经济应用场景和市场规模数据。",
+        "url": "https://example.org/report",
+    }
+
+    rejected = web.task_acceptance_filter(off_topic, {"search_task": search_task})
+    accepted = web.task_acceptance_filter(on_topic, {"search_task": search_task})
+
+    assert rejected["accepted"] is False
+    assert rejected["reason"] == "topic_anchor_missing"
+    assert accepted["accepted"] is True
+
+
 def test_llm_query_rewrite_call_cap_and_cache(monkeypatch):
     _ready_query_rewrite(monkeypatch)
     calls = {"count": 0}

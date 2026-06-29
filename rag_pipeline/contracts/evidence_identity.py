@@ -70,9 +70,25 @@ def evidence_aliases(item: Dict[str, Any]) -> List[str]:
     return _dedupe(aliases)
 
 
-def _put_alias(alias_map: Dict[str, str], alias: str, canonical: str) -> None:
+def line_level_alias_variants(value: Any) -> List[str]:
+    key = normalize_evidence_ref_key(value)
+    if not key:
+        return []
+    match = re.fullmatch(r"(.+-)l(\d+)", key)
+    if match:
+        return [f"{match.group(1)}{match.group(2)}"]
+    match = re.fullmatch(r"(.+-)(\d+)", key)
+    if match:
+        return [f"{match.group(1)}l{match.group(2)}"]
+    return []
+
+
+def _put_alias(alias_map: Dict[str, str], alias: str, canonical: str, exact_keys: Dict[str, str] | None = None) -> None:
     key = normalize_evidence_ref_key(alias)
     if not key:
+        return
+    exact_keys = exact_keys or {}
+    if key in exact_keys and exact_keys[key] != canonical:
         return
     current = alias_map.get(key)
     if current and current != canonical:
@@ -85,14 +101,35 @@ def _put_alias(alias_map: Dict[str, str], alias: str, canonical: str) -> None:
 
 def build_evidence_alias_map(fact_cards: Sequence[Dict[str, Any]]) -> Dict[str, str]:
     alias_map: Dict[str, str] = {}
+    items: List[Dict[str, Any]] = []
+    exact_keys: Dict[str, str] = {}
     for raw in list(fact_cards or []):
         item = _as_dict(raw)
         canonical = canonical_evidence_id(item)
         if not canonical:
             continue
-        _put_alias(alias_map, canonical, canonical)
-        for alias in evidence_aliases(item):
-            _put_alias(alias_map, alias, canonical)
+        items.append(item)
+        exact_key = normalize_evidence_ref_key(canonical)
+        if not exact_key:
+            continue
+        current = exact_keys.get(exact_key)
+        if current and current != canonical:
+            exact_keys[exact_key] = AMBIGUOUS_ALIAS
+        else:
+            exact_keys[exact_key] = canonical
+    for key, canonical in exact_keys.items():
+        alias_map[key] = canonical
+    for item in items:
+        canonical = canonical_evidence_id(item)
+        if not canonical:
+            continue
+        aliases = evidence_aliases(item)
+        for value in [canonical, *aliases]:
+            for variant in line_level_alias_variants(value):
+                if normalize_evidence_ref_key(variant) not in exact_keys:
+                    aliases.append(variant)
+        for alias in aliases:
+            _put_alias(alias_map, alias, canonical, exact_keys)
     return alias_map
 
 

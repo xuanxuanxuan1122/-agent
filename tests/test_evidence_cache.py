@@ -3,8 +3,16 @@ from __future__ import annotations
 import json
 import sqlite3
 
-from rag_pipeline.cache.evidence_cache import lookup_evidence, lookup_search, store_evidence_from_package, store_search
+import pytest
+
+from rag_pipeline.cache.evidence_cache import EvidenceCache, lookup_evidence, lookup_search, store_evidence_from_package, store_search
+from rag_pipeline.agents import web_analysis_agent as web_analysis_agent_module
 from rag_pipeline.agents import brain_agent as brain_agent_module
+
+
+@pytest.fixture(autouse=True)
+def _enable_cache_reads_for_cache_contract_tests(monkeypatch):
+    monkeypatch.setenv("EVIDENCE_CACHE_READ_ENABLED", "true")
 
 
 def test_persistent_search_cache_roundtrip(tmp_path, monkeypatch):
@@ -27,6 +35,62 @@ def test_persistent_search_cache_roundtrip(tmp_path, monkeypatch):
     assert cached["cache"]["hit"] is True
     assert cached["cache"]["layer"] == "search_cache"
     assert cached["results"][0]["url"] == "https://www.sec.gov/filing"
+
+
+def test_evidence_cache_connect_context_manager_closes_sqlite_connection(tmp_path):
+    cache = EvidenceCache(path=tmp_path / "evidence_cache.sqlite")
+
+    with cache._connect() as conn:
+        assert conn.execute("SELECT 1").fetchone()[0] == 1
+
+    with pytest.raises(sqlite3.ProgrammingError):
+        conn.execute("SELECT 1")
+
+
+def test_global_evidence_cache_read_gate_isolates_stored_search_and_evidence(tmp_path, monkeypatch):
+    monkeypatch.setenv("EVIDENCE_CACHE_PATH", str(tmp_path / "evidence_cache.sqlite"))
+    monkeypatch.setenv("EVIDENCE_CACHE_SQLITE_JOURNAL_MODE", "MEMORY")
+    monkeypatch.setenv("IQS_SEARCH_CACHE_ENABLED", "true")
+    query = "cache isolation probe"
+    options = {"engineType": "Deep", "timeRange": "NoLimit", "contents": "mainText"}
+    payload = {
+        "query": query,
+        "results": [{"title": "Cached source", "url": "https://example.com/cached"}],
+        "errors": [],
+    }
+    package = {
+        "analysis_ready_evidence": [
+            {
+                "fact": "Cached evidence should not be reused while the global read gate is closed.",
+                "source_level": "B",
+                "proof_role": "source_check",
+                "source": {"title": "Cached source", "url": "https://example.com/cached", "source_type": "research"},
+            }
+        ]
+    }
+
+    store_search(query, options, {}, payload)
+    store_evidence_from_package(query=query, evidence_package=package)
+    monkeypatch.setenv("EVIDENCE_CACHE_READ_ENABLED", "false")
+
+    assert lookup_search(query, options, {}) is None
+    assert (
+        lookup_evidence(
+            {"query": query, "proof_role": "source_check"},
+            min_source_level=["A", "B", "C"],
+            required_fields=["source"],
+        )
+        == []
+    )
+
+
+def test_global_evidence_cache_read_gate_disables_web_evidence_cache_reads(monkeypatch):
+    monkeypatch.setenv("IQS_AGENT_CACHE_ENABLED", "true")
+    monkeypatch.setenv("IQS_SEARCH_CACHE_ENABLED", "true")
+    monkeypatch.setenv("EVIDENCE_CACHE_READ_ENABLED", "false")
+
+    assert web_analysis_agent_module._web_cache_allowed({}) is False
+    assert web_analysis_agent_module._iqs_search_cache_allowed({}) is False
 
 
 def test_persistent_search_cache_preserves_hydrated_page_and_fact_payload(tmp_path, monkeypatch):
@@ -97,6 +161,30 @@ def test_search_cache_key_includes_request_size(tmp_path, monkeypatch):
 
     assert lookup_search(query, small_options, task)
     assert lookup_search(query, large_options, task) is None
+
+
+def test_search_cache_key_includes_topic_anchor_terms(tmp_path, monkeypatch):
+    monkeypatch.setenv("EVIDENCE_CACHE_PATH", str(tmp_path / "evidence_cache.sqlite"))
+    monkeypatch.setenv("EVIDENCE_CACHE_SQLITE_JOURNAL_MODE", "MEMORY")
+    monkeypatch.setenv("IQS_SEARCH_CACHE_ENABLED", "true")
+    query = "market size official data"
+    options = {"engineType": "Deep", "timeRange": "NoLimit"}
+    payload = {
+        "query": query,
+        "results": [
+            {
+                "title": "Supply chain official data",
+                "url": "https://example.gov/supply-chain",
+                "snippet": "supply chain market size",
+            }
+        ],
+        "errors": [],
+    }
+
+    store_search(query, options, {"proof_role": "source_check", "topic_anchor_terms": ["supply chain digitalization"]}, payload)
+    cached = lookup_search(query, options, {"proof_role": "source_check", "topic_anchor_terms": ["low altitude economy"]})
+
+    assert cached is None
 
 
 def test_search_cache_respects_iqs_cache_flag(tmp_path, monkeypatch):
@@ -291,6 +379,53 @@ def test_evidence_cache_rejects_generic_cross_topic_match(tmp_path, monkeypatch)
     assert exact_topic_hits
 
 
+def test_evidence_cache_requires_topic_anchor_match_when_task_has_anchor(tmp_path, monkeypatch):
+    monkeypatch.setenv("EVIDENCE_CACHE_PATH", str(tmp_path / "evidence_cache.sqlite"))
+    monkeypatch.setenv("EVIDENCE_CACHE_SQLITE_JOURNAL_MODE", "MEMORY")
+    store_evidence_from_package(
+        query="supply chain digitalization market size official data",
+        evidence_package={
+            "analysis_ready_evidence": [
+                {
+                    "fact": "Official data says supply chain digitalization market size reached 120 billion in 2025.",
+                    "source_level": "A",
+                    "proof_role": "source_check",
+                    "confidence": 0.82,
+                    "source": {
+                        "title": "Supply chain digitalization official data",
+                        "url": "https://data.gov.cn/supply-chain-data",
+                        "source_type": "official",
+                    },
+                }
+            ]
+        },
+    )
+
+    wrong_topic_hits = lookup_evidence(
+        {
+            "query": "supply chain market size official data",
+            "proof_role": "source_check",
+            "lane_targets": ["official_data"],
+            "topic_anchor_terms": ["low altitude economy"],
+        },
+        min_source_level=["A", "B"],
+        required_fields=["source"],
+    )
+    right_topic_hits = lookup_evidence(
+        {
+            "query": "supply chain market size official data",
+            "proof_role": "source_check",
+            "lane_targets": ["official_data"],
+            "topic_anchor_terms": ["supply chain digitalization"],
+        },
+        min_source_level=["A", "B"],
+        required_fields=["source"],
+    )
+
+    assert wrong_topic_hits == []
+    assert right_topic_hits
+
+
 def test_evidence_cache_rejects_placeholder_and_error_page_evidence(tmp_path, monkeypatch):
     monkeypatch.setenv("EVIDENCE_CACHE_PATH", str(tmp_path / "evidence_cache.sqlite"))
     monkeypatch.setenv("EVIDENCE_CACHE_SQLITE_JOURNAL_MODE", "MEMORY")
@@ -382,6 +517,46 @@ def test_evidence_cache_lookup_filters_legacy_dirty_rows(tmp_path, monkeypatch):
                 json.dumps(dirty_raw),
             ),
         )
+
+    hits = lookup_evidence(
+        {"query": query, "proof_role": "metric", "lane_targets": ["official_data"]},
+        min_source_level=["A", "B", "C"],
+        required_fields=["source"],
+    )
+
+    assert hits == []
+
+
+def test_evidence_cache_lookup_filters_source_identity_mismatch_rows(tmp_path, monkeypatch):
+    db_path = tmp_path / "evidence_cache.sqlite"
+    monkeypatch.setenv("EVIDENCE_CACHE_PATH", str(db_path))
+    monkeypatch.setenv("EVIDENCE_CACHE_SQLITE_JOURNAL_MODE", "MEMORY")
+    query = "ai agent source identity"
+    store_evidence_from_package(
+        query=query,
+        evidence_package={
+            "analysis_ready_evidence": [
+                {
+                    "fact": "Enterprise AI agent adoption reached 42% in 2025 according to a government dataset.",
+                    "metric": "enterprise AI agent adoption",
+                    "value": "42",
+                    "unit": "%",
+                    "period": "2025",
+                    "source_level": "A",
+                    "proof_role": "metric",
+                    "source": {
+                        "title": "National enterprise AI adoption bulletin",
+                        "url": "https://data.beijing.gov.cn/reports/ai-agent-data",
+                        "source_type": "official",
+                    },
+                }
+            ]
+        },
+    )
+    with sqlite3.connect(db_path) as conn:
+        raw = json.loads(conn.execute("SELECT raw_json FROM evidence_cache").fetchone()[0])
+        raw["source"]["source_title_url_mismatch_suspected"] = True
+        conn.execute("UPDATE evidence_cache SET raw_json=?", (json.dumps(raw),))
 
     hits = lookup_evidence(
         {"query": query, "proof_role": "metric", "lane_targets": ["official_data"]},

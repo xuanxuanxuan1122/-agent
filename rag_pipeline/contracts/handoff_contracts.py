@@ -440,6 +440,43 @@ def _citation_ref(item: Dict[str, Any]) -> str:
     return raw
 
 
+def _normalize_citation_ref(value: Any) -> str:
+    raw = _text(value)
+    if raw.isdigit():
+        return f"[{raw}]"
+    match = CITATION_RE.search(raw)
+    if match:
+        return f"[{match.group(1)}]"
+    return raw
+
+
+def _manifest_from_final_citation_audit(
+    final_citation_audit: Dict[str, Any],
+    source_registry: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    audit = _as_dict(final_citation_audit)
+    status = _text(audit.get("final_citation_reconciliation_status") or audit.get("status")).lower()
+    missing = [_normalize_citation_ref(item) for item in _as_list(audit.get("final_missing_appendix_refs"))]
+    body_refs = _unique(_normalize_citation_ref(item) for item in _as_list(audit.get("final_body_citation_refs")))
+    appendix_refs = set(_normalize_citation_ref(item) for item in _as_list(audit.get("final_appendix_refs")))
+    if status != "ok" or missing or not body_refs or not appendix_refs:
+        return {}
+    if any(ref not in appendix_refs for ref in body_refs):
+        return {}
+    sources_by_ref: Dict[str, Dict[str, Any]] = {}
+    for source in _as_list(source_registry):
+        if not isinstance(source, dict):
+            continue
+        for ref in {_normalize_citation_ref(source.get("ref")), _normalize_citation_ref(source.get("source_ref"))}:
+            if ref:
+                sources_by_ref.setdefault(ref, source)
+    items: List[Dict[str, Any]] = []
+    for ref in body_refs:
+        source = dict(sources_by_ref.get(ref) or {})
+        items.append({**source, "ref": ref, "citation_ref": ref})
+    return {"items": items}
+
+
 def validate_citation_reconciliation(
     *,
     markdown: str,
@@ -497,6 +534,11 @@ def build_handoff_contract_summary(
     sources = list(source_registry or _source_registry(report) or _source_registry(evidence_package))
     resolved_markdown = markdown if markdown is not None else _text(report.get("report_markdown"))
     resolved_manifest = _as_dict(citation_manifest) or _as_dict(report.get("citation_manifest"))
+    if not _manifest_items(resolved_manifest):
+        resolved_manifest = _manifest_from_final_citation_audit(
+            _as_dict(report.get("final_citation_audit")),
+            sources,
+        ) or resolved_manifest
     results = {
         "evidence_to_analysis": validate_evidence_package_for_analysis(evidence_package).to_dict(),
         "analysis_to_writer": validate_structured_analysis_for_writer(

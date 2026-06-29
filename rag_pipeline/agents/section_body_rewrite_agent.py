@@ -34,6 +34,13 @@ def _text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
+def _excerpt(value: Any, *, limit: int = 240) -> str:
+    text = _text(value)
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "..."
+
+
 def _env_flag(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None:
@@ -62,7 +69,8 @@ def body_rewrite_max_sections() -> int:
     quality_mode = str(os.getenv("REPORT_QUALITY_MODE") or "").strip().lower()
     replay_mode = str(os.getenv("REPORT_REPLAY_EXECUTION_MODE") or "").strip().lower()
     if quality_mode == "high" or replay_mode == "quality_llm_replay":
-        value = max(value, 24)
+        quality_floor = _env_int("REPORT_BODY_REWRITE_QUALITY_MIN_SECTIONS", 40, min_value=0, max_value=200)
+        value = max(value, quality_floor)
     return value
 
 
@@ -173,6 +181,39 @@ def _original_paragraph(section: Dict[str, Any]) -> str:
     return ""
 
 
+POLLUTED_FALLBACK_RE = re.compile(
+    r"(?:"
+    r"市场规模\s*[:：]"
+    r"|关键事实\s*[:：]"
+    r"|数据指标\s*[:：]"
+    r"|定性事实\s*[:：]"
+    r"|报告编号\s*[:：]"
+    r"|订购电话\s*[:：]?"
+    r"|客服\s*[:：]?\s*\d{3,}"
+    r"|电子版\s*[:：]?\s*\d+(?:\.\d+)?\s*元"
+    r"|纸介版\s*[:：]?\s*\d+(?:\.\d+)?\s*元"
+    r"|它对应的关键变量"
+    r"|工具调用、权限、安全"
+    r")"
+)
+
+
+def _is_polluted_public_paragraph(value: Any) -> bool:
+    text = _text(value)
+    return bool(text and POLLUTED_FALLBACK_RE.search(text))
+
+
+def _fallback_paragraph(section: Dict[str, Any]) -> str:
+    original = _original_paragraph(section)
+    if not _is_polluted_public_paragraph(original):
+        return original
+    for key in ("claim", "reasoning", "mechanism", "paragraph"):
+        candidate = _text(section.get(key))
+        if candidate and not _is_polluted_public_paragraph(candidate):
+            return candidate
+    return original
+
+
 def _required_fact_refs(section: Dict[str, Any], facts: Sequence[Dict[str, Any]]) -> List[str]:
     section_fact_refs = _as_list(section.get("used_fact_refs"))
     if not section_fact_refs:
@@ -237,10 +278,15 @@ def _fallback(
     reason: str = "",
     model: str = "",
 ) -> Dict[str, Any]:
+    paragraph = _fallback_paragraph(section)
     return {
         "status": status,
-        "paragraph": _original_paragraph(section),
+        "section_id": section.get("section_id"),
+        "chapter_id": section.get("chapter_id"),
+        "section_title": section.get("section_title"),
+        "paragraph": paragraph,
         "original_paragraph": _original_paragraph(section),
+        "original_excerpt": _excerpt(_original_paragraph(section)),
         "failure_reason": reason,
         "model": model,
         "input_ref_count": len(_required_fact_refs(section, facts)),
@@ -249,6 +295,7 @@ def _fallback(
         "citation_refs": _required_citation_refs(section, facts),
         "llm_called": False,
         "cache_hit": False,
+        "fallback_pollution_removed": paragraph != _original_paragraph(section),
     }
 
 
@@ -303,11 +350,15 @@ def _validate_candidate(
         return False, "new_numeric_claim"
     original_len = len(re.sub(r"\s+", "", original))
     candidate_len = len(re.sub(r"\s+", "", paragraph))
+    min_accept_raw = os.getenv("REPORT_BODY_REWRITE_MIN_ACCEPT_CHARS")
     min_safe_chars = _env_int("REPORT_BODY_REWRITE_MIN_ACCEPT_CHARS", 80, min_value=20, max_value=2000)
+    strict_min_accept = min_accept_raw is not None and str(min_accept_raw).strip() != ""
     try:
         min_ratio = float(os.getenv("REPORT_BODY_REWRITE_MIN_COMPRESSION_RATIO", "0.35") or "0.35")
     except ValueError:
         min_ratio = 0.35
+    if strict_min_accept and candidate_len < min_safe_chars:
+        return False, "output_too_short"
     if original_len >= 30 and candidate_len < min_safe_chars and candidate_len < int(original_len * min_ratio):
         return False, "output_too_short"
     max_ratio = body_rewrite_max_expansion_ratio()
@@ -363,8 +414,9 @@ def _system_prompt() -> str:
         "You are a section-level industry research writing editor. Rewrite only the given "
         "composer paragraph into a polished Chinese industry-research paragraph. Use only "
         "the provided facts. Do not add companies, numbers, sources, claims, or citations. "
-        "If target_chars is provided, treat it as a soft upper target, not a reason to add content. "
-        "When evidence is thin, keep the paragraph concise and state only the supported boundary. "
+        "If target_chars is provided, use it as a writing-depth guide: expand the supported meaning, "
+        "mechanism, boundary, and industry implication of the cited facts without inventing facts. "
+        "When evidence is thin, keep cautious wording but still explain why the cited signal matters. "
         "Do not change claim strength. Preserve all used_fact_refs and citation_refs exactly. "
         "Do not output gap_id, EV ids, QA, Clean, fatal, repair advice, or other internal diagnostics. "
         "Return JSON only: {\"paragraph\":\"...\", \"used_fact_refs\":[...], \"citation_refs\":[...]}."
@@ -472,6 +524,9 @@ def rewrite_section_body(
         rejected = _fallback(section, facts, status="rejected", reason=reason, model=active_model)
         rejected["llm_called"] = True
         rejected["fallback_used"] = fallback_used
+        rejected["candidate_excerpt"] = _excerpt(paragraph)
+        if reason == "new_numeric_claim":
+            rejected["candidate_numbers"] = sorted(_numbers(paragraph) - _numbers(_source_text(section, facts)))
         return rejected
     output = {
         "status": "rewritten",
@@ -546,6 +601,19 @@ def rewrite_sections_for_chapter(
             payload["reasoning"] = paragraph
             payload["mechanism"] = paragraph
             payload["render_blocks"] = [{"type": "paragraph", "label": "", "text": paragraph}]
+        elif result.get("fallback_pollution_removed"):
+            paragraph = _text(result.get("paragraph"))
+            if paragraph:
+                payload["claim"] = paragraph
+                payload["reasoning"] = paragraph
+                payload["mechanism"] = paragraph
+                payload["render_blocks"] = [{"type": "paragraph", "label": "", "text": paragraph}]
+            if status == "rejected":
+                diagnostics["rejected_count"] += 1
+            elif status == "skipped":
+                diagnostics["skipped_count"] += 1
+            else:
+                diagnostics["fallback_count"] += 1
         elif status == "rejected":
             diagnostics["rejected_count"] += 1
         elif status == "skipped":
@@ -591,7 +659,30 @@ def _new_diagnostics(*, enabled: Optional[bool] = None) -> Dict[str, Any]:
         "elapsed_seconds": 0.0,
         "concurrency": body_rewrite_concurrency(),
         "failure_reasons": {},
+        "failure_samples": [],
     }
+
+
+def _record_failure_sample(diagnostics: Dict[str, Any], result: Dict[str, Any]) -> None:
+    reason = str(result.get("failure_reason") or "")
+    if not reason:
+        return
+    samples = diagnostics.setdefault("failure_samples", [])
+    if len(samples) >= 8:
+        return
+    sample = {
+        "reason": reason,
+        "status": result.get("status"),
+        "section_id": result.get("section_id"),
+        "chapter_id": result.get("chapter_id"),
+        "section_title": result.get("section_title"),
+        "model": result.get("model"),
+        "candidate_excerpt": result.get("candidate_excerpt") or "",
+        "original_excerpt": result.get("original_excerpt") or _excerpt(result.get("original_paragraph")),
+    }
+    if result.get("candidate_numbers"):
+        sample["candidate_numbers"] = result.get("candidate_numbers")
+    diagnostics["failure_samples"].append(sample)
 
 
 def _record_result(diagnostics: Dict[str, Any], result: Dict[str, Any]) -> None:
@@ -611,6 +702,7 @@ def _record_result(diagnostics: Dict[str, Any], result: Dict[str, Any]) -> None:
     reason = str(result.get("failure_reason") or "")
     if reason:
         diagnostics["failure_reasons"][reason] = diagnostics["failure_reasons"].get(reason, 0) + 1
+        _record_failure_sample(diagnostics, result)
     if status in {"rewritten", "cached"}:
         original_len = len(re.sub(r"\s+", "", str(result.get("original_paragraph") or "")))
         rewritten_len = len(re.sub(r"\s+", "", str(result.get("paragraph") or "")))
@@ -640,6 +732,12 @@ def _merge_diagnostics(target: Dict[str, Any], source: Dict[str, Any]) -> None:
     target["enabled"] = bool(target.get("enabled") or source.get("enabled"))
     for reason, count in _as_dict(source.get("failure_reasons")).items():
         target["failure_reasons"][reason] = target["failure_reasons"].get(reason, 0) + int(count or 0)
+    samples = target.setdefault("failure_samples", [])
+    for sample in _as_list(source.get("failure_samples")):
+        if len(samples) >= 8:
+            break
+        if isinstance(sample, dict):
+            samples.append(dict(sample))
 
 
 def _apply_rewrite_result(section: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, Any]:
@@ -651,6 +749,13 @@ def _apply_rewrite_result(section: Dict[str, Any], result: Dict[str, Any]) -> Di
         payload["reasoning"] = paragraph
         payload["mechanism"] = paragraph
         payload["render_blocks"] = [{"type": "paragraph", "label": "", "text": paragraph}]
+    elif result.get("fallback_pollution_removed"):
+        paragraph = _text(result.get("paragraph"))
+        if paragraph:
+            payload["claim"] = paragraph
+            payload["reasoning"] = paragraph
+            payload["mechanism"] = paragraph
+            payload["render_blocks"] = [{"type": "paragraph", "label": "", "text": paragraph}]
     else:
         payload = ensure_public_render_blocks(payload)
     payload["body_rewrite_status"] = status

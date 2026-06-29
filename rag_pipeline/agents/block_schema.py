@@ -17,10 +17,10 @@ BLOCK_REGISTRY: Dict[str, Dict[str, Any]] = {
     "stakeholder_map": {"label": "相关主体与影响分化", "renderer": "render_stakeholder_map", "roles": ["case", "official_data"]},
     "value_chain_map": {"label": "价值链位置与瓶颈", "renderer": "render_value_chain_map", "roles": ["metric", "company_filing"]},
     "case_comparison": {"label": "代表性案例对比", "renderer": "render_case_comparison", "roles": ["case", "customer_case"]},
-    "customer_painpoint_matrix": {"label": "客户场景与采购约束", "renderer": "render_customer_painpoint_matrix", "roles": ["customer_case", "case"]},
+    "customer_painpoint_matrix": {"label": "用户场景与使用约束", "renderer": "render_customer_painpoint_matrix", "roles": ["customer_case", "case"]},
     "competitive_positioning": {"label": "竞争位置与替代压力", "renderer": "render_competitive_positioning", "roles": ["case", "metric"]},
-    "technology_maturity": {"label": "技术成熟度与量产边界", "renderer": "render_technology_maturity", "roles": ["technology_product", "case"]},
-    "unit_economics": {"label": "商业化证据", "renderer": "render_unit_economics", "roles": ["financial_metric", "filing"]},
+    "technology_maturity": {"label": "技术成熟度与应用边界", "renderer": "render_technology_maturity", "roles": ["technology_product", "case"]},
+    "unit_economics": {"label": "兑现条件", "renderer": "render_unit_economics", "roles": ["financial_metric", "filing"]},
     "scenario_analysis": {"label": "情景分层与结论弹性", "renderer": "render_scenario_analysis", "roles": ["metric", "counter"]},
     "risk_trigger": {"label": "反向信号与失效条件", "renderer": "render_risk_trigger", "roles": ["counter"]},
     "verification_checklist": {"label": "后续验证重点", "renderer": "render_verification_checklist", "roles": ["support", "counter"]},
@@ -471,6 +471,77 @@ def _evidence_roles_from_package(evidence_package: Dict[str, Any] | None = None)
     return _dedupe(roles, limit=20)
 
 
+def _refs_from_claim_payload(claim: Dict[str, Any] | None = None) -> List[str]:
+    claim = _as_dict(claim)
+    return _dedupe(
+        [
+            *_as_list(claim.get("fact_ids")),
+            *_as_list(claim.get("used_fact_refs")),
+            *_as_list(claim.get("used_evidence_ids")),
+            *_as_list(claim.get("supporting_evidence_refs")),
+            *_as_list(claim.get("supporting_evidence")),
+            *_as_list(claim.get("evidence_refs")),
+            *_as_list(claim.get("source_ids")),
+            *_as_list(claim.get("citation_refs")),
+        ],
+        limit=8,
+    )
+
+
+def _claim_first_blocks_from_section_plan(
+    chapter: Dict[str, Any],
+    *,
+    chapter_claims: Sequence[Dict[str, Any]],
+    limit: int,
+) -> List[Dict[str, Any]]:
+    section_plan = [item for item in _as_list(chapter.get("section_plan")) if isinstance(item, dict)]
+    if not section_plan:
+        return []
+    claim_by_id = {
+        str(claim.get("claim_id") or claim.get("id") or "").strip(): claim
+        for claim in list(chapter_claims or [])
+        if isinstance(claim, dict) and str(claim.get("claim_id") or claim.get("id") or "").strip()
+    }
+    chapter_id = str(chapter.get("chapter_id") or "chapter").strip() or "chapter"
+    blocks: List[Dict[str, Any]] = []
+    max_sections = max(1, min(24, int(os.getenv("REPORT_MAX_CLAIM_SECTIONS_PER_CHAPTER", str(max(1, limit * 4))) or "8")))
+    for index, section in enumerate(section_plan[:max_sections], start=1):
+        claim_id = str(section.get("claim_id") or "").strip()
+        matched_claim = _as_dict(section.get("matched_llm_claim")) or _as_dict(claim_by_id.get(claim_id))
+        refs = _as_list(section.get("required_evidence_refs")) or _refs_from_claim_payload(matched_claim)
+        if not claim_id and matched_claim:
+            claim_id = str(matched_claim.get("claim_id") or matched_claim.get("id") or "").strip()
+        block_type = str(section.get("block_type") or section.get("output_type") or "").strip()
+        if not block_type and matched_claim:
+            for candidate in claim_supported_block_types(matched_claim):
+                if candidate in BLOCK_REGISTRY:
+                    block_type = candidate
+                    break
+        block_type = block_type if block_type in BLOCK_REGISTRY else "integrated_signal"
+        definition = block_definition(block_type)
+        blocks.append(
+            {
+                "block_id": str(section.get("section_id") or f"{chapter_id}_claim_{index:02d}"),
+                "block_type": block_type,
+                "role": str(section.get("section_role") or block_type),
+                "title": section.get("section_title") or definition.get("label") or block_type,
+                "section_title": section.get("section_title") or "",
+                "claim_id": claim_id,
+                "matched_llm_claim": matched_claim,
+                "required_evidence_refs": refs,
+                "required_evidence_roles": _as_list(section.get("required_evidence_roles")),
+                "min_evidence_refs": 1,
+                "renderer": section.get("renderer") or definition.get("renderer") or "render_thesis_block",
+                "public_render": True,
+                "block_evidence_fit_score": 90 if refs else 60,
+                "selection_reason": "claim_first_section_plan",
+                "render_plan": "must_render",
+                "matched_by_llm_claim": bool(matched_claim),
+            }
+        )
+    return blocks
+
+
 def select_blocks_for_chapter(
     chapter: Dict[str, Any],
     *,
@@ -489,6 +560,16 @@ def select_blocks_for_chapter(
     evidence_roles = _evidence_roles_from_package(evidence_package)
     chapter_id = str(chapter.get("chapter_id") or _as_dict(evidence_package).get("chapter_id") or "").strip()
     chapter_claims = list(_as_dict(claim_units_by_chapter).get(chapter_id, []))
+    claim_first_blocks = _claim_first_blocks_from_section_plan(
+        chapter,
+        chapter_claims=chapter_claims,
+        limit=limit,
+    )
+    if claim_first_blocks and (
+        str(chapter.get("chapter_role") or "") == "claim_driven_final_chapter"
+        or str(layout_policy.get("block_selection_source") or "") == "claim_units"
+    ):
+        return claim_first_blocks
 
     candidates: List[str] = []
     candidates.extend(preferred)

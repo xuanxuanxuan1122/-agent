@@ -5,6 +5,7 @@ from rag_pipeline.agents.brain_agent import (
 )
 from rag_pipeline.agents.evidence_binder import bind_evidence_to_chapters
 from rag_pipeline.agents.pre_layout_agent import run_pre_layout_agent
+from rag_pipeline.agents.problem_framing_agent import apply_problem_framing, run_problem_framing_agent
 from rag_pipeline.agents.research_planner import run_research_planner_agent
 from rag_pipeline.agents.markdown_renderer import render_chapter_package, render_final_reference_analysis
 
@@ -43,6 +44,59 @@ def test_research_planner_builds_closed_loop_from_dynamic_hypotheses():
     assert chapter_ids
     assert task_chapter_ids
     assert task_chapter_ids <= chapter_ids
+
+
+def test_problem_framing_uses_academic_template_for_broad_discipline_topics():
+    framing = run_problem_framing_agent(query="\u4f1a\u8ba1\u5b66")
+    text = " ".join(
+        [str(framing.get("core_question") or "")]
+        + [str(item.get("statement") or "") for item in framing.get("hypotheses") or []]
+        + [
+            str(term)
+            for item in framing.get("hypotheses") or []
+            for terms in (item.get("evidence_bundle") or {}).values()
+            for term in terms
+        ]
+    )
+
+    assert framing["research_object"] == "\u4f1a\u8ba1\u5b66"
+    assert any(term in text for term in ["\u5b66\u79d1", "\u4e13\u4e1a", "\u8bfe\u7a0b"])
+    assert any(term in text for term in ["\u5c97\u4f4d", "\u804c\u4e1a", "\u4eba\u624d"])
+    for forbidden in [
+        "\u5e02\u573a\u7a7a\u95f4",
+        "\u6982\u5ff5\u70ed\u5ea6",
+        "\u5546\u4e1a\u5316\u8bc1\u636e",
+        "\u5ba2\u6237",
+        "\u8ba2\u5355",
+        "\u73a9\u5bb6",
+    ]:
+        assert forbidden not in text
+
+
+def test_academic_topic_search_tasks_do_not_use_commercial_query_terms():
+    query = "\u4f1a\u8ba1\u5b66"
+    framing = run_problem_framing_agent(query=query)
+    plan = apply_problem_framing({"query": query, "research_object": query, "chapters": []}, framing)
+    blueprint = run_pre_layout_agent(query=query, research_plan=plan)
+    expanded = expand_search_tasks_from_chapters(plan, blueprint)
+    text = " ".join(
+        str(value or "")
+        for task in expanded.get("search_tasks") or []
+        for value in [task.get("query"), task.get("evidence_goal")]
+    )
+
+    assert expanded.get("search_tasks")
+    assert any(term in text for term in ["\u5c31\u4e1a", "\u5c97\u4f4d", "\u8bfe\u7a0b", "\u8bc1\u4e66"])
+    for forbidden in [
+        "\u5ba2\u6237",
+        "\u8ba2\u5355",
+        "\u91c7\u8d2d",
+        "\u8d22\u62a5",
+        "\u62db\u80a1\u4e66",
+        "\u6295\u8d44\u8005\u5173\u7cfb",
+        "\u4ea7\u54c1\u6807\u51c6",
+    ]:
+        assert forbidden not in text
 
 
 def test_pre_layout_rewrites_legacy_titles_and_keeps_chapter_contract():

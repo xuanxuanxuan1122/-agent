@@ -60,6 +60,39 @@ def _try_load(text: str) -> Any:
         return None
 
 
+def _balanced_json_prefix(text: str) -> str:
+    """Return the first complete JSON object/array prefix, ignoring trailing logs."""
+
+    text = str(text or "").lstrip()
+    if not text or text[0] not in "{[":
+        return ""
+    stack: List[str] = []
+    in_string = False
+    escape = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char in "{[":
+            stack.append("}" if char == "{" else "]")
+            continue
+        if char in "}]":
+            if not stack or stack[-1] != char:
+                return ""
+            stack.pop()
+            if not stack:
+                return text[: index + 1]
+    return ""
+
+
 def salvage_json_payload(raw_text: str) -> Dict[str, Any]:
     text = _strip_code_fence(raw_text)
     start = _json_start(text)
@@ -69,6 +102,11 @@ def salvage_json_payload(raw_text: str) -> Dict[str, Any]:
     loaded = _try_load(text)
     if isinstance(loaded, dict):
         return loaded
+    prefix = _balanced_json_prefix(text)
+    if prefix:
+        loaded = _try_load(prefix)
+        if isinstance(loaded, dict):
+            return loaded
     closed = _close_truncated_json(text)
     loaded = _try_load(closed)
     return loaded if isinstance(loaded, dict) else {}

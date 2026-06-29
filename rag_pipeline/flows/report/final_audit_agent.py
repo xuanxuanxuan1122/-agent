@@ -6,13 +6,24 @@ from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
 from rag_pipeline.config.search_config import build_llm_config_for_task
-from rag_pipeline.contracts.quality_gate_policy import quality_gate_mode, quality_gates_isolated
+from rag_pipeline.contracts.quality_gate_policy import advisory_weight_mode, public_signal_mode, quality_gate_mode, quality_gates_isolated
 from rag_pipeline.search.memory import call_openai_compatible_json, llm_config_is_ready, normalize_llm_config
+
+try:
+    from rag_pipeline.observability.probe_api import emit_transform as _probe_emit_transform
+    from rag_pipeline.observability.probe_context import (
+        current_probe_context_from_env as _current_probe_context_from_env,
+    )
+except Exception:  # pragma: no cover - observability must never block final audit
+    _probe_emit_transform = None
+    _current_probe_context_from_env = None
 
 
 FINAL_AUDIT_SYSTEM_PROMPT = """You are the final audit model for a Chinese investment and industry research report.
 
 Audit the report for publishability. Be strict. Do not rewrite the report.
+Return only the highest-signal findings. Respect user_payload.finding_limits and do not exceed
+the per-list cap; summarize repeated issues instead of enumerating every occurrence.
 Return only a valid JSON object with this shape:
 {
   "status": "pass|warning|fatal",
@@ -43,6 +54,11 @@ investment conclusions that overreach the evidence, and risk sections that are t
 When a finding maps to a known gap, include requirement_id, gap_id, and section_id so the repair ledger can create the next search task.
 Also treat leaked internal pipeline markers (for example ch_01, policy_summary in a non-policy report,
 绗?杞?traces, malformed metric tables, or source appendix gaps) as fatal unless clearly intentional.
+If REPORT_EVIDENCE_MODE=public_signal or advisory_weight, source grades (A/B/C/D), weak sources,
+single-source support, media/self-media/social/forum evidence, or missing official data are advisory
+weight signals only. Do not mark them fatal solely because of grade/source class. Treat them as warnings
+or caveats unless they create topic pollution, uncited hard facts, fake sources, or citations that clearly
+do not support the text.
 """
 
 
@@ -59,6 +75,19 @@ def _env_int(name: str, default: int, *, min_value: int = 0, max_value: int = 1_
     except (TypeError, ValueError):
         value = default
     return min(max_value, max(min_value, value))
+
+
+AUDIT_FINDING_LIST_KEYS = (
+    "critical_findings",
+    "unsupported_claims",
+    "citation_issues",
+    "scope_or_method_issues",
+    "risk_section_feedback",
+)
+
+
+def _audit_finding_limit() -> int:
+    return _env_int("REPORT_FINAL_AUDIT_MAX_FINDINGS", 8, min_value=1, max_value=50)
 
 
 def _final_audit_mode() -> str:
@@ -80,6 +109,67 @@ def _as_dict(value: Any) -> Dict[str, Any]:
 
 def _as_list(value: Any) -> List[Any]:
     return list(value) if isinstance(value, list) else []
+
+
+def _probe_int(value: Any) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _emit_final_audit_probe(result: Dict[str, Any], *, report_markdown: str) -> None:
+    if _probe_emit_transform is None or _current_probe_context_from_env is None:
+        return
+    try:
+        probe = _current_probe_context_from_env()
+        if probe is None:
+            return
+        audit = _as_dict(result.get("audit"))
+        deterministic = _as_dict(result.get("deterministic_audit"))
+        findings = [
+            *_as_list(audit.get("critical_findings")),
+            *_as_list(result.get("delivery_blockers")),
+            *_as_list(deterministic.get("findings")),
+        ]
+        reason_counts: Dict[str, int] = {}
+        for finding in findings:
+            payload = _as_dict(finding)
+            key = str(payload.get("type") or payload.get("code") or payload.get("severity") or "finding").strip()
+            reason_counts[key or "finding"] = reason_counts.get(key or "finding", 0) + 1
+        status = str(result.get("status") or "").strip().lower()
+        enabled = bool(result.get("enabled"))
+        blocked = bool(result.get("blocked"))
+        fatal_observed = status == "fatal"
+        _probe_emit_transform(
+            probe,
+            stage="final_audit",
+            module="final_audit_agent",
+            input_count=1 if str(report_markdown or "").strip() else 0,
+            output_count=0 if not enabled or status == "skipped" else 1,
+            drop_count=1 if blocked or fatal_observed else 0,
+            status="error" if status in {"fatal", "failed"} or blocked else ("warning" if status == "skipped" else "ok"),
+            reason_counts=reason_counts,
+            metrics={
+                "overall_score": _probe_int(audit.get("overall_score")),
+                "critical_finding_count": len(_as_list(audit.get("critical_findings"))),
+                "delivery_blocker_count": len(_as_list(result.get("delivery_blockers"))),
+                "report_chars": len(str(report_markdown or "")),
+            },
+            diagnostics={
+                "enabled": enabled,
+                "success": bool(result.get("success")),
+                "status": result.get("status") or "",
+                "blocked": blocked,
+                "fatal_observed": fatal_observed,
+                "blocking": bool(result.get("blocking")),
+                "final_audit_mode": result.get("final_audit_mode") or "",
+                "quality_fatal_observed": bool(result.get("quality_fatal_observed")),
+                "skipped_reason": result.get("skipped_reason") or "",
+            },
+        )
+    except Exception:
+        return
 
 
 def _compact_text(value: Any, max_chars: int = 600) -> str:
@@ -227,6 +317,75 @@ def _is_fatal_audit(payload: Dict[str, Any]) -> bool:
         if str(_as_dict(item).get("severity") or "").strip().lower() == "fatal":
             return True
     return False
+
+
+PUBLIC_SIGNAL_SOFT_FINDING_TYPES = {
+    "weak_evidence",
+    "weak_source",
+    "source_quality",
+    "source_reliability",
+    "single_source",
+    "evidence_gap",
+    "missing_official_data",
+}
+
+
+def _public_signal_soft_finding(item: Dict[str, Any]) -> bool:
+    finding_type = str(item.get("type") or "").strip().lower()
+    if finding_type in PUBLIC_SIGNAL_SOFT_FINDING_TYPES:
+        return True
+    text = " ".join(
+        str(item.get(key) or "")
+        for key in ("message", "evidence_hint", "suggested_fix", "summary")
+    ).lower()
+    return any(
+        token in text
+        for token in (
+            "weak source",
+            "weak evidence",
+            "single source",
+            "official data",
+            "source unreliable",
+            "来源偏弱",
+            "来源较弱",
+            "单一来源",
+            "单源",
+            "缺少官方",
+            "官方数据不足",
+            "二手来源",
+            "自媒体",
+            "社交媒体",
+            "媒体报道",
+        )
+    )
+
+
+def _soften_public_signal_audit_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not (public_signal_mode() or advisory_weight_mode()):
+        return payload
+    result = dict(payload or {})
+    changed = False
+    hard_fatal_found = False
+    for key in ("critical_findings", "findings"):
+        softened: List[Any] = []
+        for raw in _as_list(result.get(key)):
+            item = dict(raw) if isinstance(raw, dict) else raw
+            if isinstance(item, dict) and str(item.get("severity") or "").strip().lower() == "fatal":
+                if _public_signal_soft_finding(item):
+                    item["severity"] = "high"
+                    item["public_signal_downgraded"] = True
+                    changed = True
+                else:
+                    hard_fatal_found = True
+            softened.append(item)
+        if softened:
+            result[key] = softened
+    if changed:
+        result["public_signal_audit_softened"] = True
+        if not hard_fatal_found:
+            result["status"] = "warning"
+            result["publish_recommendation"] = "publish_with_caveats"
+    return result
 
 
 DELIVERY_BLOCKER_TYPES = {
@@ -559,7 +718,7 @@ def run_deterministic_audit(
 
 
 def _normalize_audit_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    result = dict(payload or {})
+    result = _soften_public_signal_audit_payload(dict(payload or {}))
     status = str(result.get("status") or "").strip().lower()
     if status not in {"pass", "warning", "fatal"}:
         status = "fatal" if _is_fatal_audit(result) else "warning"
@@ -573,14 +732,17 @@ def _normalize_audit_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     except (TypeError, ValueError):
         score = 0
     result["overall_score"] = max(0, min(100, score))
-    for key in (
-        "critical_findings",
-        "unsupported_claims",
-        "citation_issues",
-        "scope_or_method_issues",
-        "risk_section_feedback",
-    ):
-        result[key] = _as_list(result.get(key))
+    finding_limit = _audit_finding_limit()
+    overflow_counts: Dict[str, int] = {}
+    for key in AUDIT_FINDING_LIST_KEYS:
+        items = _as_list(result.get(key))
+        if len(items) > finding_limit:
+            overflow_counts[key] = len(items) - finding_limit
+            items = items[:finding_limit]
+        result[key] = items
+    result["finding_list_limit"] = finding_limit
+    if overflow_counts:
+        result["finding_overflow_counts"] = overflow_counts
     result["summary"] = _compact_text(result.get("summary"), 1200)
     return result
 
@@ -661,7 +823,9 @@ def run_final_audit(
     query: str = "",
 ) -> Dict[str, Any]:
     if not _env_flag("REPORT_ENABLE_FINAL_AUDIT", True):
-        return {"enabled": False, "success": True, "status": "skipped", "skipped_reason": "disabled"}
+        result = {"enabled": False, "success": True, "status": "skipped", "skipped_reason": "disabled"}
+        _emit_final_audit_probe(result, report_markdown=report_markdown)
+        return result
 
     package = _as_dict(writer_package_payload)
     writer_report = _as_dict(package.get("writer_report"))
@@ -678,7 +842,7 @@ def run_final_audit(
     blocking = _env_flag("REPORT_FINAL_AUDIT_BLOCKING", True) and not isolated_gate and audit_mode != "audit_only"
     deterministic_blocks = bool(deterministic_audit.get("fatal")) if audit_mode == "publish_strict" else bool(delivery_blockers)
     if deterministic_blocks and blocking:
-        return {
+        result = {
             "enabled": True,
             "success": True,
             "status": "fatal",
@@ -697,6 +861,8 @@ def run_final_audit(
                 "summary": deterministic_audit.get("summary"),
             },
         }
+        _emit_final_audit_probe(result, report_markdown=report_markdown)
+        return result
 
     config = dict(build_llm_config_for_task("final_audit"))
     min_output_tokens = _env_int(
@@ -731,7 +897,7 @@ def run_final_audit(
                 isolated_gate=isolated_gate,
             )
         )
-        return {
+        result = {
             "enabled": True,
             "success": False,
             "status": top_status,
@@ -746,8 +912,11 @@ def run_final_audit(
             "deterministic_audit": deterministic_audit,
             "audit": audit_payload,
         }
+        _emit_final_audit_probe(result, report_markdown=report_markdown)
+        return result
 
-    max_chars = _env_int("REPORT_FINAL_AUDIT_MAX_CHARS", 200000, min_value=4000, max_value=1_000_000)
+    max_chars = _env_int("REPORT_FINAL_AUDIT_MAX_CHARS", 60000, min_value=4000, max_value=1_000_000)
+    finding_limit = _audit_finding_limit()
     report_payload = _truncate_report(report_markdown, max_chars)
     current_audit_date = _current_audit_date()
     user_payload = {
@@ -764,6 +933,10 @@ def run_final_audit(
         "evidence_handoff_diagnostics": _as_dict(package.get("evidence_handoff_diagnostics")),
         "qa_blocker_summary": _as_dict(package.get("qa_blocker_summary")),
         "quality_gate_state": _as_dict(package.get("quality_gate_state")),
+        "finding_limits": {
+            "max_items_per_list": finding_limit,
+            "instruction": "Return only the highest-signal findings; summarize repeated issues.",
+        },
         "score_gaps": _compact_score_gaps_for_audit(package, writer_report),
         "requirement_gap_summary": _as_dict(package.get("requirement_gap_summary") or writer_report.get("requirement_gap_summary")),
         "final_citation_audit": _compact_final_citation_audit(package.get("final_citation_audit") or writer_report.get("final_citation_audit")),
@@ -790,7 +963,7 @@ def run_final_audit(
                 isolated_gate=isolated_gate,
             )
             blocked = bool(blocking and delivery_blockers)
-        return {
+        result = {
             "enabled": True,
             "success": True,
             "status": top_status,
@@ -809,9 +982,11 @@ def run_final_audit(
             "llm_call": _as_dict(response.get("llm_call")),
             "report_truncation": user_payload["report_truncation"],
         }
+        _emit_final_audit_probe(result, report_markdown=report_markdown)
+        return result
     except Exception as exc:
         diagnostic = _as_dict(getattr(exc, "diagnostic", {}))
-        return {
+        result = {
             "enabled": True,
             "success": False,
             "status": "failed",
@@ -835,3 +1010,5 @@ def run_final_audit(
             "llm_call": diagnostic,
             "report_truncation": user_payload["report_truncation"],
         }
+        _emit_final_audit_probe(result, report_markdown=report_markdown)
+        return result

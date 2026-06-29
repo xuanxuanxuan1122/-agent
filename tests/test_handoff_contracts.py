@@ -1,4 +1,5 @@
 from rag_pipeline.contracts.handoff_contracts import (
+    build_handoff_contract_summary,
     validate_citation_reconciliation,
     validate_evidence_package_for_analysis,
     validate_repair_priorities_for_dispatch,
@@ -166,3 +167,46 @@ def test_citation_reconciliation_contract_resolves_markdown_refs():
     assert "citation_ref_missing_from_manifest" in result.errors
     assert result.summary["markdown_ref_count"] == 2
     assert result.summary["resolved_ref_count"] == 1
+
+
+def test_handoff_uses_final_citation_audit_when_original_manifest_is_empty():
+    summary = build_handoff_contract_summary(
+        evidence_package={
+            "analysis_ready_evidence": [
+                {
+                    "evidence_id": "EV-1",
+                    "fact": "A cited source supports the body claim.",
+                    "source_id": "SRC-1",
+                    "allowed_use": "core_claim",
+                }
+            ],
+            "source_registry": [{"source_id": "SRC-1", "ref": "[1]", "url": "https://example.com/report"}],
+        },
+        structured_analysis={
+            "claim_units": [
+                {
+                    "claim_id": "CL-1",
+                    "claim": "A cited source supports the body claim.",
+                    "fact_ids": ["EV-1"],
+                    "source_ids": ["SRC-1"],
+                    "requirement_ids": ["REQ-1"],
+                }
+            ]
+        },
+        writer_report={
+            "report_markdown": "## Market\n\nA cited source supports the body claim [1].",
+            "citation_manifest": {},
+            "final_citation_audit": {
+                "final_citation_reconciliation_status": "ok",
+                "final_body_citation_refs": ["[1]"],
+                "final_appendix_refs": ["[1]"],
+                "final_missing_appendix_refs": [],
+            },
+            "source_registry": [{"source_id": "SRC-1", "ref": "[1]", "url": "https://example.com/report"}],
+        },
+    )
+
+    citation = summary["results"]["citation_reconciliation"]
+    assert citation["ok"] is True
+    assert "citation_reconciliation" not in summary["failed_contracts"]
+    assert citation["summary"]["manifest_ref_count"] == 1

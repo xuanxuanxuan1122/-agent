@@ -5,6 +5,7 @@ from collections import Counter
 from typing import Any, Dict, Iterable, List, Sequence
 
 from rag_pipeline.contracts.source_strategy import source_strategy_for_role
+from rag_pipeline.contracts.review_suggestion_contract import repair_action_for_review_suggestion
 
 
 def _as_dict(value: Any) -> Dict[str, Any]:
@@ -90,6 +91,22 @@ def _query_without_avoid(base_parts: Sequence[Any], avoid_queries: Sequence[Any]
 
 def dispatch_repair_seed(task: Dict[str, Any], *, failed_queries: Sequence[Any] | None = None) -> Dict[str, Any]:
     payload = dict(_as_dict(task))
+    if payload.get("schema_version") == "review_suggestion_v1" or payload.get("diagnostic_only"):
+        action = repair_action_for_review_suggestion(payload)
+        payload["repair_action"] = action
+        if action in {"reanalyze_existing", "recompose_outline", "rewrite_with_caveat"}:
+            payload.update(
+                {
+                    "repair_dispatch_version": "repair_dispatcher_v1",
+                    "repair_route": action,
+                    "allowed_for_writing": False,
+                    "query": str(payload.get("query") or payload.get("suggested_query") or "").strip(),
+                    "source_priority": _dedupe(payload.get("source_priority") or [], limit=12),
+                    "query_enhancers": _dedupe(payload.get("query_enhancers") or [], limit=20),
+                    "avoid_queries": _dedupe(failed_queries or payload.get("avoid_queries") or [], limit=12),
+                }
+            )
+            return payload
     role = _role(payload)
     strategy = source_strategy_for_role(role, overrides=_as_dict(payload.get("source_strategy")))
     focus = str(payload.get("required_field_focus") or _field_focus(payload, missing_fields=payload.get("missing_fields") or payload.get("missing"))).strip()

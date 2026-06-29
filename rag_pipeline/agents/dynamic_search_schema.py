@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Sequence
 
 
 HIGH_STAKES_RE = re.compile(
@@ -140,6 +140,14 @@ class SearchTask:
     min_source_level: List[str] = field(default_factory=lambda: ["A", "B"])
     research_object: str = ""
     global_required_terms: List[str] = field(default_factory=list)
+    topic_anchor_terms: List[str] = field(default_factory=list)
+    topic_anchor_status: str = ""
+    topic_anchor_repaired: bool = False
+    topic_anchor_missing_before_repair: bool = False
+    chapter_focus_terms: List[str] = field(default_factory=list)
+    chapter_focus_status: str = ""
+    chapter_focus_repaired: bool = False
+    chapter_focus_missing_before_repair: bool = False
 
 
 @dataclass
@@ -231,6 +239,239 @@ def _derive_global_required_terms(*values: Any) -> List[str]:
         if term and term not in deduped:
             deduped.append(term)
     return deduped[:6]
+
+
+_REAL_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+_UNICODE_QUERY_CUT_RE = re.compile(
+    r"(?:商业化|机会|风险|分析|报告|研究|研判|怎么看|如何|哪些|是否|当前|未来|现状|趋势|前景)",
+    re.I,
+)
+
+
+def _has_real_cjk(value: Any) -> bool:
+    return bool(_REAL_CJK_RE.search(str(value or "")))
+
+
+def _strip_query_noise(value: Any) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").replace("\u3000", " ")).strip()
+    text = re.sub(r"[（(]\s*(?:20\d{2}|19\d{2})\s*[）)]", "", text).strip()
+    text = re.sub(r"^(?:请|帮我|麻烦|分析一下|研究一下|看一下)\s*", "", text).strip()
+    return text.strip(" \t\r\n,.;:!?，。；：！？")
+
+
+def _unicode_query_subject(value: Any) -> str:
+    text = _strip_query_noise(value)
+    if not _has_real_cjk(text):
+        return ""
+    first_clause = re.split(r"[，。；：！？、\n\r]", text, maxsplit=1)[0].strip()
+    candidate = first_clause or text
+    cut = _UNICODE_QUERY_CUT_RE.search(candidate)
+    if cut and cut.start() >= 2:
+        candidate = candidate[: cut.start()].strip()
+    candidate = candidate.strip(" -_—：:，,。.")
+    if len(candidate) > 28:
+        for suffix in ("产业链", "低空经济", "人工智能", "机器人", "新能源", "半导体", "芯片", "电池", "行业", "市场", "赛道", "经济"):
+            idx = candidate.find(suffix)
+            if idx >= 0:
+                candidate = candidate[: idx + len(suffix)]
+                break
+    return candidate.strip()
+
+
+def _unicode_query_anchor_terms(value: Any) -> List[str]:
+    subject = _unicode_query_subject(value)
+    if not subject:
+        return []
+    candidates: List[Any] = [subject]
+    compact = re.sub(r"\s+", "", subject)
+    if compact.startswith("中国") and len(compact) > 2:
+        candidates.append(compact[2:])
+    if compact.startswith("国内") and len(compact) > 2:
+        candidates.append(compact[2:])
+    # Keep high-signal subtopics from the original query. This makes topic
+    # guards robust when the planner returns a verbose subject such as
+    # "中国低空经济产业链" but downstream queries only need "低空经济".
+    for pattern in (
+        r"低空经济",
+        r"eVTOL",
+        r"无人机",
+        r"通航",
+        r"人工智能",
+        r"AI\s*Agent",
+        r"AIGC",
+        r"大模型",
+        r"机器人",
+        r"半导体",
+        r"芯片",
+        r"动力电池",
+        r"固态电池",
+        r"储能",
+    ):
+        match = re.search(pattern, str(value or ""), re.I)
+        if match:
+            candidates.append(match.group(0))
+    return _dedupe_limited_terms(candidates, limit=8, max_chars=32)
+
+
+def _looks_placeholder_or_mojibake(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return True
+    compact = re.sub(r"\s+", "", text)
+    if compact.count("?") >= max(3, len(compact) // 3):
+        return True
+    if "\ufffd" in compact:
+        return True
+    return False
+
+
+def _topic_compatible_with_query_anchors(query_anchors: Sequence[str], candidate: Any) -> bool:
+    if not query_anchors:
+        return True
+    text = re.sub(r"\s+", "", str(candidate or "")).lower()
+    if not text or _looks_placeholder_or_mojibake(candidate):
+        return False
+    # A Chinese user query should not accept an unrelated ASCII-only topic from
+    # the planner, e.g. "wind energy windpower" for "中国低空经济".
+    if any(_has_real_cjk(anchor) for anchor in query_anchors) and not _has_real_cjk(text):
+        return False
+    for anchor in query_anchors:
+        key = re.sub(r"\s+", "", str(anchor or "")).lower()
+        if key and (key in text or text in key):
+            return True
+    cjk_tokens = {
+        token
+        for token in re.findall(r"[\u4e00-\u9fff]{2,}", text)
+        if token not in {"中国", "国内", "全球", "行业", "市场", "产业链"}
+    }
+    for anchor in query_anchors:
+        anchor_tokens = {
+            token
+            for token in re.findall(r"[\u4e00-\u9fff]{2,}", str(anchor or ""))
+            if token not in {"中国", "国内", "全球", "行业", "市场", "产业链"}
+        }
+        if cjk_tokens & anchor_tokens:
+            return True
+    return False
+
+
+_PLAN_GENERIC_DIMENSION_TERMS = (
+    "商业化",
+    "机会",
+    "风险",
+    "投资",
+    "判断",
+    "落地",
+    "趋势",
+    "格局",
+)
+
+_PLAN_EVIDENCE_DIMENSION_TERMS = (
+    "政策",
+    "产业链",
+    "供应链",
+    "应用场景",
+    "市场规模",
+    "投资判断",
+    "客户案例",
+    "财报",
+    "公告",
+    "招股书",
+    "反证",
+    "风险事件",
+)
+
+_PLAN_TOPIC_ANCHOR_GENERIC_TERMS = {
+    "产业链",
+    "供应链",
+    "中国市场",
+    "市场",
+    "商业化",
+    "政策",
+    "应用场景",
+    "投资判断",
+    "风险",
+    "机会",
+    "研究",
+    "分析",
+    "判断",
+    "市场规模",
+    "需求",
+    "数据",
+    "统计",
+    "口径",
+    "来源",
+}
+
+
+def _dedupe_limited_terms(values: List[Any], *, limit: int = 8, max_chars: int = 32) -> List[str]:
+    result: List[str] = []
+    seen = set()
+    for value in values:
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        text = text.strip(" ,;:!?，。；：！？、()（）[]【】{}《》\"'")
+        if not text:
+            continue
+        key = re.sub(r"\s+", "", text.lower())
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(text[:max_chars].strip())
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _term_in_plan_text(term: str, *values: Any) -> bool:
+    text = re.sub(r"\s+", "", " ".join(str(value or "") for value in values)).lower()
+    key = re.sub(r"\s+", "", str(term or "")).lower()
+    return bool(key and key in text)
+
+
+def _topic_anchor_variants(term: Any) -> List[str]:
+    text = re.sub(r"\s+", " ", str(term or "")).strip()
+    if not text:
+        return []
+    variants = [text]
+    compact = re.sub(r"\s+", "", text)
+    if compact.startswith("中国") and len(compact) > 2:
+        variants.append(compact[2:])
+    if compact.startswith("国内") and len(compact) > 2:
+        variants.append(compact[2:])
+    return _dedupe_limited_terms(variants, limit=3, max_chars=32)
+
+
+def _is_generic_topic_anchor(term: Any) -> bool:
+    compact = re.sub(r"\s+", "", str(term or "")).strip()
+    if not compact:
+        return True
+    return compact in _PLAN_TOPIC_ANCHOR_GENERIC_TERMS
+
+
+def _derive_topic_anchor_terms_for_plan(
+    *,
+    plan_query: str,
+    research_object: str,
+    global_required_terms: List[str],
+    explicit_terms: List[str],
+) -> List[str]:
+    candidates: List[Any] = [*explicit_terms, research_object, *global_required_terms]
+    anchors: List[Any] = []
+    for value in candidates:
+        if _is_generic_topic_anchor(value):
+            continue
+        anchors.extend(_topic_anchor_variants(value))
+    if not anchors and re.search(r"\bAI\s*Agent\b|智能体|智能代理", plan_query, re.I):
+        anchors.append("AI Agent")
+    return _dedupe_limited_terms(anchors, limit=6, max_chars=32)
+
+
+def _derive_plan_dimensions(plan_query: str, payload: Dict[str, Any], terms: Sequence[str]) -> List[str]:
+    values: List[Any] = [plan_query, payload.get("query"), payload.get("research_object")]
+    values.extend(_as_list(payload.get("key_questions")))
+    values.extend(str(item.get("dimension_name") or item.get("name") or "") for item in _as_list(payload.get("dimensions")) if isinstance(item, dict))
+    found = [term for term in terms if _term_in_plan_text(term, *values)]
+    return _dedupe_limited_terms(found, limit=12, max_chars=24)
 
 
 def _dict_list(value: Any) -> List[Dict[str, Any]]:
@@ -401,6 +642,7 @@ def normalize_search_task(raw: Dict[str, Any], *, fallback_index: int = 1) -> Di
         "chapter_question": chapter_question,
         "query": query,
         "query_contract": _as_dict(task.get("query_contract")),
+        "query_quality": _as_dict(task.get("query_quality")),
         "evidence_goal": evidence_goal,
         "targets_gap": str(task.get("targets_gap") or evidence_goal).strip(),
         "evidence_goal_id": str(task.get("evidence_goal_id") or task.get("goal_id") or "").strip(),
@@ -457,6 +699,14 @@ def normalize_search_task(raw: Dict[str, Any], *, fallback_index: int = 1) -> Di
         "allowed_domains": _string_list(task.get("allowed_domains")),
         "research_object": str(task.get("research_object") or "").strip(),
         "global_required_terms": _compact_search_terms(task.get("global_required_terms"), limit=6),
+        "topic_anchor_terms": _compact_search_terms(task.get("topic_anchor_terms"), limit=6),
+        "topic_anchor_status": str(task.get("topic_anchor_status") or "").strip(),
+        "topic_anchor_repaired": _as_bool(task.get("topic_anchor_repaired"), False),
+        "topic_anchor_missing_before_repair": _as_bool(task.get("topic_anchor_missing_before_repair"), False),
+        "chapter_focus_terms": _compact_search_terms(task.get("chapter_focus_terms"), limit=6),
+        "chapter_focus_status": str(task.get("chapter_focus_status") or "").strip(),
+        "chapter_focus_repaired": _as_bool(task.get("chapter_focus_repaired"), False),
+        "chapter_focus_missing_before_repair": _as_bool(task.get("chapter_focus_missing_before_repair"), False),
     }
 
 
@@ -863,14 +1113,53 @@ def enforce_research_plan_chapter_limits(plan: Dict[str, Any], *, query: str = "
 def normalize_research_plan(raw: Dict[str, Any], *, query: str = "") -> Dict[str, Any]:
     payload = _as_dict(raw)
     article_brief = _as_dict(payload.get("article_brief"))
-    plan_query = str(payload.get("planning_query") or article_brief.get("planning_query") or payload.get("query") or query or "").strip()
+    trusted_query = str(query or "").strip()
+    plan_query = str(trusted_query or payload.get("planning_query") or article_brief.get("planning_query") or payload.get("query") or "").strip()
     article_direction = str(payload.get("article_direction") or article_brief.get("direction") or article_brief.get("display_subtitle") or "").strip()
     report_title = str(payload.get("report_title") or article_brief.get("display_title") or article_brief.get("main_title") or "").strip()
     report_subtitle = str(payload.get("report_subtitle") or article_brief.get("display_subtitle") or "").strip()
     plan_research_object = str(payload.get("research_object") or query or "").strip()
+    original_query_anchor_terms = _unicode_query_anchor_terms(plan_query or query)
+    topic_repaired_from_query = False
+    if original_query_anchor_terms and not _topic_compatible_with_query_anchors(original_query_anchor_terms, plan_research_object):
+        plan_research_object = original_query_anchor_terms[0]
+        topic_repaired_from_query = True
     plan_global_required_terms = _string_list(payload.get("global_required_terms")) or _derive_global_required_terms(
         plan_query,
         plan_research_object,
+    )
+    if original_query_anchor_terms:
+        plan_global_required_terms = _dedupe_limited_terms(
+            [*original_query_anchor_terms, *plan_global_required_terms],
+            limit=8,
+            max_chars=32,
+        )
+    plan_topic_anchor_terms = _derive_topic_anchor_terms_for_plan(
+        plan_query=plan_query,
+        research_object=plan_research_object,
+        global_required_terms=plan_global_required_terms,
+        explicit_terms=_string_list(payload.get("topic_anchor_terms")),
+    )
+    if original_query_anchor_terms:
+        compatible_plan_anchors = [
+            term
+            for term in plan_topic_anchor_terms
+            if _topic_compatible_with_query_anchors(original_query_anchor_terms, term)
+        ]
+        plan_topic_anchor_terms = _dedupe_limited_terms(
+            [*original_query_anchor_terms, *compatible_plan_anchors],
+            limit=8,
+            max_chars=32,
+        )
+    plan_generic_dimensions = _string_list(payload.get("generic_dimensions")) or _derive_plan_dimensions(
+        plan_query,
+        payload,
+        _PLAN_GENERIC_DIMENSION_TERMS,
+    )
+    plan_evidence_dimensions = _string_list(payload.get("evidence_dimensions")) or _derive_plan_dimensions(
+        plan_query,
+        payload,
+        _PLAN_EVIDENCE_DIMENSION_TERMS,
     )
     raw_chapters = [item for item in _as_list(payload.get("chapters")) if isinstance(item, dict)]
     nested_tasks: List[Dict[str, Any]] = []
@@ -1060,12 +1349,24 @@ def normalize_research_plan(raw: Dict[str, Any], *, query: str = "") -> Dict[str
 
     def _attach_plan_topic(payload_item: Dict[str, Any]) -> Dict[str, Any]:
         item = dict(payload_item)
+        topic_anchor = plan_topic_anchor_terms[0] if plan_topic_anchor_terms else plan_research_object
         if plan_research_object and not item.get("research_object"):
             item["research_object"] = plan_research_object
-        if plan_research_object and item.get("query") and plan_research_object not in str(item.get("query") or ""):
-            item["query"] = f"{plan_research_object} {str(item.get('query') or '').strip()}".strip()
+        if plan_topic_anchor_terms and not item.get("topic_anchor_terms"):
+            item["topic_anchor_terms"] = plan_topic_anchor_terms
+        if topic_anchor and item.get("query") and topic_anchor not in str(item.get("query") or ""):
+            item["query"] = f"{topic_anchor} {str(item.get('query') or '').strip()}".strip()
         if plan_global_required_terms and not item.get("global_required_terms"):
             item["global_required_terms"] = plan_global_required_terms
+        if plan_generic_dimensions and not item.get("generic_dimensions"):
+            item["generic_dimensions"] = plan_generic_dimensions
+        if plan_evidence_dimensions and not item.get("evidence_dimensions"):
+            item["evidence_dimensions"] = plan_evidence_dimensions
+        if plan_topic_anchor_terms:
+            contract = _as_dict(item.get("query_contract"))
+            contract.setdefault("topic_anchor_terms", plan_topic_anchor_terms)
+            contract.setdefault("topic_anchor_required", True)
+            item["query_contract"] = contract
         if plan_global_required_terms:
             existing_terms = _string_list(item.get("must_have_terms"))
             merged_terms: List[str] = []
@@ -1123,9 +1424,13 @@ def normalize_research_plan(raw: Dict[str, Any], *, query: str = "") -> Dict[str
         "report_title": report_title,
         "report_subtitle": report_subtitle,
         "research_type": str(payload.get("research_type") or "generic_topic").strip(),
+        "research_domain": str(payload.get("research_domain") or _as_dict(payload.get("problem_framing")).get("research_domain") or "").strip(),
         "decision_context": str(payload.get("decision_context") or "").strip(),
         "report_family": str(payload.get("report_family") or "briefing_note").strip(),
         "research_object": plan_research_object,
+        "topic_anchor_terms": plan_topic_anchor_terms,
+        "generic_dimensions": plan_generic_dimensions,
+        "evidence_dimensions": plan_evidence_dimensions,
         "core_question": str(payload.get("core_question") or payload.get("question") or query or "").strip(),
         "key_questions": key_questions,
         "hypotheses": hypotheses,
@@ -1143,6 +1448,8 @@ def normalize_research_plan(raw: Dict[str, Any], *, query: str = "") -> Dict[str
         "global_forbidden_terms": _string_list(payload.get("global_forbidden_terms")),
         "global_required_terms": plan_global_required_terms,
         "quality_rules": _as_dict(payload.get("quality_rules")),
+        "topic_repaired_from_query": topic_repaired_from_query,
+        "original_query_anchor_terms": original_query_anchor_terms,
         "legacy_planner_chapters": [dict(item) for item in _as_list(payload.get("legacy_planner_chapters")) if isinstance(item, dict)],
         "legacy_planner_dimensions": [dict(item) for item in _as_list(payload.get("legacy_planner_dimensions")) if isinstance(item, dict)],
         "legacy_planner_search_tasks": [dict(item) for item in _as_list(payload.get("legacy_planner_search_tasks")) if isinstance(item, dict)],

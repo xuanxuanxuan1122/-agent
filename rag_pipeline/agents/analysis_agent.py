@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -12,6 +13,12 @@ import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple, TypedDict
 
 try:
+    from rag_pipeline.contracts.chapter_identity import (
+        build_chapter_identity_map,
+        canonical_chapter_ids,
+        canonical_chapter_payload,
+        resolve_canonical_chapter_id,
+    )
     from rag_pipeline.contracts.claim_roles import classify_claim_unit_roles
     from rag_pipeline.contracts.evidence_identity import build_evidence_alias_map
     from rag_pipeline.contracts.evidence_support_validation import (
@@ -19,14 +26,30 @@ try:
         validate_claim_supported_by_facts,
     )
     from rag_pipeline.contracts.research_reflection import build_research_reflection_memo
-    from rag_pipeline.contracts.evidence_quality import classify_evidence
+    from rag_pipeline.contracts.evidence_quality import (
+        NON_CLAIM_ALLOWED_USES,
+        NON_CLAIM_ANALYSIS_READINESS,
+        classify_evidence,
+    )
     from rag_pipeline.contracts.json_salvage import salvage_chapter_json
-    from rag_pipeline.contracts.quality_gate_policy import quality_gate_mode, quality_gates_isolated
+    from rag_pipeline.contracts.quality_gate_policy import advisory_weight_mode, quality_gate_mode, quality_gates_isolated
     from rag_pipeline.contracts.ref_normalizer import normalize_claim_refs
     from rag_pipeline.search.memory import call_openai_compatible_json, llm_config_is_ready, normalize_llm_config
     from .evidence_merger import get_dynamic_dimensions
     from .summary_quality import sanitize_summary_judgments
 except Exception:  # pragma: no cover - script mode fallback
+    try:
+        from rag_pipeline.contracts.chapter_identity import (  # type: ignore
+            build_chapter_identity_map,
+            canonical_chapter_ids,
+            canonical_chapter_payload,
+            resolve_canonical_chapter_id,
+        )
+    except Exception:  # pragma: no cover
+        build_chapter_identity_map = None  # type: ignore
+        canonical_chapter_ids = None  # type: ignore
+        canonical_chapter_payload = None  # type: ignore
+        resolve_canonical_chapter_id = None  # type: ignore
     try:
         from rag_pipeline.contracts.claim_roles import classify_claim_unit_roles  # type: ignore
     except Exception:  # pragma: no cover
@@ -36,16 +59,39 @@ except Exception:  # pragma: no cover - script mode fallback
     except Exception:  # pragma: no cover
         build_evidence_alias_map = None  # type: ignore
     try:
-        from rag_pipeline.contracts.evidence_quality import classify_evidence  # type: ignore
+        from rag_pipeline.contracts.evidence_quality import (  # type: ignore
+            NON_CLAIM_ALLOWED_USES,
+            NON_CLAIM_ANALYSIS_READINESS,
+            classify_evidence,
+        )
     except Exception:  # pragma: no cover
+        NON_CLAIM_ALLOWED_USES = {  # type: ignore
+            "rejected",
+            "not_allowed",
+            "not_for_writing",
+            "diagnostic_only",
+            "appendix_only",
+            "clue_only",
+            "clue",
+            "search_only",
+        }
+        NON_CLAIM_ANALYSIS_READINESS = {  # type: ignore
+            "blocked",
+            "followup_only",
+            "clue_only",
+            "diagnostic_only",
+        }
         classify_evidence = None  # type: ignore
     try:
         from rag_pipeline.contracts.json_salvage import salvage_chapter_json  # type: ignore
     except Exception:  # pragma: no cover
         salvage_chapter_json = None  # type: ignore
     try:
-        from rag_pipeline.contracts.quality_gate_policy import quality_gate_mode, quality_gates_isolated  # type: ignore
+        from rag_pipeline.contracts.quality_gate_policy import advisory_weight_mode, quality_gate_mode, quality_gates_isolated  # type: ignore
     except Exception:  # pragma: no cover
+        def advisory_weight_mode(default: bool = False) -> bool:  # type: ignore
+            return default
+
         def quality_gate_mode(default: str = "blocking") -> str:  # type: ignore
             return default
 
@@ -76,10 +122,86 @@ except Exception:  # pragma: no cover - script mode fallback
     from evidence_merger import get_dynamic_dimensions  # type: ignore
     from summary_quality import sanitize_summary_judgments  # type: ignore
 
+try:
+    from rag_pipeline.cache.stage_execution_guard import (
+        get_cached_stage_output as _stage_guard_get_cached_output,
+        record_stage_execution as _stage_guard_record_execution,
+        stable_stage_hash as _stage_guard_hash,
+        stage_cache_enabled as _stage_guard_cache_enabled,
+        stage_guard_enabled as _stage_guard_enabled,
+        store_stage_output as _stage_guard_store_output,
+    )
+except Exception:  # pragma: no cover - diagnostics only.
+    _stage_guard_get_cached_output = None  # type: ignore
+    _stage_guard_record_execution = None  # type: ignore
+    _stage_guard_hash = None  # type: ignore
+    _stage_guard_cache_enabled = None  # type: ignore
+    _stage_guard_enabled = None  # type: ignore
+    _stage_guard_store_output = None  # type: ignore
+
+
+@dataclass(frozen=True)
+class NumericGroundingResult:
+    valid: bool
+    reasons: List[str]
+    numbers: List[str]
+
+
+NUMERIC_FACT_TOKEN_RE = re.compile(
+    r"\d+(?:\.\d+)?\s*(?:万亿元|亿元|万元|%|％|个百分点|万台|万架|万家|万套|台|架|家|个)"
+)
+MALFORMED_YEAR_RANGE_RE = re.compile(r"20\d{2}\s*[-—]\s*\d{1,2}\s*年")
+
+
+def _numeric_grounding_text(value: Any) -> str:
+    text = re.sub(r"\s+", "", str(value or ""))
+    return text.replace("％", "%")
+
+
+def validate_numeric_fact_grounding(claim_text: str, cited_facts: Sequence[Dict[str, Any]]) -> NumericGroundingResult:
+    """Check that public numeric hard facts are present in cited facts."""
+
+    reasons: List[str] = []
+    claim = str(claim_text or "")
+    if MALFORMED_YEAR_RANGE_RE.search(claim):
+        reasons.append("malformed_year_range")
+    fact_text = " ".join(
+        str(
+            fact.get("fact")
+            or fact.get("clean_fact")
+            or fact.get("distilled_fact")
+            or fact.get("text")
+            or fact.get("content")
+            or ""
+        )
+        for fact in list(cited_facts or [])
+        if isinstance(fact, dict)
+    )
+    fact_norm = _numeric_grounding_text(fact_text)
+    numbers = [re.sub(r"\s+", "", token).replace("％", "%") for token in NUMERIC_FACT_TOKEN_RE.findall(claim)]
+    for token in numbers:
+        if token and token not in fact_norm:
+            reasons.append("unsupported_number_or_unit")
+            break
+    return NumericGroundingResult(valid=not reasons, reasons=_dedupe(reasons), numbers=_dedupe(numbers))
+
+try:  # Runtime probes are diagnostic-only and must never block analysis.
+    from rag_pipeline.observability.probe_api import emit_transform as _probe_emit_transform
+    from rag_pipeline.observability.probe_context import current_probe_context_from_env as _current_probe_context_from_env
+    from rag_pipeline.observability.data_root_hygiene import inspect_evidence_analysis_hygiene as _inspect_evidence_analysis_hygiene
+except Exception:  # pragma: no cover - optional diagnostics only.
+    _probe_emit_transform = None
+    _current_probe_context_from_env = None
+    _inspect_evidence_analysis_hygiene = None
+
 
 AGENT_NAME = "analysis_agent"
 AGENT_DESCRIPTION = "Dynamic Research Claim Builder. Converts evidence packages into claim units for the writer."
 CHAPTER_EVIDENCE_COLLECTIONS = (
+    "analysis_ready_facts",
+    "fact_cards",
+    "evidence_cards",
+    "evidence_fact_cards",
     "core_evidence",
     "supporting_evidence",
     "metric_evidence",
@@ -188,6 +310,81 @@ def _int_or_zero(value: Any) -> int:
         return 0
 
 
+def _emit_analysis_agent_probe(result: Dict[str, Any]) -> None:
+    """Record analysis-ready evidence to claim-unit conversion as a sidecar event."""
+
+    if _probe_emit_transform is None or _current_probe_context_from_env is None:
+        return
+    try:
+        probe = _current_probe_context_from_env()
+        if probe is None:
+            return
+        package = _as_dict(result.get("evidence_package"))
+        structured = _as_dict(result.get("structured_analysis"))
+        diagnostics = _as_dict(structured.get("analysis_stage_diagnostics"))
+        analysis_ready = [item for item in _as_list(package.get("analysis_ready_evidence")) if isinstance(item, dict)]
+        claim_units = [item for item in _as_list(structured.get("claim_units")) if isinstance(item, dict)]
+        bound_claims = sum(1 for item in claim_units if _as_list(item.get("fact_ids") or item.get("used_evidence_ids") or item.get("used_fact_refs")))
+        requirement_bound = sum(1 for item in claim_units if _as_list(item.get("requirement_ids")) or str(item.get("requirement_id") or "").strip())
+        output_claim_count = len(claim_units)
+        raw_claim_count = _int_or_zero(diagnostics.get("llm_raw_claim_count")) or output_claim_count
+        dropped_claim_count = _int_or_zero(diagnostics.get("llm_dropped_claim_count"))
+        deferred_claim_count = _int_or_zero(diagnostics.get("llm_deferred_claim_count"))
+        evidence_hygiene = _inspect_evidence_analysis_hygiene(analysis_ready) if _inspect_evidence_analysis_hygiene else {}
+        evidence_dirty_count = int(evidence_hygiene.get("dirty_item_count") or 0) if isinstance(evidence_hygiene, dict) else 0
+        evidence_reason_counts = dict(evidence_hygiene.get("reason_counts") or {}) if isinstance(evidence_hygiene, dict) else {}
+        _probe_emit_transform(
+            probe,
+            stage="analysis_agent",
+            module="analysis_agent",
+            input_count=len(analysis_ready),
+            output_count=output_claim_count,
+            drop_count=max(0, raw_claim_count - output_claim_count) + dropped_claim_count,
+            status="ok" if output_claim_count > 0 else "warning",
+            reason_counts={
+                **_as_dict(diagnostics.get("llm_validation_issue_counts")),
+                "dropped_claim": dropped_claim_count,
+                "deferred_claim": deferred_claim_count,
+                "quality_path_degraded": 1 if diagnostics.get("quality_path_degraded") else 0,
+                "input_evidence_dirty_item": evidence_dirty_count,
+                **{f"input_evidence_{key}": value for key, value in evidence_reason_counts.items()},
+            },
+            id_coverage={
+                "claim_fact_binding": (bound_claims / output_claim_count) if output_claim_count else 0.0,
+                "claim_requirement_binding": (requirement_bound / output_claim_count) if output_claim_count else 0.0,
+                "input_requirement_id": (
+                    sum(1 for item in analysis_ready if str(item.get("requirement_id") or "").strip()) / len(analysis_ready)
+                )
+                if analysis_ready
+                else 0.0,
+            },
+            cache={
+                "llm_analysis_cache_hit_count": _int_or_zero(diagnostics.get("llm_analysis_cache_hit_count")),
+                "semantic_judge_cache_hit_count": _int_or_zero(_as_dict(diagnostics.get("llm_semantic_judge_counts")).get("cache_hit")),
+            },
+            metrics={
+                "llm_usable_claim_count": _int_or_zero(diagnostics.get("llm_usable_claim_count")),
+                "llm_raw_claim_count": _int_or_zero(diagnostics.get("llm_raw_claim_count")),
+                "llm_usable_chapter_count": _int_or_zero(diagnostics.get("llm_usable_chapter_count")),
+                "decision_ready_claim_count": _int_or_zero(diagnostics.get("decision_ready_claim_count")),
+                "directional_claim_count": _int_or_zero(diagnostics.get("directional_claim_count")),
+            },
+            diagnostics={
+                "final_analysis_source": diagnostics.get("final_analysis_source") or "",
+                "uses_llm_analysis": bool(diagnostics.get("uses_llm_analysis")),
+                "llm_analysis_status": diagnostics.get("llm_analysis_status") or "",
+                "llm_usable_claim_count": _int_or_zero(diagnostics.get("llm_usable_claim_count")),
+                "llm_dropped_claim_count": dropped_claim_count,
+                "llm_deferred_claim_count": deferred_claim_count,
+                "research_reflection_status": diagnostics.get("research_reflection_status") or "",
+                "research_reflection_seed_count": _int_or_zero(diagnostics.get("research_reflection_seed_count")),
+                "evidence_root_hygiene": evidence_hygiene,
+            },
+        )
+    except Exception:
+        return
+
+
 def _compact(value: Any, max_chars: int = 260) -> str:
     text = re.sub(r"\s+", " ", str(value or "")).strip()
     if len(text) <= max_chars:
@@ -233,6 +430,9 @@ GENERIC_LLM_CLAIM_PATTERNS = [
     r"方向性观察",
     r"后续验证",
     r"继续校准",
+    r"已有可观察的公开资料信号",
+    r"已有方向性公开资料信号",
+    r"已有初步公开资料线索",
 ]
 
 
@@ -353,6 +553,10 @@ def _normalize_key(value: Any) -> str:
     return re.sub(r"[^\w\u4e00-\u9fff]+", "", text)
 
 
+def _is_canonical_chapter_key(value: Any) -> bool:
+    return bool(re.fullmatch(r"ch[_-]?\d{1,3}", str(value or "").strip().lower()))
+
+
 def _overlaps(left: Any, right: Any) -> bool:
     left_key = _normalize_key(left)
     right_key = _normalize_key(right)
@@ -371,15 +575,62 @@ def _research_plan(evidence_package: Dict[str, Any]) -> Dict[str, Any]:
 def _analysis_dimensions(evidence_package: Dict[str, Any]) -> List[str]:
     research_plan = _research_plan(evidence_package)
     dimensions = get_dynamic_dimensions(research_plan)
+    chapter_packages = [
+        chapter
+        for chapter in _as_list(evidence_package.get("chapter_evidence_packages"))
+        if isinstance(chapter, dict)
+    ]
+    if chapter_packages:
+        canonical_dimensions: List[str] = []
+        aliases: set[str] = set()
+        for index, chapter in enumerate(chapter_packages, start=1):
+            chapter_id = str(
+                chapter.get("chapter_id")
+                or chapter.get("dimension_id")
+                or _normalize_key(chapter.get("chapter_title") or chapter.get("chapter_question"))
+                or f"ch_{index:02d}"
+            ).strip()
+            if chapter_id and chapter_id not in canonical_dimensions:
+                canonical_dimensions.append(chapter_id)
+            for value in (
+                chapter_id,
+                chapter.get("chapter_title"),
+                chapter.get("chapter_question"),
+                chapter.get("dimension_id"),
+            ):
+                raw = str(value or "").strip()
+                if not raw:
+                    continue
+                aliases.add(raw)
+                normalized = _normalize_key(raw)
+                if normalized:
+                    aliases.add(normalized)
+        for dimension in dimensions:
+            text = str(dimension or "").strip()
+            if not text or text in canonical_dimensions:
+                continue
+            normalized = _normalize_key(text)
+            if text in aliases or (normalized and normalized in aliases):
+                continue
+            canonical_dimensions.append(text)
+        return canonical_dimensions or ["缁煎悎鐮旂┒闂"]
     for dimension in _as_dict(evidence_package.get("per_dimension")).keys():
         text = str(dimension or "").strip()
         if text and text not in dimensions:
             dimensions.append(text)
     for item in _as_list(evidence_package.get("analysis_ready_evidence")) + _as_list(evidence_package.get("clean_evidence_list")):
         if isinstance(item, dict):
-            text = str(item.get("dimension_name") or item.get("evidence_goal") or item.get("dimension") or "").strip()
-            if text and text not in dimensions:
-                dimensions.append(text)
+            for value in (
+                item.get("chapter_id"),
+                item.get("dimension_id"),
+                item.get("hypothesis_id"),
+                item.get("dimension_name"),
+                item.get("evidence_goal"),
+                item.get("dimension"),
+            ):
+                text = str(value or "").strip()
+                if text and text not in dimensions:
+                    dimensions.append(text)
     for chapter in _as_list(evidence_package.get("chapter_evidence_packages")):
         if not isinstance(chapter, dict):
             continue
@@ -552,6 +803,21 @@ NOISY_PUBLIC_FACT_RE = re.compile(
     re.I,
 )
 
+RAW_PAGE_FRAGMENT_RE = re.compile(
+    r"(https?://|www\.|!\(|\]\(|#{2,}|/detail\.php|"
+    r"\b(login|contact|copyright|javascript|cookie|download)\b|"
+    r"热门文章|最新文章|浏览量|文章来源|字号|打印|关闭|"
+    r"首页|联系我们|加入我们|上一篇|下一篇|中\s*EN|EN\s*安泰)",
+    re.I,
+)
+WEB_CHROME_FRAGMENT_RE = re.compile(
+    r"/newstatic/images/logo|(?:^|/|\\)logo\.(?:gif|png|jpg|jpeg|webp|svg)\b|"
+    r"\u6570\u636e\u4e2d\u5fc3|\u5168\u7403\u8d22\u7ecf\u5feb\u8baf|\u8d22\u7ecf\u5feb\u8baf|"
+    r"\u884c\u60c5\u4e2d\u5fc3|Choice\s*\u6570\u636e|\u4e1c\u65b9\u8d22\u5bcc|\u81ea\u9009\u80a1|\u80a1\u5427|"
+    r"(?:\[[^\]]{0,80}\]\((?:https?:)?//[^)]+|/[^)]+\).*){2,}",
+    re.I,
+)
+
 
 def _public_fact_quality(item: Dict[str, Any]) -> Dict[str, Any]:
     return _as_dict(item.get("public_fact_quality"))
@@ -566,12 +832,24 @@ def _public_fact_card(item: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
+def _normalize_public_fact_markup(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", text)
+    text = re.sub(r"\[([^\]]{2,240})\]\((?:https?:)?/?[^)]+\)", r"\1", text)
+    text = re.sub(r"\[([^\]]{2,260})\]", r"\1", text)
+    text = re.sub(r"^\s*[-*]\s*", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip(" -—:：;；。")
+
+
 def _distilled_public_fact(item: Dict[str, Any]) -> str:
     card = _public_fact_card(item)
     quality = _public_fact_quality(item)
     for payload in (card, quality, item):
         for key in ("distilled_fact", "fact", "clean_fact", "summary", "object", "finding"):
-            text = _compact(_as_dict(payload).get(key), 260)
+            text = _compact(_normalize_public_fact_markup(_as_dict(payload).get(key)), 260)
             if text:
                 return text
     subject = _compact(card.get("subject"), 80)
@@ -588,9 +866,68 @@ def _is_noisy_public_fact(text: Any) -> bool:
         return True
     if NOISY_PUBLIC_FACT_RE.search(value):
         return True
+    if RAW_PAGE_FRAGMENT_RE.search(value):
+        return True
+    if WEB_CHROME_FRAGMENT_RE.search(value):
+        return True
     if re.fullmatch(r"[-+]?\d+(?:\.\d+)?%?", value):
         return True
     return False
+
+
+def _analysis_readiness(item: Dict[str, Any]) -> str:
+    return str(item.get("analysis_readiness") or _as_dict(item.get("evidence_card")).get("analysis_readiness") or "").strip()
+
+
+def _non_claim_status_reason(item: Dict[str, Any]) -> str:
+    allowed = _analysis_allowed_use(item).strip().lower()
+    if allowed in NON_CLAIM_ALLOWED_USES:
+        return f"allowed_use:{allowed}"
+    readiness = _analysis_readiness(item).strip().lower()
+    if readiness in NON_CLAIM_ANALYSIS_READINESS:
+        return f"analysis_readiness:{readiness}"
+    return ""
+
+
+QUALITATIVE_PROOF_ROLES = {
+    "source_check",
+    "support",
+    "case",
+    "counter",
+    "filing",
+    "policy",
+    "official_data",
+    "technology_product",
+    "boundary",
+}
+
+
+def _metric_proof_gaps_block_claim(item: Dict[str, Any]) -> bool:
+    gaps = _as_list(item.get("metric_proof_gaps") or _as_dict(item.get("evidence_card")).get("metric_proof_gaps"))
+    if not gaps:
+        return False
+    proof_role = str(item.get("proof_role") or _as_dict(item.get("evidence_card")).get("proof_role") or "").strip().lower()
+    claim_type = str(item.get("claim_type") or item.get("conclusion_type") or _as_dict(item.get("evidence_card")).get("claim_type") or "").strip().lower()
+    metric = str(item.get("metric") or "").strip().lower()
+    has_value = bool(
+        str(item.get("value") or "").strip()
+        or item.get("numeric_values")
+        or item.get("numeric_value") is not None
+    )
+    if advisory_weight_mode() and _analysis_allowed_use(item) in {"supporting_context", "directional_signal"}:
+        if proof_role in QUALITATIVE_PROOF_ROLES or metric in QUALITATIVE_PROOF_ROLES:
+            return False
+    if proof_role in QUALITATIVE_PROOF_ROLES and not has_value:
+        return False
+    return claim_type == "hard_metric" or proof_role == "metric" or has_value
+
+
+def _analysis_public_fact_text(item: Dict[str, Any], *, max_chars: int = 180) -> str:
+    text = _distilled_public_fact(item) or _fact_text(item)
+    text = _public_normalize_analysis_text(_compact(text, max_chars))
+    if _is_noisy_public_fact(text):
+        return ""
+    return text
 
 
 def _is_public_quality_card(item: Dict[str, Any]) -> bool:
@@ -606,6 +943,8 @@ def _is_public_quality_card(item: Dict[str, Any]) -> bool:
     if quality and quality.get("eligible_for_report") is False:
         return False
     if quality and str(quality.get("rejection_reason") or "").strip():
+        return False
+    if _non_claim_status_reason(item):
         return False
     if not _has_traceable_source(item):
         return False
@@ -649,7 +988,15 @@ def _ensure_sentence(text: Any) -> str:
 
 
 def _claim_from_public_fact(dimension: Any, fact: Any, strength: str = "") -> str:
-    return _ensure_sentence(fact)
+    topic = _compact(dimension, 100)
+    if not topic or _is_canonical_chapter_key(_normalize_key(topic)):
+        topic = "本章主题"
+    strength_key = str(strength or "").strip().lower()
+    if strength_key in {"strong", "moderate"}:
+        return f"{topic}已有可观察的公开资料信号，后续判断需结合来源范围、样本边界和时间窗口校准。"
+    if strength_key == "directional":
+        return f"{topic}已有方向性公开资料信号，但仍需避免把单一材料外推为确定性结论。"
+    return f"{topic}已有初步公开资料线索，可作为后续分析的背景信号。"
 
 
 def _reasoning_from_public_facts(facts: List[str]) -> str:
@@ -765,6 +1112,11 @@ def _items_for_dimension(evidence_package: Dict[str, Any], dimension: str) -> Li
             _normalize_key(item.get("dimension")),
         }
         item_keys = {key for key in item_keys if key}
+        dimension_key = _normalize_key(dimension)
+        if _is_canonical_chapter_key(dimension_key):
+            if dimension_key in item_keys:
+                items.append(dict(item))
+            continue
         if dimension_keys & item_keys or any(_overlaps(dimension, key) for key in item_keys):
             items.append(dict(item))
     for chapter in _as_list(evidence_package.get("chapter_evidence_packages")):
@@ -779,7 +1131,10 @@ def _items_for_dimension(evidence_package: Dict[str, Any], dimension: str) -> Li
         }
         chapter_keys = {key for key in chapter_keys if key}
         dimension_key = _normalize_key(dimension)
-        if dimension_key not in chapter_keys and not any(_overlaps(dimension, key) for key in chapter_keys):
+        if _is_canonical_chapter_key(dimension_key):
+            if dimension_key not in chapter_keys:
+                continue
+        elif dimension_key not in chapter_keys and not any(_overlaps(dimension, key) for key in chapter_keys):
             continue
         for collection in CHAPTER_EVIDENCE_COLLECTIONS:
             for item in _as_list(chapter.get(collection)):
@@ -929,20 +1284,35 @@ def _select_analysis_items_for_dimension(items: Sequence[Dict[str, Any]], *, max
 
 def _claim_units_from_synthesis(dimension_synthesis: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
     units: List[Dict[str, Any]] = []
+    seen_units: set[Tuple[str, Tuple[str, ...]]] = set()
     for dimension, synthesis in dimension_synthesis.items():
         synthesis = _as_dict(synthesis)
         claim = synthesis.get("takeaway") or ""
+        refs = synthesis.get("evidence_ids") or synthesis.get("directional_evidence_ids") or synthesis.get("fact_ids") or []
         if not str(claim or "").strip():
             continue
+        if not _as_list(refs):
+            continue
+        chapter_id = str(synthesis.get("chapter_id") or "").strip()
+        unit_id = f"{chapter_id or _normalize_key(dimension) or 'fallback'}_fallback"
+        unit_key = (unit_id, tuple(str(ref or "").strip() for ref in _as_list(refs) if str(ref or "").strip()))
+        if unit_key in seen_units:
+            continue
+        seen_units.add(unit_key)
         units.append(
             {
+                "id": unit_id,
+                "chapter_id": chapter_id,
                 "question": dimension,
                 "claim": claim,
                 "claim_status": "decision_ready" if _as_list(synthesis.get("evidence_ids")) else "directional",
                 "claim_strength": synthesis.get("claim_strength") or ("moderate" if _as_list(synthesis.get("evidence_ids")) else "directional"),
                 "quality_status": "valid" if _as_list(synthesis.get("evidence_ids")) else "directional_with_boundary",
-                "supporting_evidence": synthesis.get("evidence_ids") or synthesis.get("directional_evidence_ids") or [],
-                "evidence_refs": synthesis.get("evidence_ids") or synthesis.get("directional_evidence_ids") or [],
+                "supporting_evidence": refs,
+                "evidence_refs": refs,
+                "fact_ids": synthesis.get("fact_ids") or refs,
+                "requirement_ids": _as_list(synthesis.get("requirement_ids")),
+                "source_ids": _as_list(synthesis.get("source_ids")),
                 "counter_evidence": synthesis.get("counter") or "",
                 "reasoning": synthesis.get("mechanism") or synthesis.get("explain_why") or "",
                 "mechanism": synthesis.get("mechanism") or "",
@@ -952,6 +1322,12 @@ def _claim_units_from_synthesis(dimension_synthesis: Dict[str, Dict[str, Any]]) 
             }
         )
     return units
+
+
+def _is_fallback_synthesis_claim(item: Dict[str, Any]) -> bool:
+    claim_text = item.get("claim") or item.get("judgment") or item.get("takeaway") or ""
+    identifier = str(item.get("id") or item.get("claim_id") or "").strip().lower()
+    return identifier.endswith("_fallback") or _is_generic_llm_claim(claim_text)
 
 
 def _chapter_insights_from_synthesis(
@@ -981,14 +1357,18 @@ def _chapter_insights_from_synthesis(
         )
         claim = synthesis.get("takeaway") or ""
         key_claims = []
+        refs = synthesis.get("evidence_ids") or synthesis.get("directional_evidence_ids") or synthesis.get("fact_ids") or []
         if str(claim or "").strip():
             key_claims.append(
                 {
                     "claim": claim,
                     "claim_status": "decision_ready" if _as_list(synthesis.get("evidence_ids")) else "directional",
                     "claim_strength": synthesis.get("claim_strength") or ("moderate" if _as_list(synthesis.get("evidence_ids")) else "directional"),
-                    "supporting_evidence": synthesis.get("evidence_ids") or synthesis.get("directional_evidence_ids") or [],
-                    "evidence_refs": synthesis.get("evidence_ids") or synthesis.get("directional_evidence_ids") or [],
+                    "supporting_evidence": refs,
+                    "evidence_refs": refs,
+                    "fact_ids": synthesis.get("fact_ids") or refs,
+                    "requirement_ids": _as_list(synthesis.get("requirement_ids")),
+                    "source_ids": _as_list(synthesis.get("source_ids")),
                     "mechanism": synthesis.get("mechanism") or "",
                     "reasoning": synthesis.get("mechanism") or "",
                     "counter_evidence": synthesis.get("counter") or "",
@@ -1026,6 +1406,8 @@ def _analysis_allowed_use(item: Dict[str, Any]) -> str:
     allowed = str(item.get("allowed_use") or _as_dict(item.get("evidence_card")).get("allowed_use") or "").strip()
     if allowed:
         return allowed
+    if advisory_weight_mode() and _has_traceable_source(item):
+        return "supporting_context"
     if classify_evidence is not None:
         return str(classify_evidence(item).get("allowed_use") or "").strip() or "appendix_only"
     level = _analysis_source_level(item)
@@ -1047,10 +1429,14 @@ def _analysis_allowed_use(item: Dict[str, Any]) -> str:
 
 def _is_usable_for_claim(item: Dict[str, Any]) -> bool:
     allowed_use = _analysis_allowed_use(item)
-    readiness = str(item.get("analysis_readiness") or _as_dict(item.get("evidence_card")).get("analysis_readiness") or "").strip()
-    if readiness in {"blocked", "followup_only", "directional_ready"}:
+    readiness = _analysis_readiness(item)
+    if _non_claim_status_reason(item):
         return False
-    if _as_list(item.get("metric_proof_gaps") or _as_dict(item.get("evidence_card")).get("metric_proof_gaps")):
+    if _metric_proof_gaps_block_claim(item):
+        return False
+    if advisory_weight_mode():
+        return _has_traceable_source(item)
+    if readiness == "directional_ready":
         return False
     return (
         _analysis_source_level(item) in {"A", "B"}
@@ -1090,7 +1476,7 @@ def _evidence_gap_tags(item: Dict[str, Any]) -> List[str]:
             gaps.append("title_only_source")
     if level in {"A", "B"} and allowed in {"core_claim", "supporting"} and traceable and not _has_verified_source(item):
         gaps.append("source_not_verified")
-    if level not in {"A", "B"} and allowed != "directional_signal":
+    if level not in {"A", "B"} and allowed != "directional_signal" and not advisory_weight_mode():
         gaps.append("needs_authoritative_source")
     if allowed in {"clue", "appendix_only"}:
         gaps.append("needs_corroboration")
@@ -1180,6 +1566,9 @@ def _evidence_analysis(item: Dict[str, Any], dimension: str, index: int) -> Dict
         "evidence_id": evidence_id,
         "chapter_id": item.get("chapter_id"),
         "dimension_id": item.get("dimension_id"),
+        "requirement_id": item.get("requirement_id") or item.get("evidence_goal_id"),
+        "source_id": item.get("source_id") or item.get("run_source_id") or source.get("id") or source.get("ref"),
+        "search_task_id": item.get("search_task_id") or item.get("task_id"),
         "evidence_goal": item.get("evidence_goal"),
         "dimension": dimension,
         "fact": fact,
@@ -1239,8 +1628,18 @@ def _dimension_synthesis(dimension: str, analyses: List[Dict[str, Any]]) -> Dict
     ]
     evidence_ids = [str(item.get("evidence_id")) for item in usable if item.get("evidence_id")][:12]
     directional_ids = [str(item.get("evidence_id")) for item in directional if item.get("evidence_id")][:12]
-    usable_facts = [_compact(item.get("fact"), 120) for item in usable if str(item.get("fact") or "").strip()]
-    directional_facts = [_compact(item.get("fact"), 120) for item in directional if str(item.get("fact") or "").strip()]
+    usable_facts = [
+        fact
+        for item in usable
+        for fact in [_analysis_public_fact_text(item, max_chars=120)]
+        if fact
+    ]
+    directional_facts = [
+        fact
+        for item in directional
+        for fact in [_analysis_public_fact_text(item, max_chars=120)]
+        if fact
+    ]
     verified_source_keys = {
         _source_identity_key(item)
         for item in usable
@@ -1269,7 +1668,11 @@ def _dimension_synthesis(dimension: str, analyses: List[Dict[str, Any]]) -> Dict
             if str(item.get("suggested_followup_query") or "").strip()
         ]
     )
-    first_fact = usable_facts[0] if usable_facts else (directional_facts[0] if directional_facts else _compact(_as_dict(analyses[0] if analyses else {}).get("fact"), 220))
+    first_fact = usable_facts[0] if usable_facts else (
+        directional_facts[0]
+        if directional_facts
+        else _analysis_public_fact_text(_as_dict(analyses[0] if analyses else {}), max_chars=220)
+    )
     fact_chain = usable_facts[:5] if usable_facts else directional_facts[:5]
     metric_facts = [
         _compact(f"{item.get('metric')}: {item.get('value')} {item.get('period') or ''}", 160)
@@ -1306,7 +1709,16 @@ def _dimension_synthesis(dimension: str, analyses: List[Dict[str, Any]]) -> Dict
             "evidence_gap_tags": all_gaps,
             "followup_queries": followups[:6],
         }
-    takeaway = _claim_from_public_fact(dimension, first_fact, claim_strength)
+    source_items = usable or directional
+    dimension_label = next(
+        (
+            str(item.get("dimension_name") or item.get("evidence_goal") or item.get("dimension") or "").strip()
+            for item in source_items
+            if str(item.get("dimension_name") or item.get("evidence_goal") or item.get("dimension") or "").strip()
+        ),
+        dimension,
+    )
+    takeaway = _claim_from_public_fact(dimension_label, first_fact, claim_strength)
     mechanism_chain = _build_mechanism_chain(
         fact_chain=fact_chain,
         metric_facts=metric_facts,
@@ -1317,8 +1729,26 @@ def _dimension_synthesis(dimension: str, analyses: List[Dict[str, Any]]) -> Dict
     counter = _ensure_sentence(counter_facts[0]) if counter_facts else "反向样本或失败案例仍需补充，用于校准该判断的适用边界。"
     verify_kpi = _build_verify_kpi(all_gaps, followups, metric_facts)
     decision_implication = _build_decision_implication(claim_strength, first_fact)
-    source_items = usable or directional
+    chapter_ids = _dedupe([item.get("chapter_id") or item.get("dimension_id") for item in source_items])
+    requirement_ids = _dedupe(
+        [
+            item.get("requirement_id")
+            or item.get("evidence_goal_id")
+            or item.get("search_task_id")
+            for item in source_items
+        ]
+    )
+    source_ids = _dedupe(
+        [
+            item.get("source_id")
+            or item.get("run_source_id")
+            or _source_payload(item).get("id")
+            or _source_payload(item).get("ref")
+            for item in source_items
+        ]
+    )
     return {
+        "chapter_id": chapter_ids[0] if chapter_ids else "",
         "takeaway": takeaway,
         "chapter_answer": takeaway,
         "fact": first_fact,
@@ -1334,6 +1764,9 @@ def _dimension_synthesis(dimension: str, analyses: List[Dict[str, Any]]) -> Dict
         "decision_implication": decision_implication,
         "evidence_ids": evidence_ids,
         "directional_evidence_ids": directional_ids,
+        "fact_ids": evidence_ids or directional_ids,
+        "requirement_ids": requirement_ids,
+        "source_ids": source_ids,
         "claim_strength": claim_strength,
         "distinct_verified_ab_source_count": distinct_verified_source_count,
         "confidence": round(sum(_confidence(item) for item in source_items) / max(len(source_items), 1), 3) if source_items else 0.0,
@@ -1390,7 +1823,12 @@ def _hypothesis_insights(research_plan: Dict[str, Any], evidence_analyses: List[
         ready = not gaps and len(usable) >= max(1, required_ab)
         evidence_ids = [str(item.get("evidence_id")) for item in support if item.get("evidence_id")]
         counter_ids = [str(item.get("evidence_id")) for item in counters if item.get("evidence_id")]
-        fact_chain = [_compact(item.get("fact"), 180) for item in support if str(item.get("fact") or "").strip()][:5]
+        fact_chain = [
+            fact
+            for item in support
+            for fact in [_analysis_public_fact_text(item, max_chars=180)]
+            if fact
+        ][:5]
         metric_facts = [
             _compact(f"{item.get('metric')}: {item.get('value')} {item.get('period') or ''}", 160)
             for item in metric_items
@@ -1410,7 +1848,12 @@ def _hypothesis_insights(research_plan: Dict[str, Any], evidence_analyses: List[
             claim_strength=claim_strength,
             distinct_source_count=distinct_verified_source_count,
         )
-        counter_boundary = [_compact(item.get("fact"), 180) for item in counters if str(item.get("fact") or "").strip()][:3]
+        counter_boundary = [
+            fact
+            for item in counters
+            for fact in [_analysis_public_fact_text(item, max_chars=180)]
+            if fact
+        ][:3]
         evidence_chapter_id = next(
             (
                 str(item.get("chapter_id") or "").strip()
@@ -1600,7 +2043,7 @@ def _source_url(item: Dict[str, Any]) -> str:
     return str(source.get("url") or item.get("source_url") or item.get("url") or "").strip()
 
 
-def _analysis_readiness(payload: Dict[str, Any]) -> str:
+def _chapter_analysis_readiness(payload: Dict[str, Any]) -> str:
     core_ab = int(float(payload.get("core_ab_source_count") or 0))
     claim_ready = int(float(payload.get("claim_ready_evidence_count") or len(_as_list(payload.get("claim_ready_evidence_refs"))) or 0))
     directional = int(float(payload.get("directional_only_count") or 0))
@@ -1664,6 +2107,50 @@ def resolve_chapter_id(
     return ""
 
 
+def _report_blueprint_for_llm(evidence_package: Dict[str, Any]) -> Dict[str, Any]:
+    metadata = _as_dict(evidence_package.get("metadata"))
+    raw_output = _as_dict(evidence_package.get("raw_output"))
+    for candidate in (
+        evidence_package.get("report_blueprint"),
+        metadata.get("report_blueprint"),
+        raw_output.get("report_blueprint"),
+        _as_dict(metadata.get("query_analysis")).get("report_blueprint"),
+    ):
+        payload = _as_dict(candidate)
+        if _as_list(payload.get("chapters")):
+            return payload
+    packages = [item for item in _as_list(evidence_package.get("chapter_evidence_packages")) if isinstance(item, dict)]
+    if packages:
+        return {"chapters": packages}
+    diagnostics = _as_dict(evidence_package.get("chapter_evidence_diagnostics")) or _as_dict(evidence_package.get("evidence_analysis_by_chapter"))
+    if diagnostics:
+        chapters: List[Dict[str, Any]] = []
+        for key, payload in diagnostics.items():
+            item = _as_dict(payload)
+            chapters.append(
+                {
+                    "chapter_id": item.get("chapter_id") or key,
+                    "chapter_title": item.get("chapter_title") or item.get("title") or key,
+                    "chapter_question": item.get("chapter_question") or item.get("question") or item.get("chapter_title") or key,
+                    "chapter_id_aliases": _as_list(item.get("chapter_id_aliases")),
+                    "hypothesis_id": item.get("hypothesis_id"),
+                    "dimension": item.get("dimension"),
+                    "dimension_name": item.get("dimension_name"),
+                }
+            )
+        return {"chapters": chapters}
+    return {}
+
+
+def _chapter_identity_for_llm(evidence_package: Dict[str, Any]) -> Dict[str, Any]:
+    if build_chapter_identity_map is None:
+        return {}
+    return build_chapter_identity_map(
+        blueprint=_report_blueprint_for_llm(evidence_package),
+        research_plan=_research_plan(evidence_package),
+    )
+
+
 def _chapter_evidence_diagnostics(
     evidence_package: Dict[str, Any],
     evidence_analyses: List[Dict[str, Any]],
@@ -1700,7 +2187,7 @@ def _chapter_evidence_diagnostics(
             payload.get("dimension"),
             payload.get("dimension_name"),
         )
-        item["analysis_readiness"] = _analysis_readiness(item)
+        item["analysis_readiness"] = _chapter_analysis_readiness(item)
         diagnostics[item["chapter_id"]] = item
     if diagnostics:
         return diagnostics
@@ -1766,7 +2253,7 @@ def _chapter_evidence_diagnostics(
             bucket["gap_types"].append("insufficient_ab_sources")
         if bucket["counter_signal_count"] <= 0 and "counter_evidence_missing" not in bucket["gap_types"]:
             bucket["gap_types"].append("counter_evidence_missing")
-        bucket["analysis_readiness"] = _analysis_readiness(bucket)
+        bucket["analysis_readiness"] = _chapter_analysis_readiness(bucket)
         bucket["claim_ready_evidence_refs"] = _dedupe(bucket["claim_ready_evidence_refs"])[:12]
         bucket["metric_ready_refs"] = _dedupe(bucket["metric_ready_refs"])[:12]
         bucket["counter_refs"] = _dedupe(bucket["counter_refs"])[:12]
@@ -1979,6 +2466,31 @@ def analysis_depth_quality(structured_analysis: Dict[str, Any]) -> Dict[str, Any
     }
 
 
+def _input_evidence_card_count_for_diagnostics(
+    structured_analysis: Dict[str, Any],
+    evidence_package: Dict[str, Any],
+) -> int:
+    ids: set[str] = set()
+    package = _as_dict(evidence_package)
+    for key in ("analysis_ready_evidence", "clean_evidence_list", "fact_cards"):
+        for item in _as_list(package.get(key)):
+            if not isinstance(item, dict):
+                continue
+            ref = str(item.get("evidence_id") or item.get("fact_id") or item.get("ref") or "").strip()
+            if ref:
+                ids.add(ref)
+    if ids:
+        return len(ids)
+    analysis = _as_dict(structured_analysis)
+    for item in _as_list(analysis.get("evidence_analyses")):
+        if not isinstance(item, dict):
+            continue
+        ref = str(item.get("evidence_id") or item.get("fact_id") or item.get("ref") or "").strip()
+        if ref:
+            ids.add(ref)
+    return len(ids) if ids else len(_as_list(analysis.get("evidence_analyses")))
+
+
 def claim_binding_feedback_summary(structured_analysis: Dict[str, Any]) -> Dict[str, Any]:
     diagnostics = _as_dict(structured_analysis.get("chapter_evidence_diagnostics"))
     units_by_chapter: Dict[str, List[Dict[str, Any]]] = {}
@@ -2029,6 +2541,28 @@ def claim_binding_feedback_summary(structured_analysis: Dict[str, Any]) -> Dict[
 
 
 def _chapter_filter_for_llm(evidence_package: Dict[str, Any], *, max_chapters: int) -> Dict[str, Dict[str, Any]]:
+    identity = _chapter_identity_for_llm(evidence_package)
+    if identity and canonical_chapter_ids is not None and canonical_chapter_payload is not None:
+        chapter_filter: Dict[str, Dict[str, Any]] = {}
+        for chapter_id in canonical_chapter_ids(identity)[:max_chapters]:
+            payload = canonical_chapter_payload(identity, chapter_id)
+            if not payload:
+                continue
+            chapter_filter[chapter_id] = {
+                "chapter_id": chapter_id,
+                "chapter_title": payload.get("chapter_title") or chapter_id,
+                "chapter_question": payload.get("chapter_question") or payload.get("chapter_title") or chapter_id,
+                "chapter_id_aliases": _dedupe(
+                    [
+                        chapter_id,
+                        payload.get("chapter_title"),
+                        payload.get("chapter_question"),
+                        *_as_list(payload.get("chapter_id_aliases")),
+                    ]
+                )[:16],
+            }
+        if chapter_filter:
+            return chapter_filter
     packages = [item for item in _as_list(evidence_package.get("chapter_evidence_packages")) if isinstance(item, dict)]
     if packages:
         chapter_filter: Dict[str, Dict[str, Any]] = {}
@@ -2064,6 +2598,13 @@ def _evidence_cards_for_llm(
     max_chapters: int,
     max_per_chapter: int,
 ) -> List[Dict[str, Any]]:
+    curated_cards = _curated_evidence_cards_for_llm(
+        evidence_package,
+        max_chapters=max_chapters,
+        max_per_chapter=max_per_chapter,
+    )
+    if curated_cards:
+        return curated_cards
     ledger_cards = _ledger_evidence_cards_for_llm(
         evidence_package,
         max_chapters=max_chapters,
@@ -2075,6 +2616,20 @@ def _evidence_cards_for_llm(
     buckets: Dict[str, int] = {}
     cards: List[Dict[str, Any]] = []
     seen_refs: set[str] = set()
+    lineage_by_evidence_id: Dict[str, Dict[str, Any]] = {}
+    for item in _as_list(evidence_package.get("normalized_evidence")):
+        if not isinstance(item, dict):
+            continue
+        evidence_id = str(item.get("evidence_id") or item.get("id") or "").strip()
+        if evidence_id and evidence_id not in lineage_by_evidence_id:
+            lineage_by_evidence_id[evidence_id] = item
+    requirements_by_chapter = _requirements_by_chapter_for_llm(evidence_package)
+    requirement_chapter_lookup = {
+        str(requirement.get("requirement_id") or "").strip(): chapter_id
+        for chapter_id, requirements in requirements_by_chapter.items()
+        for requirement in requirements
+        if str(requirement.get("requirement_id") or "").strip()
+    }
     source_items = _as_list(evidence_package.get("analysis_ready_evidence")) + _as_list(evidence_package.get("clean_evidence_list"))
     ranked_items = sorted(
         [item for item in source_items if isinstance(item, dict) and _is_public_quality_card(item)],
@@ -2093,39 +2648,78 @@ def _evidence_cards_for_llm(
         evidence_id = str(item.get("evidence_id") or item.get("id") or "").strip()
         if not evidence_id or evidence_id in seen_refs:
             continue
-        raw_chapter_id = _chapter_key_for_item(item)
+        source = _source_payload(item)
+        card = _as_dict(item.get("evidence_card"))
+        fact_card = _public_fact_card(item)
+        fact = _distilled_public_fact(item)
+        lineage_item = _as_dict(lineage_by_evidence_id.get(evidence_id))
+        lineage_search_task = _as_dict(lineage_item.get("search_task"))
+        search_task = _as_dict(item.get("search_task"))
+        requirement_id = str(
+            item.get("requirement_id")
+            or item.get("evidence_requirement_id")
+            or _as_dict(item.get("lineage")).get("requirement_id")
+            or search_task.get("requirement_id")
+            or search_task.get("evidence_requirement_id")
+            or search_task.get("slot_id")
+            or lineage_item.get("requirement_id")
+            or lineage_item.get("evidence_requirement_id")
+            or lineage_search_task.get("requirement_id")
+            or lineage_search_task.get("evidence_requirement_id")
+            or lineage_search_task.get("slot_id")
+            or ""
+        ).strip()
+        raw_chapter_id = (
+            str(
+                item.get("chapter_id")
+                or _as_dict(item.get("lineage")).get("chapter_id")
+                or search_task.get("chapter_id")
+                or lineage_item.get("chapter_id")
+                or lineage_search_task.get("chapter_id")
+                or requirement_chapter_lookup.get(requirement_id)
+                or _chapter_key_for_item(item)
+                or ""
+            ).strip()
+        )
         chapter_id = raw_chapter_id
         if chapter_filter:
             resolved_chapter_id = resolve_chapter_id(chapter_filter, raw_chapter_id)
+            if not resolved_chapter_id and requirement_id:
+                resolved_chapter_id = resolve_chapter_id(chapter_filter, requirement_chapter_lookup.get(requirement_id))
             if not resolved_chapter_id:
                 continue
             chapter_id = resolved_chapter_id
         if buckets.get(chapter_id, 0) >= max_per_chapter:
             continue
-        source = _source_payload(item)
-        card = _as_dict(item.get("evidence_card"))
-        fact_card = _public_fact_card(item)
-        fact = _distilled_public_fact(item)
-        search_task = _as_dict(item.get("search_task"))
-        requirement_id = str(
-            item.get("requirement_id")
-            or item.get("evidence_requirement_id")
-            or search_task.get("requirement_id")
-            or search_task.get("evidence_requirement_id")
-            or search_task.get("slot_id")
+        hypothesis_id = str(
+            item.get("hypothesis_id")
+            or _as_dict(item.get("lineage")).get("hypothesis_id")
+            or search_task.get("hypothesis_id")
+            or lineage_item.get("hypothesis_id")
+            or lineage_search_task.get("hypothesis_id")
             or ""
         ).strip()
-        hypothesis_id = str(item.get("hypothesis_id") or search_task.get("hypothesis_id") or "").strip()
         source_id = str(
             item.get("source_id")
             or item.get("source_ref")
             or item.get("citation_ref")
+            or lineage_item.get("source_id")
+            or lineage_item.get("source_ref")
+            or lineage_item.get("citation_ref")
             or source.get("source_ref")
             or source.get("document_id")
             or source.get("url")
             or ""
         ).strip()
-        search_task_id = str(item.get("search_task_id") or search_task.get("task_id") or search_task.get("id") or "").strip()
+        search_task_id = str(
+            item.get("search_task_id")
+            or search_task.get("task_id")
+            or search_task.get("id")
+            or lineage_item.get("search_task_id")
+            or lineage_search_task.get("task_id")
+            or lineage_search_task.get("id")
+            or ""
+        ).strip()
         lineage = {
             key: value
             for key, value in {
@@ -2378,34 +2972,290 @@ def _compact_llm_fact_card(card: Dict[str, Any], *, max_fact_chars: int) -> Dict
     fact_type = str(public_card.get("fact_type") or card.get("fact_type") or card.get("proof_role") or "").strip()
     return {
         "evidence_id": str(card.get("evidence_id") or "").strip(),
+        "chapter_id": str(card.get("chapter_id") or _as_dict(card.get("lineage")).get("chapter_id") or "").strip(),
         "hypothesis_id": str(card.get("hypothesis_id") or "").strip(),
         "requirement_id": str(card.get("requirement_id") or "").strip(),
         "analysis_role": str(card.get("analysis_role") or "").strip(),
         "analysis_eligible": bool(card.get("analysis_eligible")),
         "allowed_use": str(card.get("allowed_use") or "").strip(),
+        "source_id": str(card.get("source_id") or _as_dict(card.get("lineage")).get("source_id") or "").strip(),
+        "search_task_id": str(card.get("search_task_id") or _as_dict(card.get("lineage")).get("search_task_id") or "").strip(),
         "lineage": _as_dict(card.get("lineage")),
         "distilled_fact": _compact(card.get("distilled_fact") or card.get("fact"), max_fact_chars),
         "fact_type": fact_type,
         "source_level": str(card.get("source_level") or "").strip().upper(),
         "source_verification_status": str(card.get("source_verification_status") or "").strip(),
         "proof_role": str(card.get("proof_role") or "").strip(),
+        "topic_fit": str(card.get("topic_fit") or "").strip(),
         "block_affinity": block_affinity,
         "metric": _compact(card.get("metric"), 80),
         "value": _compact(card.get("value"), 80),
         "unit": _compact(card.get("unit"), 40),
         "period": _compact(card.get("period"), 80),
+        "claim_strength_hint": str(card.get("claim_strength_hint") or "").strip(),
+        "limitations": _as_list(card.get("limitations") or card.get("limitation_boundary")),
+        "usable_for": _as_list(card.get("usable_for")),
         "source_title": _compact(card.get("source_title"), 120),
         "source_url": str(card.get("source_url") or "").strip(),
     }
 
 
+def _llm_fact_role(card: Dict[str, Any]) -> str:
+    for key in ("proof_role", "analysis_role", "fact_type", "allowed_use"):
+        value = str(card.get(key) or "").strip().lower()
+        if value:
+            return value
+    return "support"
+
+
+def _role_balanced_llm_fact_cards(cards: Sequence[Dict[str, Any]], *, limit: int) -> List[Dict[str, Any]]:
+    if limit <= 0:
+        return []
+    ordered = [card for card in cards if isinstance(card, dict)]
+    if len(ordered) <= limit:
+        return ordered[:limit]
+    by_role: Dict[str, List[Dict[str, Any]]] = {}
+    for card in ordered:
+        by_role.setdefault(_llm_fact_role(card), []).append(card)
+    selected: List[Dict[str, Any]] = []
+    selected_ids: set[str] = set()
+    preferred_roles = [
+        "metric",
+        "policy",
+        "case",
+        "counter",
+        "technology_product",
+        "filing",
+        "support",
+        "supporting_context",
+    ]
+    for role in preferred_roles + [role for role in by_role if role not in preferred_roles]:
+        for card in by_role.get(role, [])[:1]:
+            evidence_id = str(card.get("evidence_id") or "").strip()
+            if evidence_id and evidence_id in selected_ids:
+                continue
+            selected.append(card)
+            if evidence_id:
+                selected_ids.add(evidence_id)
+            break
+        if len(selected) >= limit:
+            return selected[:limit]
+    for card in ordered:
+        evidence_id = str(card.get("evidence_id") or "").strip()
+        if evidence_id and evidence_id in selected_ids:
+            continue
+        selected.append(card)
+        if evidence_id:
+            selected_ids.add(evidence_id)
+        if len(selected) >= limit:
+            break
+    return selected[:limit]
+
+
+def _inventory_items_for_chapter(evidence_package: Dict[str, Any], chapter_id: str, fact_cards: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    inventory_payload = _as_dict(evidence_package.get("evidence_inventory"))
+    items = [item for item in _as_list(inventory_payload.get("inventories")) if isinstance(item, dict)]
+    if not items:
+        return []
+    card_ids = {
+        str(card.get("evidence_id") or "").strip()
+        for card in fact_cards
+        if isinstance(card, dict) and str(card.get("evidence_id") or "").strip()
+    }
+    card_clusters = {
+        str(card.get("cluster_key") or card.get("fact_type") or "").strip()
+        for card in fact_cards
+        if isinstance(card, dict) and str(card.get("cluster_key") or card.get("fact_type") or "").strip()
+    }
+    selected: List[Dict[str, Any]] = []
+    for item in items:
+        item_chapter_ids = {
+            str(value or "").strip()
+            for value in _as_list(item.get("chapter_ids")) + [item.get("chapter_id")]
+            if str(value or "").strip()
+        }
+        item_evidence_ids = {
+            str(value or "").strip()
+            for value in _as_list(item.get("usable_evidence_ids"))
+            if str(value or "").strip()
+        }
+        cluster_key = str(item.get("cluster_key") or "").strip()
+        if (
+            (chapter_id and chapter_id in item_chapter_ids)
+            or bool(card_ids & item_evidence_ids)
+            or (cluster_key and cluster_key in card_clusters)
+        ):
+            selected.append(
+                {
+                    "inventory_id": str(item.get("inventory_id") or "").strip(),
+                    "cluster_key": cluster_key,
+                    "requirement_id": str(item.get("requirement_id") or "").strip(),
+                    "chapter_id": str(item.get("chapter_id") or "").strip(),
+                    "curated_evidence_count": int(item.get("curated_evidence_count") or 0),
+                    "usable_evidence_ids": _as_list(item.get("usable_evidence_ids"))[:20],
+                    "fact_type_counts": _as_dict(item.get("fact_type_counts")),
+                    "strongest_available_level": str(item.get("strongest_available_level") or "").strip(),
+                    "dominant_strength": str(item.get("dominant_strength") or "").strip(),
+                    "analysis_brief": _compact(item.get("analysis_brief"), 360),
+                    "limitations": _as_list(item.get("limitations"))[:6],
+                    "suggested_analysis_direction": _as_list(item.get("suggested_analysis_direction"))[:8],
+                }
+            )
+        if len(selected) >= 4:
+            break
+    return selected
+
+
+def _analysis_shard_for_chapter(evidence_package: Dict[str, Any], chapter_id: str, fact_cards: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    shards = [item for item in _as_list(evidence_package.get("analysis_shards")) if isinstance(item, dict)]
+    if not shards:
+        return {}
+    card_ids = {
+        str(card.get("evidence_id") or "").strip()
+        for card in fact_cards
+        if isinstance(card, dict) and str(card.get("evidence_id") or "").strip()
+    }
+    card_clusters = {
+        str(card.get("cluster_key") or card.get("fact_type") or "").strip()
+        for card in fact_cards
+        if isinstance(card, dict) and str(card.get("cluster_key") or card.get("fact_type") or "").strip()
+    }
+    best: Dict[str, Any] = {}
+    best_score = -1
+    for shard in shards:
+        shard_ids = {
+            str(value or "").strip()
+            for value in _as_list(shard.get("curated_evidence_ids"))
+            if str(value or "").strip()
+        }
+        cluster_key = str(shard.get("cluster_key") or "").strip()
+        score = 0
+        if chapter_id and chapter_id == str(shard.get("chapter_id") or "").strip():
+            score += 4
+        if card_ids & shard_ids:
+            score += len(card_ids & shard_ids)
+        if cluster_key and cluster_key in card_clusters:
+            score += 1
+        if score > best_score:
+            best = shard
+            best_score = score
+    if not best or best_score <= 0:
+        return {}
+    return {
+        "schema_version": "analysis_shard_pointer_v1",
+        "cluster_key": str(best.get("cluster_key") or "").strip(),
+        "chapter_id": str(best.get("chapter_id") or "").strip(),
+        "requirement_id": str(best.get("requirement_id") or "").strip(),
+        "inventory_id": str(best.get("inventory_id") or "").strip(),
+        "input_hash": str(best.get("input_hash") or "").strip(),
+        "curated_evidence_ids": _as_list(best.get("curated_evidence_ids"))[:30],
+    }
+
+
+def _curated_topic_fit_for_llm(note: Dict[str, Any], query: str) -> str:
+    explicit = str(note.get("topic_fit") or "").strip().lower()
+    if explicit:
+        return explicit
+    query_text = str(query or "").lower()
+    text = " ".join(
+        str(value or "")
+        for value in (
+            note.get("clean_fact"),
+            note.get("fact"),
+            note.get("source_title"),
+            note.get("source_url"),
+        )
+    ).lower()
+    if not re.search(r"低空|evtol|无人机|通航|空域|low[-\s]?altitude", query_text):
+        return "direct"
+    if re.search(r"低空|evtol|无人机|无人驾驶飞行|通航|直升机|飞行器|航空器|空域|航线|飞行服务|低空旅游|低空物流", text):
+        return "direct"
+    if re.search(r"人形机器人|机器人|储能|数据要素|算力|大模型|半导体|光伏|新能源车", text):
+        return "off_topic"
+    if re.search(r"政策|监管|标准|基础设施|供应链|商业化|应用场景|安全|保险", text):
+        return "related"
+    return "background"
+
+
+def _curated_evidence_cards_for_llm(
+    evidence_package: Dict[str, Any],
+    *,
+    max_chapters: int,
+    max_per_chapter: int,
+) -> List[Dict[str, Any]]:
+    if not _env_flag("REPORT_ANALYSIS_USE_CURATED_EVIDENCE", True):
+        return []
+    curated_payload = _as_dict(evidence_package.get("curated_evidence"))
+    notes = [
+        item
+        for item in _as_list(curated_payload.get("curated_evidence"))
+        if isinstance(item, dict) and str(item.get("evidence_id") or "").strip()
+    ]
+    if not notes:
+        return []
+    chapter_filter = _chapter_filter_for_llm(evidence_package, max_chapters=max_chapters)
+    buckets: Dict[str, int] = {}
+    cards: List[Dict[str, Any]] = []
+    query_text = str(evidence_package.get("query") or evidence_package.get("original_query") or "").strip()
+    for note in notes:
+        topic_fit = _curated_topic_fit_for_llm(note, query_text)
+        if _env_flag("REPORT_ANALYSIS_SKIP_OFF_TOPIC_CURATED", True) and topic_fit == "off_topic":
+            continue
+        raw_chapter_id = str(note.get("chapter_id") or _as_dict(note.get("lineage")).get("chapter_id") or "").strip()
+        chapter_id = raw_chapter_id
+        if chapter_filter:
+            resolved = resolve_chapter_id(chapter_filter, raw_chapter_id)
+            if not resolved:
+                continue
+            chapter_id = resolved
+        if not chapter_id:
+            chapter_id = "curated_evidence"
+        if buckets.get(chapter_id, 0) >= max_per_chapter:
+            continue
+        cards.append(
+            {
+                "evidence_id": str(note.get("evidence_id") or "").strip(),
+                "chapter_id": chapter_id,
+                "cluster_key": str(note.get("cluster_key") or "").strip(),
+                "requirement_id": str(note.get("requirement_id") or "").strip(),
+                "analysis_role": str(note.get("fact_type") or "").strip(),
+                "analysis_eligible": True,
+                "allowed_use": str(note.get("evidence_use_level") or "directional_signal").strip(),
+                "source_id": str(note.get("source_id") or "").strip(),
+                "search_task_id": str(note.get("search_task_id") or "").strip(),
+                "lineage": _as_dict(note.get("lineage")),
+                "distilled_fact": _compact(
+                    note.get("clean_fact"),
+                    _env_int("BRAIN_LLM_ANALYSIS_MAX_FACT_CHARS", 420, min_value=40, max_value=800),
+                ),
+                "fact": _compact(note.get("clean_fact"), 420),
+                "fact_type": str(note.get("fact_type") or "").strip(),
+                "source_level": str(note.get("source_level") or "").strip().upper(),
+                "proof_role": str(note.get("proof_role") or note.get("fact_type") or "").strip().lower(),
+                "source_verification_status": "curated",
+                "claim_strength_hint": str(note.get("claim_strength_hint") or "directional").strip(),
+                "topic_fit": topic_fit,
+                "limitations": _as_list(note.get("limitations")),
+                "usable_for": _as_list(note.get("usable_for")),
+                "source_title": _compact(note.get("source_title"), 120),
+                "source_url": str(note.get("source_url") or "").strip(),
+            }
+        )
+        buckets[chapter_id] = buckets.get(chapter_id, 0) + 1
+    return cards
+
+
 def _requirements_by_chapter_for_llm(evidence_package: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
     contract = _as_dict(evidence_package.get("report_contract")) or _as_dict(evidence_package.get("report_plan"))
     requirements = _as_list(_as_dict(contract.get("evidence_requirements")).get("requirements"))
+    identity = _chapter_identity_for_llm(evidence_package)
     grouped: Dict[str, List[Dict[str, Any]]] = {}
     for item in requirements:
         requirement = _as_dict(item)
-        chapter_id = str(requirement.get("chapter_id") or "").strip()
+        raw_chapter_id = str(requirement.get("chapter_id") or requirement.get("hypothesis_id") or "").strip()
+        chapter_id = raw_chapter_id
+        if identity and resolve_canonical_chapter_id is not None:
+            chapter_id = resolve_canonical_chapter_id(identity, raw_chapter_id)
         requirement_id = str(requirement.get("requirement_id") or "").strip()
         if not chapter_id or not requirement_id:
             continue
@@ -2424,13 +3274,16 @@ def _requirements_by_chapter_for_llm(evidence_package: Dict[str, Any]) -> Dict[s
 
 def build_llm_analysis_input_v2(evidence_package: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[str, Any]:
     max_chapters = _env_int("BRAIN_LLM_ANALYSIS_MAX_CHAPTERS", 8, min_value=1, max_value=30)
-    max_per_chapter = _env_int("BRAIN_LLM_ANALYSIS_MAX_FACTS_PER_CHAPTER", 8, min_value=1, max_value=30)
+    max_per_chapter = _env_int("BRAIN_LLM_ANALYSIS_MAX_FACTS_PER_CHAPTER", 16, min_value=1, max_value=30)
     max_fact_chars = _env_int("BRAIN_LLM_ANALYSIS_MAX_FACT_CHARS", 260, min_value=40, max_value=800)
     diagnostics = _chapter_filter_for_llm(evidence_package, max_chapters=max_chapters) or _as_dict(fallback.get("chapter_evidence_diagnostics"))
+    candidate_per_chapter = max_per_chapter
+    if _env_flag("BRAIN_LLM_ANALYSIS_ROLE_BALANCE", True):
+        candidate_per_chapter = min(90, max_per_chapter * 3)
     cards = _evidence_cards_for_llm(
         evidence_package,
         max_chapters=max_chapters,
-        max_per_chapter=max_per_chapter,
+        max_per_chapter=candidate_per_chapter,
     )
     requirements_by_chapter = _requirements_by_chapter_for_llm(evidence_package)
     grouped: Dict[str, List[Dict[str, Any]]] = {}
@@ -2442,13 +3295,12 @@ def build_llm_analysis_input_v2(evidence_package: Dict[str, Any], fallback: Dict
         if chapter_id not in grouped:
             grouped[chapter_id] = []
             chapter_order.append(chapter_id)
-        if len(grouped[chapter_id]) < max_per_chapter:
-            compact_card = _compact_llm_fact_card(card, max_fact_chars=max_fact_chars)
-            if compact_card.get("evidence_id") and compact_card.get("distilled_fact"):
-                grouped[chapter_id].append(compact_card)
+        compact_card = _compact_llm_fact_card(card, max_fact_chars=max_fact_chars)
+        if compact_card.get("evidence_id") and compact_card.get("distilled_fact"):
+            grouped[chapter_id].append(compact_card)
     chapters: List[Dict[str, Any]] = []
     for chapter_id in chapter_order[:max_chapters]:
-        fact_cards = grouped.get(chapter_id) or []
+        fact_cards = _role_balanced_llm_fact_cards(grouped.get(chapter_id) or [], limit=max_per_chapter)
         if not fact_cards:
             continue
         metadata = _chapter_payload_metadata(chapter_id, diagnostics, fallback)
@@ -2456,6 +3308,8 @@ def build_llm_analysis_input_v2(evidence_package: Dict[str, Any], fallback: Dict
             {
                 **metadata,
                 "evidence_requirements": requirements_by_chapter.get(chapter_id, []),
+                "evidence_inventory": _inventory_items_for_chapter(evidence_package, chapter_id, fact_cards),
+                "analysis_shard": _analysis_shard_for_chapter(evidence_package, chapter_id, fact_cards),
                 "allowed_evidence_ids": [item["evidence_id"] for item in fact_cards],
                 "fact_cards": fact_cards,
             }
@@ -2512,12 +3366,93 @@ def _store_llm_analysis_cache(path: Path, payload: Dict[str, Any]) -> None:
         return
 
 
+def _persist_analysis_shard_output_cache(
+    *,
+    evidence_package: Dict[str, Any],
+    chapter_payload: Dict[str, Any],
+    analysis_result: Dict[str, Any],
+    model: str,
+    prompt_version: str,
+) -> Dict[str, Any]:
+    if not _env_flag("REPORT_ANALYSIS_SHARD_OUTPUT_CACHE_ENABLED", True):
+        return {"status": "disabled"}
+    if not _as_dict(chapter_payload.get("analysis_shard")):
+        return {"status": "skipped", "reason": "missing_analysis_shard"}
+    run_id = str(
+        evidence_package.get("run_id")
+        or evidence_package.get("report_id")
+        or evidence_package.get("stage_snapshot_run_id")
+        or os.getenv("REPORT_STAGE_SNAPSHOT_RUN_ID")
+        or os.getenv("REPORT_RUN_ID")
+        or ""
+    ).strip()
+    if not run_id:
+        return {"status": "skipped", "reason": "missing_run_id"}
+    try:
+        from rag_pipeline.cache.analysis_memory_cache import persist_analysis_shard_output
+
+        return persist_analysis_shard_output(
+            evidence_package,
+            chapter_payload=chapter_payload,
+            analysis_result=analysis_result,
+            run_id=run_id,
+            model=model,
+            prompt_version=prompt_version,
+        )
+    except Exception as exc:  # pragma: no cover - cache persistence must never block analysis.
+        return {"status": "error", "error": str(exc)}
+
+
+def _load_analysis_shard_output_cache(
+    *,
+    evidence_package: Dict[str, Any],
+    chapter_payload: Dict[str, Any],
+    model: str,
+    prompt_version: str,
+) -> Dict[str, Any]:
+    if not _env_flag("REPORT_ANALYSIS_SHARD_OUTPUT_CACHE_READ_ENABLED", False):
+        return {"status": "disabled"}
+    if not _as_dict(chapter_payload.get("analysis_shard")):
+        return {"status": "miss", "reason": "missing_analysis_shard"}
+    run_id = str(
+        evidence_package.get("run_id")
+        or evidence_package.get("report_id")
+        or evidence_package.get("stage_snapshot_run_id")
+        or os.getenv("REPORT_STAGE_SNAPSHOT_RUN_ID")
+        or os.getenv("REPORT_RUN_ID")
+        or ""
+    ).strip()
+    if not run_id:
+        return {"status": "miss", "reason": "missing_run_id"}
+    try:
+        from rag_pipeline.cache.analysis_memory_cache import load_analysis_shard_output
+
+        return load_analysis_shard_output(
+            chapter_payload=chapter_payload,
+            run_id=run_id,
+            model=model,
+            prompt_version=prompt_version,
+        )
+    except Exception as exc:  # pragma: no cover - cache read must never block live analysis.
+        return {"status": "miss", "reason": "error", "error": str(exc)}
+
+
 def _llm_chapter_system_prompt() -> str:
     return """
 You are an evidence-to-claim analyst for a Chinese industry research report.
 You analyze one chapter at a time.
 Use only the provided fact_cards. Do not invent facts, numbers, companies, sources, URLs, or citations.
 Return strict JSON with: chapter_id, claim_units, analysis_limits.
+
+First build an evidence inventory mentally from the supplied fact_cards:
+- identify market, policy, player, order, price, case, technology, supply-chain and risk signals;
+- merge duplicated evidence that points to the same fact;
+- keep source limitations as boundaries instead of deleting the evidence;
+- do not reject evidence only because source level is C or D;
+- convert relevant weak evidence into bounded directional claims when it has a traceable source.
+- use topic_fit=direct fact_cards as the main claim anchors;
+- use topic_fit=related/background only as context, analogy, boundary, or caveat unless the fact text explicitly connects to the chapter topic;
+- never turn adjacent-industry background into a core industry claim without direct topic evidence.
 
 Each claim_unit must include:
 - claim: one complete Chinese judgment sentence;
@@ -2542,6 +3477,9 @@ Fewer claim_units are acceptable only when the input evidence genuinely supports
 Relevant but incomplete evidence must become a contextual_claim, counter_boundary_claim, or limited_evidence directional claim instead of disappearing.
 A/B verified evidence may support strong or moderate claims.
 B/C traceable or qualitative evidence may still support a directional or limited_evidence claim.
+When evidence is traceable but weak, produce a directional or limited_evidence claim with explicit limitation_boundary.
+Do not over-expand a fact into a stronger mechanism than the cited evidence supports.
+Prefer more bounded claims over fewer over-strong claims.
 claim_strength must never exceed claim_strength_ceiling.
 If requirement_ids cannot be derived from the cited fact_cards, still make a directional or limited_evidence claim with requirement_ids left empty — do NOT reject it; the binding is carried by used_evidence_ids.
 Missing hard metrics (market size, growth rate, adoption rate) is NOT a reason to abstain: make a directional/limited_evidence claim grounded in the qualitative signal and state the boundary in limitation_boundary instead.
@@ -2585,9 +3523,23 @@ def synthesize_chapter_with_llm_analysis(
         "chapter": chapter_payload,
     }
     normalized_config = normalize_llm_config(config) if normalize_llm_config is not None else {}
+    prompt_version = "llm_analysis_v4_2026_06_curated_inventory"
+    shard_cache = _load_analysis_shard_output_cache(
+        evidence_package=evidence_package,
+        chapter_payload=chapter_payload,
+        model=str(normalized_config.get("model") or ""),
+        prompt_version=prompt_version,
+    )
+    if shard_cache.get("status") == "hit":
+        result = _as_dict(shard_cache.get("analysis_result"))
+        result["_llm_cache_hit"] = True
+        result["_llm_cache_path"] = str(shard_cache.get("output_cache_path") or "")
+        result["_analysis_shard_output_cache"] = shard_cache
+        result["_analysis_shard_output_cache_hit"] = True
+        return result
     cache_input = {
         **user_payload,
-        "prompt_version": "llm_analysis_v3_2026_06_typed_claims",
+        "prompt_version": prompt_version,
         "model": normalized_config.get("model", ""),
     }
     cache_path = _llm_analysis_cache_path(evidence_package, chapter_id, cache_input)
@@ -2621,6 +3573,13 @@ def synthesize_chapter_with_llm_analysis(
     raw_payload["_llm_cache_hit"] = False
     raw_payload["_llm_elapsed_seconds"] = round(time.time() - started, 3)
     raw_payload["_llm_cache_path"] = str(cache_path)
+    raw_payload["_analysis_shard_output_cache"] = _persist_analysis_shard_output_cache(
+        evidence_package=evidence_package,
+        chapter_payload=chapter_payload,
+        analysis_result=raw_payload,
+        model=str(normalized_config.get("model") or ""),
+        prompt_version=prompt_version,
+    )
     _store_llm_analysis_cache(
         cache_path,
         {
@@ -2720,6 +3679,7 @@ def synthesize_with_llm_analysis_v2(
     cache_hits = 0
     failed = 0
     retry_total = 0
+    shard_output_cache_stored = 0
     json_salvage_attempted = 0
     json_salvage_success = 0
     max_retries = _env_int("BRAIN_LLM_ANALYSIS_MAX_RETRIES", 2, min_value=0, max_value=5)
@@ -2813,6 +3773,8 @@ def synthesize_with_llm_analysis_v2(
             for chapter in _as_list(payload.get("chapter_synthesis")):
                 if isinstance(chapter, dict):
                     raw_chapters.append(chapter)
+            shard_output_cache = _as_dict(payload.get("_analysis_shard_output_cache"))
+            shard_output_cache_stored += int(str(shard_output_cache.get("status") or "") == "stored")
             chapter_results.append(
                 {
                     "chapter_id": result.get("chapter_id"),
@@ -2823,6 +3785,7 @@ def synthesize_with_llm_analysis_v2(
                     ),
                     "claim_count": sum(len(_as_list(ch.get("claim_units"))) for ch in _as_list(payload.get("chapter_synthesis")) if isinstance(ch, dict)),
                     "cache_path": payload.get("_llm_cache_path"),
+                    "analysis_shard_output_cache": shard_output_cache,
                 }
             )
     return {
@@ -2840,6 +3803,7 @@ def synthesize_with_llm_analysis_v2(
         "_llm_submitted_chapter_count": len(chapters),
         "_llm_retry_count": retry_total,
         "_llm_deadline_skipped_chapter_count": deadline_skipped,
+        "_analysis_shard_output_cache_stored_count": shard_output_cache_stored,
         "_llm_json_salvage_attempted_count": json_salvage_attempted,
         "_llm_json_salvage_success_count": json_salvage_success,
     }
@@ -2908,6 +3872,8 @@ NON_DROPPING_CLAIM_ISSUES = {
     "llm_claim_semantic_judge_unsupported_observed",
     "llm_numeric_claim_incomplete_metric_fact",
     "llm_numeric_claim_incomplete_metric_fact_observed",
+    "llm_numeric_claim_grounding_failed",
+    "llm_numeric_claim_grounding_failed_observed",
     "claim_support_needs_repair_observed",
     "claim_support_anchor_mismatch_observed",
 }
@@ -3151,6 +4117,124 @@ def _append_claim_review_suggestion(
     unit["claim_review_mutation_mode"] = _claim_review_mutation_mode()
 
 
+_INDUSTRY_GENERALIZATION_RE = re.compile(
+    r"(?:industry|market|sector|ecosystem|enterprise adoption cycle|broad adoption|trend|"
+    r"行业|市场|赛道|生态|整体|普遍|广泛|趋势|周期|企业级落地)",
+    re.I,
+)
+
+
+def _is_industry_generalization_claim(claim_text: str) -> bool:
+    text = str(claim_text or "").strip()
+    if not text:
+        return False
+    return bool(_INDUSTRY_GENERALIZATION_RE.search(text))
+
+
+def _single_source_generalization_priority(
+    *,
+    chapter: Dict[str, Any],
+    unit: Dict[str, Any],
+    claim_text: str,
+    refs: Sequence[str],
+    source_ids: Sequence[str],
+    requirement_ids: Sequence[str],
+    source_identities: Sequence[str] = (),
+) -> Dict[str, Any]:
+    claim_id = str(unit.get("claim_id") or "").strip()
+    chapter_id = str(chapter.get("chapter_id") or "").strip()
+    return {
+        "schema_version": "claim_source_sufficiency_repair_priority_v1",
+        "gap_type": "single_source_industry_generalization",
+        "gap_id": f"{chapter_id or 'chapter'}_{claim_id or 'claim'}_single_source_industry_generalization",
+        "chapter_id": chapter.get("chapter_id"),
+        "claim_id": claim_id,
+        "requirement_ids": list(requirement_ids or []),
+        "evidence_refs": list(refs or []),
+        "source_ids": list(source_ids or []),
+        "source_identities": list(source_identities or []),
+        "source_identity_count": len(list(source_identities or [])),
+        "claim": _compact(claim_text, 360),
+        "required_fields": ["second_independent_source", "source_url", "publisher", "date_or_period"],
+        "proof_role": unit.get("proof_role") or "support",
+        "success_criteria": "Find at least one additional independent source that supports the same industry-level claim, or keep the claim directional with a clear boundary.",
+        "reject_if": ["snippet_only", "no_source_url", "same_publisher_family", "vendor_claim_only", "off_topic_source"],
+        "allowed_for_writing": False,
+        "writing_permission": "cautious_with_boundary",
+        "recommended_action": "corroborate_or_soften_claim",
+    }
+
+
+def _claim_review_recommended_action(suggestion: Dict[str, Any]) -> str:
+    issue_type = str(suggestion.get("issue_type") or "").strip().lower()
+    writing_permission = str(suggestion.get("suggested_writing_permission") or "").strip().lower()
+    if issue_type == "single_source_industry_generalization":
+        return "needs_corroboration"
+    if writing_permission in {"repair_before_publication", "not_allowed_until_repaired"}:
+        return "repair_before_publication"
+    if writing_permission == "cautious_with_boundary":
+        return "cautious_with_boundary"
+    if str(suggestion.get("suggested_analysis_role") or "").strip().lower() == "contextual":
+        return "use_as_context_only"
+    return "review_before_writing"
+
+
+def _claim_review_action_plan(chapters: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    actions: List[Dict[str, Any]] = []
+    summary: Dict[str, int] = {
+        "total_actions": 0,
+        "repair_before_publication": 0,
+        "cautious_with_boundary": 0,
+        "needs_corroboration": 0,
+        "use_as_context_only": 0,
+        "review_before_writing": 0,
+    }
+    for chapter in chapters:
+        if not isinstance(chapter, dict):
+            continue
+        chapter_id = chapter.get("chapter_id")
+        for unit in _as_list(chapter.get("claim_units")):
+            if not isinstance(unit, dict):
+                continue
+            for suggestion in _as_list(unit.get("claim_review_suggestions")):
+                if not isinstance(suggestion, dict):
+                    continue
+                action = _claim_review_recommended_action(suggestion)
+                summary["total_actions"] += 1
+                summary[action] = summary.get(action, 0) + 1
+                actions.append(
+                    {
+                        "schema_version": "claim_review_action_v1",
+                        "chapter_id": chapter_id,
+                        "claim_id": unit.get("claim_id"),
+                        "claim": _compact(unit.get("claim"), 300),
+                        "issue_type": suggestion.get("issue_type"),
+                        "source_stage": suggestion.get("source_stage"),
+                        "recommended_action": action,
+                        "suggested_claim_strength": suggestion.get("suggested_claim_strength"),
+                        "suggested_analysis_role": suggestion.get("suggested_analysis_role"),
+                        "suggested_evidence_use_level": suggestion.get("suggested_evidence_use_level"),
+                        "suggested_writing_permission": suggestion.get("suggested_writing_permission"),
+                        "repair_priority": _as_dict(suggestion.get("repair_priority")),
+                        "diagnostic_only": True,
+                        "not_for_public_text": True,
+                        "must_not_render": True,
+                        "public_text_allowed": False,
+                        "executor_should_decide": True,
+                    }
+                )
+    return {
+        "schema_version": "claim_review_action_plan_v1",
+        "summary": summary,
+        "actions": actions,
+        "diagnostic_only": True,
+        "not_for_public_text": True,
+        "must_not_render": True,
+        "public_text_allowed": False,
+        "executor_should_decide": True,
+    }
+
+
 def _semantic_judge_status(value: Any) -> str:
     text = str(value or "").strip().lower()
     if text in {"yes", "true", "supported", "support", "pass", "passed"}:
@@ -3260,6 +4344,13 @@ def _semantic_judge_fact_payload(cards: Sequence[Dict[str, Any]]) -> List[Dict[s
                 "unit": _compact(item.get("unit") or item.get("numeric_unit"), 40),
                 "period": _compact(item.get("period") or item.get("time_or_scope") or item.get("date"), 80),
                 "source_title": _compact(item.get("source_title") or source.get("title"), 180),
+                "source_url": _compact(item.get("source_url") or item.get("url") or source.get("source_url") or source.get("url"), 240),
+                "source_id": str(item.get("source_id") or source.get("id") or source.get("source_id") or "").strip(),
+                "source_title_url_mismatch_suspected": bool(
+                    item.get("source_title_url_mismatch_suspected") or source.get("source_title_url_mismatch_suspected")
+                ),
+                "source_binding_fuzzy": bool(item.get("source_binding_fuzzy") or source.get("source_binding_fuzzy")),
+                "source_title_missing": bool(item.get("source_title_missing") or source.get("source_title_missing")),
                 "source_level": str(item.get("source_level") or source.get("source_level") or "").strip(),
                 "allowed_use": str(item.get("allowed_use") or "").strip(),
                 "source_verification_status": str(
@@ -3523,6 +4614,7 @@ def validate_llm_analysis_output(
             "llm_rejected_claim_examples": [],
             "llm_deferred_claim_examples": [],
             "claim_repair_priorities": [],
+            "claim_review_action_plan": _claim_review_action_plan([]),
             "deferred_claim_count": 0,
             "llm_semantic_judge_counts": {},
             "llm_semantic_judge_usage": {},
@@ -3728,6 +4820,42 @@ def validate_llm_analysis_output(
                 unit["missing_binding_reason"] = unit.get("missing_binding_reason") or "decision_ready claim lacked valid evidence refs"
                 issues.append({"type": "decision_claim_downgraded_no_valid_ref", "chapter_id": chapter.get("chapter_id")})
             cited_cards = [_as_dict(card_by_ref.get(ref)) for ref in refs if _as_dict(card_by_ref.get(ref))]
+            numeric_grounding = validate_numeric_fact_grounding(claim_text, cited_cards)
+            if not numeric_grounding.valid:
+                issue = {
+                    "type": "llm_numeric_claim_grounding_failed_observed"
+                    if (review_isolated or not claim_review_can_mutate)
+                    else "llm_numeric_claim_grounding_failed",
+                    "chapter_id": chapter.get("chapter_id"),
+                    "claim_id": unit.get("claim_id"),
+                    "evidence_refs": refs,
+                    "reasons": numeric_grounding.reasons,
+                    "numbers": numeric_grounding.numbers,
+                }
+                if not review_isolated and claim_review_can_mutate:
+                    issue["downgraded_to"] = "directional"
+                issues.append(issue)
+                unit["numeric_grounding_status"] = "failed"
+                unit["numeric_grounding_reasons"] = numeric_grounding.reasons
+                unit["unsupported_numeric_tokens"] = numeric_grounding.numbers
+                unit["public_hard_number_allowed"] = False
+                if not review_isolated and claim_review_can_mutate:
+                    unit["claim_strength"] = "directional"
+                    unit["claim_strength_ceiling"] = "directional"
+                    unit["claim_status"] = "directional"
+                    unit["analysis_role"] = "directional"
+                    unit["evidence_use_level"] = "directional_signal"
+                    unit["writing_permission"] = "cautious_without_unsupported_numbers"
+                else:
+                    _append_claim_review_suggestion(
+                        unit,
+                        source_stage="numeric_grounding_gate",
+                        issue_type="llm_numeric_claim_grounding_failed",
+                        reason="numeric hard fact token was not found in cited fact cards",
+                        suggested_claim_strength="directional",
+                        suggested_evidence_use_level="directional_signal",
+                        suggested_writing_permission="omit_unsupported_numbers",
+                    )
             anchor_mismatch_pending: Optional[Dict[str, Any]] = None
             if validate_claim_supported_by_facts is None:
                 issue = {
@@ -4120,9 +5248,25 @@ def validate_llm_analysis_output(
             if not inferred_requirement_ids and requirement_contract_required:
                 issue = {"type": "llm_claim_unit_missing_requirement_ids", "chapter_id": chapter.get("chapter_id")}
                 issues.append(issue)
-                if len(rejected_examples) < 5:
-                    rejected_examples.append({**issue, "claim": claim_text, "evidence_refs": refs})
-                continue
+                unit["requirement_binding_status"] = "missing_observed"
+                unit["claim_strength"] = "directional"
+                unit["claim_strength_ceiling"] = "directional"
+                unit["analysis_role"] = str(unit.get("analysis_role") or "contextual")
+                unit["evidence_use_level"] = str(unit.get("evidence_use_level") or "directional_signal")
+                unit["writing_permission"] = "cautious_with_boundary"
+                _append_claim_review_suggestion(
+                    unit,
+                    source_stage="requirement_lineage_gate",
+                    issue_type="missing_requirement_ids",
+                    reason=(
+                        "claim cites traceable evidence but no requirement_id could be inferred; "
+                        "keep only as chapter-scoped directional analysis"
+                    ),
+                    suggested_claim_strength="directional",
+                    suggested_analysis_role="contextual",
+                    suggested_evidence_use_level="directional_signal",
+                    suggested_writing_permission="cautious_with_boundary",
+                )
             hypothesis_id = str(unit.get("hypothesis_id") or chapter.get("hypothesis_id") or "").strip()
             if not hypothesis_id:
                 hypothesis_id = next(
@@ -4149,15 +5293,16 @@ def validate_llm_analysis_output(
             ceiling = str(unit.get("claim_strength_ceiling") or "").strip().lower()
             if ceiling and _claim_strength_score(claim_strength) > _claim_strength_score(ceiling):
                 issue = {
-                    "type": "llm_claim_strength_exceeds_ceiling",
+                    "type": "llm_claim_strength_clamped_to_ceiling",
                     "chapter_id": chapter.get("chapter_id"),
-                    "claim_strength": claim_strength,
+                    "claim_strength": ceiling,
+                    "claim_strength_original": claim_strength,
                     "claim_strength_ceiling": ceiling,
                 }
                 issues.append(issue)
-                if len(rejected_examples) < 5:
-                    rejected_examples.append({**issue, "claim": claim_text, "evidence_refs": refs})
-                continue
+                unit["claim_strength_clamped_from"] = claim_strength
+                unit["claim_strength"] = ceiling
+                claim_strength = ceiling
             source_ids = _dedupe(
                 [
                     str(card.get("source_id") or _as_dict(card.get("lineage")).get("source_id") or "").strip()
@@ -4165,6 +5310,53 @@ def validate_llm_analysis_output(
                     if str(card.get("source_id") or _as_dict(card.get("lineage")).get("source_id") or "").strip()
                 ]
             )
+            source_identities = _dedupe(
+                [
+                    _source_identity_key(card)
+                    for card in cited_cards
+                    if _source_identity_key(card)
+                ]
+            )
+            distinct_support_count = len(source_identities or source_ids or refs)
+            if (
+                _claim_strength_score(claim_strength) >= _claim_strength_score("moderate")
+                and distinct_support_count <= 1
+                and _is_industry_generalization_claim(claim_text)
+                and semantic_status in {"supported", "partial"}
+            ):
+                source_priority = _single_source_generalization_priority(
+                    chapter=chapter,
+                    unit=unit,
+                    claim_text=claim_text,
+                    refs=refs,
+                    source_ids=source_ids,
+                    requirement_ids=inferred_requirement_ids,
+                    source_identities=source_identities,
+                )
+                issues.append(
+                    {
+                        "type": "single_source_industry_generalization_observed",
+                        "chapter_id": chapter.get("chapter_id"),
+                        "claim_id": unit.get("claim_id"),
+                        "evidence_refs": refs,
+                        "source_ids": source_ids,
+                        "source_identities": source_identities,
+                        "distinct_source_count": distinct_support_count,
+                    }
+                )
+                claim_repair_priorities.append(source_priority)
+                unit["source_sufficiency_status"] = "single_source_industry_generalization_observed"
+                unit["source_sufficiency_repair_hint"] = source_priority
+                _append_claim_review_suggestion(
+                    unit,
+                    source_stage="source_sufficiency_gate",
+                    issue_type="single_source_industry_generalization",
+                    reason="industry-level generalization is currently supported by only one independent source",
+                    suggested_claim_strength="directional",
+                    suggested_evidence_use_level="directional_signal",
+                    suggested_writing_permission="cautious_with_boundary",
+                    repair_priority=source_priority,
+                )
             search_task_ids = _dedupe(
                 [
                     str(card.get("search_task_id") or _as_dict(card.get("lineage")).get("search_task_id") or "").strip()
@@ -4211,6 +5403,7 @@ def validate_llm_analysis_output(
         issue_type = str(issue.get("type") or "unknown")
         issue_counts[issue_type] = issue_counts.get(issue_type, 0) + 1
     usable_claim_count = sum(len(_as_list(chapter.get("claim_units"))) for chapter in chapters)
+    claim_review_action_plan = _claim_review_action_plan(chapters)
     return {
         "status": status,
         "issues": issues,
@@ -4227,6 +5420,7 @@ def validate_llm_analysis_output(
         "llm_rejected_claim_examples": rejected_examples,
         "llm_deferred_claim_examples": deferred_examples,
         "claim_repair_priorities": claim_repair_priorities,
+        "claim_review_action_plan": claim_review_action_plan,
         "deferred_claim_count": len(claim_repair_priorities),
         "llm_semantic_judge_counts": semantic_judge_counts,
         "llm_semantic_judge_usage": semantic_judge_usage,
@@ -4368,6 +5562,7 @@ def merge_llm_analysis_with_fallback(
                 "chapter_synthesis": [],
                 "cross_chapter_conflicts": _as_list(llm_payload.get("cross_chapter_conflicts")),
                 "evidence_repair_priorities": evidence_repair_priorities,
+                "claim_review_action_plan": _as_dict(validation.get("claim_review_action_plan")),
                 "rewrite_priorities": _as_list(llm_payload.get("rewrite_priorities")),
                 "usage": llm_payload.get("_llm_usage", {}),
                 "model": llm_payload.get("_llm_model", ""),
@@ -4422,8 +5617,34 @@ def merge_llm_analysis_with_fallback(
             decision_implication = _compact(unit.get("decision_use") or chapter.get("decision_implication") or "", 360)
             if _has_internal_analysis_language(decision_implication):
                 decision_implication = ""
+            claim_id = str(unit.get("claim_id") or unit.get("id") or f"{chapter_id}_claim_{unit_index}").strip()
+            recommended_chapter = _compact(
+                unit.get("recommended_chapter")
+                or chapter.get("chapter_title")
+                or chapter.get("chapter_question")
+                or chapter_id,
+                160,
+            )
+            cluster_key = str(
+                unit.get("cluster_key")
+                or unit.get("claim_cluster")
+                or unit.get("fact_type")
+                or unit.get("claim_type")
+                or block_affinity
+                or ""
+            ).strip()
+            evidence_status = str(unit.get("evidence_status") or "").strip()
+            if not evidence_status:
+                evidence_status = "sufficient" if str(unit.get("claim_strength") or "").strip().lower() in {"strong", "moderate"} else "partial"
+            can_anchor_section = bool(unit.get("can_anchor_section")) if "can_anchor_section" in unit else bool(refs)
             claim_payload = {
+                "claim_id": claim_id,
                 "claim": claim,
+                "chapter_id": chapter_id,
+                "recommended_chapter": recommended_chapter,
+                "cluster_key": cluster_key,
+                "can_anchor_section": can_anchor_section,
+                "evidence_status": evidence_status,
                 "claim_status": unit.get("claim_status") or ("decision_ready" if refs else "directional"),
                 "claim_strength": unit.get("claim_strength") or unit.get("claim_status") or ("moderate" if refs else "directional"),
                 "claim_strength_ceiling": unit.get("claim_strength_ceiling"),
@@ -4462,7 +5683,12 @@ def merge_llm_analysis_with_fallback(
             claim_units.append(
                 {
                     "id": f"{chapter_id}_llm_{unit_index}",
+                    "claim_id": claim_id,
                     "chapter_id": chapter_id,
+                    "recommended_chapter": recommended_chapter,
+                    "cluster_key": cluster_key,
+                    "can_anchor_section": can_anchor_section,
+                    "evidence_status": evidence_status,
                     "dimension": chapter.get("chapter_title") or chapter_id,
                     "question": chapter.get("chapter_title") or chapter_id,
                     "claim": claim,
@@ -4500,9 +5726,14 @@ def merge_llm_analysis_with_fallback(
             if refs:
                 key_judgments.append(
                     {
+                        "claim_id": claim_id,
+                        "chapter_id": chapter_id,
                         "judgment": claim,
                         "supporting_dimensions": [chapter.get("chapter_title") or chapter_id],
                         "evidence_ids": refs,
+                        "fact_ids": claim_payload["fact_ids"],
+                        "source_ids": claim_payload["source_ids"],
+                        "requirement_ids": claim_payload["requirement_ids"],
                         "claim_strength": claim_payload["claim_strength"],
                         "evidence_use_level": claim_payload["evidence_use_level"],
                         "writing_permission": claim_payload["writing_permission"],
@@ -4543,7 +5774,12 @@ def merge_llm_analysis_with_fallback(
             key = str(chapter.get("chapter_id") or chapter.get("chapter_question") or len(chapter_map) + 1)
             chapter_map[key] = {**_as_dict(chapter_map.get(key)), **chapter}
         insight["chapters"] = list(chapter_map.values())
-        ranked_judgments = _rank_key_judgments(key_judgments + _as_list(merged.get("key_judgments")))
+        existing_judgments = [
+            item
+            for item in _as_list(merged.get("key_judgments"))
+            if isinstance(item, dict) and not _is_fallback_synthesis_claim(item)
+        ]
+        ranked_judgments = _rank_key_judgments(key_judgments + existing_judgments)
         summary_judgments, summary_quality = sanitize_summary_judgments(ranked_judgments, max_items=3)
         insight["executive_summary_quality"] = {
             **_as_dict(insight.get("executive_summary_quality")),
@@ -4569,7 +5805,11 @@ def merge_llm_analysis_with_fallback(
         merged["report_insight_package"] = insight
         merged["chapter_insights"] = list(chapter_map.values())
     if claim_units:
-        existing_units = [item for item in _as_list(merged.get("claim_units")) if isinstance(item, dict)]
+        existing_units = [
+            item
+            for item in _as_list(merged.get("claim_units"))
+            if isinstance(item, dict) and not _is_fallback_synthesis_claim(item)
+        ]
         merged_units: List[Dict[str, Any]] = []
         seen_units = set()
         for unit in claim_units + existing_units:
@@ -4583,7 +5823,12 @@ def merge_llm_analysis_with_fallback(
             seen_units.add(key)
             merged_units.append(unit)
         merged["claim_units"] = merged_units
-        merged["key_judgments"] = _rank_key_judgments(key_judgments + _as_list(merged.get("key_judgments")))
+        existing_judgments = [
+            item
+            for item in _as_list(merged.get("key_judgments"))
+            if isinstance(item, dict) and not _is_fallback_synthesis_claim(item)
+        ]
+        merged["key_judgments"] = _rank_key_judgments(key_judgments + existing_judgments)
     evidence_repair_priorities: List[Dict[str, Any]] = []
     seen_repair_ids: set[str] = set()
     for item in [
@@ -4601,11 +5846,14 @@ def merge_llm_analysis_with_fallback(
         "chapter_synthesis": chapters,
         "cross_chapter_conflicts": _as_list(llm_payload.get("cross_chapter_conflicts")),
         "evidence_repair_priorities": evidence_repair_priorities,
+        "claim_review_action_plan": _as_dict(validation.get("claim_review_action_plan")),
         "rewrite_priorities": _as_list(llm_payload.get("rewrite_priorities")),
         "usage": llm_payload.get("_llm_usage", {}),
         "model": llm_payload.get("_llm_model", ""),
         "validation": validation,
     }
+    if _as_list(_as_dict(validation.get("claim_review_action_plan")).get("actions")):
+        merged["claim_review_action_plan"] = _as_dict(validation.get("claim_review_action_plan"))
     if evidence_repair_priorities:
         _attach_repair_priorities_to_analysis(merged, evidence_repair_priorities)
     return merged
@@ -5051,6 +6299,66 @@ def run_analysis_agent(
         package = _as_dict(evidence_package)
         if query and not package.get("query"):
             package = {**package, "query": query}
+        stage_guard_meta: Dict[str, Any] = {}
+        stage_guard_input_hash = ""
+        stage_guard_cacheable = False
+        if _stage_guard_hash is not None and _stage_guard_enabled is not None and _stage_guard_enabled():
+            try:
+                stage_guard_input_hash = _stage_guard_hash(
+                    {
+                        "schema_version": "analysis_agent_stage_input_v1",
+                        "evidence_package": package,
+                        "query": query or str(package.get("query") or ""),
+                        "llm_config": {
+                            key: value
+                            for key, value in _as_dict(llm_config).items()
+                            if key not in {"api_key", "apiKey", "authorization", "headers"}
+                        },
+                        "env": {
+                            "BRAIN_ENABLE_LLM_EVIDENCE_ANALYSIS": os.getenv("BRAIN_ENABLE_LLM_EVIDENCE_ANALYSIS", ""),
+                            "BRAIN_LLM_ANALYSIS_INPUT_VERSION": os.getenv("BRAIN_LLM_ANALYSIS_INPUT_VERSION", ""),
+                            "BRAIN_LLM_ANALYSIS_MODE": os.getenv("BRAIN_LLM_ANALYSIS_MODE", ""),
+                            "BRAIN_LLM_ANALYSIS_MAX_CHAPTERS": os.getenv("BRAIN_LLM_ANALYSIS_MAX_CHAPTERS", ""),
+                            "REPORT_QUALITY_MODE": os.getenv("REPORT_QUALITY_MODE", ""),
+                        },
+                        "producer_version": "analysis_agent_guard_v1",
+                    }
+                )
+                stage_guard_cacheable = bool(
+                    _stage_guard_cache_enabled is not None
+                    and _stage_guard_cache_enabled("analysis_agent")
+                    and _stage_guard_get_cached_output is not None
+                    and _stage_guard_store_output is not None
+                )
+                if stage_guard_cacheable:
+                    cached = _stage_guard_get_cached_output(stage="analysis_agent", input_hash=stage_guard_input_hash)
+                    if cached.get("hit"):
+                        cached_state = _as_dict(cached.get("output"))
+                        cached_structured = _as_dict(cached_state.get("structured_analysis"))
+                        cached_diagnostics = {
+                            **_as_dict(cached_structured.get("analysis_stage_diagnostics")),
+                            "stage_execution_guard": _as_dict(cached),
+                            "run_scoped_analysis_cache_hit": True,
+                        }
+                        cached_structured["analysis_stage_diagnostics"] = cached_diagnostics
+                        cached_state["structured_analysis"] = cached_structured
+                        cached_state["answer_text"] = json.dumps(
+                            {"structured_analysis": cached_structured},
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                            default=str,
+                        )
+                        raw_output = _as_dict(cached_state.get("raw_output"))
+                        if raw_output:
+                            raw_output["structured_analysis"] = cached_structured
+                            cached_state["raw_output"] = raw_output
+                        return cached_state  # type: ignore[return-value]
+                if _stage_guard_record_execution is not None:
+                    stage_guard_meta = _as_dict(
+                        _stage_guard_record_execution(stage="analysis_agent", input_hash=stage_guard_input_hash)
+                    )
+            except Exception:
+                stage_guard_meta = {"status": "error", "stage": "analysis_agent"}
         structured = build_fallback_analysis(package)
         llm_status = "disabled"
         llm_error = ""
@@ -5181,6 +6489,7 @@ def run_analysis_agent(
             "llm_rejected_claim_examples": llm_validation.get("llm_rejected_claim_examples", []),
             "llm_deferred_claim_examples": llm_validation.get("llm_deferred_claim_examples", []),
             "claim_repair_priorities": llm_validation.get("claim_repair_priorities", []),
+            "claim_review_action_plan": llm_validation.get("claim_review_action_plan", {}),
             "llm_chapter_results": llm_payload.get("_llm_chapter_results", []) if "llm_payload" in locals() else [],
             "llm_semantic_judge_counts": llm_validation.get("llm_semantic_judge_counts", {}),
             "llm_semantic_judge_usage": llm_validation.get("llm_semantic_judge_usage", {}),
@@ -5206,10 +6515,13 @@ def run_analysis_agent(
             "research_reflection_status": research_reflection_memo.get("status"),
             "research_reflection_write_mode": research_reflection_memo.get("write_mode"),
             "research_reflection_seed_count": len(_as_list(research_reflection_memo.get("next_search_task_seeds"))),
+            "stage_execution_guard": stage_guard_meta,
         }
+        diagnostics["evidence_analysis_record_count"] = len(_as_list(structured.get("evidence_analyses")))
+        diagnostics["input_evidence_card_count"] = _input_evidence_card_count_for_diagnostics(structured, package)
         structured["analysis_stage_diagnostics"] = diagnostics
         source = final_analysis_source
-        return {
+        state: AnalysisAgentState = {
             "query": query or str(package.get("query") or ""),
             "evidence_package": package,
             "structured_analysis": structured,
@@ -5230,8 +6542,15 @@ def run_analysis_agent(
                 "final_analysis_source": final_analysis_source,
             },
         }
+        if stage_guard_cacheable and stage_guard_input_hash and _stage_guard_store_output is not None:
+            try:
+                _stage_guard_store_output(stage="analysis_agent", input_hash=stage_guard_input_hash, output=state)
+            except Exception:
+                pass
+        _emit_analysis_agent_probe(state)
+        return state
     except Exception as exc:
-        return {
+        state = {
             "query": query,
             "evidence_package": _as_dict(evidence_package),
             "structured_analysis": {},
@@ -5245,6 +6564,8 @@ def run_analysis_agent(
                 "handoff_ready": False,
             },
         }
+        _emit_analysis_agent_probe(state)
+        return state
     finally:
         _set_analysis_deadline(None)
 

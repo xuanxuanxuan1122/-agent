@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
+
+import pytest
 
 from rag_pipeline.cache.artifact_store import ArtifactStore
 
@@ -14,7 +17,8 @@ def _store(tmp_path: Path) -> ArtifactStore:
     )
 
 
-def test_artifact_store_initializes_schema_wal_and_run_scoped_requirements(tmp_path):
+def test_artifact_store_initializes_schema_wal_and_run_scoped_requirements(tmp_path, monkeypatch):
+    monkeypatch.setenv("EVIDENCE_CACHE_READ_ENABLED", "false")
     store = _store(tmp_path)
 
     store.upsert_run(run_id="run-a", query="AI Agent adoption", report_type="industry", status="running")
@@ -229,3 +233,81 @@ def test_lineage_edge_insert_respects_disabled_store(tmp_path, monkeypatch):
     added = store.add_lineage_edge("run-a", "requirement", "H1_case", "score_gap", "GAP-1", "gap")
 
     assert added is False
+
+
+def test_connect_context_manager_closes_sqlite_connection(tmp_path):
+    store = _store(tmp_path)
+    store.upsert_run(run_id="run-a", query="q", status="running")
+
+    with store._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
+
+    with pytest.raises(sqlite3.ProgrammingError):
+        conn.execute("SELECT 1")
+
+
+def test_prune_runs_keeps_current_and_newest_and_purges_rows(tmp_path, monkeypatch):
+    monkeypatch.setenv("ARTIFACT_LEDGER_RETENTION_MAX_RUNS", "2")
+    monkeypatch.setenv("ARTIFACT_LEDGER_RETENTION_MAX_AGE_DAYS", "0")
+    monkeypatch.setenv("ARTIFACT_LEDGER_VACUUM_ON_PRUNE", "0")
+    store = _store(tmp_path)
+
+    # created_at oldest -> newest so ordering is deterministic
+    for index, run_id in enumerate(["r_old", "r_mid", "r_new", "r_current"]):
+        store.upsert_run(run_id=run_id, query="q", status="running")
+        store.upsert_fact_card(run_id=run_id, fact_id="EV-1", source_id="S1", fact="fact")
+        stamp = f"2026-06-01T0{index}:00:00Z"
+        with store._connect() as conn:
+            conn.execute("UPDATE runs SET created_at=? WHERE run_id=?", (stamp, run_id))
+            conn.commit()
+
+    result = store.prune_runs(keep_run_id="r_current")
+
+    remaining = {row["run_id"] for row in store.list_run_ids()}
+    assert result["status"] == "pruned"
+    assert result["deleted_count"] == 1
+    # current always kept (not counted against the cap) + newest 2 others
+    assert {"r_current", "r_new", "r_mid"} == remaining
+    assert "r_old" not in remaining
+    # rows for the purged run are actually gone; current run rows remain
+    assert store.list_fact_cards("r_old") == []
+    assert store.list_fact_cards("r_current")
+
+
+def test_record_artifact_pointer_mode_skips_payload_serialization(tmp_path):
+    store = _store(tmp_path)
+    store.upsert_run(run_id="run-ptr", query="q", status="running")
+
+    # Pointer artifact: caller supplies storage_uri + size + hash. The recorded
+    # size/hash must be exactly what was passed (NOT recomputed from payload) —
+    # proof that the (here deliberately mismatched-size) payload was not
+    # re-serialized to measure it.
+    result = store.record_artifact(
+        run_id="run-ptr",
+        stage="writer_report",
+        artifact_type="writer_report",
+        payload={"body": "x" * 100},
+        storage_uri=str(tmp_path / "snap" / "writer_report" / "payload.json"),
+        storage_bytes=987654,
+        content_hash="deadbeefcafe",
+    )
+
+    assert result.payload_inline is False
+    assert result.bytes == 987654
+    assert result.output_hash == "deadbeefcafe"
+    row = store.get_artifact(result.artifact_id)
+    assert row["storage_bytes"] == 987654
+    assert row["payload_json"] in ("", None)
+    assert row["storage_uri"].endswith("payload.json")
+
+
+def test_prune_runs_disabled_when_no_limits(tmp_path, monkeypatch):
+    monkeypatch.setenv("ARTIFACT_LEDGER_RETENTION_MAX_RUNS", "0")
+    monkeypatch.setenv("ARTIFACT_LEDGER_RETENTION_MAX_AGE_DAYS", "0")
+    store = _store(tmp_path)
+    store.upsert_run(run_id="r1", query="q", status="running")
+
+    result = store.prune_runs(keep_run_id="r_current")
+
+    assert result["status"] == "disabled"
+    assert {row["run_id"] for row in store.list_run_ids()} == {"r1"}

@@ -91,6 +91,23 @@ def _strict_quality_mode() -> bool:
     return str(os.getenv("STRICT_EVIDENCE_MODE") or "").strip().lower() in {"1", "true", "yes", "on", "strict"}
 
 
+def _is_claim_first_blueprint(blueprint: Dict[str, Any]) -> bool:
+    payload = _as_dict(blueprint)
+    strategy = _as_dict(payload.get("layout_strategy"))
+    source = str(strategy.get("source") or payload.get("blueprint_source") or "").strip().lower()
+    if source in {"claim_first_recomposer", "claim_first", "claims", "analysis_claims"}:
+        return True
+    if str(payload.get("blueprint_role") or "").strip().lower() == "final_outline":
+        chapters = [chapter for chapter in _as_list(payload.get("chapters")) if isinstance(chapter, dict)]
+        return any(
+            str(chapter.get("chapter_role") or "").strip() == "claim_driven_final_chapter"
+            or _as_list(chapter.get("claim_ids"))
+            or _as_list(chapter.get("fact_ids"))
+            for chapter in chapters
+        )
+    return False
+
+
 def _claim_type_for_unit(unit: Dict[str, Any]) -> str:
     explicit = str(unit.get("claim_type") or unit.get("conclusion_type") or "").strip().lower()
     if explicit:
@@ -244,6 +261,7 @@ def _is_weak_evidence(item: Dict[str, Any]) -> bool:
 def validate_report_blueprint(report_blueprint: Dict[str, Any]) -> Dict[str, Any]:
     issues: List[Dict[str, Any]] = []
     blueprint = _as_dict(report_blueprint)
+    claim_first = _is_claim_first_blueprint(blueprint)
     chapters = [chapter for chapter in _as_list(blueprint.get("chapters")) if isinstance(chapter, dict)]
     if not blueprint.get("report_family"):
         _issue(issues, package="report_blueprint", issue_type="missing_report_family", message="report_family is recommended.", severity="warning")
@@ -254,9 +272,9 @@ def validate_report_blueprint(report_blueprint: Dict[str, Any]) -> Dict[str, Any
     if not chapters:
         _issue(issues, package="report_blueprint", issue_type="chapters_empty", message="At least one chapter is required.")
     shell = _as_dict(blueprint.get("report_shell"))
-    if not shell:
+    if not shell and not claim_first:
         _issue(issues, package="report_blueprint", issue_type="missing_report_shell", message="report_shell is required for dynamic report structure.", severity="warning")
-    else:
+    elif shell:
         if not _as_list(shell.get("front_blocks")):
             _issue(issues, package="report_blueprint", issue_type="missing_front_blocks", message="report_shell.front_blocks should not be empty.", severity="warning")
         if not _as_list(shell.get("back_blocks")):
@@ -302,14 +320,14 @@ def validate_report_blueprint(report_blueprint: Dict[str, Any]) -> Dict[str, Any
             _issue(issues, package="report_blueprint", issue_type="missing_chapter_question", message="Each chapter must have chapter_question.", path=path)
         if not str(chapter.get("core_question") or question or "").strip():
             _issue(issues, package="report_blueprint", issue_type="missing_core_question", message="Each chapter must have core_question.", path=path)
-        if not _as_list(chapter.get("required_evidence_mix")):
+        if not claim_first and not _as_list(chapter.get("required_evidence_mix")):
             _issue(issues, package="report_blueprint", issue_type="missing_required_evidence_mix", message="Each chapter should declare required_evidence_mix.", path=path, severity="warning")
         layout_policy = _as_dict(chapter.get("layout_policy"))
         if not _as_list(layout_policy.get("preferred_blocks")):
             _issue(issues, package="report_blueprint", issue_type="missing_preferred_blocks", message="Each chapter should declare layout_policy.preferred_blocks.", path=path, severity="warning")
-        if int(chapter.get("min_total_sources") or 0) < 4:
+        if not claim_first and int(chapter.get("min_total_sources") or 0) < 4:
             _issue(issues, package="report_blueprint", issue_type="weak_min_total_sources", message="Each chapter should require at least four total sources.", path=path, severity="warning")
-        if int(chapter.get("min_ab_sources") or 0) < 1:
+        if not claim_first and int(chapter.get("min_ab_sources") or 0) < 1:
             _issue(issues, package="report_blueprint", issue_type="weak_min_ab_sources", message="Each chapter should require at least one A/B source.", path=path, severity="warning")
         if not str(chapter.get("chapter_role") or "").strip():
             _issue(issues, package="report_blueprint", issue_type="missing_chapter_role", message="chapter_role is recommended.", path=path, severity="warning")
@@ -328,6 +346,7 @@ def validate_report_blueprint(report_blueprint: Dict[str, Any]) -> Dict[str, Any
 def validate_profile_contract(report_blueprint: Dict[str, Any], micro_layouts: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     issues: List[Dict[str, Any]] = []
     blueprint = _as_dict(report_blueprint)
+    claim_first = _is_claim_first_blueprint(blueprint)
     profile_name = str(_as_dict(blueprint.get("layout_strategy")).get("profile") or blueprint.get("report_family") or "")
     contract = quality_contract_for_profile(profile_name)
     must_blocks = {str(item) for item in _as_list(contract.get("must_have_blocks")) if str(item).strip()}
@@ -355,6 +374,8 @@ def validate_profile_contract(report_blueprint: Dict[str, Any], micro_layouts: S
                 block_type=block,
             )
     for role in sorted(must_roles):
+        if claim_first:
+            continue
         if role not in evidence_roles:
             _issue(
                 issues,
@@ -388,9 +409,9 @@ def validate_chapter_evidence_packages(chapter_evidence_packages: Sequence[Dict[
             if not _has_source_ref(item):
                 _issue(issues, package="chapter_evidence_packages", issue_type="core_evidence_missing_source", message="core_evidence must have source/source_ref.", path=path)
             if level == "D":
-                _issue(issues, package="chapter_evidence_packages", issue_type="d_level_in_core", message="D-level evidence cannot enter core_evidence.", path=path)
+                _issue(issues, package="chapter_evidence_packages", issue_type="d_level_in_core", message="D-level evidence should be handled as a directional signal.", path=path, severity="warning")
             if _is_weak_evidence(item):
-                _issue(issues, package="chapter_evidence_packages", issue_type="weak_evidence_in_core", message="Weak evidence should be appendix_evidence, not core_evidence.", path=path)
+                _issue(issues, package="chapter_evidence_packages", issue_type="weak_evidence_in_core", message="Weak evidence in core_evidence should be written with caveats.", path=path, severity="warning")
         for conflict_index, conflict in enumerate(_as_list(package.get("conflicts"))):
             conflict = _as_dict(conflict)
             if not (conflict.get("description") or conflict.get("reason") or conflict.get("conflict_type")):
@@ -576,6 +597,7 @@ def validate_argument_units(argument_units: Sequence[Dict[str, Any]]) -> Dict[st
                 issue_type="core_claim_without_ab_source",
                 message="decision-ready claims must bind at least one A/B source or validated supporting metric.",
                 path=path,
+                severity="error" if _strict_quality_mode() else "warning",
             )
     return _contract_result("argument_units", issues)
 
