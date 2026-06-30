@@ -1608,6 +1608,44 @@ def _compact_cited_summary_line(line: str, *, max_chars: int = 260) -> str:
     return _public_text(text)
 
 
+_CORE_OBSERVATION_BRIDGE_RE = re.compile(
+    r"(?:"
+    r"\u5982\u679c\u628a\u8fd9\u4e00\u4fe1\u53f7|"
+    r"\u8fd9\u4f1a\u628a\u5355\u70b9\u4e8b\u5b9e|"
+    r"\u5206\u6790\u91cd\u70b9\u4f1a\u4ece|"
+    r"\u53d8\u5316\u53d1\u751f\u5728\u54ea\u91cc|"
+    r"\u8c01\u627f\u62c5\u53d8\u5316\u6210\u672c|"
+    r"\u54ea\u4e9b\u73af\u8282\u5148\u53d7\u5f71\u54cd|"
+    r"\u653e\u8fdb\u8fde\u7eed\u53d8\u5316\u4e2d\u89c2\u5bdf|"
+    r"\u5173\u7cfb\u66f4\u6e05\u695a|"
+    r"\u7eed\u89c2\u5bdf\u54ea\u4e9b\u7ea6\u675f\u6761\u4ef6|"
+    r"\u4f5c\u4e3a\u65b9\u5411\u6027\u89c2\u5bdf\u8fdb\u5165\u6b63\u6587|"
+    r"\u540c\u7c7b\u4e3b\u4f53\u3001\u540c\u7c7b\u573a\u666f|"
+    r"\u76f8\u540c\u53e3\u5f84\u4fe1\u606f\u662f\u5426\u91cd\u590d\u51fa\u73b0|"
+    r"\u8fd9\u4e00\u4fe1\u53f7\u4ecd\u53d7\u6765\u6e90\u8986\u76d6\u8303\u56f4|"
+    r"\u516c\u5f00\u62ab\u9732\u5145\u5206\u6027\u7684\u9650\u5236|"
+    r"\u8be5\u7ebf\u7d22\u66f4\u9002\u5408\u88ab\u5904\u7406\u4e3a|"
+    r"\u4e0d\u5b9c\u88ab\u76f4\u63a5\u5199\u6210"
+    r")"
+)
+
+
+# Chapter roadmap / scope sentences ("本章将重点剖析…", "本节旨在…") describe what
+# the chapter is about rather than stating a finding, so they must not be lifted
+# into the executive 核心观察 block.
+_CORE_OBSERVATION_ROADMAP_RE = re.compile(r"^本(?:章|节|报告|文)(?:将|从|拟|旨在|意在|聚焦|围绕|重点|主要)")
+
+
+def _looks_like_core_observation_bridge_line(text: str) -> bool:
+    compact = re.sub(r"\[\d{1,5}\]", "", str(text or ""))
+    compact = re.sub(r"\s+", "", compact)
+    if not compact:
+        return True
+    if _CORE_OBSERVATION_ROADMAP_RE.match(compact):
+        return True
+    return bool(_CORE_OBSERVATION_BRIDGE_RE.search(compact))
+
+
 def _ensure_public_core_observation_block(markdown: str) -> str:
     source = str(markdown or "").strip()
     if not source or _PUBLIC_SUMMARY_HEADING_RE.search(source):
@@ -1624,20 +1662,27 @@ def _ensure_public_core_observation_block(markdown: str) -> str:
         candidate = _compact_cited_summary_line(stripped)
         if not candidate:
             continue
-        key = re.sub(r"\[\d{1,5}\]", "", candidate).strip()
+        if _looks_like_core_observation_bridge_line(candidate):
+            continue
+        key = re.sub(r"\[\d{1,5}\]", "", candidate)
+        key = re.sub(r"\s+", "", key).strip()
         if key in seen:
             continue
         seen.add(key)
         candidates.append(candidate)
-        if len(candidates) >= 3:
-            break
     if not candidates:
         return source
+    # Lead the executive summary with the strongest findings: prefer observations
+    # that carry a concrete metric (market size, growth, forecast) over whatever
+    # sentence the first chapter happens to open with. Stable within each group.
+    salient = [item for item in candidates if _METRIC_CLAIM_RE.search(item)]
+    rest = [item for item in candidates if not _METRIC_CLAIM_RE.search(item)]
+    selected = (salient + rest)[:3]
     lines = body.splitlines()
     insert_at = 1 if lines and re.match(r"^#\s+", lines[0].strip()) else 0
     while insert_at < len(lines) and not lines[insert_at].strip():
         insert_at += 1
-    block = ["", "## \u6838\u5fc3\u89c2\u5bdf", *[f"- {item}" for item in candidates], ""]
+    block = ["", "## \u6838\u5fc3\u89c2\u5bdf", *[f"- {item}" for item in selected], ""]
     updated_body = "\n".join([*lines[:insert_at], *block, *lines[insert_at:]]).strip()
     return "\n\n".join(part for part in [updated_body, appendix] if str(part or "").strip())
 

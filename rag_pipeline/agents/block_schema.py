@@ -529,7 +529,12 @@ def _claim_first_blocks_from_section_plan(
                 "claim_id": claim_id,
                 "matched_llm_claim": matched_claim,
                 "required_evidence_refs": refs,
-                "required_evidence_roles": _as_list(section.get("required_evidence_roles")),
+                # Fall back to the block-type's canonical roles (consistent with the
+                # other block builders) so claim-first blocks always declare
+                # required_evidence_roles instead of tripping block_missing_required_roles.
+                "required_evidence_roles": _as_list(section.get("required_evidence_roles"))
+                or _as_list(definition.get("roles"))
+                or ["support"],
                 "min_evidence_refs": 1,
                 "renderer": section.get("renderer") or definition.get("renderer") or "render_thesis_block",
                 "public_render": True,

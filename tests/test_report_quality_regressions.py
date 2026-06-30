@@ -353,6 +353,61 @@ def test_web_normalization_preserves_rerank_scores_on_sources_and_raw_points():
     assert child["rerank_diagnostics"]["returned_count"] == 8
 
 
+def test_iqs_rerank_low_score_spread_is_marked_low_confidence(monkeypatch):
+    monkeypatch.setattr(web_analysis_agent_module, "DEFAULT_RERANK_API_KEY", "test-key")
+    monkeypatch.setattr(web_analysis_agent_module, "DEFAULT_RERANK_PROVIDER", "jina")
+    monkeypatch.setattr(web_analysis_agent_module, "DEFAULT_RERANK_URL", "http://rerank.local/v1/rerank")
+    monkeypatch.setattr(web_analysis_agent_module, "DEFAULT_RERANK_MODEL", "qwen3-reranker-8b")
+    monkeypatch.setattr(web_analysis_agent_module, "DEFAULT_RERANK_TIMEOUT", 5)
+    monkeypatch.setenv("RAG_ENABLE_API_RERANK", "1")
+    monkeypatch.setenv("IQS_RERANK_MIN_SCORE_SPREAD", "0.06")
+
+    def fake_rerank_api(**kwargs):
+        assert kwargs["model"] == "qwen3-reranker-8b"
+        return [
+            {"index": 1, "relevance_score": 0.953},
+            {"index": 3, "relevance_score": 0.946},
+            {"index": 2, "relevance_score": 0.939},
+            {"index": 0, "relevance_score": 0.931},
+        ]
+
+    monkeypatch.setattr(web_analysis_agent_module, "call_external_rerank_api", fake_rerank_api)
+    results = [
+        {
+            "title": "会计岗位数字化转型与智能财务课程改革",
+            "url": "https://example.org/accounting-ai",
+            "snippet": "会计岗位从基础核算转向财务数据分析、预算管理和智能财务工具应用。",
+        },
+        {
+            "title": "周末旅游餐饮攻略",
+            "url": "https://example.org/travel-food",
+            "snippet": "海边酒店、餐饮路线和旅游攻略。",
+        },
+        {
+            "title": "人工智能影响财务共享中心和审计流程",
+            "url": "https://example.org/finance-ai",
+            "snippet": "AI正在影响财务共享中心、审计流程、会计实训课程。",
+        },
+        {
+            "title": "篮球比赛新闻",
+            "url": "https://example.org/sports",
+            "snippet": "球队比赛进入加时赛并更换主教练。",
+        },
+    ]
+
+    reranked, meta = web_analysis_agent_module.rerank_web_results(
+        "会计学专业就业趋势 AI影响 财务共享 智能财务",
+        results,
+        top_k=4,
+        options={"rerank_top_k": 4, "rerank_max_docs": 4, "rerank_prefilter_max_docs": 4},
+    )
+
+    assert meta["api_rerank_low_confidence"] is True
+    assert meta["api_rerank_score_spread"] < 0.06
+    assert meta["rerank_score_weight"] == 0.0
+    assert reranked[0]["title"] == "会计岗位数字化转型与智能财务课程改革"
+
+
 def test_evidence_merger_uses_rerank_score_as_light_relevance_signal():
     package = merge_evidence_package(
         original_query="test market report",

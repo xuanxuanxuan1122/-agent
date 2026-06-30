@@ -2562,6 +2562,7 @@ def rerank_web_results(
         "top_k": top_k,
         "max_docs": max_docs,
     }
+    rerank_score_weight = 0.40
     if prepared and api_rerank_enabled and DEFAULT_RERANK_API_KEY:
         max_chars_per_doc = _env_int("IQS_RERANK_MAX_CHARS_PER_DOC", DEFAULT_RERANK_MAX_CHARS_PER_DOC, min_value=500, max_value=5000)
         documents = [_result_text(item, max_chars=max_chars_per_doc) for item in prepared]
@@ -2588,6 +2589,25 @@ def rerank_web_results(
                 if 0 <= idx < len(prepared):
                     prepared[idx]["web_rerank_score"] = float(rerank_item.get("relevance_score", 0.0) or 0.0)
                     prepared[idx]["web_rerank_rank"] = rank
+            rerank_scores = [
+                float(item.get("web_rerank_score", 0.0) or 0.0)
+                for item in prepared
+                if item.get("web_rerank_rank") is not None
+            ]
+            score_spread = round(max(rerank_scores) - min(rerank_scores), 6) if len(rerank_scores) >= 2 else 0.0
+            min_score_spread = _env_float("IQS_RERANK_MIN_SCORE_SPREAD", 0.04, min_value=0.0, max_value=1.0)
+            low_confidence = bool(len(rerank_scores) >= 3 and score_spread < min_score_spread)
+            if low_confidence:
+                rerank_score_weight = 0.0
+                for item in prepared:
+                    item["web_rerank_low_confidence"] = True
+            meta["api_rerank_valid_score_count"] = len(rerank_scores)
+            meta["api_rerank_score_spread"] = score_spread
+            meta["api_rerank_min_score_spread"] = min_score_spread
+            meta["api_rerank_low_confidence"] = low_confidence
+            meta["rerank_score_weight"] = rerank_score_weight
+            if low_confidence:
+                meta["api_rerank_low_confidence_reason"] = "score_spread_below_threshold"
             meta["returned_count"] = len(rerank_items)
             _progress(
                 "iqs-rerank",
@@ -2598,6 +2618,8 @@ def rerank_web_results(
         except Exception as exc:
             meta["error"] = str(exc)
             _progress("iqs-rerank", "API 重排失败，改用本地分数", error=exc)
+    meta.setdefault("api_rerank_low_confidence", False)
+    meta.setdefault("rerank_score_weight", rerank_score_weight)
     for item in prepared:
         rerank_score = float(item.get("web_rerank_score", 0.0) or 0.0)
         credibility = float(item.get("credibility_score", 0.0) or 0.0)
@@ -2608,14 +2630,23 @@ def rerank_web_results(
         if task_score < 0:
             item["web_final_score"] = -1
         else:
-            item["web_final_score"] = round(
-                (0.40 * rerank_score)
-                + (0.20 * credibility)
-                + (0.15 * lexical)
-                + (0.15 * task_score)
-                + (0.10 * origin),
-                6,
-            )
+            if rerank_score_weight <= 0:
+                item["web_final_score"] = round(
+                    (0.30 * credibility)
+                    + (0.35 * lexical)
+                    + (0.25 * task_score)
+                    + (0.10 * origin),
+                    6,
+                )
+            else:
+                item["web_final_score"] = round(
+                    (rerank_score_weight * rerank_score)
+                    + (0.20 * credibility)
+                    + (0.15 * lexical)
+                    + (0.15 * task_score)
+                    + (0.10 * origin),
+                    6,
+                )
     prepared.sort(key=lambda item: (float(item.get("web_final_score", 0.0)), float(item.get("credibility_score", 0.0))), reverse=True)
     selected = [
         item

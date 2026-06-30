@@ -1,4 +1,8 @@
-from rag_pipeline.agents.final_writer_agent import _render_key_data_block, run_final_writer_agent
+from rag_pipeline.agents.final_writer_agent import (
+    _ensure_public_core_observation_block,
+    _render_key_data_block,
+    run_final_writer_agent,
+)
 from rag_pipeline.agents.markdown_renderer import (
     _compact_chapter_heading,
     render_appendix,
@@ -37,6 +41,50 @@ def test_compact_chapter_heading_uses_complete_phrase_not_mid_clause_truncation(
 
     assert heading == "\u4f1a\u8ba1\u5b66\u4e13\u4e1a\u5c31\u4e1a\u7684\u73b0\u5b9e\u4ef7\u503c"
     assert not heading.endswith("\u8d22")
+
+
+def test_core_observation_ignores_bridge_sentences_and_keeps_concrete_facts():
+    markdown = (
+        "# \u4f1a\u8ba1\u5b66\u4e13\u4e1a\u5c31\u4e1a\u7814\u7a76\u62a5\u544a\n\n"
+        "## 1. \u4f1a\u8ba1\u5c31\u4e1a\u7684\u73b0\u5b9e\u4ef7\u503c\n"
+        "\u5982\u679c\u628a\u8fd9\u4e00\u4fe1\u53f7\u4e0e\u76f8\u90bb\u4e8b\u5b9e\u5bf9\u7167\uff0c\u5206\u6790\u91cd\u70b9\u4f1a\u4ece\u201c\u6709\u6ca1\u6709\u53d8\u5316\u201d\u8f6c\u5411\u201c\u53d8\u5316\u53d1\u751f\u5728\u54ea\u91cc\u3001\u8c01\u627f\u62c5\u53d8\u5316\u6210\u672c\u3001\u54ea\u4e9b\u73af\u8282\u5148\u53d7\u5f71\u54cd\u201d\u3002[1][2]\n"
+        "\u8fd9\u4f1a\u628a\u5355\u70b9\u4e8b\u5b9e\u653e\u8fdb\u8fde\u7eed\u53d8\u5316\u4e2d\u89c2\u5bdf\uff0c\u4f7f\u5c97\u4f4d\u4efb\u52a1\u3001\u7ec4\u7ec7\u5b89\u6392\u548c\u80fd\u529b\u8981\u6c42\u4e4b\u95f4\u7684\u5173\u7cfb\u66f4\u6e05\u695a\u3002[1][2]\n"
+        "\u65e0\u9521\u5e022023\u5e74\u4e09\u5b63\u5ea6\u4e0e2025\u5e74\u4e00\u5b63\u5ea6\u4eba\u529b\u8d44\u6e90\u5e02\u573a\u7edf\u8ba1\u663e\u793a\uff0c\u4f9b\u6c42\u603b\u91cf\u5747\u4fdd\u6301\u5e73\u7a33\u589e\u957f\uff0c\u4e14\u4e0e\u5de5\u4e1a\u751f\u4ea7\u6062\u590d\u3001\u6d88\u8d39\u590d\u82cf\u53ca\u670d\u52a1\u4e1a\u589e\u52bf\u76f8\u543b\u5408\u3002[1][2]\n"
+        "\u65e0\u9521\u5e022023\u5e74\u4e09\u5b63\u5ea6\u4e0e2025\u5e74\u4e00\u5b63\u5ea6\u4eba\u529b\u8d44\u6e90\u5e02\u573a\u7edf\u8ba1\u663e\u793a\uff0c\u4f9b\u6c42\u603b\u91cf\u5747\u4fdd\u6301\u5e73\u7a33\u589e\u957f\uff0c\u4e14\u4e0e\u5de5\u4e1a\u751f\u4ea7\u6062\u590d\u3001\u6d88\u8d39\u590d\u82cf\u53ca\u670d\u52a1\u4e1a\u589e\u52bf\u76f8\u543b\u5408\u3002[1][2]\n"
+    )
+
+    updated = _ensure_public_core_observation_block(markdown)
+    summary = updated.split("## 1.", 1)[0]
+
+    assert "\u5982\u679c\u628a\u8fd9\u4e00\u4fe1\u53f7" not in summary
+    assert "\u8fd9\u4f1a\u628a\u5355\u70b9\u4e8b\u5b9e" not in summary
+    assert summary.count("\u65e0\u9521\u5e022023\u5e74\u4e09\u5b63\u5ea6") == 1
+
+
+def test_core_observation_drops_roadmap_lines_and_leads_with_metric():
+    from rag_pipeline.agents.final_writer_agent import _looks_like_core_observation_bridge_line
+
+    # Roadmap/scope sentences describe the chapter, not a finding.
+    assert _looks_like_core_observation_bridge_line("\u672c\u7ae0\u5c06\u91cd\u70b9\u5256\u6790\u9700\u6c42\u4fe1\u53f7\u7684\u8fb9\u754c\u3002[1]") is True
+    assert _looks_like_core_observation_bridge_line("2023\u5e74\u4e2d\u56fd\u5e02\u573a\u89c4\u6a21\u8fbe4186\u4ebf\u5143\u3002[2]") is False
+
+    markdown = (
+        "# \u6d4b\u8bd5\u62a5\u544a\n\n"
+        "## 1. \u9700\u6c42\u4e0e\u5e02\u573a\u7a7a\u95f4\n"
+        "\u672c\u7ae0\u5c06\u91cd\u70b9\u5256\u6790\u9700\u6c42\u4fe1\u53f7\u7684\u8fb9\u754c\u4e0e\u542f\u793a\uff0c\u4e3a\u5224\u65ad\u5e02\u573a\u7a7a\u95f4\u63d0\u4f9b\u65b9\u5411\u6027\u89c6\u89d2\u3002[1]\n"
+        "\u5149\u5927\u8bc1\u5238\u8fd1\u671f\u4e0a\u8c03\u67d0\u516c\u53f8\u8bc4\u7ea7\uff0c\u53cd\u6620\u8d44\u672c\u5e02\u573a\u7684\u65e9\u671f\u8ba4\u53ef\u3002[1]\n"
+        "2023\u5e74\u4e2d\u56fd\u5177\u8eab\u667a\u80fd\u5e02\u573a\u89c4\u6a21\u5df2\u8fbe4186\u4ebf\u5143\uff0c\u6709\u671b\u57282027\u5e74\u589e\u957f\u81f36328\u4ebf\u5143\u3002[2]\n"
+    )
+
+    updated = _ensure_public_core_observation_block(markdown)
+    summary = updated.split("## 1.", 1)[0]
+
+    # The roadmap sentence must not be lifted into \u6838\u5fc3\u89c2\u5bdf.
+    assert "\u672c\u7ae0\u5c06\u91cd\u70b9\u5256\u6790" not in summary
+    # The metric-bearing observation should lead the summary, not the first body line.
+    assert "4186\u4ebf\u5143" in summary
+    first_bullet = next(line for line in summary.splitlines() if line.strip().startswith("- "))
+    assert "4186\u4ebf\u5143" in first_bullet
 
 
 def test_compact_chapter_heading_returns_empty_instead_of_mid_clause_fragment():

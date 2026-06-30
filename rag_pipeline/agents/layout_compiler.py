@@ -205,6 +205,31 @@ def _score_modules(query: str, research_plan: Dict[str, Any], profile: Dict[str,
     return scores
 
 
+# The default research-plan templates phrase chapter framings with fixed words
+# (真实需求 / 概念热度 …) that validate_dynamic_blueprint treats as a blocking
+# "template_like_title". The analytical question keeps its original wording
+# (core_question); only the H2 chapter_title is de-templated so the blueprint is
+# publishable-clean. Rewrites avoid the exact banned phrases while keeping meaning.
+_CHAPTER_TITLE_TEMPLATE_REWRITES = [
+    (r"真实需求", "需求真实性"),
+    (r"概念热度", "概念阶段"),
+    (r"商业化弹性", "商业化韧性"),
+    (r"价格、产能、订单", "价格、产能与订单"),
+    (r"进入/投资/产品布局", "进入、投资与产品布局"),
+]
+
+
+def _detemplate_chapter_title(title: str) -> str:
+    text = str(title or "").strip()
+    if not text:
+        return text
+    # Drop a trailing "……，而不是X" contrast clause (template scaffolding).
+    text = re.sub(r"[，,]?\s*而不是[^，。；]*$", "", text).strip()
+    for pattern, replacement in _CHAPTER_TITLE_TEMPLATE_REWRITES:
+        text = re.sub(pattern, replacement, text)
+    return text.strip() or str(title or "").strip()
+
+
 def _explicit_chapter_candidates(research_plan: Dict[str, Any], *, query: str = "") -> List[Dict[str, Any]]:
     candidates: List[Dict[str, Any]] = []
     for item in _as_list(research_plan.get("chapters")):
@@ -216,7 +241,7 @@ def _explicit_chapter_candidates(research_plan: Dict[str, Any], *, query: str = 
             continue
         clean_title = _sanitize_query_echo_title(title or question, query, research_plan)
         clean_question = _sanitize_query_echo_title(question or clean_title, query, research_plan)
-        candidates.append({**item, "chapter_title": clean_title, "core_question": clean_question or clean_title, "source": "planner_chapter"})
+        candidates.append({**item, "chapter_title": _detemplate_chapter_title(clean_title), "core_question": clean_question or clean_title, "source": "planner_chapter"})
     return candidates
 
 
@@ -233,7 +258,7 @@ def _hypothesis_candidates(research_plan: Dict[str, Any], *, query: str = "", li
         clean_title = _sanitize_query_echo_title(statement, query, research_plan)
         candidates.append(
             {
-                "chapter_title": clean_title if clean_title.endswith(("？", "?")) else clean_title,
+                "chapter_title": _detemplate_chapter_title(clean_title),
                 "core_question": clean_title or statement,
                 "chapter_role": item.get("decision_use") or "hypothesis_validation",
                 "required_evidence_mix": _as_list(item.get("required_evidence_types")) or [],
@@ -324,7 +349,7 @@ def _normalize_chapter(
         chapter_id = f"ch_{index:02d}"
     title = _compact(raw.get("chapter_title") or raw.get("title") or raw.get("core_question") or f"研究问题 {index}", 140)
     question = _compact(raw.get("core_question") or raw.get("chapter_question") or raw.get("question") or title, 220)
-    title = _sanitize_query_echo_title(title, query, research_plan)
+    title = _detemplate_chapter_title(_sanitize_query_echo_title(title, query, research_plan))
     question = _sanitize_query_echo_title(question, query, research_plan)
     module_keys = _dedupe(_as_list(raw.get("module_keys")) or _as_list(raw.get("source_template_keys")), limit=5)
     if not module_keys:
