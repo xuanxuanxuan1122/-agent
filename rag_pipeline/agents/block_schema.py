@@ -640,7 +640,7 @@ def select_blocks_for_chapter(
     selected_records: List[Dict[str, Any]] = []
     seen_blocks = set()
     try:
-        max_must_blocks = max(1, min(3, int(os.getenv("REPORT_MAX_MUST_BLOCKS_PER_CHAPTER", "2"))))
+        max_must_blocks = max(1, min(3, int(os.getenv("REPORT_MAX_MUST_BLOCKS_PER_CHAPTER", "3"))))
     except ValueError:
         max_must_blocks = 2
     for record in sorted(scored, key=lambda item: (item["score"], item["block_type"] not in GENERIC_BLOCK_TYPES), reverse=True):

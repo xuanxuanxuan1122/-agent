@@ -1634,12 +1634,20 @@ _CORE_OBSERVATION_BRIDGE_RE = re.compile(
 # the chapter is about rather than stating a finding, so they must not be lifted
 # into the executive 核心观察 block.
 _CORE_OBSERVATION_ROADMAP_RE = re.compile(r"^本(?:章|节|报告|文)(?:将|从|拟|旨在|意在|聚焦|围绕|重点|主要)")
+# A summary line that opens with a dangling metric ("5%；…") or a separator is a
+# split sentence fragment, not a self-contained observation. A real number-led
+# observation ("2025年…", "90%份额…") continues with a word, not a separator.
+_CORE_OBSERVATION_FRAGMENT_RE = re.compile(
+    r"^(?:\d+(?:\.\d+)?\s*[%％]?\s*[；;、，,。：:]|[；;、，,。：:)）\]】])"
+)
 
 
 def _looks_like_core_observation_bridge_line(text: str) -> bool:
     compact = re.sub(r"\[\d{1,5}\]", "", str(text or ""))
     compact = re.sub(r"\s+", "", compact)
     if not compact:
+        return True
+    if _CORE_OBSERVATION_FRAGMENT_RE.match(compact):
         return True
     if _CORE_OBSERVATION_ROADMAP_RE.match(compact):
         return True

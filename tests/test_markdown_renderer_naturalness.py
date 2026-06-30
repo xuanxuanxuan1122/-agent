@@ -87,6 +87,17 @@ def test_core_observation_drops_roadmap_lines_and_leads_with_metric():
     assert "4186\u4ebf\u5143" in first_bullet
 
 
+def test_core_observation_drops_split_metric_fragments():
+    from rag_pipeline.agents.final_writer_agent import _looks_like_core_observation_bridge_line
+
+    # A dangling metric like "5%\uff1b\u4e0a\u6e38\u6db5\u76d6\u2026" is a split sentence, not an observation.
+    assert _looks_like_core_observation_bridge_line("5%\uff1b\u4e0a\u6e38\u6db5\u76d6\u7a7a\u5fc3\u676f\u7535\u673a\u3001\u4f20\u611f\u5668\u3002[2]") is True
+    assert _looks_like_core_observation_bridge_line("\u3001\u4f20\u611f\u5668\u4e0e\u63a7\u5236\u5668\u6784\u6210\u4e0a\u6e38\u3002[2]") is True
+    # Real number-led observations must still be kept.
+    assert _looks_like_core_observation_bridge_line("2025\u5e74\u5e02\u573a\u89c4\u6a21\u8fbe4186\u4ebf\u5143\u3002[1]") is False
+    assert _looks_like_core_observation_bridge_line("\u4e2d\u56fd\u4f01\u4e1a\u4ee590%\u7684\u5168\u7403\u4efd\u989d\u5360\u636e\u4f18\u52bf\u3002[3]") is False
+
+
 def test_compact_chapter_heading_returns_empty_instead_of_mid_clause_fragment():
     heading = _compact_chapter_heading(
         "会计与财务管理类专业的课程基础已从单一财会知识扩展为涵盖经济、金融、税务及管理的复合型理论体系",

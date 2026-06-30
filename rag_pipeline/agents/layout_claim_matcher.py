@@ -15,6 +15,13 @@ BLOCK_TYPES = {
     "scenario_analysis",
     "competitive_positioning",
     "unit_economics",
+    # Profile-expected analytical blocks; without these the matcher rejected an
+    # explicit policy_timeline/mechanism_chain/stakeholder_map block_type and the
+    # claim collapsed to integrated_signal, tripping missing_profile_block.
+    "mechanism_chain",
+    "policy_timeline",
+    "stakeholder_map",
+    "value_chain_map",
     "integrated_signal",
 }
 
@@ -106,6 +113,12 @@ def claim_supported_block_types(claim: Any) -> List[str]:
         "standard": "technology_maturity",
         "counter": "risk_trigger",
         "risk": "risk_trigger",
+        "policy": "policy_timeline",
+        "policy_original": "policy_timeline",
+        "mechanism": "mechanism_chain",
+        "official_data": "stakeholder_map",
+        "company_filing": "value_chain_map",
+        "filing": "value_chain_map",
     }.get(fact_type)
     if mapped and mapped not in result:
         result.append(mapped)

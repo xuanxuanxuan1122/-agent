@@ -1182,6 +1182,15 @@ def _normalize_public_packages_for_contract(
         if isinstance(package, dict) and str(package.get("chapter_id") or "").strip()
     }
     units = [dict(unit) for unit in list(argument_units or []) if isinstance(unit, dict)]
+    # Rotate the generic actionable fallback so chapters that lack a real
+    # decision implication do not repeat the identical template sentence.
+    _actionable_fallback_variants = [
+        "这一判断可用于梳理岗位任务、能力要求和组织安排的变化方向。",
+        "据此可优先排布资源投入顺序，并锁定需要持续跟踪的关键变量。",
+        "可作为筛选标的与评估进入时点的参考，并结合后续可复核数据校准。",
+        "建议据此设定阶段性观察指标，在新增证据出现时重新排序优先级。",
+    ]
+    _actionable_fallback_idx = 0
     for unit in units:
         if unit.get("omit_from_report") or unit.get("public_render") is False:
             continue
@@ -1193,10 +1202,12 @@ def _normalize_public_packages_for_contract(
         if not str(unit.get("counter_evidence") or "").strip():
             unit["counter_evidence"] = "如果后续公开材料与当前事实方向相反，前述判断需要重新校准。"
         if not str(unit.get("actionable") or unit.get("decision_implication") or "").strip():
-            unit["actionable"] = "这一判断可用于梳理岗位任务、能力要求和组织安排的变化方向。"
-            unit["actionable_is_fallback"] = True
             if os.environ.get("REPORT_TEMPLATE_FALLBACKS", "0").strip() in {"1", "true", "True"}:
                 unit["actionable"] = "后续重点跟踪同口径材料、执行结果和反向样本，再根据连续变化校准判断。"
+            else:
+                unit["actionable"] = _actionable_fallback_variants[_actionable_fallback_idx % len(_actionable_fallback_variants)]
+                _actionable_fallback_idx += 1
+            unit["actionable_is_fallback"] = True
         if not _as_list(unit.get("evidence_refs")) and fallback_refs:
             unit["evidence_refs"] = list(fallback_refs)
     first_unit = _first_public_unit_by_chapter(units)
