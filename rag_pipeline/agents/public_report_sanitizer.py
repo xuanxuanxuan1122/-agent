@@ -387,6 +387,45 @@ def has_internal_gap_language(text: str) -> bool:
     return any(re.search(pattern, value, re.I) for pattern in INTERNAL_GAP_PATTERNS)
 
 
+# The template composers narrate the *analysis methodology* into the body
+# ("这一变化首先影响任务分工和能力配置…", "当主体行动持续、影响路径清楚…").
+# That generic "how to judge any change" scaffolding is what makes the report
+# read like an internal analysis tool rather than an industry-research deliverable,
+# so any sentence carrying these framework markers is dropped from public text.
+_ANALYSIS_FRAMEWORK_NARRATION_RE = re.compile(
+    r"任务分工[与和]?能力配置"
+    r"|系统接口和?责任边界"
+    r"|重新安排人员能力"
+    r"|原本偏执行的工作"
+    r"|影响路径是否清[楚晰]"
+    r"|主体行动是否持续"
+    r"|约束条件是否可解释"
+    r"|可以解释真实工作流程"
+    r"|放进连续变化中观察"
+    r"|谁承担变化成本"
+    r"|哪些环节先受影响"
+    r"|场景深度[、，]组织采纳"
+    r"|梳理岗位任务"
+    r"|可解释的分析材料"
+    r"|单点样本转化为"
+)
+
+
+def _strip_analysis_framework_narration(text: str) -> str:
+    value = str(text or "")
+    if not _ANALYSIS_FRAMEWORK_NARRATION_RE.search(value):
+        return value
+    sentences = re.split(r"(?<=[。！？\n])", value)
+    kept = [s for s in sentences if not (s.strip() and _ANALYSIS_FRAMEWORK_NARRATION_RE.search(s))]
+    rebuilt = "".join(kept).strip()
+    # If only citation markers remain (the sentence carrying them was framework
+    # narration), drop them so no dangling "[1]" is left behind.
+    if rebuilt and re.fullmatch(r"(?:\[\d{1,5}\]|\s)+", rebuilt):
+        return ""
+    # If stripping would empty real text, leave it untouched rather than blanking.
+    return rebuilt or value
+
+
 def rewrite_internal_gap_language(text: str) -> str:
     value = str(text or "")
     for pattern, replacement in [
@@ -409,6 +448,7 @@ def rewrite_internal_gap_language(text: str) -> str:
         value = re.sub(pattern, replacement, value, flags=re.I)
     for pattern, replacement in PUBLIC_BODY_REWRITES:
         value = re.sub(pattern, replacement, value, flags=re.I)
+    value = _strip_analysis_framework_narration(value)
     # Drop dangling cross-references whose referent was stripped during cleaning,
     # e.g. "（参见）" / "（详见 ）" / empty "（）". Parentheses that still carry a
     # real referent such as "（参见图3）" are left untouched.

@@ -30,6 +30,27 @@ def test_real_cross_reference_parentheses_are_preserved():
     assert "（参见图3）" in rewrite_internal_gap_language("市场规模持续扩大（参见图3）。")
 
 
+def test_analysis_framework_narration_is_stripped_from_body():
+    # Methodology-narration sentences make the report read like an internal tool;
+    # they must be dropped while the real industry content is kept.
+    text = (
+        "2025年具身智能市场规模达53亿元，预计2030年突破千亿元。"
+        "这一变化首先影响任务分工和能力配置，要求重新安排人员能力、系统接口和责任边界。"
+        "深圳头部企业核心部件国产化率超90%。"
+        "当主体行动持续、影响路径清楚时，相关变化才是可解释的分析材料。"
+    )
+    out = rewrite_internal_gap_language(text)
+    assert "53亿元" in out
+    assert "国产化率超90%" in out
+    assert "任务分工" not in out
+    assert "可解释的分析材料" not in out
+
+
+def test_framework_strip_does_not_blank_an_all_framework_paragraph():
+    # If a fragment is entirely framework narration, keep it rather than blank it.
+    assert rewrite_internal_gap_language("这一判断可用于梳理岗位任务、能力要求的变化方向。").strip()
+
+
 def test_compact_chapter_heading_uses_complete_phrase_not_mid_clause_truncation():
     title = (
         "\u4f1a\u8ba1\u5b66\u4e13\u4e1a\u5c31\u4e1a\u7684\u73b0\u5b9e\u4ef7\u503c"
@@ -1482,7 +1503,10 @@ def test_sanitize_public_markdown_rewrites_review_style_directional_language():
     ):
         assert phrase not in cleaned
     assert "实际进展" in cleaned
-    assert "影响路径" in cleaned
+    # Methodology-narration prose (主体行动是否持续 / 影响路径是否更清晰) is now stripped
+    # from the body, not rewritten into milder framework language.
+    assert "主体行动是否持续" not in cleaned
+    assert "影响路径是否" not in cleaned
     assert "相关主体、组织安排和后续决策" in cleaned
 
 
