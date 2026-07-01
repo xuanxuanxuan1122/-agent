@@ -410,6 +410,10 @@ _ANALYSIS_FRAMEWORK_NARRATION_RE = re.compile(
     r"|单点样本转化为"
     r"|这一判断的价值[不]?在于"
     r"|不在于(?:复述|重复)资料"
+    # Deep-unit template framing that narrates the analytical model instead of the
+    # finding, e.g. "放在“供给约束、需求兑现、价格利润、反向样本”四层关系中观察".
+    r"|放在[“”\"'][^。！？]{2,50}[”“\"'](?:[^。！？]{0,8})?关系中(?:观察|判断)"
+    r"|需要放在.{0,30}关系中(?:观察|判断)"
 )
 
 

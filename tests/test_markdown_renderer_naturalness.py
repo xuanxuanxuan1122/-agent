@@ -66,6 +66,20 @@ def test_analysis_value_narration_and_hedging_leadins_are_cleaned():
     assert "140家" in out2
 
 
+def test_deep_unit_analysis_framing_is_stripped_but_fact_kept():
+    # Deep-unit template claims narrate the analytical model ("放在…关系中观察"),
+    # which must be dropped, while a real number in the same paragraph survives.
+    out = rewrite_internal_gap_language(
+        "中国具身智能需要放在“供给约束、需求兑现、价格利润、反向样本”四层关系中观察，而不是按单个事实外推。"
+        "2025年市场规模达53亿元。"
+    )
+    assert "四层关系中" not in out
+    assert "53亿元" in out
+    # A legitimate sentence that merely contains "关系中" must not be stripped.
+    legit = rewrite_internal_gap_language("在政策与资本关系中，2024年市场规模达6702亿元。")
+    assert "6702亿元" in legit
+
+
 def test_compact_chapter_heading_uses_complete_phrase_not_mid_clause_truncation():
     title = (
         "\u4f1a\u8ba1\u5b66\u4e13\u4e1a\u5c31\u4e1a\u7684\u73b0\u5b9e\u4ef7\u503c"

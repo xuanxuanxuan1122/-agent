@@ -2070,7 +2070,9 @@ def _deep_unit_from_package(
             "claim": claim,
             "reasoning": _long_reasoning(package, lens=lens, facts=facts),
             "mechanism": _long_reasoning(package, lens="mechanism", facts=facts[:4]),
-            "counter_evidence": counter,
+            # These deep-unit counters are generic methodology caveats, not real
+            # counter facts, so they must not be rendered as a public 反证 paragraph.
+            "counter_evidence": "",
             "actionable": action,
             "decision_implication": action,
             "confidence": "medium" if support.get("grade") in {"high", "medium"} else "low",
