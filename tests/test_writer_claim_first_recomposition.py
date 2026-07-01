@@ -61,6 +61,145 @@ def test_writer_uses_claim_first_final_chapters_instead_of_empty_plan_chapters(m
     assert report["table_isolation_summary"]["tables_isolated"] is True
 
 
+def test_writer_materializes_every_claim_first_section_plan_claim(monkeypatch):
+    monkeypatch.setenv("REPORT_BLUEPRINT_SOURCE", "claim_first")
+    monkeypatch.setenv("REPORT_TABLES_ENABLED", "false")
+    monkeypatch.setenv("REPORT_ENABLE_LLM_BODY_REWRITE", "false")
+    monkeypatch.setenv("REPORT_ENABLE_LLM_CHAPTER_NARRATIVE", "false")
+
+    sources = [
+        {"source_id": f"S{index}", "ref": f"[{index}]", "url": f"https://example.com/accounting-{index}"}
+        for index in range(1, 4)
+    ]
+    evidence = [
+        {
+            "evidence_id": f"EV-{index}",
+            "fact_id": f"EV-{index}",
+            "source_id": f"S{index}",
+            "source_ref": f"[{index}]",
+            "source_level": "C",
+            "url": f"https://example.com/accounting-{index}",
+            "fact": f"Accounting employment fact {index}.",
+            "chapter_id": "plan_jobs",
+            "proof_role": "case",
+            "allowed_use": "supporting_context",
+            "public_fact_quality": {
+                "eligible_for_report": True,
+                "public_fact_card": {
+                    "distilled_fact": f"Accounting employment fact {index}.",
+                    "fact_type": "case",
+                },
+            },
+        }
+        for index in range(1, 4)
+    ]
+    claims = [
+        {
+            "claim_id": f"CL-{index}",
+            "chapter_id": "plan_jobs",
+            "cluster_key": "employment",
+            "claim": f"Accounting employment claim {index} should become a public paragraph.",
+            "fact_ids": [f"EV-{index}"],
+            "source_ids": [f"S{index}"],
+            "used_fact_refs": [f"EV-{index}"],
+            "supporting_facts": [f"Accounting employment fact {index}."],
+            "claim_strength": "directional",
+            "can_anchor_section": True,
+        }
+        for index in range(1, 4)
+    ]
+
+    report = build_writer_report(
+        query="会计学就业",
+        report_blueprint={"chapters": [{"chapter_id": "plan_jobs", "chapter_title": "就业能力变化"}]},
+        evidence_package={"analysis_ready_evidence": evidence, "source_registry": sources},
+        structured_analysis={"claim_units": claims},
+        source_registry=sources,
+    )
+
+    assert report["chapter_recomposition"]["metrics"]["claim_to_final_chapter_transfer_rate"] == 1.0
+    assert report["chapter_recomposition"]["metrics"]["bound_claim_count"] == 3
+    rendered_claim_ids = []
+    for chapter in report.get("chapter_packages", []):
+        for section in chapter.get("sections", []):
+            if not section.get("public_render") or section.get("omit_from_report"):
+                continue
+            rendered_claim_ids.append(section.get("claim_id"))
+            rendered_claim_ids.extend(section.get("paragraph_claim_ids") or [])
+    assert set(rendered_claim_ids) == {"CL-1", "CL-2", "CL-3"}
+    assert report["analysis_transfer"]["analysis_claim_count"] == 3
+    assert report["analysis_transfer"]["rendered_analysis_claim_count"] == 3
+    assert report["analysis_transfer"]["claim_to_section_transfer_rate"] == 1.0
+
+
+def test_writer_fallbacks_render_as_public_implications_not_internal_advice(monkeypatch):
+    monkeypatch.setenv("REPORT_BLUEPRINT_SOURCE", "claim_first")
+    monkeypatch.setenv("REPORT_TABLES_ENABLED", "false")
+    monkeypatch.setenv("REPORT_ENABLE_LLM_BODY_REWRITE", "false")
+    monkeypatch.setenv("REPORT_ENABLE_LLM_CHAPTER_NARRATIVE", "false")
+    monkeypatch.setenv("REPORT_COMPOSER_TARGET_SECTION_CHARS", "500")
+
+    sources = [{"source_id": "S1", "ref": "[1]", "url": "https://example.com/accounting"}]
+    evidence = [
+        {
+            "evidence_id": "EV-1",
+            "fact_id": "EV-1",
+            "source_id": "S1",
+            "source_ref": "[1]",
+            "source_level": "C",
+            "url": "https://example.com/accounting",
+            "fact": "某高校会计专业培养方案增加数字财务、智能财税和数据分析相关课程。",
+            "chapter_id": "plan_jobs",
+            "proof_role": "case",
+            "allowed_use": "supporting_context",
+            "public_fact_quality": {
+                "eligible_for_report": True,
+                "public_fact_card": {
+                    "distilled_fact": "某高校会计专业培养方案增加数字财务、智能财税和数据分析相关课程。",
+                    "fact_type": "case",
+                },
+            },
+        }
+    ]
+    report = build_writer_report(
+        query="会计学就业",
+        report_blueprint={"chapters": [{"chapter_id": "plan_jobs", "chapter_title": "就业能力变化"}]},
+        evidence_package={"analysis_ready_evidence": evidence, "source_registry": sources},
+        structured_analysis={
+            "claim_units": [
+                {
+                    "claim_id": "CL-1",
+                    "chapter_id": "plan_jobs",
+                    "cluster_key": "employment",
+                    "claim": "会计专业培养正在从传统核算训练转向数字财务和智能财税能力组合。",
+                    "fact_ids": ["EV-1"],
+                    "source_ids": ["S1"],
+                    "used_fact_refs": ["EV-1"],
+                    "supporting_facts": ["某高校会计专业培养方案增加数字财务、智能财税和数据分析相关课程。"],
+                    "claim_strength": "directional",
+                    "can_anchor_section": True,
+                }
+            ]
+        },
+        source_registry=sources,
+    )
+
+    markdown = report.get("report_markdown") or ""
+    for forbidden in (
+        "后续重点跟踪",
+        "据此可优先",
+        "反向样本持续验证",
+        "重新校准判断",
+        "建议据此",
+        "新增证据出现时",
+        "变化发生在哪里",
+        "影响了哪些主体",
+        "任务分工",
+        "责任边界",
+    ):
+        assert forbidden not in markdown
+
+
 def test_claim_first_section_plan_drives_micro_layout_blocks():
     blocks = select_blocks_for_chapter(
         {
@@ -537,7 +676,7 @@ def test_writer_section_sync_preserves_claim_lineage_fields():
     assert section["used_fact_refs"] == ["EV-1"]
 
 
-def test_claim_first_public_rebuild_triggers_when_old_handoff_lacks_claim_ids(monkeypatch):
+def test_claim_first_public_rebuild_reports_advisory_when_old_handoff_lacks_claim_ids(monkeypatch):
     monkeypatch.setenv("REPORT_PUBLIC_REBUILD_MIN_CLAIM_COVERAGE", "0.85")
 
     summary = needs_public_rebuild(
@@ -569,7 +708,9 @@ def test_claim_first_public_rebuild_triggers_when_old_handoff_lacks_claim_ids(mo
         ],
     )
 
-    assert summary["required"] is True
+    assert summary["required"] is False
+    assert summary["blocking_hit_count"] == 0
+    assert summary["advisory_hit_count"] >= 1
     hit = next(item for item in summary["hits"] if item["pattern"] == "claim_first_handoff_coverage_below_minimum")
     assert hit["structured_claim_count"] == 2
     assert hit["argument_claim_count"] == 0

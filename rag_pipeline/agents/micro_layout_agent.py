@@ -885,9 +885,9 @@ def _section_title_payload_for_llm(package: Dict[str, Any], sections: Sequence[D
         "chapter_question": package.get("chapter_question"),
         "sections": payload_sections,
         "rules": [
-            "Return natural Chinese report subtitles, not internal labels.",
-            "Do not use these words: 证据, 口径, 变量, 可验证信号, 核心观察, 事实依据, 商业化证据.",
-            "Each title should be 8-18 Chinese characters and should not repeat within the chapter.",
+            "返回自然的中文报告小标题，不要返回内部标签。",
+            "不要使用这些词：证据、口径、变量、可验证信号、核心观察、事实依据、商业化证据。",
+            "每个标题建议 8-18 个汉字，同一章内不要重复。",
         ],
     }
 
@@ -1108,6 +1108,18 @@ def _section_for_block(package: Dict[str, Any], block: Dict[str, Any], *, index:
         "section_role": str(block.get("role") or block_type),
         "block_type": block_type,
         "original_block_type": original_block_type,
+        "claim_id": block.get("claim_id"),
+        "claim_ids": _as_list(block.get("claim_ids")),
+        "supporting_claim_ids": _as_list(block.get("supporting_claim_ids")),
+        "source_ids": _as_list(block.get("source_ids")),
+        "paragraph_claim_ids": _as_list(block.get("paragraph_claim_ids")),
+        "paragraph_main_claim_id": block.get("paragraph_main_claim_id") or block.get("claim_id"),
+        "paragraph_supporting_claim_ids": _as_list(block.get("paragraph_supporting_claim_ids")),
+        "narrative_role": block.get("narrative_role"),
+        "narrative_transition_in": block.get("narrative_transition_in"),
+        "narrative_transition_out": block.get("narrative_transition_out"),
+        "narrative_do_not_render": block.get("narrative_do_not_render"),
+        "narrative_plan_public_text_allowed": block.get("narrative_plan_public_text_allowed"),
         "required_evidence_refs": refs,
         "required_evidence_roles": _as_list(block.get("required_evidence_roles")),
         "output_type": block_type,
@@ -1174,6 +1186,15 @@ def _enrich_section_with_matched_claim(
         section["matched_llm_claim_facts"] = basis
     section["matched_llm_claim"] = dict(claim)
     section["matched_by_llm_claim"] = True
+    claim_id = str(claim.get("claim_id") or claim.get("id") or "").strip()
+    if claim_id and not _as_list(section.get("claim_ids")):
+        section["claim_ids"] = [claim_id]
+    if claim_id and not str(section.get("paragraph_main_claim_id") or "").strip():
+        section["paragraph_main_claim_id"] = claim_id
+    if not _as_list(section.get("paragraph_claim_ids")):
+        section["paragraph_claim_ids"] = _as_list(section.get("claim_ids")) or ([claim_id] if claim_id else [])
+    if not _as_list(section.get("paragraph_supporting_claim_ids")):
+        section["paragraph_supporting_claim_ids"] = _as_list(section.get("supporting_claim_ids"))
     section["selection_reason"] = section.get("selection_reason") or "llm_claim_supported"
     if section.get("block_title_generation_failed") or not section.get("section_title"):
         title = _claim_title_for_section(package, block_type, claim)

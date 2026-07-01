@@ -1222,10 +1222,10 @@ def test_llm_semantic_judge_cache_key_includes_source_identity_flags(tmp_path, m
 
 def test_llm_analysis_prompts_request_typed_claims_without_two_to_three_cap(monkeypatch):
     chapter_prompt = analysis_agent._llm_chapter_system_prompt()
-    assert "4-6 claim_units" in chapter_prompt
+    assert "4-6 个 claim_units" in chapter_prompt
     assert "claim_type" in chapter_prompt
     assert "contextual" in chapter_prompt
-    assert "boundary" in chapter_prompt
+    assert "边界" in chapter_prompt
     assert "2-3 claim_units" not in chapter_prompt
 
     captured = {}
@@ -1245,10 +1245,152 @@ def test_llm_analysis_prompts_request_typed_claims_without_two_to_three_cap(monk
     )
 
     global_prompt = captured["system_prompt"]
-    assert "4-6 claim_units" in global_prompt
+    assert "4-6 个 claim_units" in global_prompt
     assert "claim_type" in global_prompt
     assert "contextual" in global_prompt
     assert "2-3 claim_units" not in global_prompt
+
+
+def test_analysis_public_fallback_text_has_no_mojibake():
+    fallback_dimensions = analysis_agent._analysis_dimensions({})
+    chapter_prompt = analysis_agent._llm_chapter_system_prompt()
+    joined = "\n".join([*fallback_dimensions, chapter_prompt])
+
+    for fragment in ("缁煎悎", "鐮旂┒", "闂", "璇佹嵁", "鎬ц瀵", "楠岃瘉"):
+        assert fragment not in joined
+    assert fallback_dimensions == ["综合研究问题"]
+    assert "证据不足" in chapter_prompt
+
+
+def test_analysis_stage_diagnostics_reports_requirement_lineage_coverage():
+    result = analysis_agent.build_fallback_analysis(
+        {
+            "query": "AI Agent",
+            "research_plan": {
+                "chapter_structure": [
+                    {"chapter_id": "ch_01", "chapter_title": "需求验证"},
+                ]
+            },
+            "analysis_ready_evidence": [
+                {
+                    "evidence_id": "EV-REQ",
+                    "chapter_id": "ch_01",
+                    "requirement_id": "REQ-demand",
+                    "fact": "企业将 AI Agent 用于客服流程自动化。",
+                    "source_level": "B",
+                    "source": {"title": "行业报告", "url": "https://example.org/report"},
+                },
+                {
+                    "evidence_id": "EV-NOREQ",
+                    "chapter_id": "ch_01",
+                    "fact": "企业也在试点内部知识库问答。",
+                    "source_level": "C",
+                    "source": {"title": "媒体报道", "url": "https://example.org/news"},
+                },
+            ],
+        }
+    )
+
+    diagnostics = result["analysis_stage_diagnostics"]
+    assert diagnostics["input_requirement_id_count"] == 1
+    assert diagnostics["input_missing_requirement_id_count"] == 1
+    assert diagnostics["input_requirement_id_rate"] == 0.5
+    assert "EV-NOREQ" in diagnostics["input_missing_requirement_id_examples"]
+    assert "claim_requirement_binding_rate" in diagnostics
+
+
+def test_fallback_analysis_infers_requirement_from_chapter_contract_when_fact_lacks_id():
+    evidence = _evidence("EV-FALLBACK-NO-REQ")
+    evidence.update(
+        {
+            "chapter_id": "ch_01",
+            "proof_role": "case",
+            "analysis_role": "case",
+            "allowed_use": "core_claim",
+        }
+    )
+    evidence.pop("requirement_id", None)
+
+    result = analysis_agent.build_fallback_analysis(
+        {
+            "query": "AI Agent",
+            "report_contract": {
+                "evidence_requirements": {
+                    "requirements": [
+                        {
+                            "requirement_id": "REQ-fallback-case",
+                            "chapter_id": "ch_01",
+                            "proof_role": "case",
+                        }
+                    ]
+                }
+            },
+            "chapter_evidence_packages": [{"chapter_id": "ch_01", "chapter_title": "案例验证"}],
+            "analysis_ready_evidence": [evidence],
+        }
+    )
+
+    assert result["claim_units"]
+    assert result["claim_units"][0]["requirement_ids"] == ["REQ-fallback-case"]
+    assert result["analysis_stage_diagnostics"]["claim_requirement_binding_rate"] == 1.0
+
+
+def test_fallback_analysis_preserves_requirement_from_search_task_lineage():
+    evidence = _evidence("EV-SEARCH-TASK-REQ")
+    evidence.update(
+        {
+            "chapter_id": "ch_01",
+            "proof_role": "case",
+            "analysis_role": "case",
+            "allowed_use": "core_claim",
+            "search_task": {
+                "task_id": "task-case-1",
+                "requirement_id": "REQ-search-task-case",
+            },
+        }
+    )
+    evidence.pop("requirement_id", None)
+
+    result = analysis_agent.build_fallback_analysis(
+        {
+            "query": "AI Agent",
+            "chapter_evidence_packages": [{"chapter_id": "ch_01", "chapter_title": "案例验证"}],
+            "analysis_ready_evidence": [evidence],
+        }
+    )
+
+    assert result["claim_units"]
+    assert result["claim_units"][0]["requirement_ids"] == ["REQ-search-task-case"]
+    assert result["analysis_stage_diagnostics"]["input_requirement_id_rate"] == 1.0
+
+
+def test_fallback_claim_units_emit_section_ready_lineage_aliases():
+    evidence = _evidence("EV-SECTION-LINEAGE")
+    evidence.update(
+        {
+            "chapter_id": "ch_01",
+            "requirement_id": "REQ-section-lineage",
+            "source_id": "SRC-section-lineage",
+            "proof_role": "support",
+            "allowed_use": "core_claim",
+        }
+    )
+
+    result = analysis_agent.build_fallback_analysis(
+        {
+            "query": "AI Agent",
+            "chapter_evidence_packages": [{"chapter_id": "ch_01", "chapter_title": "需求验证"}],
+            "analysis_ready_evidence": [evidence],
+        }
+    )
+    unit = result["claim_units"][0]
+
+    assert unit["used_evidence_ids"] == ["EV-SECTION-LINEAGE"]
+    assert unit["used_fact_refs"] == ["EV-SECTION-LINEAGE"]
+    assert unit["supporting_evidence_refs"] == ["EV-SECTION-LINEAGE"]
+    assert unit["source_support_map"]["claim"] == ["EV-SECTION-LINEAGE"]
+    assert unit["lineage"]["requirement_ids"] == ["REQ-section-lineage"]
+    assert unit["lineage"]["source_ids"] == ["SRC-section-lineage"]
 
 
 def test_llm_analysis_salvages_truncated_chapter_json(monkeypatch, tmp_path):
@@ -1807,6 +1949,42 @@ def test_llm_fact_cards_backfill_lineage_from_normalized_evidence_when_ready_cop
     assert cards[0]["lineage"]["requirement_id"] == "H1_case"
 
 
+def test_llm_fact_cards_infer_requirement_from_chapter_contract_when_missing_on_fact():
+    evidence = _evidence("EV-NO-REQ")
+    evidence.update(
+        {
+            "chapter_id": "ch_01",
+            "proof_role": "case",
+            "analysis_role": "case",
+            "allowed_use": "directional_signal",
+        }
+    )
+    evidence.pop("requirement_id", None)
+    evidence_package = {
+        "report_contract": {
+            "evidence_requirements": {
+                "requirements": [
+                    {
+                        "requirement_id": "REQ-case",
+                        "chapter_id": "ch_01",
+                        "proof_role": "case",
+                        "required_fields": ["company", "case", "source"],
+                    }
+                ]
+            }
+        },
+        "chapter_evidence_packages": [{"chapter_id": "ch_01", "chapter_title": "案例验证"}],
+        "analysis_ready_evidence": [evidence],
+    }
+
+    payload = build_llm_analysis_input_v2(evidence_package, {})
+    card = payload["chapters"][0]["fact_cards"][0]
+
+    assert card["requirement_id"] == "REQ-case"
+    assert card["requirement_id_source"] == "chapter_contract_proof_role"
+    assert card["lineage"]["requirement_id"] == "REQ-case"
+
+
 def test_llm_validator_preserves_requirement_ids_and_lineage():
     evidence = _evidence("EV-REQ")
     evidence.update(
@@ -2237,11 +2415,13 @@ def test_llm_analysis_input_prefers_curated_evidence_notes(monkeypatch):
 def test_llm_chapter_prompt_emphasizes_inventory_before_claims():
     prompt = analysis_agent._llm_chapter_system_prompt()
 
-    assert "evidence inventory" in prompt.lower()
+    assert "盘点 fact_cards" in prompt
     assert "topic_fit=direct" in prompt
     assert "topic_fit=related/background" in prompt
-    assert "convert relevant weak evidence into bounded directional claims" in prompt.lower()
-    assert "do not reject evidence only because source level is c or d" in prompt.lower()
+    assert "evidence_grooming" in prompt
+    assert "不得把 diagnostic-only" in prompt
+    assert "有边界的 directional" in prompt
+    assert "C/D 级" in prompt
 
 
 def test_llm_analysis_input_includes_inventory_summary(monkeypatch):
@@ -2977,6 +3157,76 @@ def test_quality_mode_marks_invalid_llm_analysis_as_degraded(monkeypatch):
     assert diagnostics["uses_llm_analysis"] is False
     assert diagnostics["quality_path_degraded"] is True
     assert diagnostics["quality_path_degradation_reason"] == "invalid_output"
+
+
+def test_analysis_diagnostics_recommend_reanalyze_existing_when_claim_conversion_low(monkeypatch, tmp_path):
+    facts = []
+    for index in range(12):
+        item = _evidence(
+            f"EV-{index}",
+            chapter_id="ch_01",
+            level="C",
+            allowed_use="supporting_context",
+            proof_role="case",
+        )
+        item["fact"] = f"财经媒体报道第 {index} 个会计学就业能力变化样本，涉及智能财税、数据分析或财务数据治理课程。"
+        item["source"]["url"] = f"https://media.example.org/accounting/{index}"
+        facts.append(item)
+    evidence_package = {
+        "query": "会计学就业能力变化",
+        "analysis_ready_evidence": facts,
+        "chapter_evidence_diagnostics": {"ch_01": {"chapter_id": "ch_01", "chapter_title": "能力变化"}},
+        "chapter_evidence_packages": [
+            {
+                "chapter_id": "ch_01",
+                "chapter_title": "能力变化",
+                "core_evidence": facts,
+            }
+        ],
+    }
+
+    def fake_llm(**kwargs):
+        user_payload = kwargs.get("user_payload") or {}
+        if user_payload.get("schema_version") == "semantic_claim_support_judge_v1":
+            return {"payload": {"status": "supported", "reason": "directly grounded", "confidence": 0.9}, "usage": {}}
+        return {
+            "payload": {
+                "chapter_id": "ch_01",
+                "claim_units": [
+                    {
+                        "claim_id": "CL-1",
+                        "claim": "会计学就业能力要求正在向智能财税和数据治理能力延伸。",
+                        "used_evidence_ids": ["EV-1"],
+                        "fact_ids": ["EV-1"],
+                        "source_ids": ["https://media.example.org/accounting/1"],
+                        "evidence_basis": [facts[1]["fact"]],
+                        "reasoning_chain": ["课程和岗位样本共同指向能力结构调整。"],
+                        "limitation_boundary": ["媒体样本适合支撑方向性判断。"],
+                        "claim_strength": "directional",
+                    }
+                ],
+            },
+            "usage": {},
+        }
+
+    monkeypatch.setattr(analysis_agent, "call_openai_compatible_json", fake_llm)
+    monkeypatch.setattr(analysis_agent, "llm_config_is_ready", lambda cfg: True)
+    monkeypatch.setattr(analysis_agent, "normalize_llm_config", lambda cfg: {"model": "fake"})
+    monkeypatch.setenv("BRAIN_ENABLE_LLM_EVIDENCE_ANALYSIS", "true")
+    monkeypatch.setenv("BRAIN_LLM_ANALYSIS_MODE", "per_chapter")
+    monkeypatch.setenv("BRAIN_LLM_ANALYSIS_INPUT_VERSION", "v2")
+    monkeypatch.setenv("BRAIN_LLM_ANALYSIS_CACHE_ENABLED", "false")
+    monkeypatch.setenv("BRAIN_LLM_ANALYSIS_CACHE_PATH", str(tmp_path))
+
+    result = run_analysis_agent(evidence_package, llm_config={"provider": "fake", "model": "fake"})
+    diagnostics = result["structured_analysis"]["analysis_stage_diagnostics"]
+
+    assert diagnostics["analysis_ready_fact_count"] == 12
+    assert diagnostics["claim_conversion_rate"] < 0.1
+    assert diagnostics["reanalyze_existing_recommended"] is True
+    assert diagnostics["analysis_review_suggestions"][0]["issue_type"] == "low_claim_conversion"
+    assert diagnostics["analysis_review_suggestions"][0]["suggested_action"] == "reanalyze_existing"
+    assert diagnostics["analysis_review_suggestions"][0]["must_not_render"] is True
 
 
 def test_invalid_llm_analysis_promotes_claim_repair_priorities_to_structured_output(monkeypatch, tmp_path):

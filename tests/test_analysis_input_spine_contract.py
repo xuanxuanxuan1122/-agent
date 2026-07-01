@@ -155,3 +155,43 @@ def test_llm_analysis_input_role_balances_fact_cards(monkeypatch):
     cards = payload["chapters"][0]["fact_cards"]
     assert len(cards) == 3
     assert "counter" in {card["proof_role"] for card in cards}
+
+
+def test_llm_analysis_input_grooms_weak_traceable_evidence_for_claim_conversion(monkeypatch):
+    monkeypatch.setenv("ARTIFACT_LEDGER_ANALYSIS_CONTEXT_ENABLED", "false")
+    evidence_package = {
+        "query": "会计学就业能力变化",
+        "report_blueprint": {"chapters": [{"chapter_id": "ch_01", "chapter_title": "能力变化"}]},
+        "analysis_ready_evidence": [
+            {
+                "evidence_id": "EV-MEDIA",
+                "chapter_id": "ch_01",
+                "fact": "一家财经媒体报道，多所高校会计专业培养方案新增智能财税、数据分析和财务数据治理课程。",
+                "source": {
+                    "title": "财经媒体报道会计专业培养变化",
+                    "url": "https://news.example/accounting-skill",
+                    "main_text": "多所高校会计专业培养方案新增智能财税、数据分析和财务数据治理课程。",
+                },
+                "source_id": "SRC-MEDIA",
+                "source_level": "D",
+                "allowed_use": "supporting_context",
+                "proof_role": "case",
+                "analysis_role": "case",
+                "requirement_id": "ch_01_case",
+                "search_task_id": "task_case_1",
+            }
+        ],
+    }
+
+    payload = build_llm_analysis_input_v2(evidence_package, {})
+
+    card = payload["chapters"][0]["fact_cards"][0]
+    grooming = card["evidence_grooming"]
+    assert card["evidence_id"] == "EV-MEDIA"
+    assert grooming["schema_version"] == "analysis_evidence_grooming_v1"
+    assert grooming["suggested_use"] in {"case_signal", "trend_signal", "background_signal"}
+    assert grooming["claim_strength_hint"] in {"directional", "weak"}
+    assert grooming["possible_claim_angles"]
+    assert "hard_metric" in grooming["do_not_use_as"]
+    assert grooming["public_text_allowed"] is False
+    assert card["possible_claim_angles"] == grooming["possible_claim_angles"]

@@ -2403,14 +2403,14 @@ def _reasoning_for_block(block_type: str, facts: Sequence[str], cards: Sequence[
         return f"技术信号需要放回实际使用条件中观察；{first} 更适合解释能力边界，而不是直接证明影响已经扩展到整体范围。"
     if block_type in {"competitive_positioning", "customer_painpoint_matrix", "case_comparison"}:
         if second:
-            return f"主体动作能验证变化质量；{first} 与 {second} 共同说明相关场景已出现，但仍要区分早期样本、稳定行动和持续结果。"
-        return f"主体动作能验证变化质量；{first} 说明已有场景线索，但还不能单独证明持续结果。"
+            return f"{first} 与 {second} 共同说明相关场景已经出现，但仍要区分早期样本、稳定行动和持续结果。"
+        return f"{first} 说明已有场景线索，但还不能单独证明持续结果。"
     if block_type in {"risk_trigger", "scenario_analysis", "verification_checklist"}:
         return f"风险事实用于校准乐观判断；{first} 一旦扩大，会改变执行节奏、成本预期和责任分配的确定性。"
     if strength in {"directional", "weak"}:
         variable_text = variable or "这类动作"
         return f"{variable_text}的意义在于把讨论落到具体动作；{first} 说明相关变量已经可观察，但是否扩大取决于同类动作是否持续出现。"
-    return f"{first} 将本章讨论从概念层拉到可观察变量，但结论仍取决于主体行动、供给能力和外部约束是否同向。"
+    return f"{first} 将本章讨论从概念层拉到具体业务和资源安排，结论仍取决于供给能力、持续结果和外部约束是否同向。"
 
 
 def _boundary_for_block(block_type: str, cards: Sequence[Dict[str, Any]], strength: str) -> str:
@@ -2967,6 +2967,17 @@ def _apply_section_metadata(unit: Dict[str, Any], section: Dict[str, Any], match
     unit["layout_match_score"] = match_score
     unit["layout_match_reason"] = _layout_match_reason(match_score)
     for key in (
+        "claim_ids",
+        "supporting_claim_ids",
+        "source_ids",
+        "paragraph_claim_ids",
+        "paragraph_main_claim_id",
+        "paragraph_supporting_claim_ids",
+        "narrative_role",
+        "narrative_transition_in",
+        "narrative_transition_out",
+        "narrative_do_not_render",
+        "narrative_plan_public_text_allowed",
         "planned_required_evidence_refs",
         "bound_evidence_refs",
         "dropped_required_evidence_refs",

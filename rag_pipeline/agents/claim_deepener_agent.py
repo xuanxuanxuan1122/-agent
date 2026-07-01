@@ -168,20 +168,19 @@ def build_claim_depth_pack(unit: Dict[str, Any], *, evidence_by_ref: Dict[str, D
     fact_summary = "; ".join(facts[:3])
     chinese = _prefers_chinese(claim, fact_summary)
     claim_head = _claim_headline(claim)
+    fact_preview = _claim_headline(fact_summary, max_chars=80)
     if chinese:
         fallback_evidence = f"公开材料提到，{fact_summary}。"
         fallback_mechanism = "材料的价值在于把可观察活动、应用场景和执行条件连接起来，而不是只提供背景描述。"
-        fallback_segmentation = "直接动作比泛化描述更接近真实落地，仍需验证的外推部分则应保留为阶段性观察。"
-        fallback_implication = "该信号可以解释需求、供给或监管条件如何变化，结论范围仍限制在已引用来源覆盖的场景内。"
+        fallback_segmentation = ""
+        fallback_implication = ""
         fallback_boundary = "结论仍受已引用来源覆盖范围限制，不能外推为超出证据边界的强结论。"
     else:
         fallback_evidence = f"The available evidence supports this judgement through these cited facts: {fact_summary}."
         fallback_mechanism = "The cited facts should be interpreted as a link between observable activity, adoption context, and practical execution conditions."
-        fallback_segmentation = "Directly observed actions carry more weight than background context, so the signal is directional rather than market-wide proof."
-        fallback_implication = "This signal helps explain how demand, supply, or governance conditions may change while remaining bounded by the cited sources."
+        fallback_segmentation = ""
+        fallback_implication = ""
         fallback_boundary = "The conclusion remains limited to the cited source scope and should not be extended beyond that scope."
-    if chinese and not _text(unit.get("segmentation")):
-        fallback_segmentation = "直接动作比泛化描述更接近真实落地，仍需验证的外推部分则保留为阶段性观察。"
     bridge_pack = build_public_bridge_pack(
         claim=claim,
         evidence_texts=facts,
@@ -189,12 +188,20 @@ def build_claim_depth_pack(unit: Dict[str, Any], *, evidence_by_ref: Dict[str, D
         claim_strength=str(unit.get("claim_strength") or ""),
         boundary=boundary,
     )
-    if not _text(unit.get("segmentation")) and _text(bridge_pack.get("mechanism_bridge")):
+    bridge_keys = {str(item or "").strip().lower() for item in _as_list(bridge_pack.get("template_keys"))}
+    generic_bridge = bool(bridge_keys) and all(key.startswith("general:") for key in bridge_keys)
+    if not generic_bridge and not _text(unit.get("segmentation")) and _text(bridge_pack.get("mechanism_bridge")):
         fallback_segmentation = _text(bridge_pack.get("mechanism_bridge"))
-    if not implication and _text(bridge_pack.get("implication_bridge")):
+    if not generic_bridge and not implication and _text(bridge_pack.get("implication_bridge")):
         fallback_implication = _text(bridge_pack.get("implication_bridge"))
     if not boundary and _text(bridge_pack.get("boundary_bridge")):
         fallback_boundary = _text(bridge_pack.get("boundary_bridge"))
+    generic_depth_fallback = not (
+        _text(unit.get("segmentation"))
+        or implication
+        or fallback_segmentation
+        or fallback_implication
+    )
     return {
         "schema_version": "claim_depth_pack_v1",
         "claim_id": _text(unit.get("claim_id") or unit.get("id")),
@@ -210,6 +217,7 @@ def build_claim_depth_pack(unit: Dict[str, Any], *, evidence_by_ref: Dict[str, D
         "diagnostic_only": False,
         "must_not_render": False,
         "public_text_allowed": True,
+        "generic_depth_fallback": generic_depth_fallback,
     }
 
 

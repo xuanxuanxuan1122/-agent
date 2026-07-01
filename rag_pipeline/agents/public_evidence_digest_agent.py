@@ -162,10 +162,10 @@ def _collect_chapter_digest_items(chapter: Dict[str, Any], *, limit: int = 18) -
 
 def _digest_title(chapter_title: str, index: int) -> str:
     if index == 1:
-        return f"{chapter_title}的公开信号"
+        return f"{chapter_title}的事实脉络"
     if index == 2:
-        return f"{chapter_title}的场景含义"
-    return f"{chapter_title}的边界观察"
+        return f"{chapter_title}的变化路径"
+    return f"{chapter_title}的影响边界"
 
 
 def _digest_paragraph(*, chapter_title: str, facts: Sequence[str]) -> str:
@@ -173,13 +173,13 @@ def _digest_paragraph(*, chapter_title: str, facts: Sequence[str]) -> str:
     rest = "；".join(facts[1:3])
     if rest:
         return (
-            f"围绕{chapter_title}，公开材料已经提供了若干可以进入正文的观察信号：{first}。"
-            f"同时，{rest}。这些材料可以把章节叙事落到主体行动、场景变化和产业链传导上："
-            "先看哪些主体开始行动，再看这些行动如何影响相关人群、组织安排和后续决策。"
+            f"围绕{chapter_title}，公开材料已经出现了可以互相补充的事实：{first}。"
+            f"与此同时，{rest}。这些信息把讨论从概念判断推进到岗位要求、业务场景和供给变化，"
+            "也让章节能够说明具体环节如何变化、哪些参与者受到影响，以及资源配置为什么会继续调整。"
         )
     return (
-        f"围绕{chapter_title}，公开材料已经提供了可以进入正文的观察信号：{first}。"
-        "它说明章节判断不能只停留在事实罗列，而要写出相关主体为什么行动、哪些环节受到影响，以及这些变化会怎样改变后续判断。"
+        f"围绕{chapter_title}，公开材料提供了一个可以展开的事实起点：{first}。"
+        "这一事实需要放回具体业务场景和利益关系中理解，才能说明它改变了哪些任务、能力要求或资源分配。"
     )
 
 
@@ -222,8 +222,8 @@ def build_public_evidence_digest_sections(chapter: Dict[str, Any]) -> List[Dict[
                 "claim": paragraph,
                 "reasoning": paragraph,
                 "mechanism": paragraph,
-                "counter_evidence": "公开披露通常更容易呈现已经启动的事项，实际进展仍会受到资金、审批、执行成本和使用门槛的共同影响。",
-                "actionable": "判断重点转向主体行动是否持续、场景是否扩大、影响路径是否更清晰。",
+                "counter_evidence": "公开材料往往更容易呈现已经启动的事项；实际推进仍可能受资金、审批、组织执行成本和使用门槛影响。",
+                "actionable": "更值得展开的是资源投入是否持续、应用场景是否扩大、相关变化是否从个别事件延伸到更多岗位和组织安排。",
                 "supporting_facts": facts,
                 "evidence_refs": refs,
                 "used_fact_refs": refs,

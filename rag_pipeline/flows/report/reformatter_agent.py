@@ -136,15 +136,14 @@ REFORMATTER_POLISH_USER_TEMPLATE = """
 """.strip()
 
 REFORMATTER_LIGHT_POLISH_USER_TEMPLATE = """
-## Current report
+## 当前报告
 {report_markdown}
 
-## Validation diff
+## 校验差异
 {validation_json}
 
-Rewrite only the sections needed to fix the validation diff. Do not add facts
-that are not already in the report. Keep existing source ids, preserve factual
-boundaries, and do not output a source appendix.
+只重写修复校验差异所需的章节。不得新增报告中不存在的事实。
+保留已有来源编号，保持事实边界，不输出来源附录。
 """.strip()
 
 CITATION_DENSITY_RULES = """

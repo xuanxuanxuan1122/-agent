@@ -20,10 +20,9 @@ def test_public_bridge_pack_is_claim_specific_and_public_safe():
     text = _joined(pack)
 
     assert pack["schema_version"] == "public_narrative_bridge_v1"
-    assert len(pack["mechanism_bridge"]) >= 120
-    assert len(pack["implication_bridge"]) >= 110
     assert "低空航线试点已经出现可观察的需求信号" in pack["claim_head"]
-    assert "低空航线试点已经出现可观察的需求信号" not in pack["mechanism_bridge"]
+    assert pack["mechanism_bridge"] == ""
+    assert pack["implication_bridge"] == ""
     assert "公开材料" in pack["evidence_context"]
     assert "低空航线试点和采购动作" in pack["evidence_context"]
     assert "采购" in text or "服务场景" in text
@@ -78,10 +77,26 @@ def test_public_bridge_pack_varies_by_claim_and_block_type():
         claim_strength="directional",
     )
 
-    assert case_pack["mechanism_bridge"] != risk_pack["mechanism_bridge"]
+    assert case_pack["block_family"] != risk_pack["block_family"]
     assert "客户试点说明需求已经从概念讨论进入流程验证" in case_pack["claim_head"]
-    assert "客户试点说明需求已经从概念讨论进入流程验证" not in case_pack["mechanism_bridge"]
+    assert case_pack["mechanism_bridge"] == ""
     assert "安全事故会削弱低空商业化推进节奏" in risk_pack["claim_head"]
-    assert "安全事故会削弱低空商业化推进节奏" not in risk_pack["mechanism_bridge"]
-    assert "风险" in risk_pack["mechanism_bridge"] or "约束" in risk_pack["mechanism_bridge"]
+    assert risk_pack["mechanism_bridge"] == ""
     assert set(case_pack["template_keys"]) != set(risk_pack["template_keys"])
+
+
+def test_public_bridge_pack_does_not_inject_generic_public_implication_templates():
+    pack = build_public_bridge_pack(
+        claim="具身智能企业开始把样机验证推向具体客户场景。",
+        evidence_texts=["优必选披露工业场景机器人验证进展。"],
+        block_type="technology_maturity",
+        claim_strength="directional",
+    )
+
+    text = _joined(pack)
+
+    assert "优必选披露工业场景机器人验证进展" in text
+    assert "这些执行条件比单纯的能力展示更关键" not in text
+    assert "这些主体、场景和约束让抽象趋势" not in text
+    assert "这一变化需要落到具体对象和业务环节中理解" not in text
+    assert "资源投入是否持续、流程调整是否明确" not in text

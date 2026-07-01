@@ -14,6 +14,7 @@ try:
     from rag_pipeline.contracts.ref_normalizer import normalize_claim_refs
     from rag_pipeline.contracts.quality_gate_policy import quality_gate_mode, quality_gates_isolated
     from rag_pipeline.contracts.research_reflection import build_research_reflection_memo
+    from rag_pipeline.contracts.review_suggestion_contract import review_suggestions_to_required_followups
     from rag_pipeline.contracts.source_registry import pick_refs as _contract_pick_refs
     from rag_pipeline.quality.conversion_summary import build_quality_conversion_summary
     from .analytics import run_analytics_agents
@@ -53,6 +54,7 @@ except Exception:  # pragma: no cover - direct script mode fallback
         from rag_pipeline.contracts.ref_normalizer import normalize_claim_refs  # type: ignore
         from rag_pipeline.contracts.quality_gate_policy import quality_gate_mode, quality_gates_isolated  # type: ignore
         from rag_pipeline.contracts.research_reflection import build_research_reflection_memo  # type: ignore
+        from rag_pipeline.contracts.review_suggestion_contract import review_suggestions_to_required_followups  # type: ignore
         from rag_pipeline.contracts.source_registry import pick_refs as _contract_pick_refs  # type: ignore
         from rag_pipeline.quality.conversion_summary import build_quality_conversion_summary  # type: ignore
     except Exception:  # pragma: no cover
@@ -67,6 +69,7 @@ except Exception:  # pragma: no cover - direct script mode fallback
             return default
 
         build_research_reflection_memo = None  # type: ignore
+        review_suggestions_to_required_followups = None  # type: ignore
         _contract_pick_refs = None  # type: ignore
         build_quality_conversion_summary = None  # type: ignore
     from analytics import run_analytics_agents  # type: ignore
@@ -432,6 +435,13 @@ def _writer_advice_collect_items(structured_analysis: Dict[str, Any], writer_rep
         for item in _as_list(structured.get(key)) + _as_list(report.get(key)):
             if isinstance(item, dict):
                 items.append({**item, "source_stage": item.get("source_stage") or key})
+    for owner, source_name in (
+        (_as_dict(structured.get("analysis_stage_diagnostics")), "analysis_stage_diagnostics"),
+        (_as_dict(report.get("analysis_stage_diagnostics")), "writer_report.analysis_stage_diagnostics"),
+    ):
+        for item in _as_list(owner.get("analysis_review_suggestions")):
+            if isinstance(item, dict):
+                items.append({**item, "source_stage": item.get("source_stage") or source_name})
     for unit in _as_list(structured.get("claim_units")):
         if not isinstance(unit, dict):
             continue
@@ -555,7 +565,7 @@ def build_writer_advice_plan(
         {
             "schema_version": "writer_advice_action_v1",
             "action": "avoid_internal_language",
-            "writing_goal": "Never render diagnostic field names, repair route names, or internal analysis labels in public markdown.",
+            "writing_goal": "公开 Markdown 中绝不能渲染诊断字段名、补正路由名或内部分析标签。",
             "forbidden_terms": sorted(WRITER_ADVICE_INTERNAL_TOKENS),
             **WRITER_ADVICE_NON_RENDERABLE_FIELDS,
         }
@@ -663,6 +673,37 @@ def _apply_writer_advice_to_argument_units(
             copied["claim_strength"] = _clamp_claim_strength_for_writer_advice(copied.get("claim_strength"), copied.get("writer_advice_tone"))
         updated.append(copied)
     return updated
+
+
+def _writer_advice_forced_rebuild_actions(writer_advice_plan: Dict[str, Any]) -> List[str]:
+    """Return non-search writer advice actions that must reach section composing.
+
+    Applying advice only to already-built argument units is not enough when
+    chapter packages were supplied by an earlier stage: the section text has
+    already been composed. For these actions, rerun the public argument pipeline
+    once so the composer sees the structural hints in the same run.
+    """
+
+    plan = _as_dict(writer_advice_plan)
+    force_actions = {
+        "reanalyze_existing",
+        "recompose_outline",
+        "rewrite_with_caveat",
+        "expand_claim_writing",
+        "keep_as_directional",
+    }
+    result: List[str] = []
+    seen = set()
+    for key in ("claim_actions", "chapter_actions", "global_actions"):
+        for raw in _as_list(plan.get(key)):
+            action = str(_as_dict(raw).get("action") or "").strip().lower()
+            if action == "expand_with_caveat":
+                action = "rewrite_with_caveat"
+            if action not in force_actions or action in seen:
+                continue
+            seen.add(action)
+            result.append(action)
+    return result
 
 
 def _env_int(name: str, default: int, *, min_value: int = 0, max_value: int = 1_000_000) -> int:
@@ -787,10 +828,11 @@ def needs_public_rebuild(
     chapter_packages: Optional[Sequence[Dict[str, Any]]] = None,
     structured_analysis: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    hits: List[Dict[str, Any]] = []
-    hits.extend(_scan_public_rebuild_hits(argument_units or [], path="argument_units", limit=16))
-    hits.extend(_scan_public_rebuild_hits(chapter_packages or [], path="chapter_packages", limit=16))
-    hits.extend(_scan_public_rebuild_hits(_as_dict(structured_analysis), path="structured_analysis", limit=8))
+    blocking_hits: List[Dict[str, Any]] = []
+    advisory_hits: List[Dict[str, Any]] = []
+    blocking_hits.extend(_scan_public_rebuild_hits(argument_units or [], path="argument_units", limit=16))
+    blocking_hits.extend(_scan_public_rebuild_hits(chapter_packages or [], path="chapter_packages", limit=16))
+    advisory_hits.extend(_scan_public_rebuild_hits(_as_dict(structured_analysis), path="structured_analysis", limit=8))
     structured_claim_ids = {
         str(item.get("claim_id") or item.get("id") or "").strip()
         for key in ("claim_units", "analysis_units")
@@ -816,7 +858,7 @@ def needs_public_rebuild(
         if argument_coverage < min_claim_coverage or section_coverage < min_claim_coverage:
             missing_argument_ids = sorted(structured_claim_ids - argument_claim_ids)[:12]
             missing_section_ids = sorted(structured_claim_ids - section_claim_ids)[:12]
-            hits.append(
+            advisory_hits.append(
                 {
                     "path": "argument_units/chapter_packages.claim_id",
                     "pattern": "claim_first_handoff_coverage_below_minimum",
@@ -840,7 +882,7 @@ def needs_public_rebuild(
     title_as_claim_count = int(_safe_float(quality.get("title_as_claim_count"), 0.0))
     ref_mismatch_count = int(_safe_float(quality.get("evidence_ref_mismatch_count"), 0.0))
     if status == "needs_rewrite":
-        hits.append(
+        advisory_hits.append(
             {
                 "path": "structured_analysis.analysis_depth_quality.status",
                 "pattern": "needs_rewrite",
@@ -848,7 +890,7 @@ def needs_public_rebuild(
             }
         )
     if repeated_ratio > 0.30:
-        hits.append(
+        advisory_hits.append(
             {
                 "path": "structured_analysis.analysis_depth_quality.repeated_claim_ratio",
                 "pattern": "repeated_claim_ratio",
@@ -856,7 +898,7 @@ def needs_public_rebuild(
             }
         )
     if title_as_claim_count > 0:
-        hits.append(
+        advisory_hits.append(
             {
                 "path": "structured_analysis.analysis_depth_quality.title_as_claim_count",
                 "pattern": "title_as_claim_count",
@@ -864,16 +906,19 @@ def needs_public_rebuild(
             }
         )
     if ref_mismatch_count > 0:
-        hits.append(
+        advisory_hits.append(
             {
                 "path": "structured_analysis.analysis_depth_quality.evidence_ref_mismatch_count",
                 "pattern": "evidence_ref_mismatch_count",
                 "snippet": f"evidence_ref_mismatch_count={ref_mismatch_count}",
             }
         )
+    hits = [*blocking_hits, *advisory_hits]
     return {
-        "required": bool(hits),
+        "required": bool(blocking_hits),
         "hit_count": len(hits),
+        "blocking_hit_count": len(blocking_hits),
+        "advisory_hit_count": len(advisory_hits),
         "hits": hits[:24],
         "argument_unit_count_before": len([item for item in list(argument_units or []) if isinstance(item, dict)]),
         "chapter_package_count_before": len([item for item in list(chapter_packages or []) if isinstance(item, dict)]),
@@ -1059,9 +1104,9 @@ def _fill_section_from_unit(section: Dict[str, Any], unit: Dict[str, Any], fallb
     if not str(result.get("reasoning") or "").strip() and unit.get("reasoning"):
         result["reasoning"] = unit.get("reasoning")
     if not str(result.get("counter_evidence") or "").strip():
-        result["counter_evidence"] = unit.get("counter_evidence") or "仍需跟踪反证信号和口径变化。"
+        result["counter_evidence"] = unit.get("counter_evidence") or ""
     if not str(result.get("actionable") or "").strip():
-        result["actionable"] = unit.get("actionable") or unit.get("decision_implication") or "优先补充可核验来源并持续跟踪。"
+        result["actionable"] = unit.get("actionable") or unit.get("decision_implication") or ""
     if not _as_list(result.get("evidence_refs")):
         refs = _pick_refs(unit, limit=8) or list(fallback_refs or [])
         if refs:
@@ -1182,15 +1227,6 @@ def _normalize_public_packages_for_contract(
         if isinstance(package, dict) and str(package.get("chapter_id") or "").strip()
     }
     units = [dict(unit) for unit in list(argument_units or []) if isinstance(unit, dict)]
-    # Rotate the generic actionable fallback so chapters that lack a real
-    # decision implication do not repeat the identical template sentence.
-    _actionable_fallback_variants = [
-        "这一判断可用于梳理岗位任务、能力要求和组织安排的变化方向。",
-        "据此可优先排布资源投入顺序，并锁定需要持续跟踪的关键变量。",
-        "可作为筛选标的与评估进入时点的参考，并结合后续可复核数据校准。",
-        "建议据此设定阶段性观察指标，在新增证据出现时重新排序优先级。",
-    ]
-    _actionable_fallback_idx = 0
     for unit in units:
         if unit.get("omit_from_report") or unit.get("public_render") is False:
             continue
@@ -1198,15 +1234,11 @@ def _normalize_public_packages_for_contract(
         fallback_refs = _refs_from_evidence_package(_as_dict(evidence_by_chapter.get(chapter_id)))
         claim = _compact(unit.get("claim") or unit.get("section_title") or unit.get("question"), 220)
         if claim and not str(unit.get("reasoning") or "").strip():
-            unit["reasoning"] = f"{claim} 这一判断需要结合已绑定证据、时间口径和反向样本持续验证。"
+            unit["reasoning"] = f"{claim} 这一判断的价值在于把公开事实和业务影响连起来，说明变化已经进入具体主体的行动安排。"
         if not str(unit.get("counter_evidence") or "").strip():
-            unit["counter_evidence"] = "如果后续公开材料与当前事实方向相反，前述判断需要重新校准。"
+            unit["counter_evidence"] = "样本仍可能受地区、主体规模和披露选择影响，不能直接外推为所有主体的共同变化。"
         if not str(unit.get("actionable") or unit.get("decision_implication") or "").strip():
-            if os.environ.get("REPORT_TEMPLATE_FALLBACKS", "0").strip() in {"1", "true", "True"}:
-                unit["actionable"] = "后续重点跟踪同口径材料、执行结果和反向样本，再根据连续变化校准判断。"
-            else:
-                unit["actionable"] = _actionable_fallback_variants[_actionable_fallback_idx % len(_actionable_fallback_variants)]
-                _actionable_fallback_idx += 1
+            unit["actionable"] = ""
             unit["actionable_is_fallback"] = True
         if not _as_list(unit.get("evidence_refs")) and fallback_refs:
             unit["evidence_refs"] = list(fallback_refs)
@@ -1297,8 +1329,8 @@ def _normalize_public_packages_for_contract(
                         "section_title": "证据边界",
                         "claim": _compact(copied.get("lead"), 220),
                         "reasoning": _compact(copied.get("lead"), 260),
-                        "counter_evidence": "仍需跟踪反证信号和口径变化。",
-                        "actionable": "优先补充可核验来源并持续跟踪。",
+                        "counter_evidence": "",
+                        "actionable": "",
                         "evidence_refs": fallback_refs,
                     }
                 )
@@ -1580,10 +1612,22 @@ def _compact_argument_unit(unit: Dict[str, Any]) -> Dict[str, Any]:
             "omit_from_report",
             "selected_by_final_chapter",
             "force_public_render_context",
+            "paragraph_main_claim_id",
+            "narrative_role",
         ],
         text_chars=160,
     )
-    for key in ("fact_ids", "source_ids", "requirement_ids", "used_fact_refs", "claim_roles"):
+    for key in (
+        "fact_ids",
+        "source_ids",
+        "requirement_ids",
+        "used_fact_refs",
+        "claim_roles",
+        "claim_ids",
+        "supporting_claim_ids",
+        "paragraph_claim_ids",
+        "paragraph_supporting_claim_ids",
+    ):
         values = _as_list(unit.get(key))
         if values:
             compacted[key] = _dedupe(values, limit=8)
@@ -1643,7 +1687,15 @@ def _compact_micro_layout(layout: Dict[str, Any]) -> Dict[str, Any]:
             "sections": [
                 _compact_mapping(
                     section,
-                    ["section_id", "section_title", "section_role", "block_type", "output_type"],
+                    [
+                        "section_id",
+                        "section_title",
+                        "section_role",
+                        "block_type",
+                        "output_type",
+                        "claim_id",
+                        "paragraph_main_claim_id",
+                    ],
                     text_chars=120,
                 )
                 for section in sections[:2]
@@ -2007,6 +2059,8 @@ def _stage_quality_card(
         top_blockers.append("table_metric_fields_missing")
     if _count_value(analysis.get("llm_failed_chapter_count") or analysis.get("failed_chapter_count")):
         top_blockers.append("analysis_partial_failure")
+    if bool(analysis.get("reanalyze_existing_recommended")):
+        top_blockers.append("analysis_low_claim_conversion")
     if bool(citation.get("citation_rebind_required")):
         top_blockers.append("citation_rebind_required")
     if str(citation.get("final_citation_reconciliation_status") or "").strip().lower() not in {"", "ok"}:
@@ -2044,6 +2098,12 @@ def _stage_quality_card(
         },
         "analysis": {
             "final_analysis_source": analysis.get("final_analysis_source"),
+            "analysis_ready_fact_count": _count_value(analysis.get("analysis_ready_fact_count")),
+            "claim_unit_count": _count_value(analysis.get("claim_unit_count")),
+            "bound_claim_count": _count_value(analysis.get("bound_claim_count")),
+            "claim_conversion_rate": analysis.get("claim_conversion_rate"),
+            "bound_claim_rate": analysis.get("bound_claim_rate"),
+            "reanalyze_existing_recommended": bool(analysis.get("reanalyze_existing_recommended")),
             "usable_claim_count": _count_value(
                 analysis.get("llm_usable_claim_count")
                 or analysis.get("usable_claim_count")
@@ -2393,11 +2453,23 @@ def _sync_chapter_section_refs_from_argument_units(
                     "source_support_map",
                     "lineage",
                     "paragraph_seed",
+                    "paragraph_main_claim_id",
+                    "narrative_role",
+                    "narrative_transition_in",
+                    "narrative_transition_out",
                 ):
                     value = unit.get(key)
                     if value not in (None, "", [], {}) and next_section.get(key) in (None, "", [], {}):
                         next_section[key] = copy.deepcopy(value)
-                for key in ("requirement_ids", "fact_ids", "source_ids"):
+                for key in (
+                    "requirement_ids",
+                    "fact_ids",
+                    "source_ids",
+                    "claim_ids",
+                    "supporting_claim_ids",
+                    "paragraph_claim_ids",
+                    "paragraph_supporting_claim_ids",
+                ):
                     values = _as_list(unit.get(key))
                     if values and not _as_list(next_section.get(key)):
                         next_section[key] = list(values)
@@ -2411,6 +2483,114 @@ def _sync_chapter_section_refs_from_argument_units(
                     if not str(next_section.get(text_key) or "").strip() and str(unit.get(text_key) or "").strip():
                         next_section[text_key] = unit.get(text_key)
             next_sections.append(next_section)
+        copied["sections"] = next_sections
+        synced.append(copied)
+    return synced
+
+
+CLAIM_LINEAGE_LIST_KEYS = (
+    "claim_ids",
+    "supporting_claim_ids",
+    "source_ids",
+    "paragraph_claim_ids",
+    "paragraph_supporting_claim_ids",
+)
+
+CLAIM_LINEAGE_SCALAR_KEYS = (
+    "claim_id",
+    "paragraph_main_claim_id",
+    "narrative_role",
+    "narrative_transition_in",
+    "narrative_transition_out",
+)
+
+
+def _claim_lineage_plan_index(final_chapters: Sequence[Dict[str, Any]]) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    by_section_id: Dict[str, Dict[str, Any]] = {}
+    by_claim_id: Dict[str, Dict[str, Any]] = {}
+    for chapter in list(final_chapters or []):
+        if not isinstance(chapter, dict):
+            continue
+        for section in _as_list(chapter.get("section_plan")):
+            if not isinstance(section, dict):
+                continue
+            payload = dict(section)
+            claim_id = str(payload.get("claim_id") or "").strip()
+            claim_ids = _as_list(payload.get("claim_ids")) or ([claim_id] if claim_id else [])
+            supporting_claim_ids = _as_list(payload.get("supporting_claim_ids"))
+            paragraph_claim_ids = _as_list(payload.get("paragraph_claim_ids")) or claim_ids
+            payload["claim_ids"] = claim_ids
+            payload["supporting_claim_ids"] = supporting_claim_ids
+            payload["paragraph_claim_ids"] = paragraph_claim_ids
+            payload["paragraph_main_claim_id"] = str(payload.get("paragraph_main_claim_id") or claim_id or "").strip()
+            payload["paragraph_supporting_claim_ids"] = (
+                _as_list(payload.get("paragraph_supporting_claim_ids")) or supporting_claim_ids
+            )
+            section_id = str(payload.get("section_id") or "").strip()
+            if section_id:
+                by_section_id[section_id] = payload
+            if claim_id and claim_id not in by_claim_id:
+                by_claim_id[claim_id] = payload
+            for linked_claim_id in claim_ids:
+                linked = str(linked_claim_id or "").strip()
+                if linked and linked not in by_claim_id:
+                    by_claim_id[linked] = payload
+    return {"by_section_id": by_section_id, "by_claim_id": by_claim_id}
+
+
+def _copy_claim_lineage(target: Dict[str, Any], plan_section: Dict[str, Any]) -> Dict[str, Any]:
+    if not plan_section:
+        return target
+    copied = dict(target)
+    for key in CLAIM_LINEAGE_LIST_KEYS:
+        merged = _dedupe([*_as_list(copied.get(key)), *_as_list(plan_section.get(key))], limit=50)
+        if merged:
+            copied[key] = merged
+    for key in CLAIM_LINEAGE_SCALAR_KEYS:
+        value = plan_section.get(key)
+        if value not in (None, "", [], {}) and copied.get(key) in (None, "", [], {}):
+            copied[key] = copy.deepcopy(value)
+    return copied
+
+
+def _sync_argument_claim_lineage_from_final_chapters(
+    argument_units: Sequence[Dict[str, Any]],
+    final_chapters: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    index = _claim_lineage_plan_index(final_chapters)
+    by_section_id = _as_dict(index.get("by_section_id"))
+    by_claim_id = _as_dict(index.get("by_claim_id"))
+    synced: List[Dict[str, Any]] = []
+    for unit in list(argument_units or []):
+        if not isinstance(unit, dict):
+            continue
+        section_id = str(unit.get("section_id") or "").strip()
+        claim_id = str(unit.get("claim_id") or unit.get("id") or "").strip()
+        plan_section = _as_dict(by_section_id.get(section_id)) or _as_dict(by_claim_id.get(claim_id))
+        synced.append(_copy_claim_lineage(unit, plan_section))
+    return synced
+
+
+def _sync_section_claim_lineage_from_final_chapters(
+    chapter_packages: Sequence[Dict[str, Any]],
+    final_chapters: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    index = _claim_lineage_plan_index(final_chapters)
+    by_section_id = _as_dict(index.get("by_section_id"))
+    by_claim_id = _as_dict(index.get("by_claim_id"))
+    synced: List[Dict[str, Any]] = []
+    for chapter in list(chapter_packages or []):
+        if not isinstance(chapter, dict):
+            continue
+        copied = copy.deepcopy(chapter)
+        next_sections: List[Dict[str, Any]] = []
+        for section in _as_list(copied.get("sections")):
+            if not isinstance(section, dict):
+                continue
+            section_id = str(section.get("section_id") or "").strip()
+            claim_id = str(section.get("claim_id") or section.get("id") or "").strip()
+            plan_section = _as_dict(by_section_id.get(section_id)) or _as_dict(by_claim_id.get(claim_id))
+            next_sections.append(_copy_claim_lineage(section, plan_section))
         copied["sections"] = next_sections
         synced.append(copied)
     return synced
@@ -3582,7 +3762,7 @@ def _expand_chapter_packages_for_body_target(chapter_packages: Sequence[Dict[str
     target = int(target_chars * _env_float("REPORT_BODY_EXPANSION_TARGET_RATIO", 0.95, min_value=0.5, max_value=2.0))
     if current >= target:
         return packages
-    if _env_flag("REPORT_ENABLE_PUBLIC_EVIDENCE_DIGEST", False):
+    if _env_flag("REPORT_ENABLE_PUBLIC_EVIDENCE_DIGEST", True):
         added_chars = 0
         updated_packages: List[Dict[str, Any]] = []
         for chapter in packages:
@@ -3606,6 +3786,8 @@ def _expand_chapter_packages_for_body_target(chapter_packages: Sequence[Dict[str
         current += added_chars
         if current >= target:
             return packages
+    if not _env_flag("REPORT_ENABLE_DETERMINISTIC_BODY_EXPANSION", False):
+        return packages
     expandable = [
         chapter
         for chapter in packages
@@ -4450,6 +4632,15 @@ def build_writer_report(
         chapter_packages=chapter_packages,
         structured_analysis=structured_analysis,
     )
+    writer_advice_forced_actions = _writer_advice_forced_rebuild_actions(writer_advice_plan)
+    force_public_rebuild = bool(writer_advice_forced_actions)
+    if force_public_rebuild:
+        public_rebuild_summary = {
+            **public_rebuild_summary,
+            "required": True,
+            "forced_by_writer_advice": True,
+            "writer_advice_forced_actions": writer_advice_forced_actions,
+        }
     if public_rebuild_summary.get("required") or not argument_units or not chapter_packages:
         rebuild_result = rebuild_public_argument_pipeline(
             chapter_evidence_packages=chapter_evidence_packages,
@@ -4471,8 +4662,10 @@ def build_writer_report(
             }
         public_rebuild_summary = {
             **public_rebuild_summary,
-            "triggered": bool(public_rebuild_summary.get("required")),
+            "triggered": bool(public_rebuild_summary.get("required") or force_public_rebuild),
             "generated_missing_inputs": bool(not public_rebuild_summary.get("argument_unit_count_before") or not public_rebuild_summary.get("chapter_package_count_before")),
+            "forced_by_writer_advice": force_public_rebuild,
+            "writer_advice_forced_actions": writer_advice_forced_actions,
             "argument_unit_count_after": rebuild_result.get("argument_unit_count_after"),
             "chapter_package_count_after": rebuild_result.get("chapter_package_count_after"),
             "claim_depth_diagnostics": claim_depth_diagnostics,
@@ -4503,6 +4696,13 @@ def build_writer_report(
         structured_analysis=structured_analysis,
     )
     argument_units = _as_list(argument_ref_normalization.get("argument_units"))
+    claim_lineage_source_chapters = _as_list(chapter_recomposition.get("final_chapters")) or _as_list(
+        _as_dict(report_blueprint).get("chapters")
+    )
+    argument_units = _sync_argument_claim_lineage_from_final_chapters(
+        argument_units,
+        claim_lineage_source_chapters,
+    )
     package_normalization_summary["argument_ref_normalization"] = _as_dict(argument_ref_normalization.get("summary"))
     chapter_ref_normalization = _normalize_chapter_packages_for_handoff(
         chapter_packages,
@@ -4512,6 +4712,10 @@ def build_writer_report(
     chapter_packages = _as_list(chapter_ref_normalization.get("chapter_packages"))
     package_normalization_summary["chapter_ref_normalization"] = _as_dict(chapter_ref_normalization.get("summary"))
     chapter_packages = _sync_chapter_section_refs_from_argument_units(chapter_packages, argument_units)
+    chapter_packages = _sync_section_claim_lineage_from_final_chapters(
+        chapter_packages,
+        claim_lineage_source_chapters,
+    )
     table_followups = _table_follow_up_queries(table_packages)
     evidence_refinement_plan = _merge_table_followups_into_refinement_plan(evidence_refinement_plan, table_followups)
     public_chapter_packages = [
@@ -5015,6 +5219,14 @@ def build_writer_report(
         or _as_list(_as_dict(qa_result.get("deep_evaluation")).get("required_followups"))
         or list(table_followups)
     )
+    qa_review_followups = (
+        review_suggestions_to_required_followups(
+            _as_list(qa_result.get("review_suggestions")),
+            source_stage="qa_review_suggestions",
+        )
+        if review_suggestions_to_required_followups is not None
+        else []
+    )
     stage_quality_card = _stage_quality_card(
         chapter_evidence_packages=[item for item in list(chapter_evidence_packages or []) if isinstance(item, dict)],
         table_quality_summary=table_quality_summary,
@@ -5139,7 +5351,7 @@ def build_writer_report(
             "ok": bool(writer_output.get("report_markdown")) and report_status != "diagnostic_only",
         },
         "qa_result": qa_result,
-        "required_followups": [*base_required_followups, *claim_review_followups, *writer_advice_followups],
+        "required_followups": [*base_required_followups, *qa_review_followups, *claim_review_followups, *writer_advice_followups],
         "package_quality_report": package_quality_report,
         "package_normalization_summary": package_normalization_summary,
         "debug_snapshot": debug_snapshot,
@@ -5164,6 +5376,7 @@ def build_writer_report(
             "claim_depth_diagnostics": claim_depth_diagnostics,
             "writer_advice_summary": _as_dict(writer_advice_plan.get("summary")),
             "writer_advice_followup_count": len(writer_advice_followups),
+            "qa_review_followup_count": len(qa_review_followups),
             "table_follow_up_count": table_gap_summary.get("table_follow_up_count", 0),
             "rendered_high_value_table_count": table_gap_summary.get("rendered_high_value_table_count", 0),
             "evidence_analysis_summary": evidence_analysis_summary,

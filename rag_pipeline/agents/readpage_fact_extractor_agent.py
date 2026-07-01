@@ -413,20 +413,19 @@ def _build_llm_config() -> Dict[str, Any]:
 
 def _system_prompt() -> str:
     return (
-        "You extract structured public fact cards from verified web page body text for industry research. "
-        "Use only the supplied page text and source metadata. Do not use search snippets, cached summaries, or model knowledge. "
-        "Do not write a report, do not give repair advice, "
-        "and do not create claims unsupported by the page. Return strict JSON only. "
-        "Each fact card must include subject, action_or_signal, variable, distilled_fact, fact_type, "
-        "source_url or source_ref, source_level, source_verification_status, proof_role, block_affinity, "
-        "claim_strength_hint. Metric cards must include metric, value, unit, period or time_or_scope, and source. "
-        "If any search_task.required_fields cannot be filled from the current page text and source metadata, reject the span. "
-        "Counter evidence cards must be allowed only as counter/risk evidence, not as support for positive strong claims. "
-        "Reject navigation, login, download notices, SEO text, search-result summaries, "
-        "HTTP error pages, marketing copy without traceable facts, and diagnostic phrases such as evidence is insufficient or suggest repair. "
-        "When a chunk object is supplied, return no more than chunk.max_fact_cards fact cards, keep each distilled_fact within chunk.max_fact_chars characters, "
-        "and prioritize complete metrics, orders/contracts, customer deployments, policy targets, and concrete risk constraints. "
-        "When public-signal mode is enabled, social/wiki/forum excerpts may be extracted only as traceable directional signals, not strong facts."
+        "你负责从已读取网页正文中抽取结构化公开 fact cards，用于中文行业研究。"
+        "只能使用输入的 page_text 和 source 元数据，不得使用搜索摘要、缓存摘要或模型常识。"
+        "不要写报告，不要给补证建议，不要生成页面原文不支持的结论；只返回严格 JSON。"
+        "每张 fact card 必须包含 subject、action_or_signal、variable、distilled_fact、fact_type、"
+        "source_url 或 source_ref、source_level、source_verification_status、proof_role、block_affinity、"
+        "claim_strength_hint。metric 类型必须包含 metric、value、unit、period 或 time_or_scope、source。"
+        "如果 search_task.required_fields 中任一字段无法从当前 page_text 和 source 元数据填出，应把该片段放入 rejected_spans。"
+        "counter 证据只能作为反证/风险证据，不能用于支撑正向强结论。"
+        "拒绝导航、登录页、下载提示、SEO 文案、搜索结果摘要、HTTP 错误页、没有可追溯事实的营销话术，"
+        "以及“证据不足、建议补证”等诊断话术。"
+        "如果输入包含 chunk 对象，fact_cards 数量不得超过 chunk.max_fact_cards，distilled_fact 长度不得超过 chunk.max_fact_chars；"
+        "优先抽取完整指标、订单/合同、客户部署、政策目标和具体风险约束。"
+        "public-signal 模式下，社交平台、百科、论坛内容只能抽为可追溯的方向性信号，不能作为强事实。"
     )
 
 
@@ -470,7 +469,7 @@ def _user_payload(*, query: str, page: Dict[str, Any], search_task: Dict[str, An
             "max_fact_cards": _chunk_max_fact_cards(),
             "max_fact_chars": _chunk_max_fact_chars(),
             "max_rejected_spans": 3,
-            "instruction": "extract facts only from this chunk; do not infer from omitted page sections",
+            "instruction": "只从当前 chunk 抽取事实，不得根据被省略的页面部分推断",
         }
     return payload
 

@@ -535,7 +535,7 @@ def _generic_hypotheses(query: str, decision_use: str) -> List[Dict[str, Any]]:
             must_disprove=["需求不可持续", "只停留在早期样本", "缺少预算或资源投入"],
             bundle=_bundle(
                 metric_terms=["市场规模", "增速", "渗透率", "活跃用户", "使用规模"],
-                case_terms=["使用案例", "应用场景", "主体行动", "可复核样本"],
+                case_terms=["使用案例", "应用场景", "业务动作", "可复核样本"],
                 counter_terms=["失败案例", "需求放缓", "预算收缩", "项目取消"],
             ),
             decision_use=decision_use,

@@ -6,8 +6,10 @@ from rag_pipeline.agents.final_writer_agent import (
 from rag_pipeline.agents.markdown_renderer import (
     _compact_chapter_heading,
     render_appendix,
+    render_chapter_deep_synthesis,
     render_chapter_package,
     render_executive_summary,
+    render_final_reference_analysis,
     render_section,
     render_table_package,
 )
@@ -51,6 +53,19 @@ def test_framework_strip_does_not_blank_an_all_framework_paragraph():
     assert rewrite_internal_gap_language("这一判断可用于梳理岗位任务、能力要求的变化方向。").strip()
 
 
+def test_analysis_value_narration_and_hedging_leadins_are_cleaned():
+    # "这一判断的价值在于…" is internal methodology narration -> whole sentence dropped.
+    out1 = rewrite_internal_gap_language(
+        "2025年市场规模达53亿元。这一判断的价值在于把资料转化为资源配置的优先顺序。"
+    )
+    assert "53亿元" in out1
+    assert "这一判断的价值在于" not in out1
+    # Vague hedging lead-in is stripped but the fact it introduces is kept.
+    out2 = rewrite_internal_gap_language("公开材料提到，2025年国内整机企业超140家。")
+    assert "公开材料提到" not in out2
+    assert "140家" in out2
+
+
 def test_compact_chapter_heading_uses_complete_phrase_not_mid_clause_truncation():
     title = (
         "\u4f1a\u8ba1\u5b66\u4e13\u4e1a\u5c31\u4e1a\u7684\u73b0\u5b9e\u4ef7\u503c"
@@ -80,6 +95,191 @@ def test_core_observation_ignores_bridge_sentences_and_keeps_concrete_facts():
     assert "\u5982\u679c\u628a\u8fd9\u4e00\u4fe1\u53f7" not in summary
     assert "\u8fd9\u4f1a\u628a\u5355\u70b9\u4e8b\u5b9e" not in summary
     assert summary.count("\u65e0\u9521\u5e022023\u5e74\u4e09\u5b63\u5ea6") == 1
+
+
+def test_core_observation_dedupes_boundary_already_embedded_in_claim():
+    boundary = "\u9884\u6d4b\u6570\u636e\u57fa\u4e8e\u4e0d\u540c\u7814\u7a76\u673a\u6784\u7684\u6a21\u578b\u5047\u8bbe\uff0c\u7edf\u8ba1\u53e3\u5f84\u6db5\u76d6\u8303\u56f4\uff08\u662f\u5426\u5305\u542b\u4f20\u7edf\u5de5\u4e1a\u673a\u5668\u4eba\u6216\u6cdbAI\u786c\u4ef6\uff09\u672a\u5b8c\u5168\u7edf\u4e00\uff0c\u9700\u4ee5\u5b9e\u9645\u4ea4\u4ed8\u4e0e\u8425\u6536\u6570\u636e\u4e3a\u51c6\u3002[1]"
+    markdown = (
+        "# \u4e2d\u56fd\u5177\u8eab\u667a\u80fd\u673a\u5668\u4eba\u7814\u7a76\u62a5\u544a\n\n"
+        "## 1. \u9700\u6c42\u4e0e\u5e02\u573a\u7a7a\u95f4\n"
+        "\u653f\u7b56\u4e0e\u8d44\u672c\u53cc\u91cd\u9a71\u52a8\u53e0\u52a0\u6280\u672f\u8fed\u4ee3\uff0c\u63a8\u52a8\u4ea7\u4e1a\u89c4\u6a21\u8fdb\u5165\u9ad8\u901f\u589e\u957f\u901a\u9053\uff0c\u4f46\u5e7f\u4e49\u4e0e\u72ed\u4e49\u5177\u8eab\u667a\u80fd\u7684\u754c\u5b9a\u4e0d\u540c\u5bfc\u81f4\u9884\u6d4b\u6570\u636e\u5448\u73b0\u533a\u95f4\u5206\u5e03 "
+        + boundary
+        + "\n"
+        + boundary
+        + "\n"
+    )
+
+    updated = _ensure_public_core_observation_block(markdown)
+    summary = updated.split("## 1.", 1)[0]
+    bullets = [line for line in summary.splitlines() if line.strip().startswith("- ")]
+
+    assert summary.count("\u9884\u6d4b\u6570\u636e\u57fa\u4e8e\u4e0d\u540c\u7814\u7a76\u673a\u6784") == 1
+    assert len(bullets) == 1
+
+
+def test_core_observation_dedupes_metric_fact_and_evidence_context():
+    markdown = (
+        "# 中国具身智能机器人商业化研究报告\n\n"
+        "## 1. 市场空间与商业化阶段\n"
+        "2025年中国具身智能机器人市场规模预计达到52.95亿元，约占全球市场份额的27%。[1]\n"
+        "公开材料提到，2025年中国具身智能机器人市场规模预计达52.95亿元，占全球约27%。[1]\n"
+        "宏观市场规模数据直接反映产业商业化初期的体量与全球占比，表明中国在该领域已具备初步的产业基础与需求规模，脱离纯概念验证阶段。[1]\n"
+        "\n"
+        "## 2. 竞争格局\n"
+        "头部企业正在围绕工业、物流和服务场景推进样机验证与客户试点，竞争重点从单点能力展示转向场景适配和交付能力。[2]\n"
+    )
+
+    updated = _ensure_public_core_observation_block(markdown)
+    summary = updated.split("## 1.", 1)[0]
+    bullets = [line for line in summary.splitlines() if line.strip().startswith("- ")]
+
+    assert "公开材料提到" not in summary
+    assert "2025年中国具身智能机器人市场规模预计达到52.95亿元" not in summary
+    assert len(bullets) == 2
+    assert "宏观市场规模数据直接反映" in bullets[0]
+    assert "头部企业正在围绕工业、物流和服务场景" in bullets[1]
+
+
+def test_core_observation_excludes_verification_caveats_from_opening():
+    markdown = (
+        "# 中国具身智能机器人商业化研究报告\n\n"
+        "## 1. 市场空间与商业化阶段\n"
+        "当前判断多基于定性信号，具体市场份额、技术代差及商业化渗透率等量化指标尚待进一步验证。[1][2]\n"
+        "由于现阶段尚缺乏具体的全球市占率、技术专利横向对比或出口规模等量化指标支撑，相关结论的精确度仍需结合后续行业白皮书及权威统计数据进行交叉验证。[1][2]\n"
+        "宏观市场规模数据直接反映产业商业化初期的体量与全球占比，表明中国在该领域已具备初步的产业基础与需求规模。[1]\n"
+        "\n"
+        "## 2. 竞争格局\n"
+        "头部企业正在围绕工业、物流和服务场景推进样机验证与客户试点，竞争重点从单点能力展示转向场景适配和交付能力。[2]\n"
+    )
+
+    updated = _ensure_public_core_observation_block(markdown)
+    summary = updated.split("## 1.", 1)[0]
+
+    assert "当前判断多基于定性信号" not in summary
+    assert "尚待进一步验证" not in summary
+    assert "缺乏具体的全球市占率" not in summary
+    assert "宏观市场规模数据直接反映" in summary
+    assert "头部企业正在围绕工业、物流和服务场景" in summary
+
+
+def test_core_observation_trims_trailing_caveat_from_judgment_line():
+    markdown = (
+        "# 中国具身智能机器人商业化研究报告\n\n"
+        "## 1. 产业链协同\n"
+        "政策与产业研究导向明确指向场景验证向产业链协同演进，表明核心环节已具备实际落地基础，产业重心正由早期样本测试转向规模化应用探索 缺乏具体技术环节成熟度分级数据，产业崛起的具体时间节点与各环节渗透率需以实际可复核材料与产能释放为准。[2]\n"
+        "产业链上下游企业正在围绕整机、核心零部件和场景集成推进协同验证。[3]\n"
+    )
+
+    updated = _ensure_public_core_observation_block(markdown)
+    summary = updated.split("## 1.", 1)[0]
+
+    assert "政策与产业研究导向明确指向场景验证向产业链协同演进" in summary
+    assert "缺乏具体技术环节成熟度分级数据" not in summary
+    assert "渗透率需以实际可复核材料" not in summary
+
+
+def test_core_observation_excludes_qualitative_label_lines():
+    markdown = (
+        "# 中国具身智能机器人商业化研究报告\n\n"
+        "## 1. 市场空间\n"
+        "“领跑全球”与“加速落地”为定性描述。[1][2][3]\n"
+        "政策与产业研究导向明确指向场景验证向产业链协同演进，表明核心环节已具备实际落地基础。[3]\n"
+    )
+
+    updated = _ensure_public_core_observation_block(markdown)
+    summary = updated.split("## 1.", 1)[0]
+
+    assert "为定性描述" not in summary
+    assert "政策与产业研究导向明确指向" in summary
+
+
+def test_core_observation_excludes_source_attribution_lines():
+    markdown = (
+        "# 中国具身智能机器人商业化研究报告\n\n"
+        "## 1. 产业趋势\n"
+        "权威机构指出具身智能正从场景落地迈向产业崛起。[2]\n"
+        "政策与产业研究导向明确指向场景验证向产业链协同演进，表明核心环节已具备实际落地基础。[2]\n"
+        "头部企业正在围绕工业、物流和服务场景推进样机验证与客户试点，竞争重点转向场景适配和交付能力。[3]\n"
+    )
+
+    updated = _ensure_public_core_observation_block(markdown)
+    summary = updated.split("## 1.", 1)[0]
+
+    assert "权威机构指出" not in summary
+    assert "政策与产业研究导向明确指向" in summary
+    assert "头部企业正在围绕工业、物流和服务场景" in summary
+
+
+def test_renderer_deep_synthesis_uses_public_prose_not_methodology_labels(monkeypatch):
+    monkeypatch.setenv("REPORT_RENDER_CHAPTER_DEEP_SYNTHESIS", "true")
+    lines = render_chapter_deep_synthesis(
+        {
+            "chapter_title": "\u4f1a\u8ba1\u5c31\u4e1a\u80fd\u529b\u53d8\u5316",
+            "chapter_summary": {
+                "key_takeaway": "\u8bfe\u7a0b\u548c\u5c97\u4f4d\u8981\u6c42\u90fd\u5f00\u59cb\u5f3a\u8c03\u6570\u636e\u5206\u6790\u80fd\u529b\u3002",
+                "mechanisms": [
+                    "\u8d22\u52a1\u5de5\u5177\u66f4\u65b0\u4f1a\u6539\u53d8\u8bfe\u7a0b\u8bad\u7ec3\u548c\u4f01\u4e1a\u7b5b\u9009\u6807\u51c6"
+                ],
+            },
+        }
+    )
+    text = "\n".join(lines)
+
+    assert "\u5f71\u54cd\u8def\u5f84" not in text
+    assert "\u7ae0\u8282\u7ed3\u8bba" not in text
+    assert "\u4e8b\u5b9e\u4e4b\u95f4" in text or "\u8d22\u52a1\u5de5\u5177" in text
+
+
+def test_renderer_final_reference_analysis_uses_public_prose_not_path_label(monkeypatch):
+    monkeypatch.setenv("REPORT_RENDER_FINAL_REFERENCE_ANALYSIS", "true")
+    lines = render_final_reference_analysis(
+        {
+            "chapter_syntheses": [
+                {
+                    "chapter_title": "\u4f1a\u8ba1\u5c31\u4e1a\u80fd\u529b\u53d8\u5316",
+                    "chapter_summary": {
+                        "key_takeaway": "\u4f1a\u8ba1\u5c97\u4f4d\u5bf9\u6570\u636e\u5206\u6790\u80fd\u529b\u7684\u8981\u6c42\u63d0\u9ad8\u3002",
+                        "mechanisms": [
+                            "\u8bfe\u7a0b\u4f53\u7cfb\u5f00\u59cb\u52a0\u5165\u667a\u80fd\u8d22\u52a1\u548c\u6570\u636e\u5206\u6790\u8bad\u7ec3"
+                        ],
+                    },
+                }
+            ]
+        }
+    )
+    text = "\n".join(lines)
+
+    assert "\u5f71\u54cd\u8def\u5f84\u53ef\u4ee5\u6982\u62ec\u4e3a" not in text
+    assert "\u5f3a\u5f31\u6392\u5e8f" not in text
+    assert "\u8bfe\u7a0b\u4f53\u7cfb" in text
+
+
+def test_render_section_drops_legacy_generic_action_advice_from_render_blocks():
+    lines = render_section(
+        {
+            "section_title": "\u5546\u4e1a\u5316\u8fdb\u5c55",
+            "render_blocks": [
+                {
+                    "type": "paragraph",
+                    "text": "\u4eba\u5f62\u673a\u5668\u4eba\u5728\u6625\u665a\u3001\u5e99\u4f1a\u548c\u5546\u573a\u7b49\u573a\u666f\u5df2\u6709\u516c\u5f00\u5e94\u7528\u6837\u672c\u3002[1]",
+                },
+                {
+                    "type": "paragraph",
+                    "text": "\u636e\u6b64\u53ef\u4f18\u5148\u6392\u5e03\u8d44\u6e90\u6295\u5165\u987a\u5e8f\uff0c\u5e76\u9501\u5b9a\u9700\u8981\u6301\u7eed\u8ddf\u8e2a\u7684\u5173\u952e\u53d8\u91cf\u3002[1]",
+                },
+                {
+                    "type": "paragraph",
+                    "text": "\u653e\u56de\u5177\u4f53\u95ee\u9898\u770b\uff0c\u91cd\u70b9\u4e0d\u662f\u53ea\u770b\u4e00\u4e2a\u6307\u6807\uff0c\u800c\u662f\u6307\u6807\u53e3\u5f84\u4e0e\u53ef\u6bd4\u6027\u7684\u4ef7\u503c\u4e0d\u5728\u4e8e\u51fa\u73b0\u4e00\u4e2a\u6848\u4f8b\u3002[2]",
+                },
+            ],
+            "citation_refs": ["[1]", "[2]"],
+        }
+    )
+    text = "\n".join(lines)
+
+    assert "\u6625\u665a" in text
+    assert "\u636e\u6b64\u53ef\u4f18\u5148\u6392\u5e03" not in text
+    assert "\u653e\u56de\u5177\u4f53\u95ee\u9898\u770b" not in text
 
 
 def test_core_observation_drops_roadmap_lines_and_leads_with_metric():
@@ -166,6 +366,42 @@ def test_render_chapter_package_does_not_repeat_generic_actionable_fallback():
     rendered = render_chapter_package(chapter, 1)
 
     assert rendered.count(repeated) <= 1
+
+
+def test_render_section_drops_current_generic_industry_fallback_sentences():
+    lines = render_section(
+        {
+            "section_title": "具身智能商业化信号",
+            "claim": "具身智能企业开始把样机验证推向具体客户场景。",
+            "reasoning": "公开案例显示，部分企业围绕工业、物流和服务场景开展样机验证。",
+            "actionable": (
+                "这会影响相关主体的产品设计、资源投入和组织协作方式。"
+                "产业含义在于资源会更集中流向已经出现真实需求和应用动作的环节。"
+                "后续判断主要看资源投入是否持续、应用场景是否扩大、执行成本和风险约束是否同步改善。"
+            ),
+            "render_blocks": [
+                {"type": "paragraph", "text": "具身智能企业开始把样机验证推向具体客户场景。"},
+                {"type": "paragraph", "text": "公开案例显示，部分企业围绕工业、物流和服务场景开展样机验证。"},
+                {
+                    "type": "paragraph",
+                    "text": (
+                        "这会影响相关主体的产品设计、资源投入和组织协作方式。"
+                        "产业含义在于资源会更集中流向已经出现真实需求和应用动作的环节。"
+                        "后续判断主要看资源投入是否持续、应用场景是否扩大、执行成本和风险约束是否同步改善。"
+                    ),
+                },
+            ],
+            "citation_refs": ["[1]"],
+            "evidence_refs": ["EV-1"],
+            "evidence_backed": True,
+        }
+    )
+
+    rendered = "\n".join(lines)
+    assert "具身智能企业开始把样机验证推向具体客户场景" in rendered
+    assert "这会影响相关主体" not in rendered
+    assert "产业含义在于" not in rendered
+    assert "后续判断主要看资源投入是否持续" not in rendered
 
 
 def test_render_chapter_package_replaces_generic_dynamic_fallback_title_with_claim_context():
@@ -1507,7 +1743,8 @@ def test_sanitize_public_markdown_rewrites_review_style_directional_language():
     # from the body, not rewritten into milder framework language.
     assert "主体行动是否持续" not in cleaned
     assert "影响路径是否" not in cleaned
-    assert "相关主体、组织安排和后续决策" in cleaned
+    assert "资源投入" in cleaned or "具体业务" in cleaned or "实际进展" in cleaned
+    assert "相关主体、组织安排和后续决策" not in cleaned
 
 
 def test_sanitize_public_markdown_repairs_count_metrics_mislabeled_as_cost():

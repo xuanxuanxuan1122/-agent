@@ -278,8 +278,8 @@ STRICT_PUBLICATION_BLOCKERS = [
 
 PUBLIC_BODY_REWRITES = [
     (r"这些信号仍受来源覆盖范围和公开披露充分性的限制，应作为方向性观察进入正文。?", "公开披露通常更容易呈现已经启动的事项，实际进展仍会受到资金、审批、执行成本和使用门槛的共同影响。"),
-    (r"后续应继续观察同类主体、同类场景和相同口径信息是否重复出现。?", "判断重点转向主体行动是否持续、场景是否扩大、影响路径是否更清晰。"),
-    (r"以及后续判断需要继续观察哪些约束条件，而不是被简单处理成孤立材料。?", "并进一步解释这些变化如何影响相关主体、组织安排和后续决策。"),
+    (r"后续应继续观察同类主体、同类场景和相同口径信息是否重复出现。?", ""),
+    (r"以及后续判断需要继续观察哪些约束条件，而不是被简单处理成孤立材料。?", "并进一步说明这些变化如何影响具体业务、资源安排和执行节奏。"),
     (r"方向性观察进入正文", "早期产业信号"),
     (r"方向性观察", "阶段性判断"),
     (r"后续变化交叉验证", "后续变化"),
@@ -408,6 +408,8 @@ _ANALYSIS_FRAMEWORK_NARRATION_RE = re.compile(
     r"|梳理岗位任务"
     r"|可解释的分析材料"
     r"|单点样本转化为"
+    r"|这一判断的价值[不]?在于"
+    r"|不在于(?:复述|重复)资料"
 )
 
 
@@ -448,6 +450,9 @@ def rewrite_internal_gap_language(text: str) -> str:
         value = re.sub(pattern, replacement, value, flags=re.I)
     for pattern, replacement in PUBLIC_BODY_REWRITES:
         value = re.sub(pattern, replacement, value, flags=re.I)
+    # Strip vague hedging lead-ins ("公开材料提到，/公开材料显示：") but keep the fact
+    # they introduce — a real industry report states the fact directly.
+    value = re.sub(r"公开材料(?:提到|显示|指出|提及)[，,：:]?\s*", "", value)
     value = _strip_analysis_framework_narration(value)
     # Drop dangling cross-references whose referent was stripped during cleaning,
     # e.g. "（参见）" / "（详见 ）" / empty "（）". Parentheses that still carry a

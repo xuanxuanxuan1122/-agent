@@ -40,7 +40,10 @@ def test_public_bridge_does_not_force_commercialization_template_for_employment_
 
     _assert_no_hard_template_terms(text)
     assert "岗位" in text or "课程" in text or "AI" in text
-    assert "主体行动" in text or "影响路径" in text or "约束条件" in text
+    assert "教育部专业目录" in text
+    assert "资源投入" not in text
+    assert "流程调整" not in text
+    assert "外部约束" not in text
 
 
 def test_section_composer_expands_employment_topic_without_hard_industry_template(monkeypatch):
@@ -83,7 +86,7 @@ def test_section_composer_expands_employment_topic_without_hard_industry_templat
     assert result["composition_status"] in {"composed", "composed_directional"}
     _assert_no_hard_template_terms(paragraph)
     assert "岗位" in paragraph or "课程" in paragraph or "AI" in paragraph
-    assert "影响路径" in paragraph or "条件" in paragraph or "时间窗口" in paragraph
+    assert "流程调整" in paragraph or "条件" in paragraph or "时间窗口" in paragraph
 
 
 def test_renderer_template_expansion_is_domain_neutral_for_employment_topic():
@@ -99,7 +102,26 @@ def test_renderer_template_expansion_is_domain_neutral_for_employment_topic():
     text = " ".join(sentences)
 
     _assert_no_hard_template_terms(text)
-    assert "岗位" in text or "会计" in text or "影响路径" in text
+    assert "岗位" in text or "会计" in text or "具体业务" in text
+    assert "影响路径" not in text
+    assert "章节判断" not in text
+
+
+def test_renderer_template_expansion_fallback_avoids_methodology_labels():
+    sentences = _public_section_expansion_sentences(
+        {
+            "section_title": "会计课程与岗位要求变化",
+            "block_type": "unknown_block",
+            "evidence_backed": True,
+            "citation_refs": ["[1]"],
+        }
+    )
+
+    text = " ".join(sentences)
+
+    assert "影响路径" not in text
+    assert "章节判断" not in text
+    assert "主体、场景、时间窗口" not in text
 
 
 def test_recomposer_uses_chinese_limitations_title_not_english_fallback():

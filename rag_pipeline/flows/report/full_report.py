@@ -25,6 +25,7 @@ from rag_pipeline.agents.report_health import build_report_health_card
 from rag_pipeline.agents.summary_quality import sanitize_summary_judgments
 from rag_pipeline.contracts.quality_gate import build_quality_gate_state
 from rag_pipeline.contracts.quality_gate_policy import quality_gates_isolated
+from rag_pipeline.contracts.review_suggestion_contract import review_suggestions_to_required_followups
 from rag_pipeline.observability.probe_api import emit_stage_snapshot
 from rag_pipeline.observability.probe_context import ProbeContext, activate_probe_context_env, create_probe_context
 from rag_pipeline.observability.run_trace import write_run_trace_from_package
@@ -747,6 +748,54 @@ def append_final_audit_note(markdown: str, final_audit_result: Dict[str, Any]) -
     if not note or not text or "## 最终审查补充" in text:
         return text
     return f"{text}\n\n{note}".strip()
+
+
+def _dedupe_required_followups(items: Iterable[Dict[str, Any]], *, limit: int = 120) -> List[Dict[str, Any]]:
+    result: List[Dict[str, Any]] = []
+    seen = set()
+    for raw in items:
+        item = as_dict(raw)
+        if not item:
+            continue
+        key = (
+            str(item.get("repair_action") or item.get("repair_route") or item.get("suggested_action") or "").strip().lower(),
+            str(item.get("issue_type") or item.get("type") or item.get("gap_type") or "").strip().lower(),
+            str(item.get("requirement_id") or "").strip(),
+            str(item.get("chapter_id") or "").strip(),
+            str(item.get("section_id") or "").strip(),
+            str(item.get("claim_id") or "").strip(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _final_audit_required_followups(final_audit_result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    result = as_dict(final_audit_result)
+    audit = as_dict(result.get("audit"))
+    findings: List[Dict[str, Any]] = []
+    for key in (
+        "critical_findings",
+        "unsupported_claims",
+        "citation_issues",
+        "scope_or_method_issues",
+        "risk_section_feedback",
+    ):
+        findings.extend(item for item in as_list(audit.get(key)) if isinstance(item, dict))
+    findings.extend(item for item in as_list(result.get("delivery_blockers")) if isinstance(item, dict))
+    findings.extend(item for item in as_list(as_dict(result.get("deterministic_audit")).get("findings")) if isinstance(item, dict))
+    normalized: List[Dict[str, Any]] = []
+    for finding in findings:
+        copied = dict(finding)
+        copied.setdefault("source_stage", "final_audit")
+        if copied.get("suggested_fix") and not copied.get("suggested_action"):
+            copied["suggested_action"] = "rewrite_with_caveat"
+        normalized.append(copied)
+    return review_suggestions_to_required_followups(normalized, source_stage="final_audit")
 
 
 def _load_final_audit_runner():
@@ -5770,6 +5819,15 @@ def main() -> int:
         final_audit_blocked = bool(final_audit_result.get("blocked"))
         record_stage_snapshot("final_audit_result", final_audit_result)
         writer_report["final_audit_result"] = final_audit_result
+        final_audit_followups = _final_audit_required_followups(final_audit_result)
+        if final_audit_followups:
+            writer_report["required_followups"] = _dedupe_required_followups(
+                [
+                    *[item for item in as_list(writer_report.get("required_followups")) if isinstance(item, dict)],
+                    *final_audit_followups,
+                ]
+            )
+            writer_report["final_audit_required_followup_count"] = len(final_audit_followups)
         writer_package_payload["writer_report"] = writer_report
         writer_package_payload["final_audit_result"] = final_audit_result
         state_dict["writer_report"] = writer_report

@@ -1028,7 +1028,7 @@ def test_public_package_normalizer_fills_sections_and_demotes_bad_tables():
     assert chapter_validation["passed"] is True
 
 
-def test_public_package_normalizer_fills_argument_unit_advisory_fields():
+def test_public_package_normalizer_does_not_inject_generic_actionable_advice():
     normalized = _normalize_public_packages_for_contract(
         chapter_evidence_packages=[
             {
@@ -1055,7 +1055,8 @@ def test_public_package_normalizer_fills_argument_unit_advisory_fields():
 
     assert unit["reasoning"]
     assert unit["counter_evidence"]
-    assert unit["actionable"]
+    assert unit["actionable"] == ""
+    assert unit["actionable_is_fallback"] is True
     assert unit["evidence_refs"] == ["1"]
     assert result["passed"] is True
 

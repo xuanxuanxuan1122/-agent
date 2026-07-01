@@ -1625,7 +1625,15 @@ _CORE_OBSERVATION_BRIDGE_RE = re.compile(
     r"\u8fd9\u4e00\u4fe1\u53f7\u4ecd\u53d7\u6765\u6e90\u8986\u76d6\u8303\u56f4|"
     r"\u516c\u5f00\u62ab\u9732\u5145\u5206\u6027\u7684\u9650\u5236|"
     r"\u8be5\u7ebf\u7d22\u66f4\u9002\u5408\u88ab\u5904\u7406\u4e3a|"
-    r"\u4e0d\u5b9c\u88ab\u76f4\u63a5\u5199\u6210"
+    r"\u4e0d\u5b9c\u88ab\u76f4\u63a5\u5199\u6210|"
+    r"\u5f53\u524d\u5224\u65ad\u591a\u57fa\u4e8e\u5b9a\u6027\u4fe1\u53f7|"
+    r"\u5b9a\u6027\u63cf\u8ff0|"
+    r"\u5b9a\u6027\u4fe1\u53f7|"
+    r"\u5c1a\u5f85\u8fdb\u4e00\u6b65\u9a8c\u8bc1|"
+    r"\u4ecd\u9700\u7ed3\u5408\u540e\u7eed|"
+    r"\u9700\u7ed3\u5408\u540e\u7eed|"
+    r"\u7f3a\u4e4f\u5177\u4f53[^。；\n]{0,80}\u91cf\u5316\u6307\u6807|"
+    r"\u7ed3\u8bba\u7684\u7cbe\u786e\u5ea6\u4ecd\u9700"
     r")"
 )
 
@@ -1634,6 +1642,20 @@ _CORE_OBSERVATION_BRIDGE_RE = re.compile(
 # the chapter is about rather than stating a finding, so they must not be lifted
 # into the executive 核心观察 block.
 _CORE_OBSERVATION_ROADMAP_RE = re.compile(r"^本(?:章|节|报告|文)(?:将|从|拟|旨在|意在|聚焦|围绕|重点|主要)")
+_CORE_OBSERVATION_EVIDENCE_CONTEXT_RE = re.compile(
+    r"^(?:公开材料|公开信息|公开披露|相关材料|相关公开信息|可核验材料|材料|资料)"
+    r"(?:提到|显示|指向|呈现|披露|包括|表明)"
+    r"|^(?:权威机构|研究机构|行业报告|白皮书|报告|研报)(?:指出|认为|显示|提到|披露|预测)"
+)
+_CORE_OBSERVATION_INTERPRETIVE_RE = re.compile(
+    r"(?:表明|说明|意味着|反映|推动|改变|决定|影响|约束|验证|印证|支撑|脱离|转向|进入|具备|形成|成为|集中|强化|削弱)"
+)
+_CORE_OBSERVATION_CAVEAT_SPLIT_RE = re.compile(
+    r"(?:当前判断多基于定性信号|由于现阶段尚缺乏|缺乏具体|尚待进一步验证|仍需结合后续|需结合后续|结论的精确度仍需)"
+)
+_CORE_OBSERVATION_NUMBER_RE = re.compile(
+    r"\d+(?:\.\d+)?\s*(?:%|％|万亿元|亿元|亿美元|万亿|亿|万|家|台|个|年)?"
+)
 # A summary line that opens with a dangling metric ("5%；…") or a separator is a
 # split sentence fragment, not a self-contained observation. A real number-led
 # observation ("2025年…", "90%份额…") continues with a word, not a separator.
@@ -1651,7 +1673,99 @@ def _looks_like_core_observation_bridge_line(text: str) -> bool:
         return True
     if _CORE_OBSERVATION_ROADMAP_RE.match(compact):
         return True
+    if _CORE_OBSERVATION_EVIDENCE_CONTEXT_RE.match(compact):
+        return True
     return bool(_CORE_OBSERVATION_BRIDGE_RE.search(compact))
+
+
+def _core_observation_dedupe_key(text: str) -> str:
+    key = re.sub(r"\[\d{1,5}\]", "", str(text or ""))
+    key = re.sub(r"[，,。；;：:\s（）()\[\]【】]+", "", key)
+    return key.strip()
+
+
+def _is_redundant_core_observation_key(key: str, seen_keys: Sequence[str]) -> bool:
+    if not key:
+        return True
+    for existing in seen_keys:
+        if not existing:
+            continue
+        shorter, longer = (key, existing) if len(key) <= len(existing) else (existing, key)
+        if len(shorter) >= 18 and shorter in longer:
+            return True
+    return False
+
+
+def _core_observation_number_tokens(text: str) -> set[str]:
+    compact = CITATION_RE.sub("", str(text or ""))
+    tokens = {
+        re.sub(r"\s+", "", match.group(0))
+        for match in _CORE_OBSERVATION_NUMBER_RE.finditer(compact)
+        if match.group(0)
+    }
+    # Year-only overlap is too weak to prove that two lines describe the same fact.
+    return {token for token in tokens if not re.fullmatch(r"20\d{2}年?", token)}
+
+
+def _trim_core_observation_caveat(text: str) -> str:
+    value = str(text or "").strip()
+    if not value:
+        return ""
+    refs = "".join(CITATION_RE.findall(value))
+    body = CITATION_RE.sub("", value).strip()
+    parts = _CORE_OBSERVATION_CAVEAT_SPLIT_RE.split(body, maxsplit=1)
+    if len(parts) == 1:
+        return value
+    head = parts[0].strip(" ，,；;。")
+    if len(re.sub(r"\s+", "", head)) < 18:
+        return ""
+    return _public_text(f"{head}。{refs}")
+
+
+def _core_observation_score(text: str) -> int:
+    compact = CITATION_RE.sub("", str(text or "")).strip()
+    compact_no_space = re.sub(r"\s+", "", compact)
+    score = min(len(compact_no_space) // 24, 6)
+    if _CORE_OBSERVATION_EVIDENCE_CONTEXT_RE.match(compact_no_space):
+        score -= 40
+    if _CORE_OBSERVATION_INTERPRETIVE_RE.search(compact_no_space):
+        score += 20
+    if _METRIC_CLAIM_RE.search(compact_no_space):
+        score += 4
+    if re.match(r"^(?:20\d{2}年|\d)", compact_no_space):
+        score -= 2
+    return score
+
+
+def _same_core_observation_cluster(left: str, right: str) -> bool:
+    left_refs = tuple(CITATION_RE.findall(str(left or "")))
+    right_refs = tuple(CITATION_RE.findall(str(right or "")))
+    if left_refs and left_refs == right_refs:
+        if _METRIC_CLAIM_RE.search(left) or _METRIC_CLAIM_RE.search(right):
+            return True
+        left_compact = re.sub(r"\s+", "", CITATION_RE.sub("", str(left or "")))
+        right_compact = re.sub(r"\s+", "", CITATION_RE.sub("", str(right or "")))
+        if _CORE_OBSERVATION_EVIDENCE_CONTEXT_RE.match(left_compact) or _CORE_OBSERVATION_EVIDENCE_CONTEXT_RE.match(right_compact):
+            return True
+    left_numbers = _core_observation_number_tokens(left)
+    right_numbers = _core_observation_number_tokens(right)
+    return len(left_numbers.intersection(right_numbers)) >= 2
+
+
+def _collapse_core_observation_candidates(candidates: Sequence[str]) -> List[str]:
+    collapsed: List[str] = []
+    for candidate in candidates:
+        replaced = False
+        for index, existing in enumerate(collapsed):
+            if not _same_core_observation_cluster(existing, candidate):
+                continue
+            if _core_observation_score(candidate) > _core_observation_score(existing):
+                collapsed[index] = candidate
+            replaced = True
+            break
+        if not replaced:
+            collapsed.append(candidate)
+    return collapsed
 
 
 def _ensure_public_core_observation_block(markdown: str) -> str:
@@ -1662,7 +1776,7 @@ def _ensure_public_core_observation_block(markdown: str) -> str:
     if not body.strip():
         return source
     candidates: List[str] = []
-    seen = set()
+    seen: List[str] = []
     for line in body.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#") or stripped.startswith("|"):
@@ -1670,16 +1784,19 @@ def _ensure_public_core_observation_block(markdown: str) -> str:
         candidate = _compact_cited_summary_line(stripped)
         if not candidate:
             continue
+        candidate = _trim_core_observation_caveat(candidate)
+        if not candidate:
+            continue
         if _looks_like_core_observation_bridge_line(candidate):
             continue
-        key = re.sub(r"\[\d{1,5}\]", "", candidate)
-        key = re.sub(r"\s+", "", key).strip()
-        if key in seen:
+        key = _core_observation_dedupe_key(candidate)
+        if _is_redundant_core_observation_key(key, seen):
             continue
-        seen.add(key)
+        seen.append(key)
         candidates.append(candidate)
     if not candidates:
         return source
+    candidates = _collapse_core_observation_candidates(candidates)
     # Lead the executive summary with the strongest findings: prefer observations
     # that carry a concrete metric (market size, growth, forecast) over whatever
     # sentence the first chapter happens to open with. Stable within each group.
@@ -1795,7 +1912,7 @@ def _section_gate_mutation_mode() -> str:
 
 
 def _section_gate_can_mutate() -> bool:
-    return _section_gate_mutation_mode() == "enforce" or _source_claim_gate_mode() == "strict"
+    return _section_gate_mutation_mode() == "enforce"
 
 
 def _append_section_review_suggestion(
@@ -2519,6 +2636,13 @@ def _apply_source_claim_support_gate(
         diagnostics["source_claim_support_status"] = "filtered"
     elif diagnostics["weak_source_strong_claim_demoted_count"]:
         diagnostics["source_claim_support_status"] = "demoted"
+    elif (
+        diagnostics["permissive_retained_unresolved_section_count"]
+        or diagnostics["permissive_retained_manifest_citation_missing_count"]
+        or diagnostics["source_claim_mismatch_examples"]
+        or diagnostics["citationless_fact_examples"]
+    ):
+        diagnostics["source_claim_support_status"] = "diagnostic_observed"
     return gated_chapters, diagnostics
 
 
@@ -2688,6 +2812,13 @@ def _merge_source_claim_support_diagnostics(target: Dict[str, Any], extra: Dict[
         merged["source_claim_support_status"] = "filtered"
     elif int(merged.get("demoted_section_count") or 0) or int(merged.get("weak_source_strong_claim_demoted_count") or 0):
         merged["source_claim_support_status"] = "demoted"
+    elif (
+        int(merged.get("permissive_retained_unresolved_section_count") or 0)
+        or int(merged.get("permissive_retained_manifest_citation_missing_count") or 0)
+        or _as_list(merged.get("source_claim_mismatch_examples"))
+        or _as_list(merged.get("citationless_fact_examples"))
+    ):
+        merged["source_claim_support_status"] = "diagnostic_observed"
     else:
         merged.setdefault("source_claim_support_status", target.get("source_claim_support_status", "ok"))
     return merged
@@ -2706,6 +2837,22 @@ def _claim_refs_for_transfer(item: Dict[str, Any]) -> List[str]:
     return _dedupe_strings(refs, limit=50)
 
 
+def _claim_ids_for_transfer(item: Dict[str, Any]) -> List[str]:
+    ids = [
+        item.get("claim_id"),
+        item.get("id"),
+        *_as_list(item.get("claim_ids")),
+        *_as_list(item.get("paragraph_claim_ids")),
+        item.get("paragraph_main_claim_id"),
+        *_as_list(item.get("paragraph_supporting_claim_ids")),
+        *_as_list(item.get("supporting_claim_ids")),
+    ]
+    return _dedupe_strings(
+        [str(value or "").strip() for value in ids if str(value or "").strip()],
+        limit=50,
+    )
+
+
 def _is_analysis_claim_for_transfer(item: Dict[str, Any]) -> bool:
     if not isinstance(item, dict):
         return False
@@ -2713,7 +2860,7 @@ def _is_analysis_claim_for_transfer(item: Dict[str, Any]) -> bool:
         return False
     if not _claim_refs_for_transfer(item):
         return False
-    if item.get("claim_id") or item.get("source_support_map") or item.get("analysis_role"):
+    if _claim_ids_for_transfer(item) or item.get("source_support_map") or item.get("analysis_role"):
         return True
     strength = str(item.get("claim_strength") or "").strip().lower()
     return strength in {"strong", "moderate", "directional", "contextual", "limited_evidence"}
@@ -2740,9 +2887,9 @@ def _analysis_transfer_diagnostics(
     ]
     claim_ids = _dedupe_strings(
         [
-            str(item.get("claim_id") or item.get("id") or "").strip()
+            claim_id
             for item in analysis_claims
-            if str(item.get("claim_id") or item.get("id") or "").strip()
+            for claim_id in _claim_ids_for_transfer(item)
         ],
         limit=200,
     )
@@ -2753,9 +2900,9 @@ def _analysis_transfer_diagnostics(
     ]
     rendered_ids = _dedupe_strings(
         [
-            str(section.get("claim_id") or section.get("id") or "").strip()
+            claim_id
             for section in rendered_sections
-            if str(section.get("claim_id") or section.get("id") or "").strip()
+            for claim_id in _claim_ids_for_transfer(section)
         ],
         limit=200,
     )
@@ -2768,23 +2915,22 @@ def _analysis_transfer_diagnostics(
     tracked_claims = [
         claim
         for claim in analysis_claims
-        if str(claim.get("claim_id") or claim.get("id") or "").strip()
+        if _claim_ids_for_transfer(claim)
     ]
     matched_ids: List[str] = []
     matched_by_ref_ids: List[str] = []
     lost_ids: List[str] = []
     for claim in tracked_claims:
-        claim_id = str(claim.get("claim_id") or claim.get("id") or "").strip()
         claim_refs = set(_claim_refs_for_transfer(claim))
-        matched_by_id = bool(claim_id and claim_id in rendered_id_set)
-        matched_by_ref = bool(claim_id and claim_refs and any(claim_refs.intersection(refs) for refs in rendered_ref_sets))
-        if matched_by_id or matched_by_ref:
-            if claim_id:
+        for claim_id in _claim_ids_for_transfer(claim):
+            matched_by_id = bool(claim_id and claim_id in rendered_id_set)
+            matched_by_ref = bool(claim_id and claim_refs and any(claim_refs.intersection(refs) for refs in rendered_ref_sets))
+            if matched_by_id or matched_by_ref:
                 matched_ids.append(claim_id)
                 if matched_by_ref and not matched_by_id:
                     matched_by_ref_ids.append(claim_id)
-        elif claim_id:
-            lost_ids.append(claim_id)
+            elif claim_id:
+                lost_ids.append(claim_id)
     claim_count = len(analysis_claims)
     matched_ids = _dedupe_strings(matched_ids, limit=200)
     matched_by_ref_ids = _dedupe_strings(matched_by_ref_ids, limit=200)
@@ -2861,6 +3007,11 @@ def _claim_public_bridge_pack(item: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
+def _is_generic_public_bridge_pack(bridge: Dict[str, Any]) -> bool:
+    keys = {str(item or "").strip().lower() for item in _as_list(bridge.get("template_keys"))}
+    return bool(keys) and all(key.startswith("general:") for key in keys)
+
+
 def _claim_evidence_context_text(item: Dict[str, Any]) -> str:
     bridge_text = _public_text(_claim_public_bridge_pack(item).get("evidence_context"))
     if bridge_text:
@@ -2876,6 +3027,8 @@ def _claim_evidence_context_text(item: Dict[str, Any]) -> str:
 
 def _claim_public_interpretation_text(item: Dict[str, Any]) -> str:
     bridge = _claim_public_bridge_pack(item)
+    if _is_generic_public_bridge_pack(bridge):
+        return ""
     bridge_parts = _dedupe_strings(
         [bridge.get("mechanism_bridge"), bridge.get("implication_bridge")],
         limit=2,
@@ -2888,7 +3041,7 @@ def _claim_public_interpretation_text(item: Dict[str, Any]) -> str:
     return _public_text(
         "公开材料如果已经呈现明确主体、具体场景、连续动作或风险约束，就更接近可分析的早期变化；"
         "如果缺少明确主体、连续动作或可复核结果，结论就只能限制在具体场景内。"
-        "判断能否继续增强，取决于主体行动、适用场景、资源投入和约束条件是否同步改善。"
+        "判断能否继续增强，取决于资源投入、应用场景、执行结果和外部约束是否同步改善。"
     )
 
 
@@ -2931,21 +3084,18 @@ def _claim_backfill_section(item: Dict[str, Any], index: int) -> Dict[str, Any]:
         item.get("reasoning")
         or item.get("mechanism")
         or item.get("analysis_reasoning")
-        or "材料已经提供一个可观察入口：如果相关主体的行动继续扩展到更多场景、资源投入和执行结果，判断基础会更稳。"
     )
     boundary = _public_text(
         item.get("counter_evidence")
         or item.get("limitation_boundary")
         or item.get("boundary")
         or item.get("limitations")
-        or "当前材料覆盖范围有限，结论只能落在已披露主体和场景内，不能直接推到全行业成熟。"
     )
     actionable = _public_text(
         item.get("actionable")
         or item.get("decision_implication")
         or item.get("implication")
         or item.get("next_step")
-        or "更值得看的，是主体行动是否持续、适用场景是否扩大、执行成本和风险约束是否同步改善。"
     )
     section_id_slug = re.sub(r"[^A-Za-z0-9_\-]+", "_", claim_id).strip("_") or f"claim_{index}"
     render_blocks = [

@@ -776,7 +776,35 @@ def _variable_for_block_type(block_type: str) -> str:
         return "风险边界"
     if block == "competitive_positioning":
         return "竞争位置"
-    return "章节信号"
+    return "结构变化"
+
+
+def _unit_basis_variable(unit: Dict[str, Any], block_type: str) -> str:
+    explicit = str(unit.get("variable") or unit.get("analysis_variable") or "").strip()
+    if explicit and explicit not in {"章节信号", "本章变量", "相关变量", "相关变化"}:
+        return explicit
+    text = " ".join(
+        str(value or "")
+        for value in (
+            unit.get("claim"),
+            unit.get("reasoning"),
+            unit.get("mechanism"),
+            unit.get("paragraph_seed"),
+        )
+    )
+    if "课程" in text:
+        return "课程结构变化"
+    if "岗位" in text and "能力" in text:
+        return "岗位能力变化"
+    if "能力" in text:
+        return "能力结构变化"
+    if "需求" in text:
+        return "需求变化"
+    if "政策" in text:
+        return "政策影响"
+    if "风险" in text:
+        return "风险边界"
+    return _variable_for_block_type(block_type)
 
 
 def _fact_cards_from_unit_basis(
@@ -824,7 +852,7 @@ def _fact_cards_from_unit_basis(
                 "public_fact_card": {
                     "subject": unit.get("subject") or unit.get("actor") or unit.get("company") or "",
                     "action_or_signal": unit.get("action_or_signal") or unit.get("signal") or "",
-                    "variable": unit.get("variable") or unit.get("analysis_variable") or _variable_for_block_type(block_type),
+                    "variable": _unit_basis_variable(unit, block_type),
                     "distilled_fact": fact,
                     "fact_type": fact_type,
                     "source_ref": ref,
@@ -1296,7 +1324,7 @@ def _section_from_unit(
         claim_key = _fact_text_key(claim)
         reasoning_key = _fact_text_key(reasoning)
         if reasoning and claim_key and (reasoning_key == claim_key or claim_key in reasoning_key):
-            reasoning = variable_explanation if variable_explanation and _fact_text_key(variable_explanation) != claim_key else ""
+            reasoning = ""
         mechanism_key = _fact_text_key(mechanism)
         reasoning_key = _fact_text_key(reasoning)
         duplicate_mechanism = bool(
@@ -1308,10 +1336,7 @@ def _section_from_unit(
             )
         )
         if duplicate_mechanism:
-            if variable_explanation and _fact_text_key(variable_explanation) not in {claim_key, reasoning_key}:
-                mechanism = variable_explanation
-            else:
-                mechanism = ""
+            mechanism = ""
         counter_key = _fact_text_key(counter_evidence)
         mechanism_key = _fact_text_key(mechanism)
         if counter_evidence and (
@@ -1383,7 +1408,7 @@ def _section_from_unit(
         or _has_template_risk(unit.get("counter_evidence"))
         or _has_template_risk(unit.get("mechanism"))
     )
-    mechanism_for_evidence = mechanism or reasoning or str(composition.get("variable_explanation") or "").strip()
+    mechanism_for_evidence = mechanism or reasoning
     if not mechanism and mechanism_for_evidence:
         mechanism = mechanism_for_evidence
     evidence_backed = bool(used_fact_refs and supporting_facts and mechanism_for_evidence and fact_card_match and not template_removed)

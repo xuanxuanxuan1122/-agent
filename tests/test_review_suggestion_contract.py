@@ -3,6 +3,7 @@ from __future__ import annotations
 from rag_pipeline.contracts.review_suggestion_contract import (
     make_review_suggestion,
     repair_action_for_review_suggestion,
+    review_suggestions_to_required_followups,
 )
 
 
@@ -31,3 +32,39 @@ def test_repair_action_dispatches_non_search_actions_before_search():
     assert repair_action_for_review_suggestion({"issue_type": "section_ref_binding_unbound"}) == "recompose_outline"
     assert repair_action_for_review_suggestion({"issue_type": "missing_case"}) == "search_more"
     assert repair_action_for_review_suggestion({"issue_type": "single_source"}) == "rewrite_with_caveat"
+
+
+def test_review_suggestions_convert_to_non_renderable_required_followups():
+    followups = review_suggestions_to_required_followups(
+        [
+            {
+                "schema_version": "review_suggestion_v1",
+                "issue_type": "body_short",
+                "severity": "warning",
+                "target": {"chapter_id": "CH1", "section_id": "S1", "claim_id": "CL1"},
+                "suggested_action": "rewrite_with_caveat",
+                "message": "正文偏短",
+                "diagnostic_only": True,
+                "must_not_render": True,
+                "public_text_allowed": False,
+            },
+            {
+                "type": "missing_case",
+                "chapter_id": "CH2",
+                "section_id": "S2",
+                "message": "缺少案例",
+            },
+        ],
+        source_stage="qa_agent",
+    )
+
+    assert followups[0]["schema_version"] == "review_suggestion_required_followup_v1"
+    assert followups[0]["repair_action"] == "rewrite_with_caveat"
+    assert followups[0]["repair_route"] == "rewrite_with_caveat"
+    assert followups[0]["chapter_id"] == "CH1"
+    assert followups[0]["claim_id"] == "CL1"
+    assert followups[0]["diagnostic_only"] is True
+    assert followups[0]["must_not_render"] is True
+    assert followups[0]["public_text_allowed"] is False
+    assert followups[1]["repair_action"] == "search_more"
+    assert followups[1]["chapter_id"] == "CH2"

@@ -1,4 +1,12 @@
-from rag_pipeline.agents.block_schema import _claim_first_blocks_from_section_plan
+from rag_pipeline.agents.block_schema import BLOCK_REGISTRY, _claim_first_blocks_from_section_plan
+
+
+def test_block_registry_public_labels_are_not_mojibake():
+    labels = "\n".join(str(payload.get("label") or "") for payload in BLOCK_REGISTRY.values())
+
+    for fragment in ("鏈", "浜嬪", "鍙", "鎸囨", "淇″彿", "鈥"):
+        assert fragment not in labels
+    assert BLOCK_REGISTRY["integrated_signal"]["label"] == "综合信号"
 
 
 def test_claim_first_blocks_always_declare_required_evidence_roles():

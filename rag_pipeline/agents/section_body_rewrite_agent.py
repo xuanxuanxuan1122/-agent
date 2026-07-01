@@ -15,6 +15,12 @@ from ..search.memory import call_openai_compatible_json, llm_config_is_ready
 
 PROMPT_VERSION = "section_body_rewrite_v3_analyst"
 DEFAULT_CACHE_PATH = Path("output/cache/section_body_rewrite")
+INTERNAL_EVIDENCE_REF_RE = re.compile(
+    r"(?:"
+    r"[\[【(（]\s*EV-[A-Za-z0-9_-]+(?:\s*[,，、;；]\s*EV-[A-Za-z0-9_-]+)*\s*[\]】)）]"
+    r"|\bEV-[A-Za-z0-9_-]+\b"
+    r")"
+)
 FORBIDDEN_RE = re.compile(
     r"QA\s*failed|Clean\s*资格|fatal|EV-|evidence_cards|URL:|"
     r"补证|建议补证|证据不足|内部诊断|质量总分|Clean",
@@ -32,6 +38,16 @@ def _as_list(value: Any) -> List[Any]:
 
 def _text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _strip_internal_evidence_refs(value: Any) -> str:
+    text = _text(value)
+    if not text or "EV-" not in text:
+        return text
+    text = INTERNAL_EVIDENCE_REF_RE.sub("", text)
+    text = re.sub(r"\s+([，。；、,.!?])", r"\1", text)
+    text = re.sub(r"([（(【\[])\s*([）)】\]])", "", text)
+    return _text(text)
 
 
 def _excerpt(value: Any, *, limit: int = 240) -> str:
@@ -66,16 +82,24 @@ def body_rewrite_cache_enabled() -> bool:
 
 def body_rewrite_max_sections() -> int:
     value = _env_int("REPORT_BODY_REWRITE_MAX_SECTIONS", 12, min_value=0, max_value=200)
-    quality_mode = str(os.getenv("REPORT_QUALITY_MODE") or "").strip().lower()
-    replay_mode = str(os.getenv("REPORT_REPLAY_EXECUTION_MODE") or "").strip().lower()
-    if quality_mode == "high" or replay_mode == "quality_llm_replay":
+    if _body_rewrite_quality_mode():
         quality_floor = _env_int("REPORT_BODY_REWRITE_QUALITY_MIN_SECTIONS", 40, min_value=0, max_value=200)
         value = max(value, quality_floor)
     return value
 
 
+def _body_rewrite_quality_mode() -> bool:
+    quality_mode = str(os.getenv("REPORT_QUALITY_MODE") or "").strip().lower()
+    replay_mode = str(os.getenv("REPORT_REPLAY_EXECUTION_MODE") or "").strip().lower()
+    return quality_mode == "high" or replay_mode == "quality_llm_replay"
+
+
 def body_rewrite_max_elapsed_seconds() -> int:
-    return _env_int("REPORT_BODY_REWRITE_MAX_ELAPSED_SECONDS", 120, min_value=0, max_value=3600)
+    value = _env_int("REPORT_BODY_REWRITE_MAX_ELAPSED_SECONDS", 120, min_value=0, max_value=3600)
+    if _body_rewrite_quality_mode():
+        quality_floor = _env_int("REPORT_BODY_REWRITE_QUALITY_MIN_ELAPSED_SECONDS", 240, min_value=0, max_value=3600)
+        value = max(value, quality_floor)
+    return value
 
 
 def body_rewrite_concurrency() -> int:
@@ -83,16 +107,21 @@ def body_rewrite_concurrency() -> int:
 
 
 def body_rewrite_target_section_chars() -> int:
-    return _env_int("REPORT_BODY_REWRITE_TARGET_SECTION_CHARS", 650, min_value=0, max_value=5000)
+    value = _env_int("REPORT_BODY_REWRITE_TARGET_SECTION_CHARS", 650, min_value=0, max_value=5000)
+    if _body_rewrite_quality_mode():
+        quality_floor = _env_int("REPORT_BODY_REWRITE_QUALITY_TARGET_SECTION_CHARS", 900, min_value=0, max_value=5000)
+        value = max(value, quality_floor)
+    return value
 
 
 def body_rewrite_max_expansion_ratio() -> float:
     raw = os.getenv("REPORT_BODY_REWRITE_MAX_EXPANSION_RATIO", "").strip()
     try:
-        value = float(raw) if raw else 5.0
+        value = float(raw) if raw else (7.0 if _body_rewrite_quality_mode() else 5.0)
     except Exception:
-        value = 5.0
-    return max(1.0, min(5.0, value))
+        value = 7.0 if _body_rewrite_quality_mode() else 5.0
+    max_value = 8.0 if _body_rewrite_quality_mode() else 5.0
+    return max(1.0, min(max_value, value))
 
 
 def _cache_root() -> Path:
@@ -512,7 +541,7 @@ def rewrite_section_body(
         return failed
 
     result = _as_dict(response.get("payload"))
-    paragraph = _text(result.get("paragraph"))
+    paragraph = _strip_internal_evidence_refs(result.get("paragraph"))
     used_fact_refs = _as_list(result.get("used_fact_refs"))
     citation_refs = _as_list(result.get("citation_refs"))
     valid, reason = _validate_candidate(

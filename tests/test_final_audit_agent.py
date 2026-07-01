@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 from rag_pipeline.flows.report import final_audit_agent
+from rag_pipeline.flows.report.full_report import _final_audit_required_followups
 
 
 def _configure_deepseek_final_audit(monkeypatch):
@@ -20,6 +21,45 @@ def test_final_audit_disabled_skips_without_calling_model(monkeypatch):
 
     assert result["status"] == "skipped"
     assert result["skipped_reason"] == "disabled"
+
+
+def test_final_audit_findings_convert_to_required_followups():
+    followups = _final_audit_required_followups(
+        {
+            "status": "fatal",
+            "audit": {
+                "critical_findings": [
+                    {
+                        "type": "unsupported_claim",
+                        "severity": "fatal",
+                        "requirement_id": "REQ-1",
+                        "gap_id": "GAP-1",
+                        "section_id": "SEC-1",
+                        "message": "论断支撑不足",
+                        "suggested_fix": "改为谨慎表述",
+                    }
+                ],
+                "citation_issues": [
+                    {
+                        "type": "citation_issue",
+                        "severity": "high",
+                        "section_id": "SEC-2",
+                        "message": "引用语义不匹配",
+                    }
+                ],
+            },
+        }
+    )
+
+    assert followups[0]["schema_version"] == "review_suggestion_required_followup_v1"
+    assert followups[0]["source"] == "final_audit"
+    assert followups[0]["issue_type"] == "unsupported_claim"
+    assert followups[0]["repair_action"] == "rewrite_with_caveat"
+    assert followups[0]["requirement_id"] == "REQ-1"
+    assert followups[0]["gap_id"] == "GAP-1"
+    assert followups[0]["section_id"] == "SEC-1"
+    assert followups[0]["must_not_render"] is True
+    assert followups[1]["issue_type"] == "citation_issue"
 
 
 def test_final_audit_fatal_blocks_when_blocking_enabled(monkeypatch):

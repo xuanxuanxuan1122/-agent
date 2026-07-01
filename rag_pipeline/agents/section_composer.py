@@ -27,6 +27,52 @@ def _text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
+GENERIC_PUBLIC_SUBJECTS = {"", "相关主体", "相关企业", "相关机构", "主体"}
+GENERIC_PUBLIC_VARIABLES = {"", "章节信号", "本章变量", "相关变量", "关键事实", "具体进展"}
+
+
+def _claim_focus_text(value: Any) -> str:
+    text = _text(value)
+    if not text:
+        return ""
+    text = re.split(r"[。；;,.，]", text, maxsplit=1)[0].strip()
+    for marker in (
+        "正在",
+        "已经",
+        "将会",
+        "将",
+        "开始",
+        "进入",
+        "推动",
+        "成为",
+        "需要",
+        "显示",
+        "说明",
+        "会",
+    ):
+        if marker in text:
+            left = text.split(marker, 1)[0].strip()
+            if 2 <= len(left) <= 24:
+                return left
+    return text[:24].strip()
+
+
+def _public_focus_from_claim(claim_unit: "ClaimUnit", fallback: Any = "") -> str:
+    focus = _claim_focus_text(getattr(claim_unit, "claim", ""))
+    if focus:
+        return focus
+    return _claim_focus_text(fallback)
+
+
+def _public_variable(value: Any, *, fallback: str = "这一变化") -> str:
+    variable = _text(value)
+    if not variable:
+        return fallback
+    if variable in GENERIC_PUBLIC_VARIABLES or "章节信号" in variable:
+        return fallback
+    return variable
+
+
 def _as_list(value: Any) -> List[Any]:
     if isinstance(value, list):
         return value
@@ -282,7 +328,9 @@ def _case_sentence(card: EvidenceFactCard) -> str:
     subject = _public_subject(card.subject, "相关主体")
     fact = card.distilled_fact.rstrip("。.")
     variable = card.variable or "具体进展"
-    return f"{subject}的材料显示{variable}已经出现可观察样本；{fact}。这类样本的意义在于帮助判断变化发生在哪里、影响了哪些主体。"
+    if subject in GENERIC_PUBLIC_SUBJECTS or variable in GENERIC_PUBLIC_VARIABLES:
+        return f"{fact}。这说明上述变化已经落到具体业务安排、产品动作或组织配置上。"
+    return f"{fact}。这使{subject}的{variable}不再只是概念性表述，而是落到具体业务安排、产品动作或组织配置上。"
 
 
 def _technology_sentence(card: EvidenceFactCard) -> str:
@@ -298,13 +346,13 @@ def _risk_sentence(card: EvidenceFactCard) -> str:
 
 
 def _boundary_sentence(lens: str, card: EvidenceFactCard, strength: str) -> str:
-    variable = card.variable or card.time_or_scope or ""
+    variable = _public_variable(card.variable or card.time_or_scope or "", fallback="")
     if lens == "metric":
         return "边界在于指标的主体、范围、期间和统计口径是否保持一致。"
     if lens in {"case", "commercial", "competition"}:
         if variable:
-            return f"边界在于{variable}是否能在更多主体、场景和时间窗口中重复出现。"
-        return "边界在于样本是否能在更多主体、场景和时间窗口中重复出现。"
+            return f"边界在于目前关于{variable}的样本仍有限，不能直接代表全部市场需求或所有地区的普遍变化。"
+        return "边界在于目前样本仍有限，不能直接代表全部市场需求或所有地区的普遍变化。"
     if lens == "technology":
         if variable:
             return f"边界在于{variable}是否同时满足可靠性、权限、安全和集成成本要求。"
@@ -314,18 +362,18 @@ def _boundary_sentence(lens: str, card: EvidenceFactCard, strength: str) -> str:
             return f"触发条件是{variable}进一步扩大，进而改变执行节奏、成本预期或责任分配确定性。"
         return "触发条件是反向样本继续扩大，进而改变执行节奏、成本预期或责任分配确定性。"
     if strength in {"directional", "weak"} and variable:
-        return f"边界在于{variable}能否在更多可追溯样本中重复出现。"
+        return f"边界在于目前关于{variable}的公开样本仍有限，结论需要保留弹性。"
     return ""
 
 
 def _variable_explanation(lens: str, card: EvidenceFactCard) -> str:
-    variable = card.variable or card.action_or_signal or card.time_or_scope
+    variable = _public_variable(card.variable or card.action_or_signal or card.time_or_scope, fallback="这一变化")
     if not variable:
         return ""
     if lens == "metric":
-        return f"这说明{variable}不是单个数值本身，而是主体、范围、期间和口径可比性的共同结果。"
+        return f"{variable}的解释力来自主体范围、期间和统计口径是否一致。"
     if lens in {"case", "commercial"}:
-        return f"这说明{variable}的关键不只是出现案例，而是案例是否能解释具体主体、场景和影响路径。"
+        return f"{variable}已经有具体样本支撑，影响范围取决于后续是否继续投入资源并形成重复动作。"
     if lens == "competition":
         return f"这说明{variable}会影响玩家分化、渠道控制和生态入口的判断。"
     if lens == "technology":
@@ -359,13 +407,13 @@ def _claim_analysis_parts(claim_unit: ClaimUnit, *, known_facts: Sequence[str] =
     role_bridge = ""
     if narrative_supporting:
         if narrative_role == "mechanism":
-            role_bridge = "这些材料放在一起看，重点不只是单点事实，而是它们共同指向的因果关系和执行条件。"
+            role_bridge = "这些材料放在一起看，能够把事实之间的因果关系和执行条件讲清楚。"
         elif narrative_role == "business_implication":
-            role_bridge = "这些材料共同指向后续影响，需要同时观察主体行动、资源配置和外部约束如何变化。"
+            role_bridge = "这些材料共同指向业务影响，核心在于资源投入、流程安排和外部约束是否同步变化。"
         elif narrative_role == "constraint":
-            role_bridge = "这些限制条件会影响判断强度，需要和前面的正向材料放在同一框架中理解。"
+            role_bridge = "这些限制条件会压低判断强度，需要和前面的正向材料一起呈现。"
         else:
-            role_bridge = "这些材料相互补充，使判断从单个样本转向更连续的场景信号。"
+            role_bridge = "这些材料相互补充，使判断从个别披露转向更完整的场景描述。"
     values: List[Any] = [
         claim_unit.claim,
         claim_unit.paragraph_seed,
@@ -373,7 +421,7 @@ def _claim_analysis_parts(claim_unit: ClaimUnit, *, known_facts: Sequence[str] =
         *narrative_supporting,
         *[_clean_analysis_basis_text(item) for item in claim_unit.evidence_basis[:2]],
         claim_unit.reasoning_chain,
-        _clean_analysis_basis_text(claim_unit.limitation_boundary),
+        # limitation_boundary is internal-only; keep it out of the public paragraph.
     ]
     for value in values:
         text = _text(value)
@@ -404,7 +452,7 @@ def _select_cards_for_claim(cards: Sequence[EvidenceFactCard], claim_unit: Claim
 
 def _join_public_sentences(parts: Sequence[str]) -> str:
     return remove_hard_industry_templates(
-        " ".join(part.strip() for part in _dedupe(parts, limit=16) if part.strip()).strip()
+        " ".join(part.strip() for part in _dedupe(parts, limit=24) if part.strip()).strip()
     )
 
 
@@ -458,64 +506,80 @@ def _expansion_sentences(
     first = selected[0]
     subject = _public_subject(first.subject, "相关主体")
     variable = first.variable or first.action_or_signal or first.time_or_scope or "本章变量"
-    if variable in {"章节信号", "本章变量", "相关变量"} or "章节信号" in variable:
-        variable = "相关变量"
     clean_basis = [_clean_analysis_basis_text(item) for item in claim_unit.evidence_basis]
     fact_basis = _dedupe([card.distilled_fact for card in selected] + [item for item in clean_basis if item], limit=4)
     facts_text = "；".join(fact_basis[:2])
     fact_reference = facts_text or (selected[0].distilled_fact if selected else "")
+    focus = _public_focus_from_claim(claim_unit, fact_reference)
+    if subject in GENERIC_PUBLIC_SUBJECTS and focus:
+        subject = focus
+    if variable in GENERIC_PUBLIC_VARIABLES or "章节信号" in variable:
+        variable = focus or "相关变化"
+    if variable == subject:
+        variable = "这一变化"
     if lens == "metric":
-        mechanism = f"从分析口径看，{variable}需要同时观察主体、范围、期间和单位是否一致；只有这些口径能够对齐，指标才适合用于解释趋势变化。"
-        implication = f"因此，本节不把单个数值当成完整结论，而是把{subject}相关指标放在时间窗口、比较对象和影响路径之间交叉理解。"
+        mechanism = f"{variable}的解释力取决于{subject}对应的统计范围、时间窗口和单位口径；这些条件越清楚，越能判断相关变化是否具备持续性。"
+        implication = f"相关数值更适合作为判断{subject}变化节奏的依据，而不是孤立的规模描述。"
     elif lens in {"case", "commercial"}:
-        mechanism = f"从机制上看，{variable}的价值不在于出现一个案例，而在于案例是否说明真实场景、责任分工和执行条件已经发生变化。"
-        implication = f"因此，{subject}的样本会把分析重点推向具体主体、影响范围和可持续性：只有这些条件连续出现，案例才有更强解释力。"
+        mechanism = f"{variable}之所以重要，是因为它已经落到{subject}的具体动作或业务安排上，能够反映需求、供给或组织配置的真实变化。"
+        implication = "如果类似动作持续增加，这一判断就会从个别披露走向更明确的产业趋势；如果样本停留在少数主体，结论仍需保持审慎。"
     elif lens == "technology":
-        mechanism = f"从技术成熟度看，{variable}会同时影响可靠性、权限治理、安全边界和集成成本；这些变量决定相关能力能否进入稳定使用。"
-        implication = f"因此，本节把技术事实转化为执行约束：能力本身只是入口，稳定运行、责任划分和系统兼容才决定实际影响。"
+        mechanism = f"{variable}会同时影响可靠性、权限治理、安全边界和集成成本，这些条件决定相关能力能否进入稳定使用。"
+        implication = f"技术能力本身只是入口，稳定运行、责任划分和系统兼容才决定实际影响。"
     elif lens == "risk":
-        mechanism = f"从风险边界看，{variable}一旦扩大，就可能改变执行节奏、成本预期或责任分配确定性，从而改变原有判断的强度。"
-        implication = f"因此，风险事实不应被放在附录里处理，而应进入正文成为约束条件，帮助区分已经验证的机会和仍需谨慎对待的假设。"
+        mechanism = f"{variable}一旦扩大，就可能改变执行节奏、成本预期或责任分配确定性，从而压低原有判断的强度。"
+        implication = f"风险事实会直接影响机会判断，帮助区分已经验证的进展和仍需谨慎对待的假设。"
     elif lens == "competition":
-        mechanism = f"从竞争结构看，{variable}会影响主体分化、资源控制、协作入口和切换成本；同一事实在不同主体中可能代表不同能力。"
-        implication = f"因此，本节关注的不只是参与者数量，而是哪些能力真正沉淀为组织能力、执行能力和可持续优势。"
+        mechanism = f"{variable}会影响主体分化、资源控制、协作入口和切换成本；同一事实在不同主体中可能代表不同能力。"
+        implication = f"竞争判断不只看参与者数量，更要看哪些能力能够沉淀为组织能力、执行能力和可持续优势。"
     else:
-        mechanism = f"结合现有公开信息，{variable}需要放回主体、场景和时间窗口中理解，重点看它是否改变岗位任务、组织安排或资源配置。"
-        implication = f"因此，分析不只罗列材料，而要说明这种变化如何传导到相关主体的行动选择和后续决策。"
-    boundary = _clean_analysis_basis_text(claim_unit.limitation_boundary) if claim_unit.limitation_boundary else ""
+        mechanism = f"结合现有公开信息，{variable}已经影响{subject}的业务安排、资源投入或服务组合。"
+        implication = "这种变化会进一步影响行动选择、评价标准和决策优先级。"
+    # limitation_boundary is internal-only; the public boundary sentence is generated
+    # below from the claim's strength, never from the internal analysis field.
+    boundary = ""
     if not boundary:
         if strength in {"strong", "moderate", "decision_ready", "core_claim"}:
-            boundary = f"边界在于{variable}能否出现在更多主体、更多场景或更连续的时间窗口中；如果只停留在少数披露，结论仍需保留弹性。"
+            boundary = f"{variable}仍需要结合更多公开披露和连续结果确认，避免把少数主体的动作外推为全部市场。"
         else:
-            boundary = f"现阶段更关键的是看{variable}是否带来具体的主体变化、行为变化或结果变化；如果这些条件不足，表述需要保持审慎。"
-    context_sentence = f"放回具体问题看，重点不是只确认{variable}是否出现，而是解释它怎样改变相关主体的行为、资源投入和协作关系。" if chapter_question else ""
-    fact_sentence = f"公开信息包括：{facts_text}。" if facts_text else ""
-    depth_sentence = f"进一步看，{variable}需要同时接受场景深度、组织采纳、执行成本和持续性的检验；这些条件越完整，相关事实越能从单点样本转化为可解释的分析材料。"
+            boundary = f"现阶段关于{variable}的材料更适合支撑阶段性判断，不能直接推出全行业已经完成同样变化。"
+    context_sentence = f"放到{subject}所在领域看，这一变化会影响投入顺序、协作方式和服务组合。" if chapter_question else ""
+    fact_sentence = f"引用材料显示：{facts_text}。" if facts_text else ""
+    depth_sentence = "其影响能否扩大，取决于后续投入是否持续、动作是否进入实际应用环节，以及外部条件是否支持扩展。"
     subject_sentence = (
-        f"对{subject}而言，这一变化首先影响的是任务分工和能力配置：原本偏执行的工作会更多被流程、工具和数据口径约束，"
-        f"从而要求相关主体重新安排人员能力、系统接口和责任边界。"
+        f"对{subject}而言，这类变化会改变资源投向和能力要求，并推动产品、课程、流程或服务组合随之调整。"
     )
     evidence_sentence = (
-        f"结合已引用材料，{fact_reference}这一事实不应只作为背景信息处理；"
-        f"它更适合用来解释为什么{variable}会成为观察岗位变化、组织调整和能力迁移的切入点。"
+        f"已引用材料中的“{fact_reference}”提供了一个具体切口，说明{variable}已经出现在公开披露的动作中。"
         if fact_reference
         else ""
     )
     comparison_sentence = (
-        f"如果把这一信号与相邻事实对照，分析重点会从“有没有变化”转向“变化发生在哪里、谁承担变化成本、哪些环节先受影响”。"
-        f"这会把单点事实放进连续变化中观察，使岗位任务、组织安排和能力要求之间的关系更清楚。"
+        "把这些动作连起来看，变化已经开始从单点披露转向资源安排、能力建设和评价标准的同步调整，判断重点也会从是否出现变化推进到变化是否已经改变具体内容、工具配置和评价方式。"
     )
     pathway_sentence = (
-        f"沿着这个路径继续拆解，{variable}会同时作用于三个层面：一是相关主体如何定义任务，"
-        f"二是组织如何配置工具和人员，三是外部环境如何改变执行难度。三个层面合在一起，才构成较完整的解释链条。"
+        "这种变化通常会先改变具体内容和工具配置，再影响协作方式、人才要求、评价方式或服务组合，最终让能力建设和实际需求之间的连接更清楚。"
+    )
+    industry_sentence = (
+        f"放到更大范围内，{variable}会改变供需双方的匹配方式：供给侧需要证明能力能够稳定交付，需求侧会更关注成本、效率和替代风险。"
+    )
+    enterprise_sentence = (
+        "对相关组织而言，它会影响预算安排、协作方式和评价标准，进而改变产品、课程、流程或服务的优先级。"
+    )
+    operation_sentence = (
+        "在具体执行中，它会把影响从单个动作延伸到效率、成本和体验，进而改变后续资源排序。"
+    )
+    execution_sentence = (
+        "如果这类变化继续进入课程、采购、产品或流程等可执行环节，能力建设会更接近真实需求，而不是停留在概念更新。"
+    )
+    risk_sentence = (
+        "在风险层面，如果它只停留在披露动作而没有形成持续结果，相关判断仍应保留为审慎结论。"
     )
     synthesis_sentence = (
-        f"因此，本节的重点不是把{subject}写成孤立案例，而是把它作为连接事实、机制和影响范围的节点："
-        f"事实说明发生了什么，机制解释为什么重要，影响范围则决定这一变化能走多远。"
+        f"因此，{subject}不是孤立披露，而是判断{variable}是否具备扩散价值的早期样本。"
     )
     limit_sentence = (
-        f"需要保留的边界是：当前材料能够说明{variable}带来的方向变化，"
-        f"但尚不能自动推出所有主体都会以同样速度调整；不同地区、院校、企业规模和岗位层级仍可能呈现差异。"
+        f"需要保留的边界是：当前材料能够说明{variable}带来的方向变化，但不同地区、企业规模、院校类型或岗位层级仍可能呈现差异。"
     )
     return [
         fact_sentence,
@@ -527,6 +591,11 @@ def _expansion_sentences(
         depth_sentence,
         comparison_sentence,
         pathway_sentence,
+        industry_sentence,
+        enterprise_sentence,
+        operation_sentence,
+        execution_sentence,
+        risk_sentence,
         synthesis_sentence,
         limit_sentence,
         boundary,
@@ -628,7 +697,12 @@ def _paragraph_from_claim_depth_pack(
         parts.extend(fallback_parts)
     status = "claim_depth_pack"
     known_facts = [card.distilled_fact for card in selected if card.distilled_fact]
-    if (force_expand or _expand_to_target_enabled()) and _compact_len(_join_public_sentences(parts)) < _section_target_chars():
+    skip_generic_depth_expansion = bool(pack.get("generic_depth_fallback"))
+    if (
+        (force_expand or _expand_to_target_enabled())
+        and not skip_generic_depth_expansion
+        and _compact_len(_join_public_sentences(parts)) < _section_target_chars()
+    ):
         added_expansion = False
         for sentence in _expansion_sentences(
             lens=lens,
@@ -680,6 +754,8 @@ def compose_section_paragraph(
     selected = _select_cards_for_claim(valid, claim_unit, limit=3)
     sentences = [_general_sentence(card, lens) for card in selected]
     variable_explanation = _variable_explanation(lens, selected[0])
+    if lens == "general" and (claim_unit.claim or claim_unit.reasoning_chain):
+        variable_explanation = ""
     refs = _dedupe([card.evidence_id for card in selected if card.evidence_id], limit=4)
     clean_basis = [_clean_analysis_basis_text(item) for item in claim_unit.evidence_basis]
     facts = _dedupe([*(card.distilled_fact for card in selected), *[item for item in clean_basis if item]], limit=6)
@@ -695,7 +771,6 @@ def compose_section_paragraph(
             known_facts=[card.distilled_fact for card in selected if card.distilled_fact],
         ),
         *sentences[:2],
-        variable_explanation,
     ]
     depth_pack = _claim_depth_pack(claim_unit)
     writer_advice_expand = _writer_advice_requires_expansion(claim_unit)
@@ -725,10 +800,11 @@ def compose_section_paragraph(
     else:
         claim = sentences[0]
     mechanism = claim_unit.reasoning_chain if claim_unit.reasoning_chain and not _is_snippet_like(claim_unit.reasoning_chain) else paragraph
+    # limitation_boundary is an internal analysis field (diagnostic caveats such as
+    # "这一判断的价值在于… / 需交叉验证"). It must not be spliced into the public body
+    # counter_evidence — only a real risk-lens fact or a generated boundary sentence may.
     boundary = ""
-    if claim_unit.limitation_boundary and not _is_snippet_like(claim_unit.limitation_boundary):
-        boundary = claim_unit.limitation_boundary
-    elif lens == "risk":
+    if lens == "risk":
         boundary = sentences[0]
     elif strength not in {"strong", "moderate", "decision_ready", "core_claim"}:
         boundary = _boundary_sentence(lens, selected[0], strength)

@@ -233,7 +233,7 @@ def test_research_planner_uses_compact_first_by_default(monkeypatch):
     def compact_first_success(**kwargs):
         calls.append(kwargs)
         assert kwargs["user_payload"]["compact_first"] is True
-        assert "Do not include search_tasks" in kwargs["system_prompt"]
+        assert "不要输出 search_tasks" in kwargs["system_prompt"]
         return {
             "payload": {
                 "query": "\u4e2d\u56fd\u4f4e\u7a7a\u7ecf\u6d4e\u4ea7\u4e1a\u94fe\u5546\u4e1a\u5316\u673a\u4f1a\u4e0e\u98ce\u9669\u5206\u6790\uff082026\uff09",

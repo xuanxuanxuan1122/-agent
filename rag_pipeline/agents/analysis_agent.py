@@ -310,6 +310,79 @@ def _int_or_zero(value: Any) -> int:
         return 0
 
 
+def _lineage_requirement_id(item: Dict[str, Any]) -> str:
+    lineage = _as_dict(item.get("lineage"))
+    search_task = _as_dict(item.get("search_task"))
+    return str(
+        item.get("requirement_id")
+        or item.get("evidence_requirement_id")
+        or lineage.get("requirement_id")
+        or lineage.get("evidence_requirement_id")
+        or search_task.get("requirement_id")
+        or search_task.get("evidence_requirement_id")
+        or search_task.get("slot_id")
+        or ""
+    ).strip()
+
+
+def _analysis_requirement_lineage_coverage(
+    evidence_package: Dict[str, Any],
+    structured_analysis: Dict[str, Any],
+) -> Dict[str, Any]:
+    analysis_ready = [
+        item
+        for item in _as_list(_as_dict(evidence_package).get("analysis_ready_evidence"))
+        if isinstance(item, dict)
+    ]
+    claim_units = [
+        item
+        for item in _as_list(_as_dict(structured_analysis).get("claim_units"))
+        if isinstance(item, dict)
+    ]
+    input_with_requirement = [item for item in analysis_ready if _lineage_requirement_id(item)]
+    missing_input_examples = [
+        str(item.get("evidence_id") or item.get("ref") or item.get("id") or "").strip()
+        for item in analysis_ready
+        if not _lineage_requirement_id(item)
+    ]
+    missing_input_examples = [item for item in missing_input_examples if item][:8]
+    claim_with_requirement = [
+        item
+        for item in claim_units
+        if _as_list(item.get("requirement_ids")) or _lineage_requirement_id(item)
+    ]
+    claim_with_fact = [
+        item
+        for item in claim_units
+        if _as_list(
+            item.get("fact_ids")
+            or item.get("used_evidence_ids")
+            or item.get("used_fact_refs")
+            or item.get("evidence_refs")
+        )
+    ]
+    missing_claim_examples = [
+        str(item.get("claim_id") or item.get("id") or "").strip()
+        for item in claim_units
+        if not (_as_list(item.get("requirement_ids")) or _lineage_requirement_id(item))
+    ]
+    missing_claim_examples = [item for item in missing_claim_examples if item][:8]
+    input_count = len(analysis_ready)
+    claim_count = len(claim_units)
+    return {
+        "input_requirement_id_count": len(input_with_requirement),
+        "input_missing_requirement_id_count": max(0, input_count - len(input_with_requirement)),
+        "input_requirement_id_rate": round(len(input_with_requirement) / input_count, 4) if input_count else 0.0,
+        "input_missing_requirement_id_examples": missing_input_examples,
+        "claim_requirement_binding_count": len(claim_with_requirement),
+        "claim_missing_requirement_binding_count": max(0, claim_count - len(claim_with_requirement)),
+        "claim_requirement_binding_rate": round(len(claim_with_requirement) / claim_count, 4) if claim_count else 0.0,
+        "claim_missing_requirement_binding_examples": missing_claim_examples,
+        "claim_fact_binding_count": len(claim_with_fact),
+        "claim_fact_binding_rate": round(len(claim_with_fact) / claim_count, 4) if claim_count else 0.0,
+    }
+
+
 def _emit_analysis_agent_probe(result: Dict[str, Any]) -> None:
     """Record analysis-ready evidence to claim-unit conversion as a sidecar event."""
 
@@ -330,6 +403,7 @@ def _emit_analysis_agent_probe(result: Dict[str, Any]) -> None:
         raw_claim_count = _int_or_zero(diagnostics.get("llm_raw_claim_count")) or output_claim_count
         dropped_claim_count = _int_or_zero(diagnostics.get("llm_dropped_claim_count"))
         deferred_claim_count = _int_or_zero(diagnostics.get("llm_deferred_claim_count"))
+        lineage_coverage = _analysis_requirement_lineage_coverage(package, structured)
         evidence_hygiene = _inspect_evidence_analysis_hygiene(analysis_ready) if _inspect_evidence_analysis_hygiene else {}
         evidence_dirty_count = int(evidence_hygiene.get("dirty_item_count") or 0) if isinstance(evidence_hygiene, dict) else 0
         evidence_reason_counts = dict(evidence_hygiene.get("reason_counts") or {}) if isinstance(evidence_hygiene, dict) else {}
@@ -350,13 +424,12 @@ def _emit_analysis_agent_probe(result: Dict[str, Any]) -> None:
                 **{f"input_evidence_{key}": value for key, value in evidence_reason_counts.items()},
             },
             id_coverage={
-                "claim_fact_binding": (bound_claims / output_claim_count) if output_claim_count else 0.0,
-                "claim_requirement_binding": (requirement_bound / output_claim_count) if output_claim_count else 0.0,
-                "input_requirement_id": (
-                    sum(1 for item in analysis_ready if str(item.get("requirement_id") or "").strip()) / len(analysis_ready)
-                )
-                if analysis_ready
-                else 0.0,
+                "claim_fact_binding": lineage_coverage.get("claim_fact_binding_rate", (bound_claims / output_claim_count) if output_claim_count else 0.0),
+                "claim_requirement_binding": lineage_coverage.get(
+                    "claim_requirement_binding_rate",
+                    (requirement_bound / output_claim_count) if output_claim_count else 0.0,
+                ),
+                "input_requirement_id": lineage_coverage.get("input_requirement_id_rate", 0.0),
             },
             cache={
                 "llm_analysis_cache_hit_count": _int_or_zero(diagnostics.get("llm_analysis_cache_hit_count")),
@@ -613,7 +686,7 @@ def _analysis_dimensions(evidence_package: Dict[str, Any]) -> List[str]:
             if text in aliases or (normalized and normalized in aliases):
                 continue
             canonical_dimensions.append(text)
-        return canonical_dimensions or ["缁煎悎鐮旂┒闂"]
+        return canonical_dimensions or ["综合研究问题"]
     for dimension in _as_dict(evidence_package.get("per_dimension")).keys():
         text = str(dimension or "").strip()
         if text and text not in dimensions:
@@ -952,7 +1025,10 @@ def _is_public_quality_card(item: Dict[str, Any]) -> bool:
         return False
     level = _analysis_source_level(item)
     allowed = _analysis_allowed_use(item)
-    return bool(level in {"A", "B", "C"} or allowed == "directional_signal")
+    return bool(
+        level in {"A", "B", "C"}
+        or allowed in {"core_claim", "supporting", "supporting_context", "directional_signal"}
+    )
 
 
 def _source_identity_key(item: Dict[str, Any]) -> str:
@@ -1299,20 +1375,38 @@ def _claim_units_from_synthesis(dimension_synthesis: Dict[str, Dict[str, Any]]) 
         if unit_key in seen_units:
             continue
         seen_units.add(unit_key)
+        refs_list = _dedupe([str(ref or "").strip() for ref in _as_list(refs) if str(ref or "").strip()])
+        fact_ids = _dedupe([str(ref or "").strip() for ref in _as_list(synthesis.get("fact_ids") or refs_list) if str(ref or "").strip()])
+        requirement_ids = _dedupe([str(ref or "").strip() for ref in _as_list(synthesis.get("requirement_ids")) if str(ref or "").strip()])
+        source_ids = _dedupe([str(ref or "").strip() for ref in _as_list(synthesis.get("source_ids")) if str(ref or "").strip()])
         units.append(
             {
                 "id": unit_id,
+                "claim_id": unit_id,
                 "chapter_id": chapter_id,
                 "question": dimension,
                 "claim": claim,
                 "claim_status": "decision_ready" if _as_list(synthesis.get("evidence_ids")) else "directional",
                 "claim_strength": synthesis.get("claim_strength") or ("moderate" if _as_list(synthesis.get("evidence_ids")) else "directional"),
                 "quality_status": "valid" if _as_list(synthesis.get("evidence_ids")) else "directional_with_boundary",
-                "supporting_evidence": refs,
-                "evidence_refs": refs,
-                "fact_ids": synthesis.get("fact_ids") or refs,
-                "requirement_ids": _as_list(synthesis.get("requirement_ids")),
-                "source_ids": _as_list(synthesis.get("source_ids")),
+                "supporting_evidence": refs_list,
+                "evidence_refs": refs_list,
+                "used_evidence_ids": refs_list,
+                "used_fact_refs": refs_list,
+                "supporting_evidence_refs": refs_list,
+                "fact_ids": fact_ids,
+                "requirement_ids": requirement_ids,
+                "source_ids": source_ids,
+                "source_support_map": {
+                    "claim": refs_list,
+                    "mechanism": refs_list,
+                    "boundary": refs_list,
+                },
+                "lineage": {
+                    "requirement_ids": requirement_ids,
+                    "fact_ids": fact_ids,
+                    "source_ids": source_ids,
+                },
                 "counter_evidence": synthesis.get("counter") or "",
                 "reasoning": synthesis.get("mechanism") or synthesis.get("explain_why") or "",
                 "mechanism": synthesis.get("mechanism") or "",
@@ -1566,7 +1660,7 @@ def _evidence_analysis(item: Dict[str, Any], dimension: str, index: int) -> Dict
         "evidence_id": evidence_id,
         "chapter_id": item.get("chapter_id"),
         "dimension_id": item.get("dimension_id"),
-        "requirement_id": item.get("requirement_id") or item.get("evidence_goal_id"),
+        "requirement_id": _lineage_requirement_id(item) or item.get("evidence_goal_id"),
         "source_id": item.get("source_id") or item.get("run_source_id") or source.get("id") or source.get("ref"),
         "search_task_id": item.get("search_task_id") or item.get("task_id"),
         "evidence_goal": item.get("evidence_goal"),
@@ -2491,6 +2585,63 @@ def _input_evidence_card_count_for_diagnostics(
     return len(ids) if ids else len(_as_list(analysis.get("evidence_analyses")))
 
 
+def _analysis_conversion_diagnostics(
+    evidence_package: Dict[str, Any],
+    structured_analysis: Dict[str, Any],
+    *,
+    input_evidence_card_count: int | None = None,
+) -> Dict[str, Any]:
+    package = _as_dict(evidence_package)
+    analysis_ready_fact_count = len([item for item in _as_list(package.get("analysis_ready_evidence")) if isinstance(item, dict)])
+    if input_evidence_card_count is None:
+        input_evidence_card_count = _input_evidence_card_count_for_diagnostics(structured_analysis, evidence_package)
+    claim_units = [item for item in _as_list(_as_dict(structured_analysis).get("claim_units")) if isinstance(item, dict)]
+    bound_claim_count = 0
+    for unit in claim_units:
+        fact_refs = _as_list(
+            unit.get("fact_ids")
+            or unit.get("used_evidence_ids")
+            or unit.get("used_fact_refs")
+            or unit.get("evidence_refs")
+            or unit.get("supporting_evidence_refs")
+        )
+        source_refs = _as_list(unit.get("source_ids") or unit.get("source_refs"))
+        if fact_refs or source_refs:
+            bound_claim_count += 1
+    denominator = max(1, int(input_evidence_card_count or analysis_ready_fact_count or 0))
+    claim_conversion_rate = round(len(claim_units) / denominator, 4)
+    bound_claim_rate = round(bound_claim_count / max(1, len(claim_units)), 4)
+    reanalyze_existing_recommended = bool(denominator >= 8 and len(claim_units) <= max(1, int(denominator * 0.12)))
+    suggestions: List[Dict[str, Any]] = []
+    if reanalyze_existing_recommended:
+        suggestions.append(
+            {
+                "schema_version": "review_suggestion_v1",
+                "issue_type": "low_claim_conversion",
+                "severity": "warning",
+                "target": {"stage": "analysis"},
+                "suggested_action": "reanalyze_existing",
+                "analysis_ready_fact_count": analysis_ready_fact_count,
+                "input_evidence_card_count": int(input_evidence_card_count or 0),
+                "claim_unit_count": len(claim_units),
+                "bound_claim_count": bound_claim_count,
+                "claim_conversion_rate": claim_conversion_rate,
+                "diagnostic_only": True,
+                "must_not_render": True,
+                "public_text_allowed": False,
+            }
+        )
+    return {
+        "analysis_ready_fact_count": analysis_ready_fact_count,
+        "claim_unit_count": len(claim_units),
+        "bound_claim_count": bound_claim_count,
+        "claim_conversion_rate": claim_conversion_rate,
+        "bound_claim_rate": bound_claim_rate,
+        "reanalyze_existing_recommended": reanalyze_existing_recommended,
+        "analysis_review_suggestions": suggestions,
+    }
+
+
 def claim_binding_feedback_summary(structured_analysis: Dict[str, Any]) -> Dict[str, Any]:
     diagnostics = _as_dict(structured_analysis.get("chapter_evidence_diagnostics"))
     units_by_chapter: Dict[str, List[Dict[str, Any]]] = {}
@@ -2689,6 +2840,16 @@ def _evidence_cards_for_llm(
             if not resolved_chapter_id:
                 continue
             chapter_id = resolved_chapter_id
+        requirement_id_source = ""
+        if not requirement_id:
+            inferred_requirement = _infer_requirement_from_chapter_contract_for_llm(
+                requirements_by_chapter,
+                chapter_id=chapter_id,
+                item=item,
+                card=card,
+            )
+            requirement_id = str(inferred_requirement.get("requirement_id") or "").strip()
+            requirement_id_source = str(inferred_requirement.get("requirement_id_source") or "").strip()
         if buckets.get(chapter_id, 0) >= max_per_chapter:
             continue
         hypothesis_id = str(
@@ -2742,6 +2903,7 @@ def _evidence_cards_for_llm(
                 "chapter_id": chapter_id,
                 "hypothesis_id": hypothesis_id,
                 "requirement_id": requirement_id,
+                "requirement_id_source": requirement_id_source or str(item.get("requirement_id_source") or "").strip(),
                 "analysis_role": str(item.get("analysis_role") or card.get("analysis_role") or "").strip(),
                 "analysis_eligible": bool(item.get("analysis_eligible") if "analysis_eligible" in item else card.get("analysis_eligible")),
                 "allowed_use": str(item.get("allowed_use") or card.get("allowed_use") or "").strip(),
@@ -2932,6 +3094,73 @@ def _text_list(value: Any) -> List[str]:
     return []
 
 
+def _evidence_grooming_for_llm(card: Dict[str, Any]) -> Dict[str, Any]:
+    proof_role = str(card.get("proof_role") or card.get("analysis_role") or card.get("fact_type") or "").strip().lower()
+    source_level = str(card.get("source_level") or "").strip().upper()
+    allowed_use = str(card.get("allowed_use") or "").strip().lower()
+    fact = str(card.get("distilled_fact") or card.get("fact") or "").strip()
+    title = str(card.get("source_title") or "").strip()
+    metric = str(card.get("metric") or "").strip()
+    claim_strength_hint = str(card.get("claim_strength_hint") or "").strip().lower()
+    if not claim_strength_hint:
+        if source_level in {"A", "B"} and allowed_use in {"core_claim", "supporting"}:
+            claim_strength_hint = "moderate"
+        elif source_level in {"A", "B", "C"} or allowed_use in {"supporting_context", "directional_signal"}:
+            claim_strength_hint = "directional"
+        else:
+            claim_strength_hint = "weak"
+    suggested_use = str(card.get("suggested_use") or "").strip()
+    if not suggested_use:
+        if proof_role in {"policy", "official_data", "filing"}:
+            suggested_use = "policy_signal"
+        elif proof_role in {"case", "commercial", "customer_case"}:
+            suggested_use = "case_signal"
+        elif proof_role in {"counter", "risk", "boundary"}:
+            suggested_use = "risk_boundary"
+        elif proof_role in {"metric", "market_data", "quant_metric"}:
+            suggested_use = "market_signal"
+        elif source_level in {"C", "D"} or allowed_use in {"supporting_context", "directional_signal"}:
+            suggested_use = "trend_signal"
+        else:
+            suggested_use = "background_signal"
+    possible_angles = _as_list(card.get("possible_claim_angles") or card.get("suggested_analysis_direction"))
+    if not possible_angles:
+        if suggested_use == "policy_signal":
+            possible_angles = ["政策方向如何改变具体业务安排", "制度约束对行业或岗位要求的影响"]
+        elif suggested_use == "case_signal":
+            possible_angles = ["具体案例说明了哪些场景变化", "案例如何反映需求、能力或流程变化"]
+        elif suggested_use == "risk_boundary":
+            possible_angles = ["反向材料限制了哪些结论强度", "风险信号会影响哪些执行条件"]
+        elif suggested_use == "market_signal":
+            possible_angles = ["数据口径能说明的市场变化", "指标适合支撑的趋势边界"]
+        else:
+            possible_angles = ["材料可以支持的方向性判断", "它对业务动作、需求或能力变化的提示"]
+    limitations = _as_list(card.get("limitations") or card.get("limitation_boundary"))
+    if source_level in {"C", "D"} and not limitations:
+        limitations.append("来源适合支撑方向性判断，不能单独外推为强结论。")
+    if allowed_use in {"supporting_context", "directional_signal"} and "hard_metric" not in limitations and proof_role not in {"metric", "market_data", "quant_metric"}:
+        limitations.append("更适合作为案例、趋势或背景信号使用。")
+    do_not_use_as = _as_list(card.get("do_not_use_as"))
+    if proof_role not in {"metric", "market_data", "quant_metric"}:
+        do_not_use_as.append("hard_metric")
+    if claim_strength_hint in {"directional", "weak"}:
+        do_not_use_as.extend(["standalone_strong_claim", "unbounded_conclusion"])
+    return {
+        "schema_version": "analysis_evidence_grooming_v1",
+        "suggested_use": suggested_use,
+        "claim_strength_hint": claim_strength_hint,
+        "possible_claim_angles": _dedupe([_compact(item, 120) for item in possible_angles if str(item or "").strip()])[:6],
+        "limitations": _dedupe([_compact(item, 140) for item in limitations if str(item or "").strip()])[:6],
+        "do_not_use_as": _dedupe(do_not_use_as)[:6],
+        "source_context": _compact(title, 120),
+        "metric_context": _compact(metric, 80),
+        "fact_excerpt": _compact(fact, 180),
+        "diagnostic_only": True,
+        "must_not_render": True,
+        "public_text_allowed": False,
+    }
+
+
 def _chapter_payload_metadata(
     chapter_id: str,
     diagnostics: Dict[str, Any],
@@ -2970,11 +3199,13 @@ def _compact_llm_fact_card(card: Dict[str, Any], *, max_fact_chars: int) -> Dict
     public_card = _as_dict(card.get("public_fact_card"))
     block_affinity = _text_list(public_card.get("block_affinity") or card.get("block_affinity"))
     fact_type = str(public_card.get("fact_type") or card.get("fact_type") or card.get("proof_role") or "").strip()
+    grooming = _evidence_grooming_for_llm(card)
     return {
         "evidence_id": str(card.get("evidence_id") or "").strip(),
         "chapter_id": str(card.get("chapter_id") or _as_dict(card.get("lineage")).get("chapter_id") or "").strip(),
         "hypothesis_id": str(card.get("hypothesis_id") or "").strip(),
         "requirement_id": str(card.get("requirement_id") or "").strip(),
+        "requirement_id_source": str(card.get("requirement_id_source") or "").strip(),
         "analysis_role": str(card.get("analysis_role") or "").strip(),
         "analysis_eligible": bool(card.get("analysis_eligible")),
         "allowed_use": str(card.get("allowed_use") or "").strip(),
@@ -2994,6 +3225,10 @@ def _compact_llm_fact_card(card: Dict[str, Any], *, max_fact_chars: int) -> Dict
         "period": _compact(card.get("period"), 80),
         "claim_strength_hint": str(card.get("claim_strength_hint") or "").strip(),
         "limitations": _as_list(card.get("limitations") or card.get("limitation_boundary")),
+        "possible_claim_angles": _as_list(card.get("possible_claim_angles")) or grooming["possible_claim_angles"],
+        "suggested_use": grooming["suggested_use"],
+        "do_not_use_as": grooming["do_not_use_as"],
+        "evidence_grooming": grooming,
         "usable_for": _as_list(card.get("usable_for")),
         "source_title": _compact(card.get("source_title"), 120),
         "source_url": str(card.get("source_url") or "").strip(),
@@ -3272,6 +3507,90 @@ def _requirements_by_chapter_for_llm(evidence_package: Dict[str, Any]) -> Dict[s
     return grouped
 
 
+def _infer_requirement_from_chapter_contract_for_llm(
+    requirements_by_chapter: Dict[str, List[Dict[str, Any]]],
+    *,
+    chapter_id: str,
+    item: Dict[str, Any],
+    card: Dict[str, Any],
+) -> Dict[str, str]:
+    requirements = [
+        requirement
+        for requirement in _as_list(requirements_by_chapter.get(str(chapter_id or "").strip()))
+        if isinstance(requirement, dict) and str(requirement.get("requirement_id") or "").strip()
+    ]
+    if not requirements:
+        return {}
+    role_candidates = {
+        str(value or "").strip().lower()
+        for value in (
+            item.get("proof_role"),
+            item.get("analysis_role"),
+            item.get("fact_type"),
+            item.get("allowed_use"),
+            card.get("proof_role"),
+            card.get("analysis_role"),
+            card.get("fact_type"),
+            card.get("allowed_use"),
+        )
+        if str(value or "").strip()
+    }
+    role_matches = [
+        requirement
+        for requirement in requirements
+        if str(requirement.get("proof_role") or "").strip().lower() in role_candidates
+    ]
+    if len(role_matches) == 1:
+        return {
+            "requirement_id": str(role_matches[0].get("requirement_id") or "").strip(),
+            "requirement_id_source": "chapter_contract_proof_role",
+        }
+    if len(requirements) == 1:
+        return {
+            "requirement_id": str(requirements[0].get("requirement_id") or "").strip(),
+            "requirement_id_source": "chapter_contract_single_requirement",
+        }
+    return {}
+
+
+def _analysis_item_with_requirement_contract_inference(
+    item: Dict[str, Any],
+    requirements_by_chapter: Dict[str, List[Dict[str, Any]]],
+    *,
+    chapter_id: str,
+) -> Dict[str, Any]:
+    copied = dict(item)
+    existing_requirement_id = _lineage_requirement_id(copied)
+    if existing_requirement_id:
+        copied.setdefault("requirement_id", existing_requirement_id)
+        lineage = dict(_as_dict(copied.get("lineage")))
+        lineage.setdefault("requirement_id", existing_requirement_id)
+        copied["lineage"] = lineage
+        return copied
+    raw_chapter_id = str(
+        copied.get("chapter_id")
+        or copied.get("dimension_id")
+        or _as_dict(copied.get("lineage")).get("chapter_id")
+        or chapter_id
+        or ""
+    ).strip()
+    inferred_requirement = _infer_requirement_from_chapter_contract_for_llm(
+        requirements_by_chapter,
+        chapter_id=raw_chapter_id,
+        item=copied,
+        card=_as_dict(copied.get("evidence_card")),
+    )
+    requirement_id = str(inferred_requirement.get("requirement_id") or "").strip()
+    if not requirement_id:
+        return copied
+    copied["requirement_id"] = requirement_id
+    copied["requirement_id_source"] = str(inferred_requirement.get("requirement_id_source") or "").strip()
+    lineage = dict(_as_dict(copied.get("lineage")))
+    lineage.setdefault("requirement_id", requirement_id)
+    copied["lineage"] = lineage
+    return copied
+
+
 def build_llm_analysis_input_v2(evidence_package: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[str, Any]:
     max_chapters = _env_int("BRAIN_LLM_ANALYSIS_MAX_CHAPTERS", 8, min_value=1, max_value=30)
     max_per_chapter = _env_int("BRAIN_LLM_ANALYSIS_MAX_FACTS_PER_CHAPTER", 16, min_value=1, max_value=30)
@@ -3439,55 +3758,51 @@ def _load_analysis_shard_output_cache(
 
 def _llm_chapter_system_prompt() -> str:
     return """
-You are an evidence-to-claim analyst for a Chinese industry research report.
-You analyze one chapter at a time.
-Use only the provided fact_cards. Do not invent facts, numbers, companies, sources, URLs, or citations.
-Return strict JSON with: chapter_id, claim_units, analysis_limits.
+你是中文行业研究报告的“证据到判断”分析师，一次只分析一个章节。
+只能使用输入中的 fact_cards，不得编造事实、数字、公司、来源、URL 或引用。
+只返回严格 JSON，顶层字段为：chapter_id、claim_units、analysis_limits。
 
-First build an evidence inventory mentally from the supplied fact_cards:
-- identify market, policy, player, order, price, case, technology, supply-chain and risk signals;
-- merge duplicated evidence that points to the same fact;
-- keep source limitations as boundaries instead of deleting the evidence;
-- do not reject evidence only because source level is C or D;
-- convert relevant weak evidence into bounded directional claims when it has a traceable source.
-- use topic_fit=direct fact_cards as the main claim anchors;
-- use topic_fit=related/background only as context, analogy, boundary, or caveat unless the fact text explicitly connects to the chapter topic;
-- never turn adjacent-industry background into a core industry claim without direct topic evidence.
+分析步骤：
+- 先在内部盘点 fact_cards 中的市场、政策、玩家、订单、价格、案例、技术、产业链和风险信号。
+- 合并指向同一事实的重复证据，保留最清楚、最可追溯的表达。
+- C/D 级、媒体、专业信息网或平台线索只要可追溯且不是脏数据，也可以转成有边界的 directional / limited_evidence 判断。
+- evidence_grooming.possible_claim_angles 只能作为内部分析方向，不能原样写入 claim。
+- 不得把 diagnostic-only、do_not_use_as、suggested_action、review_suggestion、补证建议、质量审查话术写进 claim。
+- topic_fit=direct 的 fact_cards 是主锚点；topic_fit=related/background 只能作为背景、类比或边界，除非事实文本明确连接到本章主题。
+- 不得把相邻行业或背景材料外推成核心行业结论。
 
-Each claim_unit must include:
-- claim: one complete Chinese judgment sentence;
-- requirement_ids: requirement_id values from the input fact_cards when available;
-- fact_ids: exact input evidence_id values supporting the claim;
-- source_ids: source_id values from cited fact_cards when available;
-- hypothesis_id: hypothesis_id from the chapter or input fact_cards when available;
-- used_evidence_ids: exact evidence_id values from the input;
-- evidence_basis: concise evidence sentences derived only from input facts;
-- reasoning_chain: mechanism explanation sentences;
-- limitation_boundary: specific boundary conditions;
-- claim_strength: strong, moderate, directional, or limited_evidence;
-- claim_strength_ceiling: maximum claim strength allowed by the cited fact cards;
-- claim_type: core_claim, mechanism_claim, counter_boundary_claim, contextual_claim, decision_claim, directional_claim, metric_claim, case_claim, or technology_claim;
-- analysis_role: claimable, directional, contextual, counter, metric, case, or technology;
-- source_support_map: object mapping claim/mechanism/boundary to used evidence ids;
-- paragraph_seed: one concise paragraph seed for downstream composition;
-- block_affinity: metric_reconciliation, case_comparison, technology_maturity, risk_trigger, or integrated_signal.
+每个 claim_unit 必须包含：
+- claim：一句完整的中文行业判断，像报告里的分析判断，不像内部审查说明。
+- requirement_ids：能从输入 fact_cards 得到时填写对应 requirement_id。
+- fact_ids：支撑该判断的精确 evidence_id。
+- source_ids：可得到时填写来源 id。
+- hypothesis_id：可得到时填写章节或 fact_cards 中的 hypothesis_id。
+- used_evidence_ids：精确引用输入中的 evidence_id。
+- evidence_basis：只从输入事实提炼出的证据依据，写成简洁中文。
+- reasoning_chain：解释“为什么这个事实能导向该判断”的机制链条。
+- limitation_boundary：仅供后续写作者内部把握结论强度，不是正文句子，不得写成“需验证、后续观察、来源有限”等公开话术。
+- claim_strength：strong、moderate、directional 或 limited_evidence。
+- claim_strength_ceiling：被引用 fact_cards 允许的最高判断强度。
+- claim_type：core_claim、mechanism_claim、counter_boundary_claim、contextual_claim、decision_claim、directional_claim、metric_claim、case_claim 或 technology_claim。
+- analysis_role：claimable、directional、contextual、counter、metric、case 或 technology。
+- source_support_map：说明 claim、mechanism、boundary 分别由哪些 evidence_id 支撑。
+- paragraph_seed：给后续正文写作的一段中文素材，必须是行研语气，不能是审查口吻。
+- block_affinity：metric_reconciliation、case_comparison、technology_maturity、risk_trigger 或 integrated_signal。
 
-Produce 4-6 claim_units when the chapter has enough distinct evidence signals.
-Fewer claim_units are acceptable only when the input evidence genuinely supports fewer distinct judgments.
-Relevant but incomplete evidence must become a contextual_claim, counter_boundary_claim, or limited_evidence directional claim instead of disappearing.
-A/B verified evidence may support strong or moderate claims.
-B/C traceable or qualitative evidence may still support a directional or limited_evidence claim.
-When evidence is traceable but weak, produce a directional or limited_evidence claim with explicit limitation_boundary.
-Do not over-expand a fact into a stronger mechanism than the cited evidence supports.
-Prefer more bounded claims over fewer over-strong claims.
-claim_strength must never exceed claim_strength_ceiling.
-If requirement_ids cannot be derived from the cited fact_cards, still make a directional or limited_evidence claim with requirement_ids left empty — do NOT reject it; the binding is carried by used_evidence_ids.
-Missing hard metrics (market size, growth rate, adoption rate) is NOT a reason to abstain: make a directional/limited_evidence claim grounded in the qualitative signal and state the boundary in limitation_boundary instead.
-Only return no claim_units when the chapter genuinely has NO relevant evidence at all — not merely because verifiable numbers are absent.
-Aim for role diversity within the chapter (this materially improves report completeness), but NEVER fabricate to fill a role:
-- when the evidence contains a risk, failure, limitation or contradicting signal, surface it as a counter claim (analysis_role=counter, block_affinity=risk_trigger);
-- when the evidence supports an actionable judgment, set a concrete decision_use on that claim (what a decision-maker should do or watch).
-Forbidden public claim language: 证据不足, 建议补证, 正文应以, 方向性观察, 后续验证, 继续校准.
+数量与强度规则：
+- 证据有足够不同信号时，尽量产出 4-6 个 claim_units；证据只支持更少判断时可以少于 4 个。
+- 相关但不完整的证据不要直接丢弃，优先转成 contextual_claim、counter_boundary_claim 或 limited_evidence directional claim。
+- A/B 且已核验的证据可以支撑 strong 或 moderate。
+- B/C 或定性可追溯证据可以支撑 directional 或 limited_evidence。
+- 不得把一个事实扩写成超过证据支持的机制判断。
+- 宁可多产出有边界的中低强度判断，也不要少量过强判断。
+- claim_strength 绝不能超过 claim_strength_ceiling。
+- 如果无法从 fact_cards 推导 requirement_ids，不要因此拒绝该判断；可以让 requirement_ids 为空，但 used_evidence_ids 必须完整。
+- 缺少硬指标（市场规模、增速、渗透率）不是不产 claim 的理由；可基于定性信号产出 directional / limited_evidence 判断，并把适用边界放入 limitation_boundary。
+- 只有本章确实没有任何相关证据时，才返回空 claim_units 并在 analysis_limits 说明。
+- 可以做角色多样化，但不得为填角色而编造：有风险、失败、限制或相反信号时才写 counter；有明确业务含义时才写 decision_use。
+
+公开 claim 禁止出现这些内部话术：证据不足、建议补证、正文应以、方向性观察、后续验证、继续校准、来源覆盖有限、需交叉验证。
 """.strip()
 
 
@@ -3822,23 +4137,24 @@ def synthesize_with_llm_analysis(
     if not llm_config_is_ready(config):
         raise RuntimeError("LLM config is incomplete.")
     system_prompt = """
-You are an evidence-to-analysis agent for a Chinese industry research report.
-Use only input fact_cards. Do not invent facts, numbers, sources, companies, URLs, or citations.
-Return one JSON object with chapter_synthesis, cross_chapter_conflicts, evidence_repair_priorities, and rewrite_priorities.
+你是中文行业研究报告的证据分析 Agent。
+只能使用输入 fact_cards，不得编造事实、数字、来源、公司、URL 或引用。
+只返回一个 JSON 对象，字段为 chapter_synthesis、cross_chapter_conflicts、evidence_repair_priorities、rewrite_priorities。
 
-For each chapter_synthesis item:
-- include chapter_id and chapter_title when available;
-- include 4-6 claim_units when there are enough distinct evidence signals; fewer is fine only when the cited evidence supports fewer distinct judgments;
-- every claim_unit must include claim, claim_type, used_evidence_ids, evidence_basis, reasoning_chain, limitation_boundary, and claim_strength;
-- used_evidence_ids must be exact evidence_id values from input fact_cards;
-- A/B readpage_verified or document_verified cards may support moderate/strong claims;
-- B/C or directional cards may only support directional/limited claims.
-- relevant but incomplete evidence should become a contextual, counter/boundary, or limited_evidence directional claim instead of being omitted.
-- each chapter should prefer a mix of core_claim, mechanism_claim, counter_boundary_claim, contextual_claim, decision_claim, directional_claim, metric_claim, case_claim, or technology_claim when the evidence supports those roles.
+对每个 chapter_synthesis：
+- 尽量保留 chapter_id 和 chapter_title。
+- 有足够不同证据信号时产出 4-6 个 claim_units；证据只支持更少判断时可以少于 4 个。
+- 每个 claim_unit 必须包含 claim、claim_type、used_evidence_ids、evidence_basis、reasoning_chain、limitation_boundary、claim_strength。
+- used_evidence_ids 必须是输入 fact_cards 中存在的精确 evidence_id。
+- A/B 且 readpage_verified 或 document_verified 的卡片可以支持 moderate / strong。
+- B/C 或 directional 卡片只能支持 directional / limited_evidence。
+- 相关但不完整的证据应转成 contextual、counter/boundary 或 limited_evidence directional claim，不要直接遗漏。
+- 章节内可以混合 core_claim、mechanism_claim、counter_boundary_claim、contextual_claim、decision_claim、directional_claim、metric_claim、case_claim、technology_claim，但只能在证据支持时使用。
 
-Never output internal diagnostics as public claims. Forbidden claim language includes: 证据不足, 建议补证, 正文应以, 方向性观察, 后续验证, 可追溯来源继续校准.
-Only when a chapter has no relevant evidence at all should you put the limitation in analysis_limits without creating a claim_unit.
-Output public analysis in Chinese unless the evidence itself is English-only.
+不得把内部诊断当公开 claim。公开 claim 禁止出现：证据不足、建议补证、正文应以、方向性观察、后续验证、可追溯来源继续校准、来源覆盖有限、需交叉验证。
+limitation_boundary 是内部约束字段，不是正文段落；不要把它写成完整公开句子。
+只有章节完全没有相关证据时，才把限制放入 analysis_limits 而不创建 claim_unit。
+除非证据本身只能用英文表达，所有公开分析字段都用中文。
 """.strip()
     response = call_openai_compatible_json(
         config=config,
@@ -4363,18 +4679,17 @@ def _semantic_judge_fact_payload(cards: Sequence[Dict[str, Any]]) -> List[Dict[s
 
 def _semantic_judge_system_prompt() -> str:
     return """
-You are a strict evidence support judge for a publishable research report.
-Decide whether the cited fact cards semantically support the claim.
+你是中文研究报告的严格证据支撑判断器，负责判断被引用的 fact_cards 是否在语义上支撑 claim。
 
-Rules:
-- Use only the provided fact cards; never use outside knowledge.
-- A source merely mentioning the same topic is not support.
-- Numbers, dates, companies, scope, causality, competitive claims, and risk claims must be directly grounded in the cited facts.
-- Return supported when the facts directly support the full claim.
-- Return partial when the facts support the direction but not the full strength, scope, or completeness of the claim.
-- Return adjacent when the facts are useful background but not direct support for the claim.
-- Return unsupported when the facts contradict the claim, miss key numbers/entities/dates, or are too generic to use.
-- Output one JSON object only: {"status":"supported|partial|adjacent|unsupported","reason":"...","confidence":0.0-1.0,"unsupported_terms":[]}.
+规则：
+- 只能使用输入 fact_cards，不得使用外部知识。
+- 来源只是提到同一主题，不等于支撑该 claim。
+- 数字、日期、公司、范围、因果、竞争判断和风险判断必须能在被引用事实中直接落地。
+- 当事实能直接支撑完整 claim 时，status 返回 supported。
+- 当事实支持方向，但不支持完整强度、范围或完整性时，status 返回 partial。
+- 当事实只能作为背景材料而不能直接支撑 claim 时，status 返回 adjacent。
+- 当事实与 claim 矛盾、缺少关键数字/实体/日期，或过于泛泛时，status 返回 unsupported。
+- 只输出一个 JSON 对象：{"status":"supported|partial|adjacent|unsupported","reason":"...","confidence":0.0-1.0,"unsupported_terms":[]}。
 """.strip()
 
 
@@ -4459,7 +4774,7 @@ def _llm_semantic_claim_support_judge(
                 "claim_id": str(claim_id or ""),
                 "claim": claim_text,
                 "cited_fact_cards": _semantic_judge_fact_payload(cited_cards),
-                "instruction": "Classify support as supported, partial, adjacent, or unsupported. Do not collapse partial or adjacent support into unsupported.",
+                "instruction": "请把支撑关系分类为 supported、partial、adjacent 或 unsupported。不要把 partial 或 adjacent 简单归为 unsupported。",
             },
         )
     except Exception as exc:
@@ -5863,6 +6178,7 @@ def build_fallback_analysis(evidence_package: Dict[str, Any]) -> Dict[str, Any]:
     evidence_package = _as_dict(evidence_package)
     research_plan = _research_plan(evidence_package)
     dimensions = _analysis_dimensions(evidence_package)
+    requirements_by_chapter = _requirements_by_chapter_for_llm(evidence_package)
     evidence_analyses: List[Dict[str, Any]] = []
     refs_by_dimension: Dict[str, List[str]] = {}
     index = 1
@@ -5874,7 +6190,12 @@ def build_fallback_analysis(evidence_package: Dict[str, Any]) -> Dict[str, Any]:
             max_items=_env_int("ANALYSIS_FALLBACK_MAX_ITEMS_PER_DIMENSION", 18, min_value=1, max_value=80),
         )
         for item in selected_items:
-            analysis = _evidence_analysis(item, dimension, index)
+            analysis_item = _analysis_item_with_requirement_contract_inference(
+                item,
+                requirements_by_chapter,
+                chapter_id=str(dimension or ""),
+            )
+            analysis = _evidence_analysis(analysis_item, dimension, index)
             index += 1
             evidence_analyses.append(analysis)
             refs_by_dimension[dimension].append(str(analysis.get("evidence_id")))
@@ -6040,6 +6361,7 @@ def build_fallback_analysis(evidence_package: Dict[str, Any]) -> Dict[str, Any]:
     result = _public_normalize_analysis_payload(result)
     result["analysis_depth_quality"] = analysis_depth_quality(result)
     result["claim_binding_feedback_summary"] = claim_binding_feedback_summary(result)
+    requirement_lineage_coverage = _analysis_requirement_lineage_coverage(evidence_package, result)
     result["analysis_stage_diagnostics"] = {
         "uses_llm_analysis": False,
         "llm_analysis_status": "not_run",
@@ -6048,6 +6370,12 @@ def build_fallback_analysis(evidence_package: Dict[str, Any]) -> Dict[str, Any]:
         "output_claim_count": len(claim_units),
         "decision_ready_claim_count": len([item for item in claim_units if str(item.get("claim_status") or "").strip() in {"decision_ready", "core_claim"}]),
         "directional_claim_count": len([item for item in claim_units if str(item.get("claim_status") or "").strip() in {"directional", "directional_ready"}]),
+        **_analysis_conversion_diagnostics(
+            evidence_package,
+            result,
+            input_evidence_card_count=len(evidence_analyses),
+        ),
+        **requirement_lineage_coverage,
     }
     return result
 
@@ -6516,9 +6844,17 @@ def run_analysis_agent(
             "research_reflection_write_mode": research_reflection_memo.get("write_mode"),
             "research_reflection_seed_count": len(_as_list(research_reflection_memo.get("next_search_task_seeds"))),
             "stage_execution_guard": stage_guard_meta,
+            **_analysis_requirement_lineage_coverage(package, structured),
         }
         diagnostics["evidence_analysis_record_count"] = len(_as_list(structured.get("evidence_analyses")))
         diagnostics["input_evidence_card_count"] = _input_evidence_card_count_for_diagnostics(structured, package)
+        diagnostics.update(
+            _analysis_conversion_diagnostics(
+                package,
+                structured,
+                input_evidence_card_count=int(diagnostics.get("input_evidence_card_count") or 0),
+            )
+        )
         structured["analysis_stage_diagnostics"] = diagnostics
         source = final_analysis_source
         state: AnalysisAgentState = {

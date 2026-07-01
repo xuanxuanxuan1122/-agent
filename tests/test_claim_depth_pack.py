@@ -150,7 +150,7 @@ def test_section_composer_expands_depth_pack_to_target_when_enabled(monkeypatch)
     assert result["composer_paragraph_chars"] >= 520
     assert "live pilots and procurement activity" in paragraph
     assert "repeatable workflows" in paragraph
-    assert "场景深度" in paragraph or "单点样本" in paragraph
+    assert "业务安排" in paragraph or "资源投入" in paragraph or "稳定交付" in paragraph
 
 
 def test_section_composer_long_expansion_uses_public_narrative_not_template_scaffold(monkeypatch):
@@ -201,7 +201,7 @@ def test_section_composer_long_expansion_uses_public_narrative_not_template_scaf
     assert result["composer_paragraph_chars"] >= 820
     assert "财务大数据分析" in paragraph
     assert "课程" in paragraph or "实训" in paragraph
-    for forbidden in ("读者", "报告主线", "单一材料", "整体定论", "更适合作为有边界的分析材料"):
+    for forbidden in ("读者", "报告主线", "单一材料", "整体定论", "更适合作为有边界的分析材料", "分析不只罗列材料"):
         assert forbidden not in paragraph
 
 
@@ -395,7 +395,7 @@ def test_section_composer_uses_narrative_supporting_claims_without_plan_leak(mon
 
     paragraph = result["paragraph"]
     assert "Operations coordination is a second scenario signal" in paragraph
-    assert "single sample" in paragraph or "场景信号" in paragraph
+    assert "场景描述" in paragraph or "个别披露" in paragraph
     for token in ("internal planning only", "paragraph_plan_id", "narrative_writing_goal", "writer_advice"):
         assert token not in paragraph
 
@@ -541,7 +541,13 @@ def test_claim_depth_pack_fallback_uses_public_prose_not_writer_instructions():
     assert "报告可以把" not in public_text
     assert "这些材料中直接披露的动作" not in public_text
     assert "这一点能够作为分析展开的基础" not in public_text
-    assert "主体行动是否持续" in public_text or "更可复核的分析结论" in public_text
+    assert "直接动作比泛化描述" not in public_text
+    assert "该信号可以解释" not in public_text
+    assert "这类变化的价值在于" not in public_text
+    assert pack.get("segmentation") in ("", None)
+    assert pack.get("implication") in ("", None)
+    assert pack.get("generic_depth_fallback") is True
+    assert "多地公开材料披露低空航线试点和采购动作" in public_text
     assert "订单、运营频次" not in public_text
     assert "低空航线试点和采购动作" in public_text
     for forbidden in ("公开事实包括", "这组事实", "这些事实", "这一判断", "围绕“", "后续应"):
@@ -609,9 +615,12 @@ def test_claim_depth_pack_fallback_uses_block_specific_public_bridge():
         evidence_by_ref=evidence_by_ref,
     )
 
-    assert "明确主体" in case_pack["segmentation"] or "具体场景" in case_pack["segmentation"]
-    assert "风险" in risk_pack["segmentation"] or "约束" in risk_pack["segmentation"]
-    assert case_pack["segmentation"] != risk_pack["segmentation"]
+    assert "公开案例显示企业在客服流程中测试智能体" in case_pack["evidence_chain"]
+    assert "媒体披露部分地区加强无人机飞行安全监管" in risk_pack["evidence_chain"]
+    assert case_pack["segmentation"] == ""
+    assert risk_pack["segmentation"] == ""
+    assert case_pack["generic_depth_fallback"] is True
+    assert risk_pack["generic_depth_fallback"] is True
 
 
 def _not_allowed_claim_review_suggestion() -> dict:
@@ -884,7 +893,10 @@ def test_public_bridge_pack_does_not_emit_report_process_language():
         "\u62a5\u544a\u4e2d\u7684\u5206\u6790\u4ef7\u503c",
     ):
         assert forbidden not in text
-    assert "\u4e3b\u4f53\u884c\u52a8" in text or "\u5c97\u4f4d\u4efb\u52a1" in text
+    assert "\u4e13\u4e1a\u76ee\u5f55\u5c06\u8d22\u52a1\u5927\u6570\u636e\u5206\u6790" in text
+    assert "\u8d44\u6e90\u6295\u5165" not in text
+    assert "\u6d41\u7a0b\u8c03\u6574" not in text
+    assert "\u5177\u4f53\u4e1a\u52a1" not in text
 
 
 def test_section_composer_long_expansion_does_not_emit_writing_process_language(monkeypatch):

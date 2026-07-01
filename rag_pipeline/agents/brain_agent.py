@@ -9683,14 +9683,14 @@ def _repair_contract_success_criteria(proof_role: Any, required_fields: Sequence
     role = str(proof_role or "").strip().lower()
     fields = [str(item or "").strip() for item in _as_list(list(required_fields)) if str(item or "").strip()]
     if role == "metric" or {"metric", "value", "unit", "period", "source"}.issubset({item.lower() for item in fields}):
-        return "Only count as repaired when metric/value/unit/period/source are all present and traceable to the page source."
+        return "只有同时补齐 metric/value/unit/period/source，且能追溯到页面来源时，才算修复成功。"
     if role == "counter":
-        return "Only count as repaired when the result provides traceable counter/risk evidence rather than support-only evidence."
+        return "只有找到可追溯的反向/风险证据，而不是单纯支持性材料时，才算修复成功。"
     if role in {"source_check", "filing"}:
-        return "Only count as repaired when an authoritative original source, filing, announcement, or research source is traceable by URL."
+        return "只有找到可通过 URL 追溯的原始来源、公告、财报、招股书或研究来源时，才算修复成功。"
     if fields:
-        return f"Only count as repaired when required fields are present: {', '.join(fields)}."
-    return "Only count as repaired when the missing evidence can be traced to a concrete source URL."
+        return f"只有补齐这些 required_fields 时才算修复成功：{', '.join(fields)}。"
+    return "只有缺失证据能追溯到具体来源 URL 时，才算修复成功。"
 
 
 def _repair_contract_source_patterns(proof_role: Any, lane_targets: Sequence[Any]) -> List[str]:
@@ -10499,7 +10499,7 @@ def _post_qa_repair_context(plan: Dict[str, Any], trace: Dict[str, Any]) -> Dict
         "rewrite_required": bool(plan.get("rewrite_required")),
         "rewrite_reasons": _as_list(plan.get("rewrite_reasons")),
         "evidence_followups": _as_list(plan.get("evidence_followups")),
-        "instruction": "Use the repaired evidence and rewrite weak sections. Do not publish unsupported claims.",
+        "instruction": "使用补正后的证据重写薄弱章节；不得发布无证据支撑的结论。",
     }
 
 

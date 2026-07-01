@@ -408,14 +408,14 @@ def test_readpage_extractor_user_payload_carries_prompt_contract_v2(monkeypatch)
             "proof_role": "metric",
             "required_fields": ["metric", "value", "unit", "period", "source"],
             "required_source_level": ["A", "B"],
-            "success_criteria": "Only count repaired when metric/value/unit/period/source are all present.",
+            "success_criteria": "只有 metric/value/unit/period/source 全部存在才算修复成功。",
             "reject_if": ["snippet_only", "no_date", "no_source_url"],
         },
     )
 
     payload = captured["user_payload"]
     assert payload["schema_version"] == "readpage_fact_card_v2"
-    assert "Use only the supplied page text" in captured["system_prompt"]
+    assert "只能使用输入的 page_text" in captured["system_prompt"]
     assert payload["search_task"]["requirement_id"] == "H1_metric"
     assert payload["search_task"]["gap_id"] == "GAP-metric"
     assert payload["search_task"]["required_fields"] == ["metric", "value", "unit", "period", "source"]

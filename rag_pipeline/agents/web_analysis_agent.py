@@ -1602,15 +1602,15 @@ def build_llm_query_plan(
     if dynamic_mode:
         system_prompt = (
             f"{system_prompt}\n\n"
-            "Gap-Driven Prompt Contract v2:\n"
-            "- If search_task is provided, rewrite only around that task; do not add unrelated dimensions.\n"
-            "- Each query must serve one required_field or one explicit source type.\n"
-            "- Queries must include the object plus year/period, source type, metric scope, or filing/report path; avoid generic phrases.\n"
-            "- Metric tasks should prioritize official statistics, industry reports, surveys, PDFs, and annual reports.\n"
-            "- Filing/source_check tasks should prioritize annual reports, announcements, prospectuses, exchanges, and investor relations.\n"
-            "- Counter tasks should search for failure, cost, unclear ROI, security, compliance, cancellation, and delay evidence.\n"
-            "- Preserve topic_anchor_terms in every query; never drop the research object when rewriting.\n"
-            "- Output each item with requirement_id, gap_id, proof_role, required_fields, topic_anchor_terms, and source_priority when present."
+            "Gap-Driven Prompt Contract v2：\n"
+            "- 如果提供 search_task，只围绕该任务改写，不得扩展到无关维度。\n"
+            "- 每条查询必须服务一个 required_field 或一个明确来源类型。\n"
+            "- 查询词必须包含研究对象，并尽量带年份/时期、来源类型、指标口径或公告/报告路径；避免泛词。\n"
+            "- metric 任务优先找官方统计、行业报告、调研、PDF、年报。\n"
+            "- filing/source_check 任务优先找年报、公告、招股书、交易所、投资者关系页面。\n"
+            "- counter 任务优先搜索失败、成本、ROI 不清晰、安全、合规、取消、延期等反向证据。\n"
+            "- 每条查询都必须保留 topic_anchor_terms，不得在改写时丢掉研究对象。\n"
+            "- 若输入存在 requirement_id、gap_id、proof_role、required_fields、topic_anchor_terms、source_priority，应在输出 item 中保留。"
         )
     try:
         budget["query_rewrite_call_count"] = int(budget.get("query_rewrite_call_count") or 0) + 1

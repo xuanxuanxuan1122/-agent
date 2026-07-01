@@ -2,7 +2,10 @@ import pytest
 
 from rag_pipeline.agents.section_body_rewrite_agent import (
     body_rewrite_enabled,
+    body_rewrite_max_elapsed_seconds,
+    body_rewrite_max_expansion_ratio,
     body_rewrite_max_sections,
+    body_rewrite_target_section_chars,
     rewrite_section_body,
     rewrite_sections_for_report,
 )
@@ -48,6 +51,17 @@ def test_body_rewrite_max_sections_has_quality_mode_floor(monkeypatch):
     monkeypatch.setenv("REPORT_REPLAY_EXECUTION_MODE", "quality_llm_replay")
 
     assert body_rewrite_max_sections() == 40
+
+
+def test_body_rewrite_quality_mode_increases_depth_budget(monkeypatch):
+    monkeypatch.delenv("REPORT_BODY_REWRITE_TARGET_SECTION_CHARS", raising=False)
+    monkeypatch.delenv("REPORT_BODY_REWRITE_MAX_ELAPSED_SECONDS", raising=False)
+    monkeypatch.delenv("REPORT_BODY_REWRITE_MAX_EXPANSION_RATIO", raising=False)
+    monkeypatch.setenv("REPORT_QUALITY_MODE", "high")
+
+    assert body_rewrite_target_section_chars() >= 900
+    assert body_rewrite_max_elapsed_seconds() >= 240
+    assert body_rewrite_max_expansion_ratio() >= 7.0
 
 
 def test_rewrite_section_body_accepts_valid_llm_output(monkeypatch, tmp_path):
@@ -394,6 +408,48 @@ def test_rewrite_section_body_rejects_internal_diagnostics(monkeypatch, tmp_path
 
     assert result["status"] == "rejected"
     assert result["failure_reason"] == "forbidden_public_text"
+
+
+def test_rewrite_section_body_strips_internal_evidence_ids_before_validation(monkeypatch, tmp_path):
+    monkeypatch.setenv("REPORT_ENABLE_LLM_BODY_REWRITE", "true")
+    monkeypatch.setenv("REPORT_BODY_REWRITE_CACHE_ENABLED", "false")
+    monkeypatch.setenv("REPORT_BODY_REWRITE_CACHE_PATH", str(tmp_path))
+    monkeypatch.setattr(
+        "rag_pipeline.agents.section_body_rewrite_agent.llm_config_is_ready",
+        lambda config: True,
+    )
+    facts = [
+        {
+            "evidence_id": "EV-1",
+            "distilled_fact": "Salesforce disclosed customer-service workflow deployment.",
+            "source_ref": "EV-1",
+            "source_level": "A",
+            "fact_type": "case",
+        }
+    ]
+    monkeypatch.setattr(
+        "rag_pipeline.agents.section_body_rewrite_agent.call_openai_compatible_json",
+        lambda **kwargs: {
+            "payload": {
+                "paragraph": "Salesforce disclosed customer-service workflow deployment, showing workflow adoption is moving into operations [EV-1].",
+                "used_fact_refs": ["EV-1"],
+                "citation_refs": [],
+            }
+        },
+    )
+    section = _section()
+    section["citation_refs"] = []
+
+    result = rewrite_section_body(
+        section=section,
+        facts=facts,
+        chapter_question="Can AI agents convert into workflow deployment?",
+        llm_config={"url": "https://llm.test", "api_key": "key", "model": "mock-model"},
+    )
+
+    assert result["status"] == "rewritten"
+    assert "EV-1" not in result["paragraph"]
+    assert "workflow adoption" in result["paragraph"]
 
 
 def test_rewrite_section_body_allows_high_quality_expansion_ratio(monkeypatch, tmp_path):

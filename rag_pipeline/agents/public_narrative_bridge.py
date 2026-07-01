@@ -66,32 +66,7 @@ def _evidence_context_bridge(head: str, family: str, facts: Sequence[str]) -> st
     if not cleaned:
         return ""
     fact_text = "；".join(cleaned)
-    if family == "case":
-        tail = (
-            "这些主体和动作让抽象判断落到具体场景、责任分工和执行条件中，"
-            "比单纯的话题讨论更接近可复核材料。"
-        )
-    elif family == "metric":
-        tail = (
-            "这些数字需要放到可比较的指标口径中，"
-            "才能区分规模信号、阶段性波动和单一来源估算。"
-        )
-    elif family == "risk":
-        tail = (
-            "这些约束让机会判断不再只看增长空间，"
-            "还要同时看安全、成本、责任和执行门槛。"
-        )
-    elif family == "technology":
-        tail = (
-            "这些执行条件比单纯的能力展示更关键，"
-            "因为实际影响取决于适用场景、协作成本和持续运行要求。"
-        )
-    else:
-        tail = (
-            "这些主体、场景和约束让抽象趋势落到具体产业动作里，"
-            "也让机会判断有了可继续跟踪的现实抓手。"
-        )
-    return f"公开材料提到，{fact_text}。{tail}"
+    return f"公开材料提到，{fact_text}。"
 
 
 def _block_family(block_type: Any) -> str:
@@ -108,37 +83,7 @@ def _block_family(block_type: Any) -> str:
 
 
 def _mechanism_bridge(head: str, family: str) -> str:
-    if family == "case":
-        return (
-            "关键不在概念热度，而在材料是否呈现明确主体、具体场景和连续动作。"
-            "一旦相关动作从单个样本扩展到更多地区、机构或人群，判断就会从孤立现象转向更稳定的趋势；"
-            "如果样本仍少，它只能说明早期变化正在发生，结论强度仍要看后续材料是否重复出现。"
-            "这比单看宣传表述更能判断变化是否具有重复性。"
-        )
-    if family == "metric":
-        return (
-            "指标需要回到统计口径、覆盖范围和时间窗口里理解。"
-            "口径一致的数字能够校准市场空间、增长速度或渗透节奏；"
-            "口径不一致时，数字更像参照坐标，不能直接推出行业总量。"
-        )
-    if family == "risk":
-        return (
-            "风险线索的作用是识别机会兑现前的触发条件和约束。"
-            "当安全、成本、责任或监管压力放大时，原本的增长预期需要收缩；"
-            "这不是否定全部机会，而是给机会判断设置边界。"
-        )
-    if family == "technology":
-        return (
-            "实际影响取决于可靠性、执行成本和场景适配是否同步改善。"
-            "能力展示只能证明可能性存在，只有进入稳定流程并承担持续运行要求，"
-            "才更接近可复核的应用变化。"
-        )
-    return (
-        "判断这类变化时，重点是主体行动是否持续、影响路径是否清楚、"
-        "约束条件是否可解释。相关材料如果能说明谁在行动、改变了哪些流程、"
-        "又受到哪些外部条件限制，就能更具体地解释岗位任务、组织安排或资源配置的变化；"
-        "如果这些关系尚不完整，结论就应保留在明确场景和时间窗口内。"
-    )
+    return ""
 
 
 def build_public_bridge_pack(
@@ -170,14 +115,7 @@ def build_public_bridge_pack(
                 700,
             )
 
-    implication = _public_text(
-        "这一变化需要放回具体对象和工作流程中理解：谁在行动、哪些任务被改变、"
-        "主体行动是否持续、影响路径是否清楚、约束条件是否可解释，"
-        "共同决定它对岗位任务、组织安排和资源配置的影响强度。"
-        "当这些关系能够连续出现时，相关变化就不只是孤立现象，"
-        "而是可以解释真实工作流程如何调整的持续信号。",
-        900,
-    )
+    implication = ""
 
     return {
         "schema_version": "public_narrative_bridge_v1",

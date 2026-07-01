@@ -65,7 +65,16 @@ def test_stage_quality_card_aggregates_binding_table_and_citation_signals(monkey
         ],
         table_quality_summary=table_summary,
         table_gap_summary={"missing_field_distribution": {"period": 1}, "table_follow_up_count": 1},
-        analysis_stage_diagnostics={"llm_usable_claim_count": 7, "llm_failed_chapter_count": 1, "final_analysis_source": "llm_partial_merged"},
+        analysis_stage_diagnostics={
+            "llm_usable_claim_count": 7,
+            "llm_failed_chapter_count": 1,
+            "final_analysis_source": "llm_partial_merged",
+            "analysis_ready_fact_count": 80,
+            "claim_conversion_rate": 0.08,
+            "bound_claim_count": 6,
+            "bound_claim_rate": 0.75,
+            "reanalyze_existing_recommended": True,
+        },
         final_citation_audit={
             "final_citation_reconciliation_status": "ok",
             "citation_rebind_required": True,
@@ -92,10 +101,16 @@ def test_stage_quality_card_aggregates_binding_table_and_citation_signals(monkey
     assert card["table"]["drop_count"] == 1
     assert card["table"]["reject_reason_distribution"]["body_rows_lt_2"] == 1
     assert card["analysis"]["usable_claim_count"] == 7
+    assert card["analysis"]["analysis_ready_fact_count"] == 80
+    assert card["analysis"]["claim_conversion_rate"] == 0.08
+    assert card["analysis"]["bound_claim_count"] == 6
+    assert card["analysis"]["bound_claim_rate"] == 0.75
+    assert card["analysis"]["reanalyze_existing_recommended"] is True
     assert card["citation"]["citation_rebind_required"] is True
     assert card["handoff"]["ok"] is False
     assert card["handoff"]["failed_contracts"] == ["analysis_to_writer"]
     assert card["handoff"]["results"]["analysis_to_writer"]["summary"]["missing_fact_or_evidence_refs_count"] == 1
+    assert "analysis_low_claim_conversion" in card["top_blockers"]
     assert "handoff_contract_failed" in card["top_blockers"]
     assert "citation_rebind_required" in card["top_blockers"]
 

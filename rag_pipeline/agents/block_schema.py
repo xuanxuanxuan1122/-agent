@@ -24,7 +24,7 @@ BLOCK_REGISTRY: Dict[str, Dict[str, Any]] = {
     "scenario_analysis": {"label": "情景分层与结论弹性", "renderer": "render_scenario_analysis", "roles": ["metric", "counter"]},
     "risk_trigger": {"label": "反向信号与失效条件", "renderer": "render_risk_trigger", "roles": ["counter"]},
     "verification_checklist": {"label": "后续验证重点", "renderer": "render_verification_checklist", "roles": ["support", "counter"]},
-    "integrated_signal": {"label": "缁煎悎淇″彿", "renderer": "render_signal_validation", "roles": ["support", "case"]},
+    "integrated_signal": {"label": "综合信号", "renderer": "render_signal_validation", "roles": ["support", "case"]},
 }
 
 
@@ -511,6 +511,11 @@ def _claim_first_blocks_from_section_plan(
         refs = _as_list(section.get("required_evidence_refs")) or _refs_from_claim_payload(matched_claim)
         if not claim_id and matched_claim:
             claim_id = str(matched_claim.get("claim_id") or matched_claim.get("id") or "").strip()
+        claim_ids = _as_list(section.get("claim_ids")) or ([claim_id] if claim_id else [])
+        supporting_claim_ids = _as_list(section.get("supporting_claim_ids"))
+        paragraph_claim_ids = _as_list(section.get("paragraph_claim_ids")) or claim_ids
+        paragraph_main_claim_id = str(section.get("paragraph_main_claim_id") or claim_id or "").strip()
+        paragraph_supporting_claim_ids = _as_list(section.get("paragraph_supporting_claim_ids")) or supporting_claim_ids
         block_type = str(section.get("block_type") or section.get("output_type") or "").strip()
         if not block_type and matched_claim:
             for candidate in claim_supported_block_types(matched_claim):
@@ -527,6 +532,17 @@ def _claim_first_blocks_from_section_plan(
                 "title": section.get("section_title") or definition.get("label") or block_type,
                 "section_title": section.get("section_title") or "",
                 "claim_id": claim_id,
+                "claim_ids": claim_ids,
+                "supporting_claim_ids": supporting_claim_ids,
+                "source_ids": _as_list(section.get("source_ids")) or _as_list(matched_claim.get("source_ids")),
+                "paragraph_claim_ids": paragraph_claim_ids,
+                "paragraph_main_claim_id": paragraph_main_claim_id,
+                "paragraph_supporting_claim_ids": paragraph_supporting_claim_ids,
+                "narrative_role": section.get("narrative_role"),
+                "narrative_transition_in": section.get("narrative_transition_in"),
+                "narrative_transition_out": section.get("narrative_transition_out"),
+                "narrative_do_not_render": section.get("narrative_do_not_render"),
+                "narrative_plan_public_text_allowed": section.get("narrative_plan_public_text_allowed"),
                 "matched_llm_claim": matched_claim,
                 "required_evidence_refs": refs,
                 # Fall back to the block-type's canonical roles (consistent with the

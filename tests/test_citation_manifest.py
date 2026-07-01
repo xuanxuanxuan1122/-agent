@@ -984,6 +984,7 @@ def test_final_writer_filters_unresolved_refs_before_rendered_manifest(monkeypat
 def test_final_writer_drops_factual_section_when_all_refs_unresolved(monkeypatch):
     monkeypatch.setenv("REPORT_FINAL_WRITER_SOURCE_APPENDIX", "true")
     monkeypatch.setenv("REPORT_SOURCE_CLAIM_GATE_MODE", "strict")
+    monkeypatch.setenv("REPORT_SECTION_GATE_MUTATION_MODE", "enforce")
 
     output = run_final_writer_agent(
         query="AI Agent",
@@ -1026,6 +1027,7 @@ def test_final_writer_drops_factual_section_when_all_refs_unresolved(monkeypatch
 def test_final_writer_drops_metric_claim_when_metric_fact_is_not_structured(monkeypatch):
     monkeypatch.setenv("REPORT_FINAL_WRITER_SOURCE_APPENDIX", "true")
     monkeypatch.setenv("REPORT_SOURCE_CLAIM_GATE_MODE", "strict")
+    monkeypatch.setenv("REPORT_SECTION_GATE_MUTATION_MODE", "enforce")
 
     output = run_final_writer_agent(
         query="AI Agent",
@@ -1075,6 +1077,69 @@ def test_final_writer_drops_metric_claim_when_metric_fact_is_not_structured(monk
     support = output["source_claim_support"]
     assert support["metric_claim_without_metric_fact_count"] == 1
     assert support["section_dropped_due_to_source_claim_mismatch_count"] == 1
+
+
+def test_final_writer_strict_source_gate_is_diagnostic_unless_mutation_is_enabled(monkeypatch):
+    monkeypatch.setenv("REPORT_FINAL_WRITER_SOURCE_APPENDIX", "true")
+    monkeypatch.setenv("REPORT_SOURCE_CLAIM_GATE_MODE", "strict")
+    monkeypatch.delenv("REPORT_SECTION_GATE_MUTATION_MODE", raising=False)
+
+    output = run_final_writer_agent(
+        query="AI Agent",
+        report_blueprint={
+            "report_shell": {"front_blocks": [], "back_blocks": ["appendix"]},
+            "chapters": [{"chapter_id": "ch_01", "chapter_title": "Market sizing"}],
+        },
+        chapter_packages=[
+            {
+                "chapter_id": "ch_01",
+                "chapter_title": "Market sizing",
+                "sections": [
+                    {
+                        "section_id": "s_metric",
+                        "section_title": "Market size",
+                        "block_type": "metric_reconciliation",
+                        "claim": "The AI Agent market is broad: the global market is expected to reach 2168 billion dollars by 2035.",
+                        "reasoning": "The forecast is cited, but the metric fields are not structured enough for a hard sizing claim.",
+                        "used_fact_refs": ["EV-WEAK"],
+                        "evidence_refs": ["EV-WEAK"],
+                        "supporting_facts": ["A generic industry article mentioned AI Agent market opportunity numbers."],
+                        "evidence_basis": ["A generic industry article mentioned AI Agent market opportunity numbers."],
+                        "render_blocks": [
+                            {
+                                "type": "paragraph",
+                                "text": "The AI Agent market is broad: the global market is expected to reach 2168 billion dollars by 2035.",
+                            }
+                        ],
+                        "evidence_backed": True,
+                    }
+                ],
+            }
+        ],
+        source_registry=[
+            {
+                "ref": "EV-WEAK",
+                "evidence_id": "EV-WEAK",
+                "title": "Generic AI Agent opportunities article",
+                "url": "https://example.org/generic-agent-opportunities",
+                "source_level": "C",
+                "source_verification_status": "search_result_only",
+            }
+        ],
+    )
+
+    markdown = output["report_markdown"]
+    assert "2168 billion dollars" in markdown
+    support = output["source_claim_support"]
+    assert support["source_gate_mode"] == "strict"
+    assert support["source_claim_support_status"] == "diagnostic_observed"
+    assert support["section_gate_mutation_mode"] == "diagnostic_only"
+    assert support["diagnostic_only"] is True
+    assert support["section_dropped_due_to_source_claim_mismatch_count"] == 0
+    assert support["metric_claim_without_metric_fact_count"] == 0
+    assert support["permissive_retained_unresolved_section_count"] >= 1
+    assert support["citationless_fact_examples"][0]["action"] == "retained_with_diagnostic"
+    assert support["citationless_fact_examples"][0]["diagnostic_only"] is True
 
 
 def test_final_writer_keeps_metric_claim_when_structured_metric_lives_in_evidence_package(monkeypatch):
@@ -1291,6 +1356,7 @@ def test_final_writer_rebinds_global_block_inline_registry_refs(monkeypatch):
 def test_final_writer_drops_factual_section_when_manifest_filters_its_only_source(monkeypatch):
     monkeypatch.setenv("REPORT_FINAL_WRITER_SOURCE_APPENDIX", "true")
     monkeypatch.setenv("REPORT_SOURCE_CLAIM_GATE_MODE", "strict")
+    monkeypatch.setenv("REPORT_SECTION_GATE_MUTATION_MODE", "enforce")
 
     output = run_final_writer_agent(
         query="AI Agent",
@@ -1343,6 +1409,7 @@ def test_final_writer_drops_factual_section_when_manifest_filters_its_only_sourc
 def test_final_writer_drops_evidence_backed_section_without_manifest_citation(monkeypatch):
     monkeypatch.setenv("REPORT_FINAL_WRITER_SOURCE_APPENDIX", "true")
     monkeypatch.setenv("REPORT_SOURCE_CLAIM_GATE_MODE", "strict")
+    monkeypatch.setenv("REPORT_SECTION_GATE_MUTATION_MODE", "enforce")
 
     output = run_final_writer_agent(
         query="AI Agent",
@@ -2363,6 +2430,7 @@ def test_final_writer_recovers_citation_from_supporting_fact_source_url(monkeypa
 def test_final_writer_omits_chapter_when_all_sections_dropped_after_citation_gate(monkeypatch):
     monkeypatch.setenv("REPORT_FINAL_WRITER_SOURCE_APPENDIX", "true")
     monkeypatch.setenv("REPORT_SOURCE_CLAIM_GATE_MODE", "strict")
+    monkeypatch.setenv("REPORT_SECTION_GATE_MUTATION_MODE", "enforce")
 
     output = run_final_writer_agent(
         query="AI Agent",
@@ -2725,6 +2793,7 @@ def test_final_writer_preserves_metric_claim_after_analysis_topic_checks_are_ups
 def test_final_writer_drops_metric_claim_when_source_is_placeholder_even_after_analysis(monkeypatch):
     monkeypatch.setenv("REPORT_FINAL_WRITER_SOURCE_APPENDIX", "true")
     monkeypatch.setenv("REPORT_SOURCE_CLAIM_GATE_MODE", "strict")
+    monkeypatch.setenv("REPORT_SECTION_GATE_MUTATION_MODE", "enforce")
 
     output = run_final_writer_agent(
         query="AI Agent生态发展报告",

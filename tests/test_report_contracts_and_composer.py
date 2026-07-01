@@ -7,6 +7,9 @@ from rag_pipeline.agents.report_contracts import (
     resolve_evidence_source_ref,
 )
 from rag_pipeline.agents.chapter_argument_agent import run_chapter_argument_agent
+from rag_pipeline.agents.claim_builder_agent import _reasoning_for_block
+from rag_pipeline.agents.final_writer_agent import _claim_backfill_section, run_final_writer_agent
+from rag_pipeline.agents.markdown_renderer import render_chapter_package
 from rag_pipeline.agents.section_composer import compose_section_paragraph
 from rag_pipeline.agents.writer_agent_clean import (
     _chapter_expandable,
@@ -306,6 +309,9 @@ def test_composer_turns_metric_fact_card_into_natural_paragraph():
     assert result["used_fact_refs"] == ["EV-M"]
     assert result["variable_explanation"]
     assert result["composer_variable_explanation_count"] == 1
+    assert result["variable_explanation"] not in result["paragraph"]
+    assert "解释力来自主体范围" not in result["paragraph"]
+    assert "后续是否继续投入资源" not in result["paragraph"]
 
 
 def test_composer_does_not_turn_generic_metric_shape_issue_into_hard_metric_sentence():
@@ -514,7 +520,9 @@ def test_composer_uses_claim_unit_analysis_fields_for_richer_paragraph():
     assert "Enterprise AI agents are moving from tool trials into workflow deployment." in paragraph
     assert "Customer-service workflow deployment is visible" in paragraph
     assert "requires integration, permission control, and process ownership" in paragraph
-    assert "repeatable paid usage" in paragraph
+    # limitation_boundary is an internal analysis field and must not be spliced into
+    # the public paragraph; the paragraph stays rich from claim/facts/expansion.
+    assert "repeatable paid usage" not in paragraph
     assert result["evidence_use_level"] == "directional_signal"
     assert result["writing_permission"] == "cautious_with_boundary"
     assert result["metric_completeness_status"] == "incomplete"
@@ -565,7 +573,9 @@ def test_composer_expands_valid_claim_to_research_paragraph(monkeypatch):
     assert len(paragraph.replace(" ", "")) >= 350
     assert "tool trials" in paragraph
     assert "workflow deployment" in paragraph
-    assert "repeatable paid usage" in paragraph
+    # limitation_boundary is an internal analysis field and must not be spliced into
+    # the public paragraph; the paragraph stays rich from claim/facts/expansion.
+    assert "repeatable paid usage" not in paragraph
 
 
 def test_composer_longform_does_not_repeat_same_fact_sentence(monkeypatch):
@@ -729,6 +739,112 @@ def test_claim_first_composer_expansion_does_not_emit_pipeline_meta_language(mon
     assert "本节只保留" not in paragraph
     assert "已引用事实支撑" not in paragraph
     assert "适用边界" not in paragraph
+
+
+def test_claim_first_composer_expansion_does_not_emit_process_analysis_filler(monkeypatch):
+    monkeypatch.delenv("REPORT_COMPOSER_EXPAND_TO_TARGET", raising=False)
+    monkeypatch.setenv("REPORT_BLUEPRINT_SOURCE", "claim_first")
+    monkeypatch.setenv("REPORT_COMPOSER_TARGET_SECTION_CHARS", "850")
+    card = EvidenceFactCard(
+        evidence_id="EV-PROCESS-FILLER",
+        chapter_id="ch_01",
+        subject="会计专业培养方案",
+        variable="课程结构调整",
+        action_or_signal="updated",
+        distilled_fact="某高校会计专业培养方案增加数字财务、智能财税和数据分析相关课程。",
+        fact_type="case",
+        block_affinity=["case_comparison"],
+        source_ref="[1]",
+        source_level="C",
+    )
+    claim = ClaimUnit(
+        claim_id="CL-PROCESS-FILLER",
+        chapter_id="ch_01",
+        claim="会计专业培养正在从传统核算训练转向数字财务和智能财税能力组合。",
+        evidence_refs=["EV-PROCESS-FILLER"],
+        evidence_basis=["培养方案中新增数字财务、智能财税和数据分析课程。"],
+        reasoning_chain="课程结构变化会影响学生能力模型、教师配置和实践教学场景。",
+        limitation_boundary="这一判断仍需要结合更多高校、地区和招聘口径验证。",
+        claim_strength="directional",
+    )
+
+    result = compose_section_paragraph(
+        fact_cards=[card],
+        claim_unit=claim,
+        block_type="case_comparison",
+        chapter_question="会计学专业的培养目标正在发生什么变化？",
+    )
+
+    paragraph = result["paragraph"]
+    assert result["composer_expansion_status"] == "expanded"
+    for forbidden in (
+        "事实说明",
+        "单点事实",
+        "分析重点",
+        "如果把这一信号与相邻事实对照",
+        "这会把单点事实放进连续变化中观察",
+        "不应只作为背景信息处理",
+        "公开信息包括",
+        "单点样本",
+        "沿着这个路径继续拆解",
+        "本节的重点不是",
+        "变化发生在哪里",
+        "影响了哪些主体",
+        "关键不只是出现案例",
+        "具体主体、场景和影响路径",
+        "更多主体、场景和时间窗口",
+    ):
+        assert forbidden not in paragraph
+    assert "会计专业培养正在从传统核算训练转向数字财务和智能财税能力组合" in paragraph
+    assert "课程结构变化会影响学生能力模型、教师配置和实践教学场景" in paragraph
+
+
+def test_claim_first_composer_uses_claim_focus_when_fact_card_lacks_subject_variable(monkeypatch):
+    monkeypatch.delenv("REPORT_COMPOSER_EXPAND_TO_TARGET", raising=False)
+    monkeypatch.setenv("REPORT_BLUEPRINT_SOURCE", "claim_first")
+    monkeypatch.setenv("REPORT_COMPOSER_TARGET_SECTION_CHARS", "700")
+    card = EvidenceFactCard(
+        evidence_id="EV-GENERIC-FOCUS",
+        chapter_id="ch_01",
+        distilled_fact="某高校会计专业培养方案增加数字财务、智能财税和数据分析相关课程。",
+        fact_type="case",
+        block_affinity=["case_comparison"],
+        source_ref="[1]",
+        source_level="C",
+    )
+    claim = ClaimUnit(
+        claim_id="CL-GENERIC-FOCUS",
+        chapter_id="ch_01",
+        claim="会计专业培养正在从传统核算训练转向数字财务和智能财税能力组合。",
+        evidence_refs=["EV-GENERIC-FOCUS"],
+        evidence_basis=["培养方案中新增数字财务、智能财税和数据分析课程。"],
+        reasoning_chain="课程结构变化会影响学生能力模型、教师配置和实践教学场景。",
+        claim_strength="directional",
+    )
+
+    result = compose_section_paragraph(
+        fact_cards=[card],
+        claim_unit=claim,
+        block_type="case_comparison",
+        chapter_question="会计学专业就业能力如何变化？",
+    )
+
+    paragraph = result["paragraph"]
+    assert result["composer_expansion_status"] == "expanded"
+    assert paragraph.count("关键事实") <= 1
+    assert "相关主体" not in paragraph
+    assert "具体进展" not in paragraph
+    assert "关于关键事实" not in paragraph
+    assert "会计专业培养已经影响会计专业培养" not in paragraph
+    assert "会计专业培养之所以重要，是因为它已经落到会计专业培养" not in paragraph
+    assert "谁投入资源" not in paragraph
+    assert "谁调整流程" not in paragraph
+    assert "三个层面" not in paragraph
+    assert "企业层面" not in paragraph
+    assert "运营层面" not in paragraph
+    assert paragraph.count("会计专业培养") <= 8
+    assert "会计专业培养" in paragraph
+    assert "数字财务" in paragraph
 
 
 def test_claim_first_composer_respects_manual_expand_disable(monkeypatch):
@@ -1453,6 +1569,127 @@ def test_chapter_argument_inherits_llm_used_evidence_ids_as_used_fact_refs():
     assert section["used_fact_refs"] == ["EV-LLM"]
 
 
+def test_half_chain_integrated_signal_uses_claim_context_not_generic_chapter_signal():
+    packages = run_chapter_argument_agent(
+        report_blueprint={"chapters": [{"chapter_id": "ch_01", "chapter_title": "会计学就业能力变化"}]},
+        micro_layouts=[
+            {
+                "chapter_id": "ch_01",
+                "sections": [
+                    {
+                        "section_id": "s_signal",
+                        "block_type": "integrated_signal",
+                        "dynamic_section_title": "能力结构变化",
+                    }
+                ],
+            }
+        ],
+        argument_units=[
+            {
+                "claim_id": "CL-signal",
+                "chapter_id": "ch_01",
+                "section_id": "s_signal",
+                "block_type": "integrated_signal",
+                "claim": "会计学专业的能力要求正在从基础核算转向数据治理、智能财税和业务分析组合。",
+                "reasoning": "当财务系统、数据口径和智能工具进入制度规范，岗位能力会延伸到数据治理和流程协同。",
+                "used_evidence_ids": ["EV-signal"],
+                "evidence_refs": ["EV-signal"],
+                "source_support_map": {"claim": ["EV-signal"]},
+                "public_render": True,
+                "evidence_basis": [
+                    "财政部材料强调财务数据治理、系统接口和智能工具应用。"
+                ],
+                "claim_strength": "moderate",
+            }
+        ],
+        chapter_evidence_packages=[{"chapter_id": "ch_01"}],
+    )
+
+    section = packages[0]["sections"][0]
+    markdown = render_chapter_package(packages[0], 1)
+    combined = " ".join(
+        [
+            str(section.get("composed_paragraph") or ""),
+            str(section.get("reasoning") or ""),
+            str(section.get("mechanism") or ""),
+            markdown,
+        ]
+    )
+
+    assert section["used_fact_refs"] == ["EV-signal"]
+    assert section["evidence_backed"] is True
+    assert "会计学专业的能力要求正在从基础核算转向数据治理、智能财税和业务分析组合" in combined
+    assert "财务数据治理" in combined
+    for forbidden in ("章节信号", "事实说明", "分析重点", "单点事实", "公开信息包括"):
+        assert forbidden not in combined
+
+
+def test_final_writer_core_observation_uses_claim_not_generic_variable_explanation():
+    query = "会计学就业能力变化"
+    claim = "会计学专业的能力要求正在从基础核算转向数据治理、智能财税和业务分析组合。"
+    reasoning = "当财务系统、数据口径和智能工具进入制度规范，岗位能力会延伸到数据治理和流程协同。"
+    evidence_basis = "财政部材料强调财务数据治理、系统接口和智能工具应用。"
+    claims = [
+        {
+            "claim_id": "CL-signal",
+            "chapter_id": "ch_01",
+            "section_id": "s_signal",
+            "block_type": "integrated_signal",
+            "claim": claim,
+            "reasoning": reasoning,
+            "used_evidence_ids": ["EV-signal"],
+            "evidence_refs": ["EV-signal"],
+            "source_support_map": {"claim": ["EV-signal"]},
+            "public_render": True,
+            "evidence_basis": [evidence_basis],
+            "claim_strength": "moderate",
+        }
+    ]
+    packages = run_chapter_argument_agent(
+        report_blueprint={"chapters": [{"chapter_id": "ch_01", "chapter_title": query}]},
+        micro_layouts=[
+            {
+                "chapter_id": "ch_01",
+                "sections": [
+                    {
+                        "section_id": "s_signal",
+                        "block_type": "integrated_signal",
+                        "dynamic_section_title": "能力结构变化",
+                    }
+                ],
+            }
+        ],
+        argument_units=claims,
+        chapter_evidence_packages=[{"chapter_id": "ch_01"}],
+    )
+
+    result = run_final_writer_agent(
+        query=query,
+        report_blueprint={"chapters": [{"chapter_id": "ch_01", "chapter_title": query}]},
+        chapter_packages=packages,
+        source_registry=[
+            {
+                "ref": "[1]",
+                "evidence_id": "EV-signal",
+                "source_ref": "EV-signal",
+                "title": "财政部会计信息化规范",
+                "url": "https://example.org/mof",
+            }
+        ],
+        claim_units=claims,
+    )
+
+    markdown = result["report_markdown"]
+    summary = markdown.split("## 1.", 1)[0]
+
+    assert "[1]" in markdown
+    assert claim.rstrip("。") in markdown
+    assert "财政部材料强调财务数据治理" in markdown
+    assert "会计学专业的能力要求" in summary or "数据治理" in summary
+    for forbidden in ("需要结合来源范围、场景深度和时间窗口一起判断", "避免把背景信息直接外推为结论"):
+        assert forbidden not in markdown
+
+
 def test_chapter_argument_demotes_metric_layout_when_llm_claim_is_case_signal():
     packages = run_chapter_argument_agent(
         report_blueprint={"chapters": [{"chapter_id": "ch_01", "chapter_title": "Workflow adoption"}]},
@@ -1881,12 +2118,119 @@ def test_public_evidence_digest_expands_claim_backed_chapter_without_internal_la
         "diagnostic",
         "score_gap",
         "QA",
+        "主体行动",
+        "正文应",
+        "任务分工",
         "方向性观察进入正文",
         "后续应继续观察",
         "后续判断需要继续观察",
         "被简单处理成孤立材料",
     ):
         assert forbidden not in text
+
+
+def test_body_expansion_defaults_to_public_digest_not_template_process_language(monkeypatch):
+    monkeypatch.setenv("REPORT_ENABLE_BODY_EXPANSION", "true")
+    monkeypatch.delenv("REPORT_ENABLE_PUBLIC_EVIDENCE_DIGEST", raising=False)
+    monkeypatch.delenv("REPORT_ENABLE_DETERMINISTIC_BODY_EXPANSION", raising=False)
+
+    chapter = {
+        "chapter_id": "ch_claims",
+        "chapter_title": "会计人才培养",
+        "chapter_fact_digest": [
+            {
+                "distilled_fact": "多所高校调整会计课程，增加数据分析与智能财务训练。",
+                "evidence_id": "EV-1",
+                "source_ref": "[1]",
+                "fact_type": "policy_signal",
+            },
+            {
+                "distilled_fact": "招聘信息显示，企业在财务岗位中强调数据处理和业务系统协同能力。",
+                "evidence_id": "EV-2",
+                "source_ref": "[2]",
+                "fact_type": "case_signal",
+            },
+            {
+                "distilled_fact": "培训机构开始把智能财务软件操作纳入实践课程。",
+                "evidence_id": "EV-3",
+                "source_ref": "[3]",
+                "fact_type": "market_signal",
+            },
+        ],
+        "sections": [
+            {
+                "section_id": "s1",
+                "section_title": "课程调整",
+                "claim": "高校会计课程正在增加智能财务相关训练。",
+                "evidence_refs": ["EV-1", "EV-2"],
+                "used_fact_refs": ["EV-1", "EV-2"],
+                "citation_refs": ["[1]", "[2]"],
+                "supporting_facts": [
+                    "多所高校调整会计课程，增加数据分析与智能财务训练。",
+                    "招聘信息显示，企业在财务岗位中强调数据处理和业务系统协同能力。",
+                ],
+                "public_render": True,
+                "evidence_backed": True,
+            }
+        ],
+    }
+
+    expanded = _expand_chapter_packages_for_body_target([chapter], target_chars=5_000)
+
+    digest_sections = [section for section in expanded[0]["sections"] if section.get("public_digest_generated")]
+    assert digest_sections
+    assert not any(section.get("expansion_generated") for section in expanded[0]["sections"])
+    text = " ".join(
+        str(section.get(key) or "")
+        for section in digest_sections
+        for key in ("section_title", "claim", "reasoning", "counter_evidence", "actionable")
+    )
+    for forbidden in (
+        "观察信号",
+        "方向性观察",
+        "后续决策",
+        "后续观察",
+        "diagnostic",
+        "claim_unit",
+        "主体行动",
+        "正文应",
+        "任务分工",
+    ):
+        assert forbidden not in text
+
+
+def test_final_writer_claim_backfill_uses_public_prose_not_methodology_terms():
+    section = _claim_backfill_section(
+        {
+            "claim_id": "CL-backfill-public",
+            "claim": "会计岗位能力正在从基础核算转向数据分析和业务理解。",
+            "used_evidence_ids": ["EV-backfill-public"],
+            "citation_refs": ["[1]"],
+            "evidence_basis": ["公开材料显示，课程和岗位要求开始加入数据分析、智能财务和业务协同能力。"],
+            "claim_strength": "directional",
+        },
+        1,
+    )
+
+    text = " ".join(str(block.get("text") or "") for block in section.get("render_blocks") or [])
+    for forbidden in ("主体行动", "适用场景", "约束条件是否", "更值得看的", "这类变化的价值在于"):
+        assert forbidden not in text
+    # The vague "公开材料显示，" lead-in is stripped, but the fact it introduced is kept.
+    assert "公开材料" not in text
+    assert "数据分析" in text or "业务协同" in text or "岗位要求" in text
+
+
+def test_claim_builder_reasoning_does_not_emit_methodology_terms():
+    text = _reasoning_for_block(
+        "case_comparison",
+        ["高校课程方案增加智能财务和数据分析训练。", "企业岗位要求强调业务系统协同能力。"],
+        [{"variable": "就业能力变化"}],
+        "moderate",
+    )
+
+    for forbidden in ("主体动作", "主体行动", "影响路径", "可观察变量"):
+        assert forbidden not in text
+    assert "具体场景" in text or "持续结果" in text or "业务" in text
 
 
 def test_public_evidence_digest_uses_section_plan_citation_refs(monkeypatch):

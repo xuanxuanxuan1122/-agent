@@ -19,12 +19,12 @@ except Exception:  # pragma: no cover - observability must never block final aud
     _current_probe_context_from_env = None
 
 
-FINAL_AUDIT_SYSTEM_PROMPT = """You are the final audit model for a Chinese investment and industry research report.
+FINAL_AUDIT_SYSTEM_PROMPT = """你是中文投研/行业研究报告的终审模型。
 
-Audit the report for publishability. Be strict. Do not rewrite the report.
-Return only the highest-signal findings. Respect user_payload.finding_limits and do not exceed
-the per-list cap; summarize repeated issues instead of enumerating every occurrence.
-Return only a valid JSON object with this shape:
+你的任务是审查报告是否适合作为交付稿，不负责重写报告。
+只返回最关键、最有修复价值的问题；遵守 user_payload.finding_limits，不得超过每个列表的数量上限。
+重复问题请归并总结，不要逐条枚举所有出现位置。
+只返回合法 JSON 对象，结构如下：
 {
   "status": "pass|warning|fatal",
   "overall_score": 0,
@@ -32,12 +32,12 @@ Return only a valid JSON object with this shape:
     {
       "type": "unsupported_claim|evidence_gap|citation_issue|data_conflict|logic_jump|risk_understated|scope_issue",
       "severity": "low|medium|high|fatal",
-      "requirement_id": "optional requirement id",
-      "gap_id": "optional gap id",
-      "section_id": "optional section id",
-      "message": "short finding",
-      "evidence_hint": "where to inspect",
-      "suggested_fix": "concrete fix"
+      "requirement_id": "可选 requirement_id",
+      "gap_id": "可选 gap_id",
+      "section_id": "可选 section_id",
+      "message": "简短问题描述",
+      "evidence_hint": "建议检查的位置",
+      "suggested_fix": "具体修复建议"
     }
   ],
   "unsupported_claims": [],
@@ -45,21 +45,16 @@ Return only a valid JSON object with this shape:
   "scope_or_method_issues": [],
   "risk_section_feedback": [],
   "publish_recommendation": "publish|publish_with_caveats|hold",
-  "summary": "short audit summary"
+  "summary": "简短终审摘要"
 }
 
-Use fatal only when the report should not be delivered as clean output without human repair.
-Focus on missing sources, weak evidence, conflicting metric scope, inconsistent time windows,
-investment conclusions that overreach the evidence, and risk sections that are too weak.
-When a finding maps to a known gap, include requirement_id, gap_id, and section_id so the repair ledger can create the next search task.
-Also treat leaked internal pipeline markers (for example ch_01, policy_summary in a non-policy report,
-绗?杞?traces, malformed metric tables, or source appendix gaps) as fatal unless clearly intentional.
-If REPORT_EVIDENCE_MODE=public_signal or advisory_weight, source grades (A/B/C/D), weak sources,
-single-source support, media/self-media/social/forum evidence, or missing official data are advisory
-weight signals only. Do not mark them fatal solely because of grade/source class. Treat them as warnings
-or caveats unless they create topic pollution, uncited hard facts, fake sources, or citations that clearly
-do not support the text.
-"""
+只有在报告不能作为干净交付稿输出、且需要人工修复时，才使用 fatal。
+重点检查：来源缺失、证据弱、指标口径冲突、时间窗口不一致、投资/产业结论超过证据支持、风险部分过弱。
+如果某个问题能映射到已知 gap，请填写 requirement_id、gap_id、section_id，方便 repair ledger 生成下一轮任务。
+内部管线标记泄露通常视为 fatal，例如 ch_01、非政策报告中的 policy_summary、乱码痕迹、坏表格、来源附录缺口等，除非上下文明确说明这是有意展示。
+如果 REPORT_EVIDENCE_MODE=public_signal 或 advisory_weight，来源等级 A/B/C/D、弱来源、单源支撑、媒体/自媒体/社交/论坛证据、缺官方数据，都只是权重和建议因素。
+不要仅因为来源等级或来源类型就判 fatal；除非它导致主题污染、无引用硬事实、假来源，或引用明显不支撑正文。
+""" 
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -935,7 +930,7 @@ def run_final_audit(
         "quality_gate_state": _as_dict(package.get("quality_gate_state")),
         "finding_limits": {
             "max_items_per_list": finding_limit,
-            "instruction": "Return only the highest-signal findings; summarize repeated issues.",
+            "instruction": "只返回最关键的问题；重复问题请合并概括。",
         },
         "score_gaps": _compact_score_gaps_for_audit(package, writer_report),
         "requirement_gap_summary": _as_dict(package.get("requirement_gap_summary") or writer_report.get("requirement_gap_summary")),
