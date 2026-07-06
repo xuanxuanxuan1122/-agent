@@ -504,6 +504,25 @@ def _repair_success_criteria(proof_role: Any, required_fields: Sequence[Any]) ->
     return "Only count as repaired when the missing evidence can be traced to a concrete source URL."
 
 
+_DIAGNOSTIC_QUERY_TOKEN_RE = re.compile(
+    r"\b(?:"
+    r"claim_semantic_support_mismatch|claim_support_entity_or_metric_mismatch|"
+    r"insufficient_verified_ab_sources|insufficient_ab_sources|"
+    r"core_claim_without_ab_source|single_source_industry_generalization|"
+    r"claim_support_anchor_mismatch|source_trace_missing|citation_source_missing|"
+    r"repair_before_publication|needs_corroboration|not_allowed_until_repaired"
+    r")\b",
+    re.I,
+)
+
+
+def _public_repair_query_text(parts: Sequence[Any]) -> str:
+    query = _compact_query_text(parts)
+    query = _DIAGNOSTIC_QUERY_TOKEN_RE.sub(" ", query)
+    query = re.sub(r"\s+", " ", query).strip(" -_/|,，;；")
+    return query
+
+
 def _repair_task_seed(gap_item: Dict[str, Any], retry_plan: Dict[str, Any]) -> Dict[str, Any]:
     status = _clean_scalar(gap_item.get("status"))
     previous_result_count = _context_int(retry_plan.get("result_count"))
@@ -515,19 +534,30 @@ def _repair_task_seed(gap_item: Dict[str, Any], retry_plan: Dict[str, Any]) -> D
     proof_role = gap_item.get("proof_role") or ""
     lane_targets = _as_context_list(gap_item.get("lane_targets"))
     preferred_source_patterns = _repair_preferred_source_patterns(proof_role, lane_targets)
-    query = _compact_query_text(
+    query = _public_repair_query_text(
         [
             gap_item.get("recommended_search_task_seed"),
             " ".join(_as_context_list(gap_item.get("query_terms"))),
             gap_item.get("current_insufficiency"),
-            gap_item.get("gap_type"),
+            gap_item.get("claim"),
+            gap_item.get("chapter_title"),
+            gap_item.get("chapter_question"),
             proof_role,
             " ".join(required_fields),
             " ".join(preferred_source_patterns[:3]),
         ]
     )
     if not query:
-        query = _compact_query_text([gap_item.get("gap_type"), " ".join(required_fields), gap_item.get("requirement_id")])
+        query = _public_repair_query_text(
+            [
+                gap_item.get("claim"),
+                gap_item.get("chapter_title"),
+                gap_item.get("chapter_question"),
+                " ".join(required_fields),
+                gap_item.get("requirement_id"),
+                proof_role,
+            ]
+        )
     seed = {
         "schema_version": "repair_task_seed_v2",
         "query": query,

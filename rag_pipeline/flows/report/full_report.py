@@ -24,7 +24,7 @@ from rag_pipeline.agents.public_report_sanitizer import find_publication_blocker
 from rag_pipeline.agents.report_health import build_report_health_card
 from rag_pipeline.agents.summary_quality import sanitize_summary_judgments
 from rag_pipeline.contracts.quality_gate import build_quality_gate_state
-from rag_pipeline.contracts.quality_gate_policy import quality_gates_isolated
+from rag_pipeline.contracts.quality_gate_policy import main_chain_only_mode, quality_gates_isolated
 from rag_pipeline.contracts.review_suggestion_contract import review_suggestions_to_required_followups
 from rag_pipeline.observability.probe_api import emit_stage_snapshot
 from rag_pipeline.observability.probe_context import ProbeContext, activate_probe_context_env, create_probe_context
@@ -3764,12 +3764,20 @@ HIGH_WRITING_QUALITY_DEFAULTS = {
     "REPORT_CHAPTER_NARRATIVE_MAX_CHAPTERS": "12",
     "REPORT_TARGET_BODY_CHARS": "24000",
     "REPORT_TARGET_BODY_CHARS_BLOCKING": "false",
-    "REPORT_ENABLE_PUBLIC_EVIDENCE_DIGEST": "true",
+    "REPORT_ENABLE_PUBLIC_EVIDENCE_DIGEST": "false",
     "REPORT_PUBLIC_EVIDENCE_DIGEST_MAX_SECTIONS_PER_CHAPTER": "3",
     "REPORT_COMPOSER_TARGET_SECTION_CHARS": "850",
     "REPORT_ENABLE_RENDERER_TEMPLATE_EXPANSION": "false",
     "REPORT_RENDER_MIN_SECTION_CHARS": "420",
     "REPORT_BLUEPRINT_SOURCE": "claim_first",
+}
+
+
+REPORT_MAINLINE_DEFAULTS = {
+    "REPORT_MAIN_EVIDENCE_SOURCE": "iqs_web",
+    "BRAIN_ENABLE_LOCAL_RAG": "false",
+    "REPORT_ENABLE_LOCAL_RAG": "false",
+    "RAG_ANSWER_MODE": "none",
 }
 
 
@@ -3944,7 +3952,7 @@ def apply_report_quality_posture(mode: str = "") -> Dict[str, Any]:
         "REPORT_ENABLE_LLM_CHAPTER_NARRATIVE",
     } if force_feature_enable else set()
     applied, preserved, overridden_disabled = _apply_quality_env_defaults(
-        {**defaults, **evidence_defaults, **writing_defaults},
+        {**REPORT_MAINLINE_DEFAULTS, **defaults, **evidence_defaults, **writing_defaults},
         force_enable_keys=force_enable_keys,
     )
     model_applied, model_preserved, replaced_removed_models, overridden_models = _apply_model_routing_defaults(REPORT_MODEL_ROUTING_DEFAULTS)
@@ -3987,6 +3995,16 @@ def apply_report_quality_posture(mode: str = "") -> Dict[str, Any]:
             "chapter_narrative_max_chapters": os.environ.get("REPORT_CHAPTER_NARRATIVE_MAX_CHAPTERS", ""),
             "target_body_chars": os.environ.get("REPORT_TARGET_BODY_CHARS", ""),
             "composer_target_section_chars": os.environ.get("REPORT_COMPOSER_TARGET_SECTION_CHARS", ""),
+        },
+        "mainline": {
+            "evidence_source": os.environ.get("REPORT_MAIN_EVIDENCE_SOURCE", ""),
+            "local_rag_enabled": str(
+                os.environ.get("BRAIN_ENABLE_LOCAL_RAG")
+                or os.environ.get("REPORT_ENABLE_LOCAL_RAG")
+                or ""
+            ).strip().lower()
+            in {"1", "true", "yes", "on"},
+            "rag_answer_mode": os.environ.get("RAG_ANSWER_MODE", ""),
         },
         "model_routing": {
             key: os.environ.get(key, "")
@@ -4885,13 +4903,15 @@ def main() -> int:
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
     load_dotenv(PIPELINE_ROOT / ".env")
+    os.environ.setdefault("REPORT_MAIN_CHAIN_ONLY", "true")
     os.environ.setdefault("REPORT_QUALITY_GATE_MODE", "isolated")
     os.environ.setdefault("REPORT_FINAL_AUDIT_BLOCKING", "false")
     os.environ.setdefault("QA_DEEP_EVALUATOR_BLOCKING", "false")
-    # Tables stay enabled: the metric-asset contract already filters
-    # incomplete metrics, and with the fake-metric extraction fixed upstream
-    # the table lane only sees real indicators. Disabling tables wholesale
-    # cost the structural completeness score.
+    os.environ.setdefault("REPORT_ENABLE_TABLES", "false")
+    os.environ.setdefault("REPORT_TABLES_ENABLED", "false")
+    os.environ.setdefault("REPORT_TABLES_RENDER_IN_BODY", "false")
+    os.environ.setdefault("REPORT_QA_AUTO_REWRITE", "false")
+    os.environ.setdefault("REPORT_WRITE_CLEAN_REPORT", "false")
     configure_pipeline_logging()
     resolved_quality_mode = resolve_report_quality_mode(
         os.getenv("REPORT_QUALITY_MODE", ""),
@@ -4900,6 +4920,10 @@ def main() -> int:
     os.environ["REPORT_QUALITY_MODE"] = resolved_quality_mode
     quality_posture = apply_report_quality_posture(resolved_quality_mode)
     args = build_arg_parser().parse_args()
+    if main_chain_only_mode():
+        args.skip_review = True
+        args.skip_reformatter = True
+        args.enable_llm_review = False
     report_quality_mode = resolved_quality_mode
     high_quality_mode = report_quality_mode in {"high", "strict_research"}
     if high_quality_mode:
@@ -5793,7 +5817,7 @@ def main() -> int:
     final_audit_result: Dict[str, Any] = as_dict(writer_package_payload.get("final_audit_result"))
     final_audit_blocked = False
 
-    final_audit_candidate = bool(report_markdown and not writer_not_ready)
+    final_audit_candidate = bool(report_markdown and not writer_not_ready and not main_chain_only_mode())
     if final_audit_candidate:
         try:
             run_final_audit = _load_final_audit_runner()

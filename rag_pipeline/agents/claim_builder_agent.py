@@ -899,13 +899,20 @@ def _claim_review_not_allowed_until_repaired(unit: Dict[str, Any]) -> bool:
 def _apply_claim_review_strength_suggestions(unit: Dict[str, Any]) -> Dict[str, Any]:
     normalized = dict(unit)
     if _claim_review_not_allowed_until_repaired(normalized):
-        normalized["claim_status"] = "not_allowed_until_repaired"
-        normalized["quality_status"] = "not_allowed_until_repaired"
-        normalized["evidence_use_level"] = "diagnostic_only"
-        normalized["writing_permission"] = "not_allowed_until_repaired"
-        normalized["omit_from_report"] = True
-        normalized["public_render"] = False
-        normalized["omit_reason"] = "claim_review_not_allowed_until_repaired"
+        target_strength = _claim_review_target_strength(normalized) or "directional"
+        current_strength = str(normalized.get("claim_strength") or normalized.get("claim_status") or "").strip().lower()
+        if not current_strength or _claim_strength_rank(current_strength) > _claim_strength_rank(target_strength):
+            normalized["claim_strength_reviewed_from"] = current_strength
+            normalized["claim_strength"] = target_strength
+            normalized["claim_review_strength_applied"] = True
+        normalized["claim_status"] = "directional"
+        normalized["quality_status"] = "review_required_directional"
+        normalized["evidence_use_level"] = "directional_signal"
+        normalized["writing_permission"] = "cautious_with_boundary"
+        normalized["omit_from_report"] = False
+        normalized["public_render"] = True
+        normalized["claim_review_warning_applied"] = True
+        normalized["claim_review_warning_reason"] = "claim_review_requested_repair_before_publication"
         normalized["rewrite_required"] = True
         return normalized
     target_strength = _claim_review_target_strength(normalized)
@@ -2815,17 +2822,17 @@ def _argument_unit_issues(unit: Dict[str, Any]) -> List[Dict[str, Any]]:
     elif claim.startswith(WEAK_CLAIM_PREFIXES) or _has_bad_pattern(claim):
         issues.append({"type": "weak_claim", "severity": "warning" if directional_unit and refs else "error"})
     if not reasoning:
-        issues.append({"type": "missing_reasoning", "severity": "warning" if fact_card_backed else "error"})
+        issues.append({"type": "missing_reasoning", "severity": "warning"})
     elif _has_bad_pattern(reasoning) or _is_bad_public_fact(reasoning):
         issues.append({"type": "weak_reasoning"})
     elif not any(word in reasoning for word in CAUSE_WORDS):
         issues.append({"type": "reasoning_missing_causal_chain", "severity": "warning"})
     if not counter:
-        issues.append({"type": "missing_counter_evidence", "severity": "warning" if directional_unit or fact_card_backed else "error"})
+        issues.append({"type": "missing_counter_evidence", "severity": "warning"})
     elif _has_bad_pattern(counter):
         issues.append({"type": "weak_counter_evidence"})
     if not actionable:
-        issues.append({"type": "missing_actionable", "severity": "warning" if directional_unit or fact_card_backed else "error"})
+        issues.append({"type": "missing_actionable", "severity": "warning"})
     elif _has_bad_pattern(actionable):
         issues.append({"type": "weak_actionable"})
     elif not any(word in actionable for word in ACTION_WORDS):
@@ -3384,14 +3391,33 @@ def run_claim_builder_agent(
             repeated_claim_prefixes.add((chapter_key, claim_prefix))
         if repeated_claim:
             issues = _as_list(unit.get("quality_issues"))
-            issues.append({"type": "argument_unit_repetition_failed", "severity": "warning"})
+            repetition_suggestion = {
+                "type": "argument_unit_repetition_failed",
+                "severity": "warning",
+                "suggested_action": "rewrite_with_caveat",
+                "diagnostic_only": True,
+                "must_not_render": True,
+                "public_text_allowed": False,
+            }
+            issues.append(repetition_suggestion)
             unit["quality_issues"] = issues
-            unit["omit_from_report"] = True
-            unit["public_render"] = False
-            unit["observation_only"] = True
-            unit["internal_reason"] = "argument_unit_repetition_failed"
-            cleaned.append(unit)
-            continue
+            suggestions = _as_list(unit.get("review_suggestions"))
+            suggestions.append(
+                {
+                    "schema_version": "review_suggestion_v1",
+                    "issue_type": "argument_unit_repetition_failed",
+                    "severity": "warning",
+                    "target": {
+                        "chapter_id": unit.get("chapter_id"),
+                        "claim_id": unit.get("claim_id") or unit.get("id"),
+                    },
+                    "suggested_action": "rewrite_with_caveat",
+                    "diagnostic_only": True,
+                    "must_not_render": True,
+                    "public_text_allowed": False,
+                }
+            )
+            unit["review_suggestions"] = suggestions
         if not is_public_claim(unit):
             source_quality = _as_dict(unit.get("source_quality"))
             strength = str(source_quality.get("claim_strength") or "unsupported").lower()

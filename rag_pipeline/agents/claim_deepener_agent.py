@@ -164,13 +164,20 @@ def build_claim_depth_pack(unit: Dict[str, Any], *, evidence_by_ref: Dict[str, D
     reasoning = _text(unit.get("reasoning") or unit.get("mechanism") or unit.get("reasoning_chain"))
     implication = _text(unit.get("decision_implication") or unit.get("actionable") or unit.get("implication"))
     boundary = _text(unit.get("limitation_boundary") or unit.get("counter_evidence") or unit.get("boundary"))
+    interpretation_reflects = _text(unit.get("what_evidence_reflects"))
+    why_it_matters = _text(unit.get("why_it_matters"))
+    mechanism_chain = _dedupe(_as_list(unit.get("mechanism_chain")), limit=4)
+    employment_implication = _text(unit.get("employment_implication"))
+    education_implication = _text(unit.get("education_implication"))
+    industry_implication = _text(unit.get("industry_implication"))
+    counter_reading = _text(unit.get("counter_reading"))
     source_ids = _dedupe([_source_id(evidence_by_ref.get(ref, {})) for ref in refs], limit=8)
     fact_summary = "; ".join(facts[:3])
     chinese = _prefers_chinese(claim, fact_summary)
     claim_head = _claim_headline(claim)
     fact_preview = _claim_headline(fact_summary, max_chars=80)
     if chinese:
-        fallback_evidence = f"公开材料提到，{fact_summary}。"
+        fallback_evidence = f"已引用证据显示，{fact_summary}。"
         fallback_mechanism = "材料的价值在于把可观察活动、应用场景和执行条件连接起来，而不是只提供背景描述。"
         fallback_segmentation = ""
         fallback_implication = ""
@@ -202,16 +209,40 @@ def build_claim_depth_pack(unit: Dict[str, Any], *, evidence_by_ref: Dict[str, D
         or fallback_segmentation
         or fallback_implication
     )
+    has_interpretation_depth = bool(
+        interpretation_reflects
+        or why_it_matters
+        or mechanism_chain
+        or employment_implication
+        or education_implication
+        or industry_implication
+        or counter_reading
+    )
+    if has_interpretation_depth:
+        evidence_chain = interpretation_reflects or reasoning or fallback_evidence
+        mechanism = " ".join(
+            _dedupe([why_it_matters, *mechanism_chain], limit=5)
+        ) or reasoning or fallback_mechanism
+        implication = " ".join(
+            _dedupe([employment_implication, education_implication, industry_implication, implication], limit=5)
+        )
+        boundary = counter_reading or boundary or fallback_boundary
+        generic_depth_fallback = False
+    else:
+        evidence_chain = reasoning or fallback_evidence
+        mechanism = reasoning or fallback_mechanism
+        implication = implication or fallback_implication
+        boundary = boundary or fallback_boundary
     return {
         "schema_version": "claim_depth_pack_v1",
         "claim_id": _text(unit.get("claim_id") or unit.get("id")),
         "judgement": claim,
-        "evidence_chain": reasoning or fallback_evidence,
-        "mechanism": reasoning or fallback_mechanism,
+        "evidence_chain": evidence_chain,
+        "mechanism": mechanism,
         "segmentation": _text(unit.get("segmentation"))
         or fallback_segmentation,
-        "implication": implication or fallback_implication,
-        "boundary": boundary or fallback_boundary,
+        "implication": implication,
+        "boundary": boundary,
         "used_fact_refs": refs,
         "used_source_ids": source_ids,
         "diagnostic_only": False,

@@ -713,6 +713,265 @@ SOURCE_PRIORITY_BY_ROLE = {
 }
 
 
+_GENERIC_PLANNER_TITLE_RE = re.compile(
+    r"^(?:"
+    r"市场规模(?:与|和)?增长?|竞争格局|政策(?:与|和)?监管(?:环境)?|技术路线(?:与|和)?产业链|"
+    r"资本(?:动向|动态)|产业链全景|发展趋势|机会(?:与|和)?挑战|风险分析|"
+    r"市场空间(?:与|和)?商业化|行业现状(?:与|和)?趋势"
+    r")$"
+)
+
+_SPECIFIC_PLANNER_TITLE_RE = re.compile(
+    r"MES|APS|PLM|ERP|CRM|SaaS|eVTOL|AI|"
+    r"国产替代|离散制造|落地路径|采购决策|决策链|实施失败|归因|"
+    r"半托管|海外仓|履约成本|利润结构|适航|航线|订单兑现|"
+    r"执行器|传感器|控制器|液冷|超充|投资回收|运营成本|"
+    r"支付方|使用场景|渠道建设|消防|检测认证|连锁化|客单价|"
+    r"医生供给|保险支付|AI实训|院校采购|就业导向"
+)
+
+
+def _chapter_title_is_generic_template(title: Any) -> bool:
+    text = re.sub(r"\s+", "", str(title or "")).strip()
+    if not text:
+        return True
+    return bool(_GENERIC_PLANNER_TITLE_RE.search(text))
+
+
+def _chapter_title_is_specific(title: Any, query: str = "") -> bool:
+    text = re.sub(r"\s+", "", str(title or "")).strip()
+    if not text or _chapter_title_is_generic_template(text):
+        return False
+    if _SPECIFIC_PLANNER_TITLE_RE.search(text):
+        return True
+    query_text = re.sub(r"\s+", "", str(query or "")).strip()
+    if query_text:
+        topic_tokens = [
+            token
+            for token in re.split(r"[：:、，,；;（）()/\s]+", query_text)
+            if len(token) >= 2 and token not in {"中国", "研究", "行业报告", "分析"}
+        ]
+        if any(token and token in text for token in topic_tokens[:12]):
+            return True
+    return len(text) >= 12 and not re.search(r"^(市场|竞争|政策|技术|资本|风险|趋势)", text)
+
+
+def _planner_chapters_are_specific(chapters: List[Dict[str, Any]], *, query: str = "") -> bool:
+    if len(chapters) < 3:
+        return False
+    titles = [str(chapter.get("chapter_title") or chapter.get("title") or "").strip() for chapter in chapters]
+    if not any(titles):
+        return False
+    generic_count = sum(1 for title in titles if _chapter_title_is_generic_template(title))
+    specific_count = sum(1 for title in titles if _chapter_title_is_specific(title, query=query))
+    return specific_count >= max(2, len(titles) // 2) and generic_count < len(titles)
+
+
+def _hypothesis_ref_index(*values: Any) -> Optional[int]:
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        match = re.search(r"hypothesis[_-]?H?(\d+)", text, re.I)
+        if not match:
+            match = re.search(r"\bH(\d+)\b", text, re.I)
+        if not match:
+            match = re.search(r"^hypothesis[_-]?(\d+)$", text, re.I)
+        if match:
+            try:
+                index = int(match.group(1))
+            except (TypeError, ValueError):
+                continue
+            if index > 0:
+                return index
+    return None
+
+
+_CHAPTER_ALIGNMENT_TERMS = [
+    "采购",
+    "决策",
+    "实施",
+    "失败",
+    "风险",
+    "落地",
+    "路径",
+    "技术",
+    "产品",
+    "能力",
+    "需求",
+    "政策",
+    "成本",
+    "渠道",
+    "客户",
+    "订单",
+    "商业化",
+    "场景",
+    "供应链",
+    "认证",
+    "适航",
+    "海外仓",
+    "履约",
+    "利润",
+    "支付",
+    "医生",
+    "保险",
+    "就业",
+    "课程",
+]
+
+
+def _chapter_alignment_score(text: str, chapter: Dict[str, Any]) -> int:
+    source = re.sub(r"\s+", "", str(text or "")).lower()
+    target = re.sub(
+        r"\s+",
+        "",
+        " ".join(
+            str(chapter.get(key) or "")
+            for key in ("chapter_title", "core_question", "chapter_question")
+        ),
+    ).lower()
+    if not source or not target:
+        return 0
+    score = 0
+    for term in _CHAPTER_ALIGNMENT_TERMS:
+        normalized = term.lower()
+        if normalized in source and normalized in target:
+            score += 3 if len(term) >= 3 else 2
+    for token in re.findall(r"[A-Za-z][A-Za-z0-9+.-]{1,}", source):
+        if token.lower() in target:
+            score += 2
+    return score
+
+
+def _best_chapter_id_for_text(text: str, chapters: List[Dict[str, Any]]) -> str:
+    best_id = ""
+    best_score = 0
+    for chapter in chapters:
+        chapter_id = str(chapter.get("chapter_id") or "").strip()
+        if not chapter_id:
+            continue
+        score = _chapter_alignment_score(text, chapter)
+        if score > best_score:
+            best_score = score
+            best_id = chapter_id
+    return best_id if best_score >= 3 else ""
+
+
+def _remap_hypothesis_chapter_refs(
+    items: List[Dict[str, Any]],
+    chapters: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    chapter_ids = [str(chapter.get("chapter_id") or "").strip() for chapter in chapters]
+    chapter_by_id = {str(chapter.get("chapter_id") or "").strip(): chapter for chapter in chapters}
+    remapped: List[Dict[str, Any]] = []
+    for item in items:
+        current_chapter_id = str(item.get("chapter_id") or "").strip()
+        mapped_chapter_id = current_chapter_id
+        text_for_alignment = " ".join(
+            str(item.get(key) or "")
+            for key in (
+                "query",
+                "evidence_goal",
+                "question",
+                "targets_gap",
+                "dimension_name",
+                "chapter_title",
+                "hypothesis_statement",
+            )
+        )
+        semantic_chapter_id = _best_chapter_id_for_text(text_for_alignment, chapters)
+        index = _hypothesis_ref_index(
+            item.get("hypothesis_id"),
+            item.get("task_id"),
+            item.get("goal_id"),
+            item.get("evidence_goal_id"),
+            item.get("dimension_id"),
+            current_chapter_id,
+        )
+        if index and index > len(chapter_ids):
+            index = _hypothesis_ref_index(
+                item.get("hypothesis_id"),
+                item.get("task_id"),
+                item.get("goal_id"),
+                item.get("evidence_goal_id"),
+            )
+        if index and index > len(chapter_ids):
+            index = _hypothesis_ref_index(
+                item.get("dimension_id"),
+                current_chapter_id,
+            )
+        is_hypothesis_task = any(
+            _hypothesis_ref_index(item.get(key)) is not None
+            for key in ("hypothesis_id", "task_id", "goal_id", "evidence_goal_id")
+        )
+        if semantic_chapter_id and (current_chapter_id not in chapter_by_id or is_hypothesis_task):
+            mapped_chapter_id = semantic_chapter_id
+        elif current_chapter_id not in chapter_by_id and index and index <= len(chapter_ids):
+            mapped_chapter_id = chapter_ids[index - 1]
+        if not mapped_chapter_id:
+            remapped.append(dict(item))
+            continue
+        next_item = {**item, "chapter_id": mapped_chapter_id}
+        if mapped_chapter_id != current_chapter_id:
+            next_item.setdefault("source_hypothesis_chapter_id", current_chapter_id)
+            dimension_id = str(next_item.get("dimension_id") or "").strip()
+            if (
+                not dimension_id
+                or dimension_id == current_chapter_id
+                or dimension_id not in chapter_by_id
+                and _hypothesis_ref_index(dimension_id) is not None
+            ):
+                next_item["dimension_id"] = mapped_chapter_id
+            chapter = chapter_by_id.get(mapped_chapter_id) or {}
+            if chapter.get("chapter_title") and not next_item.get("chapter_title"):
+                next_item["chapter_title"] = chapter.get("chapter_title")
+            if chapter.get("core_question") and not next_item.get("chapter_question"):
+                next_item["chapter_question"] = chapter.get("core_question")
+        remapped.append(next_item)
+    return remapped
+
+
+def _remap_hypotheses_to_planner_chapters(
+    hypotheses: List[Dict[str, Any]],
+    chapters: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    chapter_ids = [str(chapter.get("chapter_id") or "").strip() for chapter in chapters]
+    chapter_by_id = {str(chapter.get("chapter_id") or "").strip(): chapter for chapter in chapters}
+    remapped: List[Dict[str, Any]] = []
+    for index, hypothesis in enumerate(hypotheses, start=1):
+        current_dimension_id = str(hypothesis.get("dimension_id") or "").strip()
+        text_for_alignment = " ".join(
+            str(hypothesis.get(key) or "")
+            for key in (
+                "statement",
+                "claim_to_test",
+                "hypothesis_statement",
+                "dimension_name",
+            )
+        )
+        text_for_alignment = " ".join(
+            [text_for_alignment]
+            + [str(item) for item in _as_list(hypothesis.get("must_prove"))]
+            + [str(item) for item in _as_list(hypothesis.get("must_disprove"))]
+        )
+        mapped_chapter_id = _best_chapter_id_for_text(text_for_alignment, chapters)
+        if not mapped_chapter_id and index <= len(chapter_ids):
+            mapped_chapter_id = chapter_ids[index - 1]
+        if not mapped_chapter_id:
+            remapped.append(dict(hypothesis))
+            continue
+        chapter = chapter_by_id.get(mapped_chapter_id) or {}
+        next_hypothesis = {
+            **hypothesis,
+            "dimension_id": mapped_chapter_id,
+            "dimension_name": str(chapter.get("chapter_title") or hypothesis.get("dimension_name") or "").strip(),
+        }
+        if current_dimension_id and current_dimension_id != mapped_chapter_id:
+            next_hypothesis.setdefault("source_hypothesis_dimension_id", current_dimension_id)
+        remapped.append(next_hypothesis)
+    return remapped
+
+
 ACADEMIC_ROLE_SPECS = [
     ("support", "支撑材料", ["official_data", "market_research"], "official_data"),
     ("metric", "指标口径", ["official_data", "market_research"], "market_data"),
@@ -767,6 +1026,167 @@ def _terms_for_role(hypothesis: Dict[str, Any], role: str) -> List[str]:
     if role == "source_check":
         return [str(item) for item in bundle.get("source_check") or [] if str(item).strip()][:5]
     return [str(item) for item in hypothesis.get("must_prove") or [] if str(item).strip()][:5]
+
+
+ROLE_SEARCH_HINTS = {
+    "support": ["行业研究", "案例", "趋势"],
+    "metric": ["指标", "数据", "统计", "收入", "成本"],
+    "case": ["案例", "项目", "客户", "落地"],
+    "counter": ["失败", "风险", "利用率不足", "盈利困难"],
+    "filing": ["公告", "年报", "政策文件", "标准"],
+    "source_check": ["原文", "来源", "口径", "交叉验证"],
+    "technology_product": ["技术路线", "产品方案", "标准", "专利"],
+    "expert": ["研报", "白皮书", "专家", "行业研究"],
+}
+
+
+def _search_query_for_role(
+    *,
+    query: str,
+    hypothesis: Dict[str, Any],
+    role: str,
+    terms: List[str],
+    max_chars: int = 96,
+) -> str:
+    topic_terms = _topic_anchor_terms(query)
+    role_hints = ROLE_SEARCH_HINTS.get(role, [])
+    must_disprove = [str(item) for item in hypothesis.get("must_disprove") or [] if str(item).strip()]
+    role_terms = terms
+    if role == "counter" and must_disprove:
+        role_terms = must_disprove[:3]
+    if not role_terms:
+        role_terms = [str(item) for item in hypothesis.get("must_prove") or [] if str(item).strip()][:3]
+    parts = _dedupe_terms([*topic_terms, *role_terms[:4], *role_hints[:3]], limit=8)
+    text = " ".join(parts).strip()
+    if len(text) > max_chars:
+        text = _compact(" ".join(parts[:6]), max_chars)
+    return text or _compact(query, max_chars)
+
+
+_LEAKY_SEARCH_QUERY_RE = re.compile(
+    r"official data|market research|market size price|official filing|customer certification|"
+    r"product docs|brokerage association|industry research expert|"
+    r"反证\s*风险\s*失败案例|客户不买账|替代方案|负面",
+    flags=re.I,
+)
+
+
+def _search_query_needs_compaction(query_text: str, *, query: str = "", hypothesis: Dict[str, Any] | None = None) -> bool:
+    text = str(query_text or "")
+    if _LEAKY_SEARCH_QUERY_RE.search(text):
+        return True
+    if len(text) > 72:
+        return True
+    subject = _research_subject(query)
+    if subject and text.count(subject) >= 2:
+        return True
+    if re.search(r"[:：]", text) and len(text) > 56:
+        return True
+    statement = str((hypothesis or {}).get("statement") or (hypothesis or {}).get("claim_to_test") or "").strip()
+    return bool(statement and statement in text)
+
+
+def _normalize_search_task_queries(
+    *,
+    query: str,
+    tasks: List[Dict[str, Any]],
+    hypotheses: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    hypothesis_by_id = {
+        str(item.get("hypothesis_id") or "").strip(): item
+        for item in hypotheses
+        if isinstance(item, dict) and str(item.get("hypothesis_id") or "").strip()
+    }
+    normalized: List[Dict[str, Any]] = []
+    for task in tasks:
+        next_task = dict(task)
+        hypothesis = hypothesis_by_id.get(str(next_task.get("hypothesis_id") or "").strip()) or {}
+        role = str(next_task.get("proof_role") or next_task.get("intent") or "support").strip() or "support"
+        terms = [str(item) for item in _as_list(next_task.get("must_have_terms")) if str(item).strip()]
+        if not terms:
+            terms = _terms_for_role(hypothesis, role)
+        if _search_query_needs_compaction(str(next_task.get("query") or ""), query=query, hypothesis=hypothesis):
+            next_task["query"] = _search_query_for_role(query=query, hypothesis=hypothesis, role=role, terms=terms)
+            next_task["query_compacted_from_hypothesis"] = True
+        normalized.append(next_task)
+    return normalized
+
+
+def _query_aspects(query: str) -> List[str]:
+    text = re.sub(r"\s+", "", str(query or "")).strip()
+    if not re.search(r"[:：]", text):
+        return []
+    _, tail = re.split(r"[:：]", text, 1)
+    tail = re.sub(r"(研究|报告|分析|深度|专题)$", "", tail).strip()
+    raw_parts = re.split(r"[、，,；;]|与|和|及", tail)
+    aspects: List[str] = []
+    for part in raw_parts:
+        item = re.sub(r"(研究|报告|分析|路径|变化)$", "", str(part or "").strip())
+        if len(item) < 3:
+            continue
+        if item not in aspects:
+            aspects.append(item)
+    return aspects[:5]
+
+
+def _chapter_title_for_query_aspect(aspect: str) -> str:
+    aspect = _compact(aspect, 24).strip(" ：:，,。")
+    if re.search(r"场景|需求|用户|客户|物流", aspect):
+        return f"{aspect}需求与运行约束"
+    if re.search(r"资产利用率|利用率|周转|效率", aspect):
+        return f"{aspect}关键影响因素与效率评估"
+    if re.search(r"盈利|商业模式|收益|成本|利润", aspect):
+        return f"{aspect}与成本收益分析"
+    if re.search(r"采购|决策链|选型", aspect):
+        return f"{aspect}与用户需求分析"
+    if re.search(r"实施|落地", aspect):
+        return f"{aspect}与关键成功因素"
+    if re.search(r"失败|风险|扰动|法案|监管|合规", aspect):
+        return f"{aspect}机制与影响路径"
+    if re.search(r"客户结构", aspect):
+        return f"{aspect}与可持续性"
+    if re.search(r"产能", aspect):
+        return f"{aspect}与订单恢复关联"
+    return f"{aspect}分析"
+
+
+def _query_aspect_chapters(query: str) -> List[Dict[str, Any]]:
+    aspects = _query_aspects(query)
+    if len(aspects) < 2:
+        return []
+    subject = _research_subject(query)
+    chapters: List[Dict[str, Any]] = []
+    if subject:
+        chapters.append(
+            {
+                "chapter_id": "ch_01",
+                "chapter_title": f"{_compact(subject, 28)}发展背景与研究边界",
+                "core_question": f"{subject}的基本边界、需求背景和研究口径是什么？",
+                "reason_to_include": "先界定研究对象，避免后续证据和结论跑偏。",
+            }
+        )
+    for aspect in aspects:
+        chapter_index = len(chapters) + 1
+        title = _chapter_title_for_query_aspect(aspect)
+        chapters.append(
+            {
+                "chapter_id": f"ch_{chapter_index:02d}",
+                "chapter_title": title,
+                "core_question": f"{title}如何影响行业判断？",
+                "reason_to_include": "来自用户题目中的明确研究角度。",
+            }
+        )
+    if not any(re.search(r"风险|失败|边界|约束", str(item.get("chapter_title") or "")) for item in chapters):
+        chapter_index = len(chapters) + 1
+        chapters.append(
+            {
+                "chapter_id": f"ch_{chapter_index:02d}",
+                "chapter_title": "典型案例、风险边界与策略建议",
+                "core_question": "哪些案例可以验证主线，哪些风险会改变结论？",
+                "reason_to_include": "补充案例验证和风险边界，避免只写正向判断。",
+            }
+        )
+    return chapters[:7]
 
 
 def _build_chapter_goal_task_packages(
@@ -825,7 +1245,7 @@ def _build_chapter_goal_task_packages(
                 "chapter_id": chapter_id,
                 "chapter_title": statement,
                 "chapter_question": statement,
-                "query": " ".join(part for part in [query, statement, label, *terms[:3]] if part),
+                "query": _search_query_for_role(query=query, hypothesis=hypothesis, role=role, terms=terms),
                 "evidence_goal": question,
                 "evidence_goal_id": goal_id,
                 "intent": evidence_type,
@@ -877,9 +1297,13 @@ def apply_problem_framing(plan: Dict[str, Any], framing: Dict[str, Any]) -> Dict
     if not hypotheses:
         return plan
     legacy_chapters = [dict(item) for item in plan.get("chapters") or [] if isinstance(item, dict)]
+    keep_planner_chapters = _planner_chapters_are_specific(
+        legacy_chapters,
+        query=str(plan.get("query") or framing.get("planning_query") or ""),
+    )
     existing_dropped = plan.get("dropped_template_sections")
     dropped_template_sections = list(existing_dropped) if isinstance(existing_dropped, list) else []
-    if legacy_chapters:
+    if legacy_chapters and not keep_planner_chapters:
         dropped_template_sections.append(
             {
                 "source": "legacy_planner_chapters",
@@ -903,8 +1327,67 @@ def apply_problem_framing(plan: Dict[str, Any], framing: Dict[str, Any]) -> Dict
         )
         hypothesis.setdefault("dimension_id", f"hypothesis_{hypothesis_id}")
         hypothesis.setdefault("dimension_name", statement or f"假设 {index}")
-    chapters, evidence_goals, search_tasks = _build_chapter_goal_task_packages(
+    framed_chapters, framed_evidence_goals, framed_search_tasks = _build_chapter_goal_task_packages(
         query=str(plan.get("query") or plan.get("core_question") or ""),
+        hypotheses=hypotheses,
+    )
+    query_for_framing = str(plan.get("query") or plan.get("core_question") or "")
+    aspect_chapters = [] if keep_planner_chapters else _query_aspect_chapters(query_for_framing)
+    if keep_planner_chapters:
+        chapters = legacy_chapters
+        hypotheses = _remap_hypotheses_to_planner_chapters(hypotheses, chapters)
+        dimensions = [
+            {
+                "dimension_id": str(hypothesis.get("dimension_id") or "").strip(),
+                "dimension_name": str(hypothesis.get("dimension_name") or hypothesis.get("statement") or "").strip(),
+                "purpose": str(hypothesis.get("statement") or hypothesis.get("claim_to_test") or "").strip(),
+                "must_have_terms": _as_list(hypothesis.get("must_prove")),
+                "forbidden_terms": [],
+                "hypothesis_id": str(hypothesis.get("hypothesis_id") or "").strip(),
+            }
+            for hypothesis in hypotheses
+            if str(hypothesis.get("dimension_id") or "").strip()
+        ]
+        evidence_goals = _remap_hypothesis_chapter_refs([
+            dict(item)
+            for item in plan.get("evidence_goals") or []
+            if isinstance(item, dict)
+        ] or framed_evidence_goals, chapters)
+        search_tasks = _remap_hypothesis_chapter_refs([
+            dict(item)
+            for item in plan.get("search_tasks") or []
+            if isinstance(item, dict)
+        ] or framed_search_tasks, chapters)
+        chapter_source = "llm_planner_with_problem_framing"
+        chapters_come_from_hypotheses = False
+    elif aspect_chapters:
+        chapters = aspect_chapters
+        hypotheses = _remap_hypotheses_to_planner_chapters(hypotheses, chapters)
+        dimensions = [
+            {
+                "dimension_id": str(hypothesis.get("dimension_id") or "").strip(),
+                "dimension_name": str(hypothesis.get("dimension_name") or hypothesis.get("statement") or "").strip(),
+                "purpose": str(hypothesis.get("statement") or hypothesis.get("claim_to_test") or "").strip(),
+                "must_have_terms": _as_list(hypothesis.get("must_prove")),
+                "forbidden_terms": [],
+                "hypothesis_id": str(hypothesis.get("hypothesis_id") or "").strip(),
+            }
+            for hypothesis in hypotheses
+            if str(hypothesis.get("dimension_id") or "").strip()
+        ]
+        evidence_goals = _remap_hypothesis_chapter_refs(framed_evidence_goals, chapters)
+        search_tasks = _remap_hypothesis_chapter_refs(framed_search_tasks, chapters)
+        chapter_source = "query_aspect_chapters"
+        chapters_come_from_hypotheses = False
+    else:
+        chapters = framed_chapters
+        evidence_goals = framed_evidence_goals
+        search_tasks = framed_search_tasks
+        chapter_source = "problem_framing_hypotheses"
+        chapters_come_from_hypotheses = True
+    search_tasks = _normalize_search_task_queries(
+        query=query_for_framing,
+        tasks=search_tasks,
         hypotheses=hypotheses,
     )
     source_requirements = {
@@ -916,7 +1399,8 @@ def apply_problem_framing(plan: Dict[str, Any], framing: Dict[str, Any]) -> Dict
     }
     quality_rules = {
         **_as_dict(plan.get("quality_rules")),
-        "chapters_come_from_hypotheses": True,
+        "chapters_come_from_hypotheses": chapters_come_from_hypotheses,
+        "chapter_source": chapter_source,
         "core_claim_requires_A_or_B": True,
         "c_level_is_directional_signal": True,
         "single_evidence_cannot_be_claim": True,
@@ -931,7 +1415,8 @@ def apply_problem_framing(plan: Dict[str, Any], framing: Dict[str, Any]) -> Dict
         "decision_context": framing.get("decision_context") or plan.get("decision_context"),
         "research_domain": framing.get("research_domain") or plan.get("research_domain"),
         "problem_framing": framing,
-        "legacy_planner_chapters": legacy_chapters,
+        "legacy_planner_chapters": [] if keep_planner_chapters else legacy_chapters,
+        "planner_chapters_preserved": bool(keep_planner_chapters),
         "legacy_planner_dimensions": plan.get("dimensions") or [],
         "legacy_planner_search_tasks": plan.get("search_tasks") or [],
         "hypotheses": hypotheses,

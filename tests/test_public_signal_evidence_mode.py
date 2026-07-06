@@ -4,7 +4,7 @@ from rag_pipeline.agents.final_writer_agent import _source_allowed_for_report
 from rag_pipeline.agents.readpage_fact_extractor_agent import validate_extracted_fact_payload
 from rag_pipeline.cache.evidence_cache import EvidenceCache
 from rag_pipeline.contracts.evidence_quality import apply_evidence_quality_contract, classify_evidence
-from rag_pipeline.contracts.quality_gate_policy import advisory_weight_mode, evidence_mode, public_signal_mode
+from rag_pipeline.contracts.quality_gate_policy import advisory_weight_mode, evidence_mode, main_chain_only_mode, public_signal_mode
 from rag_pipeline.flows.report.final_audit_agent import _normalize_audit_payload
 
 
@@ -14,6 +14,12 @@ def test_public_signal_mode_env_aliases(monkeypatch):
     assert evidence_mode() == "public_signal"
     assert public_signal_mode() is True
     assert advisory_weight_mode() is True
+
+
+def test_main_chain_only_mode_env_alias(monkeypatch):
+    monkeypatch.setenv("REPORT_MAIN_CHAIN_ONLY", "true")
+
+    assert main_chain_only_mode() is True
 
 
 def test_public_signal_mode_keeps_self_media_as_directional_signal(monkeypatch):

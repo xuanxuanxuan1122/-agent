@@ -1053,8 +1053,8 @@ def test_public_package_normalizer_does_not_inject_generic_actionable_advice():
     unit = normalized["argument_units"][0]
     result = validate_argument_units(normalized["argument_units"])
 
-    assert unit["reasoning"]
-    assert unit["counter_evidence"]
+    assert unit["reasoning"] == ""
+    assert unit["counter_evidence"] == ""
     assert unit["actionable"] == ""
     assert unit["actionable_is_fallback"] is True
     assert unit["evidence_refs"] == ["1"]

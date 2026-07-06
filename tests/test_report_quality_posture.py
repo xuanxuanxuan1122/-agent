@@ -1,4 +1,6 @@
+import importlib
 import os
+from pathlib import Path
 
 import pytest
 
@@ -51,10 +53,15 @@ WRITING_BUDGET_KEYS = [
     "REPORT_CHAPTER_NARRATIVE_MAX_CHAPTERS",
     "REPORT_TARGET_BODY_CHARS",
     "REPORT_TARGET_BODY_CHARS_BLOCKING",
+    "REPORT_ENABLE_PUBLIC_EVIDENCE_DIGEST",
     "REPORT_COMPOSER_TARGET_SECTION_CHARS",
     "REPORT_ENABLE_RENDERER_TEMPLATE_EXPANSION",
     "REPORT_RENDER_MIN_SECTION_CHARS",
     "REPORT_BLUEPRINT_SOURCE",
+    "REPORT_MAIN_EVIDENCE_SOURCE",
+    "BRAIN_ENABLE_LOCAL_RAG",
+    "REPORT_ENABLE_LOCAL_RAG",
+    "RAG_ANSWER_MODE",
 ]
 
 DEEPSEEK_QUALITY_MODEL_KEYS = [
@@ -148,12 +155,46 @@ def test_high_quality_posture_enables_quality_writing_with_public_digest_target(
     assert int(os.environ["REPORT_CHAPTER_NARRATIVE_MAX_CHAPTERS"]) >= 12
     assert int(os.environ["REPORT_TARGET_BODY_CHARS"]) >= 12000
     assert os.environ["REPORT_TARGET_BODY_CHARS_BLOCKING"] == "false"
-    assert os.environ["REPORT_ENABLE_PUBLIC_EVIDENCE_DIGEST"] == "true"
+    assert os.environ["REPORT_ENABLE_PUBLIC_EVIDENCE_DIGEST"] == "false"
     assert int(os.environ["REPORT_BODY_REWRITE_MIN_ACCEPT_CHARS"]) >= 260
     assert int(os.environ["REPORT_COMPOSER_TARGET_SECTION_CHARS"]) >= 800
     assert os.environ["REPORT_ENABLE_RENDERER_TEMPLATE_EXPANSION"] == "false"
     assert int(os.environ["REPORT_RENDER_MIN_SECTION_CHARS"]) >= 400
     assert os.environ["REPORT_BLUEPRINT_SOURCE"] == "claim_first"
+
+
+def test_high_quality_posture_keeps_report_mainline_iqs_web_only(monkeypatch):
+    _clear_posture_env(monkeypatch)
+    monkeypatch.delenv("REPORT_MAIN_EVIDENCE_SOURCE", raising=False)
+    monkeypatch.delenv("BRAIN_ENABLE_LOCAL_RAG", raising=False)
+    monkeypatch.delenv("REPORT_ENABLE_LOCAL_RAG", raising=False)
+    monkeypatch.delenv("RAG_ANSWER_MODE", raising=False)
+
+    posture = full_report.apply_report_quality_posture("high")
+
+    assert os.environ["REPORT_MAIN_EVIDENCE_SOURCE"] == "iqs_web"
+    assert os.environ["BRAIN_ENABLE_LOCAL_RAG"] == "false"
+    assert os.environ["REPORT_ENABLE_LOCAL_RAG"] == "false"
+    assert os.environ["RAG_ANSWER_MODE"] == "none"
+    assert posture["mainline"]["evidence_source"] == "iqs_web"
+    assert posture["mainline"]["local_rag_enabled"] is False
+    assert posture["mainline"]["rag_answer_mode"] == "none"
+
+
+def test_search_config_defaults_to_no_grounded_answer_when_env_absent(monkeypatch):
+    monkeypatch.delenv("RAG_ANSWER_MODE", raising=False)
+    from rag_pipeline.config import search_config
+
+    reloaded = importlib.reload(search_config)
+
+    assert reloaded.DEFAULT_ANSWER_MODE == "none"
+
+
+def test_pipeline_env_does_not_reenable_grounded_rag_answer_mode():
+    env_path = Path(__file__).resolve().parents[1] / ".env"
+    text = env_path.read_text(encoding="utf-8", errors="ignore")
+
+    assert "RAG_ANSWER_MODE=grounded" not in text
 
 
 def test_high_quality_posture_routes_quality_models_to_deepseek_and_web_search_to_qwen(monkeypatch):

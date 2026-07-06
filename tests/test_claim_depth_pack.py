@@ -99,7 +99,46 @@ def test_section_composer_uses_claim_depth_pack_for_rich_claim_body(monkeypatch)
     assert result["used_fact_refs"] == ["EV-depth-1"]
     assert "named customer workflow" in paragraph
     assert "repeatable daily use" in paragraph
-    assert "single public example" in paragraph
+    assert "single public example" not in paragraph
+    assert depth_pack["boundary"] not in paragraph
+
+
+def test_claim_depth_pack_prefers_interpretation_fields_over_bare_supporting_facts():
+    from rag_pipeline.agents.claim_deepener_agent import build_claim_depth_pack
+
+    unit = {
+        "claim_id": "CL-interpreted",
+        "claim": "AI工具正在推动会计岗位从基础核算转向数据解释和流程治理。",
+        "used_fact_refs": ["EV-1", "EV-2", "EV-3"],
+        "evidence_refs": ["EV-1", "EV-2", "EV-3"],
+        "supporting_facts": [
+            "代账场景中AI工具使单人服务户数提升10倍以上。",
+            "审计数字化调研显示83%的受访者已在审计中应用数字化技术。",
+        ],
+        "what_evidence_reflects": "多组证据共同显示，AI首先替代重复核算与基础审计操作。",
+        "why_it_matters": "这会把岗位价值从凭证处理推向数据解释、流程治理和风险判断。",
+        "mechanism_chain": [
+            "工具接管重复处理环节后，企业会把人力投入转向系统配置和结果解释。",
+            "当审计和代账环节都出现效率提升，教育端就需要调整课程训练重点。",
+        ],
+        "employment_implication": "就业机会会向复合型财务分析、AI审计和流程优化岗位集中。",
+        "education_implication": "培养体系需要把AI工具、数据治理和内控判断嵌入核心课程。",
+        "industry_implication": "会计服务机构的竞争焦点会从人力规模转向工具化交付能力。",
+        "counter_reading": "这些信号仍主要来自公开样本，不能直接推出所有基层岗位同步变化。",
+    }
+    evidence_by_ref = {
+        "EV-1": {"evidence_id": "EV-1", "distilled_fact": "代账场景中AI工具使单人服务户数提升10倍以上。", "source_id": "SRC-1"},
+        "EV-2": {"evidence_id": "EV-2", "distilled_fact": "审计数字化调研显示83%的受访者已在审计中应用数字化技术。", "source_id": "SRC-2"},
+        "EV-3": {"evidence_id": "EV-3", "distilled_fact": "高校会计专业开始增加AI审计与数据分析课程。", "source_id": "SRC-3"},
+    }
+
+    pack = build_claim_depth_pack(unit, evidence_by_ref=evidence_by_ref)
+
+    assert pack["evidence_chain"] == unit["what_evidence_reflects"]
+    assert unit["why_it_matters"] in pack["mechanism"]
+    assert unit["employment_implication"] in pack["implication"]
+    assert unit["education_implication"] in pack["implication"]
+    assert "公开材料提到" not in pack["evidence_chain"]
 
 
 def test_section_composer_expands_depth_pack_to_target_when_enabled(monkeypatch):
@@ -151,6 +190,69 @@ def test_section_composer_expands_depth_pack_to_target_when_enabled(monkeypatch)
     assert "live pilots and procurement activity" in paragraph
     assert "repeatable workflows" in paragraph
     assert "业务安排" in paragraph or "资源投入" in paragraph or "稳定交付" in paragraph
+
+
+def test_section_composer_keeps_review_boundary_out_of_public_depth_pack(monkeypatch):
+    monkeypatch.setenv("REPORT_BLUEPRINT_SOURCE", "claim_first")
+    monkeypatch.setenv("REPORT_COMPOSER_EXPAND_TO_TARGET", "true")
+    monkeypatch.setenv("REPORT_COMPOSER_TARGET_SECTION_CHARS", "520")
+    boundary = (
+        "\u4ec5\u53cd\u6620\u804c\u4e1a\u6559\u80b2\u4f53\u7cfb\u5185\u7684\u89c4\u5212\u52a8\u5411\uff0c"
+        "\u672a\u8986\u76d6\u672c\u79d1\u53ca\u4ee5\u4e0a\u5b66\u672f\u578b\u4f1a\u8ba1\u6559\u80b2\u7684\u540c\u6b65\u8c03\u6574\u8282\u594f\u3002"
+    )
+    depth_pack = {
+        "schema_version": "claim_depth_pack_v1",
+        "claim_id": "CL-accounting-depth",
+        "judgement": "\u4f1a\u8ba1\u6559\u80b2\u57f9\u517b\u6b63\u5728\u5411\u667a\u80fd\u8d22\u52a1\u548c\u6570\u636e\u5206\u6790\u80fd\u529b\u8f6c\u5411\u3002",
+        "evidence_chain": "\u653f\u7b56\u548c\u8c03\u7814\u6750\u6599\u5171\u540c\u6307\u5411\u8bfe\u7a0b\u4f53\u7cfb\u3001\u5c97\u4f4d\u6280\u80fd\u548c\u98ce\u63a7\u8981\u6c42\u7684\u540c\u6b65\u8c03\u6574\u3002",
+        "mechanism": "\u8fd9\u79cd\u8c03\u6574\u4f1a\u628a\u57fa\u7840\u6838\u7b97\u8bad\u7ec3\u63a8\u5411\u6570\u636e\u6cbb\u7406\u3001\u4e1a\u52a1\u7406\u89e3\u548c\u98ce\u9669\u590d\u6838\u3002",
+        "implication": "\u5b66\u6821\u548c\u4f01\u4e1a\u9700\u8981\u628aAI\u5de5\u5177\u3001\u4e1a\u52a1\u573a\u666f\u548c\u5185\u63a7\u5224\u65ad\u653e\u5230\u540c\u4e00\u6761\u80fd\u529b\u94fe\u4e0a\u3002",
+        "boundary": boundary,
+        "used_fact_refs": ["EV-accounting-1"],
+    }
+    result = compose_section_paragraph(
+        fact_cards=[
+            EvidenceFactCard.from_legacy_dict(
+                {
+                    "evidence_id": "EV-accounting-1",
+                    "chapter_id": "ch_accounting",
+                    "source_id": "SRC-accounting-1",
+                    "source_level": "C",
+                    "public_fact_card": {
+                        "subject": "\u4f1a\u8ba1\u6559\u80b2",
+                        "variable": "\u57f9\u517b\u65b9\u6848\u66f4\u65b0",
+                        "distilled_fact": "\u804c\u4e1a\u6559\u80b2\u6539\u9769\u548c\u884c\u4e1a\u8c03\u7814\u6307\u5411\u4f1a\u8ba1\u4e13\u4e1a\u57f9\u517b\u65b9\u6848\u5411\u5927\u6570\u636e\u4e0e\u5408\u89c4\u98ce\u63a7\u65b9\u5411\u8fed\u4ee3\u3002",
+                        "fact_type": "case",
+                    },
+                }
+            )
+        ],
+        claim_unit=ClaimUnit.from_legacy_dict(
+            {
+                "claim_id": "CL-accounting-depth",
+                "claim": depth_pack["judgement"],
+                "used_fact_refs": ["EV-accounting-1"],
+                "claim_depth_pack": depth_pack,
+                "claim_strength": "directional",
+            }
+        ),
+        block_type="case_comparison",
+        chapter_question="\u4f1a\u8ba1\u5b66\u4e13\u4e1a\u5728AI\u65f6\u4ee3\u5982\u4f55\u8c03\u6574\u57f9\u517b\u4f53\u7cfb\uff1f",
+    )
+
+    paragraph = result["paragraph"]
+    assert boundary not in paragraph
+    for forbidden in (
+        "\u4ec5\u53cd\u6620",
+        "\u672a\u8986\u76d6",
+        "\u5355\u70b9\u4fe1\u53f7",
+        "\u5355\u70b9\u62ab\u9732",
+        "\u4e0d\u8db3\u4ee5\u4ee3\u8868\u6574\u4f53\u53d8\u5316",
+        "\u4e0d\u80fd\u76f4\u63a5\u63a8\u51fa\u5168\u884c\u4e1a",
+        "\u7ed3\u8bba\u4ecd\u9700\u4fdd\u6301\u5ba1\u614e",
+    ):
+        assert forbidden not in paragraph
+    assert "\u5206\u5c42\u5dee\u5f02" in paragraph or "\u80fd\u529b\u94fe" in paragraph
 
 
 def test_section_composer_long_expansion_uses_public_narrative_not_template_scaffold(monkeypatch):
@@ -395,7 +497,7 @@ def test_section_composer_uses_narrative_supporting_claims_without_plan_leak(mon
 
     paragraph = result["paragraph"]
     assert "Operations coordination is a second scenario signal" in paragraph
-    assert "场景描述" in paragraph or "个别披露" in paragraph
+    assert "具体动作" in paragraph or "实践训练" in paragraph or "repeatable enterprise workflows" in paragraph
     for token in ("internal planning only", "paragraph_plan_id", "narrative_writing_goal", "writer_advice"):
         assert token not in paragraph
 
@@ -659,7 +761,7 @@ def test_claim_deepener_does_not_thicken_not_allowed_claims():
     assert build_claim_depth_pack(unit, evidence_by_ref=evidence_by_ref) == {}
 
 
-def test_claim_builder_omits_not_allowed_until_repaired_claims():
+def test_claim_builder_keeps_review_blocked_claims_as_cautious_directional_content():
     from rag_pipeline.agents.claim_builder_agent import run_claim_builder_agent
 
     units = run_claim_builder_agent(
@@ -689,9 +791,12 @@ def test_claim_builder_omits_not_allowed_until_repaired_claims():
     )
 
     assert units
-    assert units[0]["public_render"] is False
-    assert units[0]["omit_from_report"] is True
-    assert units[0]["omit_reason"] == "claim_review_not_allowed_until_repaired"
+    assert units[0]["public_render"] is True
+    assert units[0]["omit_from_report"] is False
+    assert units[0]["claim_status"] == "directional"
+    assert units[0]["writing_permission"] == "cautious_with_boundary"
+    assert units[0]["rewrite_required"] is True
+    assert units[0]["claim_review_suggestions"][0]["must_not_render"] is True
 
 
 def test_claim_builder_does_not_inherit_unrelated_package_facts_for_structured_claims():
@@ -948,6 +1053,57 @@ def test_section_composer_long_expansion_does_not_emit_writing_process_language(
         "\u62a5\u544a\u4e3b\u7ebf",
         "\u8bdd\u9898\u70ed\u5ea6",
         "\u80cc\u666f\u7ebf\u7d22",
+        "\u8fd9\u8bf4\u660e\u4e0a\u8ff0\u53d8\u5316",
+        "\u628a\u8fd9\u4e9b\u52a8\u4f5c\u8fde\u8d77\u6765\u770b",
+        "\u653e\u5230",
+        "\u8d44\u6e90\u6295\u5411\u548c\u80fd\u529b\u8981\u6c42",
+        "\u5355\u70b9\u62ab\u9732",
     ):
         assert forbidden not in paragraph
     assert "\u80fd\u529b\u6a21\u5757" in paragraph
+
+
+def test_section_composer_repairs_missing_punctuation_between_fact_and_boundary(monkeypatch):
+    monkeypatch.setenv("REPORT_BLUEPRINT_SOURCE", "claim_first")
+    depth_pack = {
+        "schema_version": "claim_depth_pack_v1",
+        "claim_id": "CL-punctuation",
+        "judgement": "政策文件为会计专业数字化改造提供制度基础。",
+        "evidence_chain": "政策文件的落地降低了教育改革的试错成本 政策为宏观指导性文件，具体细则仍需等待地方配套。",
+        "mechanism": "政策信号会影响高校课程设置和资源配置。",
+        "used_fact_refs": ["EV-punctuation-1"],
+    }
+
+    result = compose_section_paragraph(
+        fact_cards=[
+            EvidenceFactCard.from_legacy_dict(
+                {
+                    "evidence_id": "EV-punctuation-1",
+                    "chapter_id": "ch_policy",
+                    "source_id": "SRC-punctuation-1",
+                    "source_level": "B",
+                    "public_fact_card": {
+                        "subject": "政策文件",
+                        "distilled_fact": "教育部等部门部署人工智能与教育融合应用。",
+                        "fact_type": "policy",
+                        "variable": "政策影响",
+                    },
+                }
+            )
+        ],
+        claim_unit=ClaimUnit.from_legacy_dict(
+            {
+                "claim_id": "CL-punctuation",
+                "claim": "政策文件为会计专业数字化改造提供制度基础。",
+                "used_fact_refs": ["EV-punctuation-1"],
+                "claim_depth_pack": depth_pack,
+                "claim_strength": "directional",
+            }
+        ),
+        block_type="integrated_signal",
+        chapter_question="会计教育培养如何调整？",
+    )
+
+    paragraph = result["paragraph"]
+    assert "试错成本 政策为" not in paragraph
+    assert "试错成本。政策为" in paragraph

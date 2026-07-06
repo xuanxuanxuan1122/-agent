@@ -186,6 +186,43 @@ def test_industry_ecosystem_report_routes_to_industry_deep_report():
     assert profile["name"] == "industry_deep_report"
 
 
+def test_industrial_software_replacement_report_is_not_policy_impact():
+    query = "中国工业软件MES/APS/PLM国产替代：离散制造落地路径、采购决策链与实施失败风险研究"
+    profile = select_report_profile(query, {"report_family": "policy_impact_report"})
+
+    assert profile["name"] == "industry_deep_report"
+
+
+def test_business_model_industry_report_with_policy_words_stays_industry_deep():
+    query = "县域新能源商用车充换电网络：重卡物流场景、资产利用率与运营商盈利模型研究"
+    profile = select_report_profile(query, {"report_family": "policy_impact_report"})
+
+    assert profile["name"] == "industry_deep_report"
+
+
+def test_cxo_order_recovery_report_with_act_disruption_stays_industry_deep():
+    query = "医药CXO出海订单恢复：美国生物安全法案扰动、产能利用率与客户结构变化研究"
+    profile = select_report_profile(query, {"report_family": "policy_impact_report"})
+
+    assert profile["name"] == "industry_deep_report"
+
+
+def test_legacy_decision_profiles_are_isolated_from_default_report_mainline(monkeypatch):
+    monkeypatch.delenv("REPORT_ENABLE_LEGACY_REPORT_PROFILES", raising=False)
+
+    assert select_report_profile("AI industry briefing", {"report_family": "briefing_note"})["name"] == "industry_deep_report"
+    assert select_report_profile("Company due diligence report", {"report_family": "company_due_diligence_report"})["name"] == "industry_deep_report"
+    assert select_report_profile("Robotics investment memo", {"report_family": "investment_memo"})["name"] == "industry_deep_report"
+
+
+def test_legacy_decision_profiles_can_be_enabled_for_old_product_lines(monkeypatch):
+    monkeypatch.setenv("REPORT_ENABLE_LEGACY_REPORT_PROFILES", "true")
+
+    assert select_report_profile("AI industry briefing", {"report_family": "briefing_note"})["name"] == "briefing_note"
+    assert select_report_profile("Company due diligence report", {"report_family": "company_due_diligence_report"})["name"] == "company_due_diligence_report"
+    assert select_report_profile("Robotics investment memo", {"report_family": "investment_memo"})["name"] == "investment_memo"
+
+
 def test_build_llm_config_from_profile_handles_model_pool_names(monkeypatch):
     profiles = {
         "qwen": "qwen3.6-plus",

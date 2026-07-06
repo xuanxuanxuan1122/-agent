@@ -7,7 +7,7 @@ from collections import Counter
 from urllib.parse import urlparse
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
-from rag_pipeline.contracts.quality_gate_policy import public_signal_mode
+from rag_pipeline.contracts.quality_gate_policy import main_chain_only_mode, public_signal_mode
 from rag_pipeline.contracts.source_registry import renumber_sources_by_first_citation as _contract_renumber_sources_by_first_citation
 from .citation_manifest import (
     attach_manifest_citations,
@@ -22,6 +22,7 @@ from .public_narrative_bridge import build_public_bridge_pack
 from .markdown_renderer import (
     _key_data_bullet_from_table_row,
     collect_format_warnings,
+    dedupe_public_markdown_paragraphs,
     normalize_markdown_spacing,
     render_appendix,
     render_chapter_package,
@@ -1632,6 +1633,14 @@ _CORE_OBSERVATION_BRIDGE_RE = re.compile(
     r"\u5c1a\u5f85\u8fdb\u4e00\u6b65\u9a8c\u8bc1|"
     r"\u4ecd\u9700\u7ed3\u5408\u540e\u7eed|"
     r"\u9700\u7ed3\u5408\u540e\u7eed|"
+    r"\u540e\u7eed\u5224\u65ad\u7684\u5173\u952e\u6761\u4ef6|"
+    r"\u8fd9\u4e9b\u4e8b\u5b9e\u5171\u540c\u6307\u5411|"
+    r"\u66f4\u5177\u4f53\u7684\u5224\u65ad|"
+    r"\u5224\u65ad\u4e0d\u80fd\u505c\u5728|"
+    r"\u5355\u4e2a\u4e8b\u4ef6\u672c\u8eab|"
+    r"\u6301\u7eed\u6539\u53d8\u8bfe\u7a0b\u3001\u5de5\u5177\u3001\u5c97\u4f4d\u548c\u4e1a\u52a1\u6d41\u7a0b|"
+    r"\u5224\u65ad\u4e0d\u80fd\u505c\u5728\u6295\u5165\u89c4\u6a21\u672c\u8eab|"
+    r"\u5224\u65ad\u4e0d\u80fd\u505c\u5728\u98ce\u9669\u63d0\u793a\u672c\u8eab|"
     r"\u7f3a\u4e4f\u5177\u4f53[^。；\n]{0,80}\u91cf\u5316\u6307\u6807|"
     r"\u7ed3\u8bba\u7684\u7cbe\u786e\u5ea6\u4ecd\u9700"
     r")"
@@ -1775,17 +1784,21 @@ def _ensure_public_core_observation_block(markdown: str) -> str:
     body, appendix = _split_rendered_source_appendix(source)
     if not body.strip():
         return source
+    if not re.search(r"[\u4e00-\u9fff]", body):
+        return source
     candidates: List[str] = []
     seen: List[str] = []
     for line in body.splitlines():
         stripped = line.strip()
-        if not stripped or stripped.startswith("#") or stripped.startswith("|"):
+        if not stripped or stripped.startswith("#") or stripped.startswith("|") or stripped.startswith("-"):
             continue
         candidate = _compact_cited_summary_line(stripped)
         if not candidate:
             continue
         candidate = _trim_core_observation_caveat(candidate)
         if not candidate:
+            continue
+        if not re.search(r"[\u4e00-\u9fff]", candidate):
             continue
         if _looks_like_core_observation_bridge_line(candidate):
             continue
@@ -1809,6 +1822,7 @@ def _ensure_public_core_observation_block(markdown: str) -> str:
         insert_at += 1
     block = ["", "## \u6838\u5fc3\u89c2\u5bdf", *[f"- {item}" for item in selected], ""]
     updated_body = "\n".join([*lines[:insert_at], *block, *lines[insert_at:]]).strip()
+    updated_body = dedupe_public_markdown_paragraphs(updated_body)
     return "\n\n".join(part for part in [updated_body, appendix] if str(part or "").strip())
 
 
@@ -3022,7 +3036,7 @@ def _claim_evidence_context_text(item: Dict[str, Any]) -> str:
     cleaned = [re.sub(r"[\s。.!?！？；;,，]+$", "", fact).strip() for fact in facts if str(fact or "").strip()]
     if not cleaned:
         return ""
-    return _public_text("公开材料提到，" + "；".join(cleaned) + "。")
+    return _public_text("已引用证据显示，" + "；".join(cleaned) + "。")
 
 
 def _claim_public_interpretation_text(item: Dict[str, Any]) -> str:
@@ -3098,11 +3112,13 @@ def _claim_backfill_section(item: Dict[str, Any], index: int) -> Dict[str, Any]:
         or item.get("next_step")
     )
     section_id_slug = re.sub(r"[^A-Za-z0-9_\-]+", "_", claim_id).strip("_") or f"claim_{index}"
-    render_blocks = [
-        {"type": "paragraph", "text": text}
-        for text in _dedupe_strings([claim_text, evidence_context, reasoning, interpretation, boundary, actionable], limit=6)
-        if text
-    ]
+    paragraph_parts = _dedupe_strings(
+        [claim_text, evidence_context, reasoning, interpretation, actionable],
+        limit=5,
+    )
+    render_blocks = []
+    if paragraph_parts:
+        render_blocks.append({"type": "paragraph", "text": _public_text(" ".join(paragraph_parts))})
     return {
         "section_id": f"analysis_observation_{section_id_slug}",
         "section_title": "补充观察",
@@ -3116,7 +3132,8 @@ def _claim_backfill_section(item: Dict[str, Any], index: int) -> Dict[str, Any]:
         "evidence_context": evidence_context,
         "interpretation": interpretation,
         "reasoning": reasoning,
-        "counter_evidence": boundary,
+        "counter_evidence": "",
+        "diagnostic_boundary": boundary,
         "actionable": actionable,
         "used_fact_refs": refs,
         "evidence_refs": refs,
@@ -3190,6 +3207,11 @@ def _backfill_unrendered_analysis_claim_sections(
 def should_render_chapter(chapter: Dict[str, Any]) -> bool:
     if chapter.get("omit_from_report"):
         return False
+    title = str(chapter.get("chapter_title") or chapter.get("title") or "").strip()
+    writing_mode = str(chapter.get("writing_mode") or chapter.get("chapter_type") or "").strip().lower()
+    if not _env_flag("REPORT_RENDER_LIMITATIONS_CHAPTER", False):
+        if writing_mode == "limitations" or title in {"限制与待验证问题", "限制与待验证", "待验证问题"}:
+            return False
 
     lead = _public_text(chapter.get("lead"))
 
@@ -3405,12 +3427,13 @@ def run_final_writer_agent(
     analysis_claim_units: Optional[Sequence[Dict[str, Any]]] = None,
     analysis_stage_diagnostics: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    main_chain_only = main_chain_only_mode()
     report_blueprint = _as_dict(report_blueprint)
     chapter_packages = [item for item in list(chapter_packages or []) if isinstance(item, dict)]
     public_chapters = [_public_chapter(chapter) for chapter in chapter_packages if should_render_chapter(chapter)]
     public_chapters = _strip_inline_citations_from_public_chapters(public_chapters, require_explicit_refs=True)
     table_packages = _all_table_packages(public_chapters, [item for item in list(table_packages or []) if isinstance(item, dict)])
-    table_packages = [
+    table_packages = [] if main_chain_only else [
         table
         for table in table_packages
         if isinstance(table, dict) and _table_passed_for_public(table)
@@ -3467,11 +3490,20 @@ def run_final_writer_agent(
             report_blueprint.get("planning_query"),
         )
     )
-    public_chapters, source_claim_support = _apply_source_claim_support_gate(
-        public_chapters,
-        source_registry,
-        topic_context=topic_context,
-    )
+    if main_chain_only:
+        source_claim_support = {
+            "enabled": False,
+            "status": "skipped",
+            "skipped_reason": "main_chain_only",
+            "source_gate_mode": "disabled",
+            "removed_section_count": 0,
+        }
+    else:
+        public_chapters, source_claim_support = _apply_source_claim_support_gate(
+            public_chapters,
+            source_registry,
+            topic_context=topic_context,
+        )
     citation_manifest = build_citation_manifest(
         chapters=public_chapters,
         claim_units=manifest_claim_units,
@@ -3520,10 +3552,18 @@ def run_final_writer_agent(
         }
     public_chapters = attach_manifest_citations(public_chapters, citation_manifest)
     public_chapters = _strip_inline_citations_from_public_chapters(public_chapters)
-    public_chapters, manifest_section_support = _drop_factual_sections_without_manifest_citations(
-        public_chapters,
-        unresolved_ref_reasons=_as_list(citation_manifest.get("filtered_unresolved_ref_reasons")),
-    )
+    if main_chain_only:
+        manifest_section_support = {
+            "enabled": False,
+            "status": "skipped",
+            "skipped_reason": "main_chain_only",
+            "removed_section_count": 0,
+        }
+    else:
+        public_chapters, manifest_section_support = _drop_factual_sections_without_manifest_citations(
+            public_chapters,
+            unresolved_ref_reasons=_as_list(citation_manifest.get("filtered_unresolved_ref_reasons")),
+        )
     source_claim_support = _merge_source_claim_support_diagnostics(source_claim_support, manifest_section_support)
     before_chapter_count = len(public_chapters)
     public_chapters = [chapter for chapter in public_chapters if _chapter_has_public_body(chapter)]
@@ -3625,7 +3665,9 @@ def run_final_writer_agent(
         citation_manifest,
         citation_reconciliation_registry,
     )
-    body_markdown = _ensure_public_core_observation_block(body_markdown)
+    if not main_chain_only:
+        body_markdown = dedupe_public_markdown_paragraphs(body_markdown)
+        body_markdown = _ensure_public_core_observation_block(body_markdown)
     parts = [body_markdown]
     citation_appendix_required = bool(CITATION_RE.search(body_markdown))
     if (appendix_requested and source_appendix_enabled) or citation_appendix_required:
@@ -3639,24 +3681,30 @@ def run_final_writer_agent(
             parts.append(rendered)
             back_section_titles.append(GLOBAL_BLOCK_TITLES.get("appendix", "appendix"))
     markdown = "\n\n".join(part for part in parts if str(part or "").strip())
-    markdown = strip_internal_layout_language(markdown)
-    markdown = strip_body_qa_leaks(markdown)
-    markdown, residual_headline_dropped_count = _drop_residual_headline_lines(markdown)
-    markdown, metric_sentence_rewritten_count = _rewrite_bare_metric_lines(markdown)
+    if main_chain_only:
+        residual_headline_dropped_count = 0
+        metric_sentence_rewritten_count = 0
+    else:
+        markdown = strip_internal_layout_language(markdown)
+        markdown = strip_body_qa_leaks(markdown)
+        markdown, residual_headline_dropped_count = _drop_residual_headline_lines(markdown)
+        markdown, metric_sentence_rewritten_count = _rewrite_bare_metric_lines(markdown)
     markdown = normalize_markdown_spacing(markdown)
     naturalness_before = public_text_artifact_counts(markdown)
     public_narrative_before = public_narrative_leak_audit(markdown)
-    markdown = sanitize_public_markdown(markdown, mode="enforce")
+    if not main_chain_only:
+        markdown = sanitize_public_markdown(markdown, mode="enforce")
     public_narrative_after_sanitize = public_narrative_leak_audit(markdown)
     markdown = _renumber_public_chapter_headings(markdown)
     markdown = normalize_markdown_spacing(markdown)
     preliminary_final_citation_audit = dict(final_citation_audit)
-    markdown, source_registry, final_citation_audit = _rewrite_final_markdown_with_reconciled_appendix(
-        markdown,
-        citation_manifest=citation_manifest,
-        source_registry=source_registry,
-        appendix_package=appendix_package,
-    )
+    if not main_chain_only:
+        markdown, source_registry, final_citation_audit = _rewrite_final_markdown_with_reconciled_appendix(
+            markdown,
+            citation_manifest=citation_manifest,
+            source_registry=source_registry,
+            appendix_package=appendix_package,
+        )
     if preliminary_final_citation_audit:
         earlier_removed = _as_list(preliminary_final_citation_audit.get("final_unresolved_citation_refs"))
         if earlier_removed:
@@ -3667,15 +3715,23 @@ def run_final_writer_agent(
             final_citation_audit["final_unresolved_citation_removed_count"] = len(
                 final_citation_audit["final_unresolved_citation_refs"]
             )
-    markdown, final_public_narrative_gate = apply_public_narrative_gate(markdown)
+    if main_chain_only:
+        final_public_narrative_gate = {
+            "enabled": False,
+            "status": "skipped",
+            "skipped_reason": "main_chain_only",
+        }
+    else:
+        markdown, final_public_narrative_gate = apply_public_narrative_gate(markdown)
     markdown = normalize_markdown_spacing(markdown)
     audit_before_final_gate = dict(final_citation_audit)
-    markdown, source_registry, final_citation_audit = _rewrite_final_markdown_with_reconciled_appendix(
-        markdown,
-        citation_manifest=citation_manifest,
-        source_registry=source_registry,
-        appendix_package=appendix_package,
-    )
+    if not main_chain_only:
+        markdown, source_registry, final_citation_audit = _rewrite_final_markdown_with_reconciled_appendix(
+            markdown,
+            citation_manifest=citation_manifest,
+            source_registry=source_registry,
+            appendix_package=appendix_package,
+        )
     if audit_before_final_gate:
         earlier_removed = _as_list(audit_before_final_gate.get("final_unresolved_citation_refs"))
         if earlier_removed:
@@ -3686,7 +3742,8 @@ def run_final_writer_agent(
             final_citation_audit["final_unresolved_citation_removed_count"] = len(
                 final_citation_audit["final_unresolved_citation_refs"]
             )
-    markdown = _ensure_public_core_observation_block(markdown)
+    if not main_chain_only:
+        markdown = _ensure_public_core_observation_block(markdown)
     markdown = normalize_markdown_spacing(markdown)
     public_narrative_after = public_narrative_leak_audit(markdown)
     public_narrative_gate = {

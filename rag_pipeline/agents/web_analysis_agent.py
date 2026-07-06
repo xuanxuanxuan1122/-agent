@@ -1593,7 +1593,7 @@ def build_llm_query_plan(
 1. 如果提供 search_task，只围绕该 task 改写，不扩展到无关维度。
 2. 如果 research_type 是 urban_population，不得加入市场规模、CAGR、市占率、融资、IPO、估值。
 3. 如果 research_type 是 policy_research，优先找政策原文、解读、实施细则、影响主体，不要找市场规模。
-4. 如果 research_type 是 company_due_diligence，优先找官网、公告、工商、财报、诉讼、融资。
+4. 如果 research_type 是 company_subject_research，优先找官网、公告、产品资料、客户案例、公开访谈、行业媒体和经营动态；不要默认加入尽调、融资、IPO、估值等投资语境。
 5. 查询词必须包含 must_have_terms 中至少一个核心词。
 6. 查询词不得包含 forbidden_terms。
 7. 每条查询只服务一个 evidence_goal。
@@ -2369,6 +2369,7 @@ def task_acceptance_filter(item: Dict[str, Any], options: Optional[Dict[str, Any
     goal_hit = _task_field_hit(text, [task.get("evidence_goal"), task.get("query")])
     dimension_hit = _task_field_hit(text, [task.get("dimension_name"), task.get("dimension_id")])
     has_number = bool(re.search(r"\d|%|cagr|yoy|qoq", text, re.I))
+    credibility = float(item.get("credibility_score", 0.0) or 0.0)
 
     score = 0.0
     if must_terms:
@@ -2384,7 +2385,7 @@ def task_acceptance_filter(item: Dict[str, Any], options: Optional[Dict[str, Any
         score += 0.10
     if has_number:
         score += 0.10
-    if float(item.get("credibility_score", 0.0) or 0.0) >= 0.65:
+    if credibility >= 0.65:
         score += 0.05
     score = min(1.0, score)
 
@@ -2397,6 +2398,16 @@ def task_acceptance_filter(item: Dict[str, Any], options: Optional[Dict[str, Any
             "matched_terms": matched_must,
         }
     if missing_topic_groups:
+        if has_number and (source_hit or credibility >= 0.65):
+            return {
+                "accepted": True,
+                "relevance_score": round(max(score, 0.34), 4),
+                "role_hint": "metric_context_fact",
+                "reason": "topic_anchor_missing_context_fact",
+                "matched_terms": matched_must,
+                "missing_topic_groups": missing_topic_groups,
+                "context_only": True,
+            }
         return {
             "accepted": False,
             "relevance_score": round(min(score, 0.2), 4),

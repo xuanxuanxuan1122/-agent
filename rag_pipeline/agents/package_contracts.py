@@ -561,7 +561,14 @@ def validate_argument_units(argument_units: Sequence[Dict[str, Any]]) -> Dict[st
         elif any(re.search(pattern, claim) for pattern in BAD_CLAIM_PATTERNS):
             _issue(issues, package="argument_units", issue_type="weak_claim_pattern", message="claim contains internal evidence-status wording.", path=path)
         if not reasoning:
-            _issue(issues, package="argument_units", issue_type="missing_reasoning", message="reasoning is required.", path=path)
+            _issue(
+                issues,
+                package="argument_units",
+                issue_type="missing_reasoning",
+                message="reasoning should be supplied by the analysis or writer agent, not filled with a template.",
+                path=path,
+                severity="warning",
+            )
         elif any(re.search(pattern, reasoning) for pattern in BAD_CLAIM_PATTERNS):
             _issue(issues, package="argument_units", issue_type="weak_reasoning_pattern", message="reasoning contains fallback/internal wording.", path=path)
         elif not any(word in reasoning for word in CAUSE_WORDS):

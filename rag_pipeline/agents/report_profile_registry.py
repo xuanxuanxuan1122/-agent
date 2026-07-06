@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import os
 import re
 from typing import Any, Dict, Iterable, List
 
 
 DEFAULT_PROFILE = "industry_deep_report"
 GENERIC_PROFILE_HINTS = {"dynamic_research_report", "dynamic_research", "topic_report", "industry_scan_report", "industry_deep_report"}
+LEGACY_DECISION_PROFILES = {"company_due_diligence_report", "investment_memo", "briefing_note"}
 
 
 REPORT_PROFILES: Dict[str, Dict[str, Any]] = {
@@ -236,6 +238,16 @@ def _text_blob(*values: Any) -> str:
     return " ".join(parts)
 
 
+def _legacy_report_profiles_enabled() -> bool:
+    return str(os.getenv("REPORT_ENABLE_LEGACY_REPORT_PROFILES") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _mainline_profile(name: str) -> str:
+    if name in LEGACY_DECISION_PROFILES and not _legacy_report_profiles_enabled():
+        return DEFAULT_PROFILE
+    return name
+
+
 def profile_names() -> List[str]:
     return list(REPORT_PROFILES.keys())
 
@@ -261,11 +273,33 @@ def select_report_profile(query: str, research_plan: Dict[str, Any] | None = Non
     ).strip()
     query_text = str(query or "")
     explicit_policy = bool(re.search(r"政策|监管|法规|补贴|出口管制|制裁|关税|合规|policy|regulation|compliance", query_text, flags=re.I))
-    explicit_industry = bool(re.search(r"行业|产业|市场|生态|发展报告|行业报告|研究报告|行研|市场规模|竞争格局|industry|market|ecosystem", query_text, flags=re.I))
+    explicit_industry_operations = bool(
+        re.search(
+            r"盈利模型|商业模式|资产利用率|产能利用率|订单恢复|客户结构|采购决策|实施路径|实施失败|"
+            r"运营商|重卡|充换电|物流场景|落地路径|出海订单|订单|产能|利用率|"
+            r"business model|utilization|order recovery|customer mix|procurement",
+            query_text,
+            flags=re.I,
+        )
+    )
+    explicit_industry = bool(
+        re.search(
+            r"行业|产业|市场|生态|发展报告|行业报告|研究报告|行研|市场规模|竞争格局|"
+            r"国产替代|供应链|产业链|商业化|落地路径|采购决策|实施失败|离散制造|厂商|"
+            r"盈利模型|商业模式|资产利用率|产能利用率|订单恢复|客户结构|运营商|重卡|充换电|物流场景|"
+            r"MES|APS|PLM|CXO|industry|market|ecosystem",
+            query_text,
+            flags=re.I,
+        )
+    )
     explicit_profile = get_report_profile(explicit)
     if explicit and explicit_profile.get("name") != DEFAULT_PROFILE:
-        if not (explicit_profile.get("name") == "policy_impact_report" and explicit_industry and not explicit_policy):
-            return explicit_profile
+        if not (
+            explicit_profile.get("name") == "policy_impact_report"
+            and explicit_industry
+            and (not explicit_policy or explicit_industry_operations)
+        ):
+            return dict(REPORT_PROFILES[_mainline_profile(str(explicit_profile.get("name") or DEFAULT_PROFILE))])
 
     blob = _text_blob(
         query,
@@ -277,8 +311,25 @@ def select_report_profile(query: str, research_plan: Dict[str, Any] | None = Non
         [item.get("question") for item in _as_list(plan.get("evidence_goals")) if isinstance(item, dict)],
     )
     explicit_policy = explicit_policy or bool(re.search(r"政策|监管|法规|补贴|出口管制|制裁|关税|合规", query_text))
-    explicit_industry = explicit_industry or bool(re.search(r"行业|产业|市场|生态|发展报告|行业报告|研究报告|行研|市场规模|竞争格局", query_text))
-    if explicit_industry and not explicit_policy:
+    explicit_industry_operations = explicit_industry_operations or bool(
+        re.search(
+            r"盈利模型|商业模式|资产利用率|产能利用率|订单恢复|客户结构|采购决策|实施路径|实施失败|"
+            r"运营商|重卡|充换电|物流场景|落地路径|出海订单|订单|产能|利用率",
+            query_text,
+            flags=re.I,
+        )
+    )
+    explicit_industry = explicit_industry or bool(
+        re.search(
+            r"行业|产业|市场|生态|发展报告|行业报告|研究报告|行研|市场规模|竞争格局|"
+            r"国产替代|供应链|产业链|商业化|落地路径|采购决策|实施失败|离散制造|厂商|"
+            r"盈利模型|商业模式|资产利用率|产能利用率|订单恢复|客户结构|运营商|重卡|充换电|物流场景|"
+            r"MES|APS|PLM|CXO",
+            query_text,
+            flags=re.I,
+        )
+    )
+    if explicit_industry and (not explicit_policy or explicit_industry_operations):
         return dict(REPORT_PROFILES["industry_deep_report"])
     if (
         re.search(r"AI|人工智能|大模型|生成式AI|AIGC", query_text, flags=re.I)
@@ -298,7 +349,7 @@ def select_report_profile(query: str, research_plan: Dict[str, Any] | None = Non
     ]
     for profile_name, pattern in priority_rules:
         if re.search(pattern, blob, flags=re.I):
-            return dict(REPORT_PROFILES[profile_name])
+            return dict(REPORT_PROFILES[_mainline_profile(profile_name)])
     scores: Dict[str, int] = {}
     for name, profile in REPORT_PROFILES.items():
         score = 0
@@ -311,6 +362,9 @@ def select_report_profile(query: str, research_plan: Dict[str, Any] | None = Non
         if explicit and explicit not in GENERIC_PROFILE_HINTS and (name in explicit or explicit in _as_list(profile.get("aliases"))):
             score += 8
         scores[name] = score
+    if not _legacy_report_profiles_enabled():
+        for legacy_name in LEGACY_DECISION_PROFILES:
+            scores[legacy_name] = -1
     selected = max(scores, key=lambda key: scores[key])
     if scores[selected] <= 0:
         selected = DEFAULT_PROFILE

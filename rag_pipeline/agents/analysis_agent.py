@@ -35,6 +35,7 @@ try:
     from rag_pipeline.contracts.quality_gate_policy import advisory_weight_mode, quality_gate_mode, quality_gates_isolated
     from rag_pipeline.contracts.ref_normalizer import normalize_claim_refs
     from rag_pipeline.search.memory import call_openai_compatible_json, llm_config_is_ready, normalize_llm_config
+    from .evidence_interpreter_agent import build_evidence_interpretation_units
     from .evidence_merger import get_dynamic_dimensions
     from .summary_quality import sanitize_summary_judgments
 except Exception:  # pragma: no cover - script mode fallback
@@ -119,6 +120,10 @@ except Exception:  # pragma: no cover - script mode fallback
         call_openai_compatible_json = None  # type: ignore
         llm_config_is_ready = None  # type: ignore
         normalize_llm_config = None  # type: ignore
+    try:
+        from evidence_interpreter_agent import build_evidence_interpretation_units  # type: ignore
+    except Exception:  # pragma: no cover
+        build_evidence_interpretation_units = None  # type: ignore
     from evidence_merger import get_dynamic_dimensions  # type: ignore
     from summary_quality import sanitize_summary_judgments  # type: ignore
 
@@ -1064,6 +1069,18 @@ def _ensure_sentence(text: Any) -> str:
 
 
 def _claim_from_public_fact(dimension: Any, fact: Any, strength: str = "") -> str:
+    topic = _compact(dimension, 100)
+    if not topic or _is_canonical_chapter_key(_normalize_key(topic)):
+        topic = "本章主题"
+    fact_text = _compact(fact, 120)
+    strength_key = str(strength or "").strip().lower()
+    if strength_key in {"strong", "moderate"}:
+        return f"{topic}正在从概念讨论转向可验证的岗位、课程和工具应用变化。"
+    if strength_key == "directional":
+        return f"{topic}已经出现可用于判断趋势方向的具体材料，适合写成审慎的行业变化判断。"
+    if fact_text:
+        return f"{topic}可以从“{fact_text}”这一类材料切入，观察岗位能力和培养方式的变化。"
+    return f"{topic}可以从岗位能力、课程调整和工具应用三个层面展开分析。"
     topic = _compact(dimension, 100)
     if not topic or _is_canonical_chapter_key(_normalize_key(topic)):
         topic = "本章主题"
@@ -2597,6 +2614,12 @@ def _analysis_conversion_diagnostics(
         input_evidence_card_count = _input_evidence_card_count_for_diagnostics(structured_analysis, evidence_package)
     claim_units = [item for item in _as_list(_as_dict(structured_analysis).get("claim_units")) if isinstance(item, dict)]
     bound_claim_count = 0
+    fact_refs_per_claim: List[int] = []
+    single_fact_claim_count = 0
+    mechanism_ready_count = 0
+    implication_ready_count = 0
+    shallow_claim_reasoning_count = 0
+    interpretation_ids: set[str] = set()
     for unit in claim_units:
         fact_refs = _as_list(
             unit.get("fact_ids")
@@ -2606,8 +2629,40 @@ def _analysis_conversion_diagnostics(
             or unit.get("supporting_evidence_refs")
         )
         source_refs = _as_list(unit.get("source_ids") or unit.get("source_refs"))
+        fact_refs_per_claim.append(len(fact_refs))
+        if len(fact_refs) == 1 or bool(unit.get("single_fact_claim")):
+            single_fact_claim_count += 1
+        if _as_list(unit.get("mechanism_chain")):
+            mechanism_ready_count += 1
+        if (
+            str(unit.get("employment_implication") or "").strip()
+            or str(unit.get("education_implication") or "").strip()
+            or str(unit.get("industry_implication") or "").strip()
+            or str(unit.get("decision_implication") or "").strip()
+        ):
+            implication_ready_count += 1
+        for interpretation_id in _as_list(unit.get("interpretation_ids")):
+            if str(interpretation_id or "").strip():
+                interpretation_ids.add(str(interpretation_id or "").strip())
+        if (
+            str(unit.get("mechanism") or "").strip()
+            and str(unit.get("reasoning") or "").strip()
+            and _normalize_key(unit.get("mechanism")) == _normalize_key(unit.get("reasoning"))
+            and not _as_list(unit.get("mechanism_chain"))
+        ):
+            shallow_claim_reasoning_count += 1
         if fact_refs or source_refs:
             bound_claim_count += 1
+    explicit_interpretation_units = [
+        item
+        for item in _as_list(_as_dict(structured_analysis).get("interpretation_units"))
+        if isinstance(item, dict)
+    ]
+    for chapter in _as_list(_as_dict(structured_analysis).get("chapter_synthesis")):
+        for item in _as_list(_as_dict(chapter).get("interpretation_units")):
+            if isinstance(item, dict):
+                explicit_interpretation_units.append(item)
+    interpretation_unit_count = len(explicit_interpretation_units) or len(interpretation_ids)
     denominator = max(1, int(input_evidence_card_count or analysis_ready_fact_count or 0))
     claim_conversion_rate = round(len(claim_units) / denominator, 4)
     bound_claim_rate = round(bound_claim_count / max(1, len(claim_units)), 4)
@@ -2637,8 +2692,325 @@ def _analysis_conversion_diagnostics(
         "bound_claim_count": bound_claim_count,
         "claim_conversion_rate": claim_conversion_rate,
         "bound_claim_rate": bound_claim_rate,
+        "interpretation_unit_count": interpretation_unit_count,
+        "fact_group_coverage_rate": round(
+            sum(fact_refs_per_claim) / max(1, denominator),
+            4,
+        ),
+        "avg_facts_per_claim": round(sum(fact_refs_per_claim) / max(1, len(claim_units)), 3),
+        "single_fact_claim_rate": round(single_fact_claim_count / max(1, len(claim_units)), 4),
+        "claims_with_mechanism_chain_rate": round(mechanism_ready_count / max(1, len(claim_units)), 4),
+        "claims_with_implication_rate": round(implication_ready_count / max(1, len(claim_units)), 4),
+        "raw_supporting_fact_rendered_count": 0,
+        "shallow_claim_reasoning_count": shallow_claim_reasoning_count,
         "reanalyze_existing_recommended": reanalyze_existing_recommended,
         "analysis_review_suggestions": suggestions,
+    }
+
+
+def _claim_fact_ref_set(unit: Dict[str, Any]) -> set[str]:
+    refs: set[str] = set()
+    for key in (
+        "fact_ids",
+        "used_evidence_ids",
+        "used_fact_refs",
+        "evidence_refs",
+        "supporting_evidence_refs",
+        "supporting_evidence",
+    ):
+        for value in _as_list(unit.get(key)):
+            text = str(value or "").strip()
+            if text:
+                refs.add(text)
+    return refs
+
+
+def _interpretation_fact_ref_set(unit: Dict[str, Any]) -> set[str]:
+    return {
+        str(value or "").strip()
+        for value in _as_list(unit.get("fact_ids"))
+        if str(value or "").strip()
+    }
+
+
+_FALLBACK_CHAPTER_EVIDENCE_KEYS = (
+    "core_evidence",
+    "supporting_evidence",
+    "metric_evidence",
+    "case_evidence",
+    "counter_evidence",
+    "directional_evidence",
+    "sample_evidence",
+)
+
+
+def _fallback_interpretation_cards_from_chapter_packages(evidence_package: Dict[str, Any]) -> List[Dict[str, Any]]:
+    cards: List[Dict[str, Any]] = []
+    seen_refs: set[str] = set()
+    for package in _as_list(evidence_package.get("chapter_evidence_packages")):
+        if not isinstance(package, dict):
+            continue
+        chapter_id = str(package.get("chapter_id") or package.get("id") or "").strip()
+        chapter_title = str(package.get("chapter_title") or package.get("title") or chapter_id).strip()
+        for key in _FALLBACK_CHAPTER_EVIDENCE_KEYS:
+            role = key.replace("_evidence", "")
+            topic_fit = "direct" if key in {"core_evidence", "metric_evidence", "case_evidence"} else "related"
+            if key == "counter_evidence":
+                topic_fit = "background"
+                role = "counter"
+            for raw in _as_list(package.get(key)):
+                if not isinstance(raw, dict):
+                    continue
+                evidence_id = str(raw.get("evidence_id") or raw.get("fact_id") or raw.get("ref") or raw.get("id") or "").strip()
+                if not evidence_id or evidence_id in seen_refs:
+                    continue
+                fact = _compact(
+                    raw.get("distilled_fact")
+                    or raw.get("clean_fact")
+                    or raw.get("fact")
+                    or raw.get("summary")
+                    or raw.get("content"),
+                    420,
+                )
+                if not fact:
+                    continue
+                source = _source_payload(raw)
+                source_id = str(
+                    raw.get("source_id")
+                    or raw.get("source_ref")
+                    or raw.get("citation_ref")
+                    or source.get("source_id")
+                    or source.get("document_id")
+                    or source.get("url")
+                    or ""
+                ).strip()
+                cards.append(
+                    {
+                        **raw,
+                        "evidence_id": evidence_id,
+                        "chapter_id": str(raw.get("chapter_id") or chapter_id).strip() or "fallback",
+                        "chapter_title": chapter_title,
+                        "requirement_id": str(raw.get("requirement_id") or _lineage_requirement_id(raw) or "").strip(),
+                        "source_id": source_id,
+                        "source_title": _compact(source.get("title") or source.get("source") or source.get("name"), 160),
+                        "source_url": str(source.get("url") or raw.get("source_url") or "").strip(),
+                        "distilled_fact": fact,
+                        "fact": fact,
+                        "proof_role": str(raw.get("proof_role") or raw.get("analysis_role") or role).strip().lower(),
+                        "topic_fit": str(raw.get("topic_fit") or topic_fit).strip(),
+                        "allowed_use": str(raw.get("allowed_use") or raw.get("analysis_role") or "supporting_context").strip(),
+                    }
+                )
+                seen_refs.add(evidence_id)
+    return cards
+
+
+def _fallback_interpretation_units(evidence_package: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if build_evidence_interpretation_units is None:
+        return []
+    max_chapters = _env_int("BRAIN_FALLBACK_ANALYSIS_INTERPRETATION_MAX_CHAPTERS", 8, min_value=1, max_value=16)
+    max_per_chapter = _env_int("BRAIN_FALLBACK_ANALYSIS_INTERPRETATION_MAX_FACTS_PER_CHAPTER", 36, min_value=3, max_value=120)
+    max_units = _env_int("BRAIN_FALLBACK_ANALYSIS_MAX_INTERPRETATION_UNITS", 8, min_value=1, max_value=24)
+    cards = _fallback_interpretation_cards_from_chapter_packages(evidence_package)
+    try:
+        supplemental_cards = _evidence_cards_for_llm(
+            evidence_package,
+            max_chapters=max_chapters,
+            max_per_chapter=max_per_chapter,
+        )
+    except Exception:
+        supplemental_cards = []
+    seen_card_refs = {
+        str(card.get("evidence_id") or "").strip()
+        for card in cards
+        if isinstance(card, dict) and str(card.get("evidence_id") or "").strip()
+    }
+    for card in supplemental_cards:
+        if not isinstance(card, dict):
+            continue
+        ref = str(card.get("evidence_id") or "").strip()
+        if ref and ref not in seen_card_refs:
+            cards.append(card)
+            seen_card_refs.add(ref)
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for card in cards:
+        if not isinstance(card, dict):
+            continue
+        chapter_id = str(card.get("chapter_id") or "").strip() or "fallback"
+        if not str(card.get("evidence_id") or "").strip() or not str(card.get("fact") or card.get("distilled_fact") or "").strip():
+            continue
+        grouped.setdefault(chapter_id, []).append(card)
+    if not grouped:
+        return []
+    diagnostics = _as_dict(evidence_package.get("chapter_evidence_diagnostics"))
+    units: List[Dict[str, Any]] = []
+    for chapter_id, fact_cards in list(grouped.items())[:max_chapters]:
+        chapter_payload = _as_dict(diagnostics.get(chapter_id))
+        chapter_question = str(
+            chapter_payload.get("chapter_question")
+            or chapter_payload.get("chapter_title")
+            or chapter_payload.get("title")
+            or chapter_id
+        ).strip()
+        try:
+            payload = build_evidence_interpretation_units(
+                chapter_id=chapter_id,
+                chapter_question=chapter_question,
+                fact_cards=fact_cards,
+                max_units=max_units,
+            )
+        except Exception:
+            payload = {}
+        for unit in _as_list(_as_dict(payload).get("interpretation_units")):
+            if isinstance(unit, dict) and str(unit.get("interpretation_id") or "").strip():
+                units.append(unit)
+    return units
+
+
+def _best_interpretations_for_claim(
+    unit: Dict[str, Any],
+    interpretation_units: List[Dict[str, Any]],
+    *,
+    limit: int = 3,
+) -> List[Dict[str, Any]]:
+    refs = _claim_fact_ref_set(unit)
+    chapter_id = str(unit.get("chapter_id") or unit.get("hypothesis_id") or unit.get("dimension_id") or "").strip()
+    scored: List[tuple[int, int, Dict[str, Any]]] = []
+    for interpretation in interpretation_units:
+        fact_refs = _interpretation_fact_ref_set(interpretation)
+        overlap = len(refs & fact_refs) if refs and fact_refs else 0
+        same_chapter = int(
+            bool(chapter_id)
+            and str(interpretation.get("chapter_id") or "").strip()
+            and str(interpretation.get("chapter_id") or "").strip() == chapter_id
+        )
+        if overlap or same_chapter:
+            scored.append((overlap, same_chapter, interpretation))
+    if not scored and interpretation_units:
+        scored.append((0, 0, interpretation_units[0]))
+    scored.sort(key=lambda item: (item[0], item[1], len(_interpretation_fact_ref_set(item[2]))), reverse=True)
+    return [item[2] for item in scored[:limit]]
+
+
+def _first_nonempty(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _enrich_fallback_claims_with_interpretations(
+    result: Dict[str, Any],
+    evidence_package: Dict[str, Any],
+) -> Dict[str, Any]:
+    interpretation_units = _fallback_interpretation_units(evidence_package)
+    if not interpretation_units:
+        return result
+    enriched_claims: List[Dict[str, Any]] = []
+    for raw_unit in _as_list(result.get("claim_units")):
+        if not isinstance(raw_unit, dict):
+            continue
+        unit = {**raw_unit}
+        matched_units = _best_interpretations_for_claim(unit, interpretation_units)
+        if not matched_units:
+            enriched_claims.append(unit)
+            continue
+        interpretation_ids = _dedupe(
+            _as_list(unit.get("interpretation_ids"))
+            + [
+                str(item.get("interpretation_id") or "").strip()
+                for item in matched_units
+                if str(item.get("interpretation_id") or "").strip()
+            ]
+        )
+        fact_ids = _dedupe(
+            _as_list(unit.get("fact_ids") or unit.get("evidence_refs") or unit.get("supporting_evidence"))
+            + [
+                fact_id
+                for item in matched_units
+                for fact_id in _as_list(item.get("fact_ids"))
+            ]
+        )
+        source_ids = _dedupe(
+            _as_list(unit.get("source_ids") or unit.get("source_refs"))
+            + [
+                source_id
+                for item in matched_units
+                for source_id in _as_list(item.get("source_ids"))
+            ]
+        )
+        primary = matched_units[0]
+        mechanism_chain = _dedupe(
+            [
+                step
+                for item in matched_units
+                for step in _as_list(item.get("mechanism_chain"))
+            ]
+        )[:5]
+        why_it_matters = _first_nonempty(
+            unit.get("why_it_matters"),
+            primary.get("why_it_matters"),
+            primary.get("what_evidence_reflects"),
+        )
+        what_reflects = _first_nonempty(unit.get("what_evidence_reflects"), primary.get("what_evidence_reflects"))
+        mechanism_text = "；".join(mechanism_chain)
+        old_reasoning = str(unit.get("reasoning") or "").strip()
+        old_mechanism = str(unit.get("mechanism") or "").strip()
+        shallow_reasoning = bool(
+            old_reasoning
+            and old_mechanism
+            and _normalize_key(old_reasoning) == _normalize_key(old_mechanism)
+        )
+        unit.update(
+            {
+                "interpretation_ids": interpretation_ids,
+                "fact_ids": fact_ids,
+                "source_ids": source_ids,
+                "what_evidence_reflects": what_reflects,
+                "why_it_matters": why_it_matters,
+                "mechanism_chain": mechanism_chain,
+                "employment_implication": _first_nonempty(
+                    unit.get("employment_implication"),
+                    primary.get("employment_implication"),
+                ),
+                "education_implication": _first_nonempty(
+                    unit.get("education_implication"),
+                    primary.get("education_implication"),
+                ),
+                "industry_implication": _first_nonempty(
+                    unit.get("industry_implication"),
+                    primary.get("industry_implication"),
+                ),
+                "counter_reading": _first_nonempty(unit.get("counter_reading"), primary.get("counter_reading")),
+                "single_fact_claim": bool(len(fact_ids) == 1 or unit.get("single_fact_claim")),
+                "claim_depth_ready": bool(interpretation_ids and mechanism_chain),
+            }
+        )
+        if mechanism_text:
+            unit["mechanism"] = mechanism_text
+        if shallow_reasoning or not old_reasoning:
+            unit["reasoning"] = _first_nonempty(why_it_matters, what_reflects, mechanism_text, old_reasoning)
+        if not str(unit.get("decision_implication") or "").strip():
+            unit["decision_implication"] = _first_nonempty(
+                unit.get("employment_implication"),
+                unit.get("education_implication"),
+                unit.get("industry_implication"),
+            )
+        enriched_claims.append(unit)
+    if not enriched_claims:
+        return result
+    return {
+        **result,
+        "claim_units": enriched_claims,
+        "interpretation_units": interpretation_units,
+        "evidence_interpretation_diagnostics": {
+            "fallback_interpretation_enabled": True,
+            "interpretation_unit_count": len(interpretation_units),
+            "claim_with_interpretation_count": len(
+                [unit for unit in enriched_claims if _as_list(unit.get("interpretation_ids"))]
+            ),
+        },
     }
 
 
@@ -2781,7 +3153,14 @@ def _evidence_cards_for_llm(
         for requirement in requirements
         if str(requirement.get("requirement_id") or "").strip()
     }
-    source_items = _as_list(evidence_package.get("analysis_ready_evidence")) + _as_list(evidence_package.get("clean_evidence_list"))
+    candidate_items = (
+        _as_list(evidence_package.get("claim_support_facts"))
+        + _as_list(evidence_package.get("analysis_candidate_facts"))
+        + _as_list(evidence_package.get("public_citation_facts"))
+    )
+    source_items = candidate_items if candidate_items else (
+        _as_list(evidence_package.get("analysis_ready_evidence")) + _as_list(evidence_package.get("clean_evidence_list"))
+    )
     ranked_items = sorted(
         [item for item in source_items if isinstance(item, dict) and _is_public_quality_card(item)],
         key=lambda item: (
@@ -3623,12 +4002,25 @@ def build_llm_analysis_input_v2(evidence_package: Dict[str, Any], fallback: Dict
         if not fact_cards:
             continue
         metadata = _chapter_payload_metadata(chapter_id, diagnostics, fallback)
+        interpretation_payload: Dict[str, Any] = {}
+        if build_evidence_interpretation_units is not None:
+            try:
+                interpretation_payload = build_evidence_interpretation_units(
+                    chapter_id=chapter_id,
+                    chapter_question=str(metadata.get("chapter_title") or metadata.get("chapter_question") or ""),
+                    fact_cards=fact_cards,
+                    max_units=_env_int("BRAIN_LLM_ANALYSIS_MAX_INTERPRETATION_UNITS", 6, min_value=1, max_value=12),
+                )
+            except Exception:
+                interpretation_payload = {}
         chapters.append(
             {
                 **metadata,
                 "evidence_requirements": requirements_by_chapter.get(chapter_id, []),
                 "evidence_inventory": _inventory_items_for_chapter(evidence_package, chapter_id, fact_cards),
                 "analysis_shard": _analysis_shard_for_chapter(evidence_package, chapter_id, fact_cards),
+                "interpretation_units": _as_list(_as_dict(interpretation_payload).get("interpretation_units")),
+                "interpretation_diagnostics": _as_dict(_as_dict(interpretation_payload).get("diagnostics")),
                 "allowed_evidence_ids": [item["evidence_id"] for item in fact_cards],
                 "fact_cards": fact_cards,
             }
@@ -3764,6 +4156,8 @@ def _llm_chapter_system_prompt() -> str:
 
 分析步骤：
 - 先在内部盘点 fact_cards 中的市场、政策、玩家、订单、价格、案例、技术、产业链和风险信号。
+- 如果输入包含 interpretation_units，必须优先从 interpretation_units 生成 claim；fact_cards 只作为引用核验和补充材料，不要把单条 fact 直接改写成正文判断。
+- 每个 claim 应体现“证据组合反映什么、为什么重要、传导机制、就业/教育/行业含义、边界”，不要停留在单条证据复述。
 - 合并指向同一事实的重复证据，保留最清楚、最可追溯的表达。
 - C/D 级、媒体、专业信息网或平台线索只要可追溯且不是脏数据，也可以转成有边界的 directional / limited_evidence 判断。
 - evidence_grooming.possible_claim_angles 只能作为内部分析方向，不能原样写入 claim。
@@ -3788,6 +4182,13 @@ def _llm_chapter_system_prompt() -> str:
 - source_support_map：说明 claim、mechanism、boundary 分别由哪些 evidence_id 支撑。
 - paragraph_seed：给后续正文写作的一段中文素材，必须是行研语气，不能是审查口吻。
 - block_affinity：metric_reconciliation、case_comparison、technology_maturity、risk_trigger 或 integrated_signal。
+- interpretation_ids：如果 claim 来自 interpretation_units，填写对应 interpretation_id。
+- what_evidence_reflects：说明多条证据共同反映的变化。
+- why_it_matters：说明该变化为什么重要。
+- mechanism_chain：用 2-4 句拆开说明传导链条，不要和 reasoning_chain 完全相同。
+- employment_implication / education_implication / industry_implication：分别写岗位、培养体系、行业结构含义；至少填写一个。
+- counter_reading：写可能的反向解释或边界，但不要写“后续需观察、证据不足、建议补证”等内部说明。
+- claim_depth_ready：当以上深度字段足以支持正文展开时填 true。
 
 数量与强度规则：
 - 证据有足够不同信号时，尽量产出 4-6 个 claim_units；证据只支持更少判断时可以少于 4 个。
@@ -3799,6 +4200,7 @@ def _llm_chapter_system_prompt() -> str:
 - claim_strength 绝不能超过 claim_strength_ceiling。
 - 如果无法从 fact_cards 推导 requirement_ids，不要因此拒绝该判断；可以让 requirement_ids 为空，但 used_evidence_ids 必须完整。
 - 缺少硬指标（市场规模、增速、渗透率）不是不产 claim 的理由；可基于定性信号产出 directional / limited_evidence 判断，并把适用边界放入 limitation_boundary。
+- 如果 evidence 很多但只能产出极少 claim，在 analysis_limits 中加入 suggested_action="reanalyze_existing"，不要把大量证据压成一个浅判断。
 - 只有本章确实没有任何相关证据时，才返回空 claim_units 并在 analysis_limits 说明。
 - 可以做角色多样化，但不得为填角色而编造：有风险、失败、限制或相反信号时才写 counter；有明确业务含义时才写 decision_use。
 
@@ -3838,7 +4240,7 @@ def synthesize_chapter_with_llm_analysis(
         "chapter": chapter_payload,
     }
     normalized_config = normalize_llm_config(config) if normalize_llm_config is not None else {}
-    prompt_version = "llm_analysis_v4_2026_06_curated_inventory"
+    prompt_version = "llm_analysis_v5_2026_07_evidence_interpretation_units"
     shard_cache = _load_analysis_shard_output_cache(
         evidence_package=evidence_package,
         chapter_payload=chapter_payload,
@@ -5028,6 +5430,8 @@ def validate_llm_analysis_output(
             refs = [ref for ref in refs if not valid_refs or ref in valid_refs]
             unit["supporting_evidence_refs"] = refs
             unit["evidence_refs"] = refs
+            unit["fact_ids"] = refs
+            unit["used_evidence_ids"] = refs
             claim_text = _compact(unit.get("claim"), 360)
             if not claim_text or _has_internal_analysis_language(claim_text) or _is_generic_llm_claim(claim_text):
                 issue = {"type": "llm_claim_unit_dropped_internal_or_generic", "chapter_id": chapter.get("chapter_id")}
@@ -5048,6 +5452,31 @@ def validate_llm_analysis_output(
                 limitation_boundary = [unit.get("limitation_boundary")]
             if not limitation_boundary and str(unit.get("counter_boundary") or unit.get("counter_evidence") or "").strip():
                 limitation_boundary = [unit.get("counter_boundary") or unit.get("counter_evidence")]
+            interpretation_ids = _dedupe(
+                [
+                    str(item or "").strip()
+                    for item in _as_list(unit.get("interpretation_ids"))
+                    if str(item or "").strip()
+                ]
+            )
+            if not interpretation_ids and str(unit.get("interpretation_id") or "").strip():
+                interpretation_ids = [str(unit.get("interpretation_id") or "").strip()]
+            mechanism_chain_detail = _as_list(unit.get("mechanism_chain"))
+            if not mechanism_chain_detail and str(unit.get("mechanism_chain") or "").strip():
+                mechanism_chain_detail = [unit.get("mechanism_chain")]
+            mechanism_chain_detail = [
+                _public_normalize_analysis_text(_compact(item, 420))
+                for item in mechanism_chain_detail
+                if str(item or "").strip()
+            ]
+            depth_text_fields = {
+                "what_evidence_reflects": _public_normalize_analysis_text(_compact(unit.get("what_evidence_reflects"), 420)),
+                "why_it_matters": _public_normalize_analysis_text(_compact(unit.get("why_it_matters"), 420)),
+                "employment_implication": _public_normalize_analysis_text(_compact(unit.get("employment_implication"), 420)),
+                "education_implication": _public_normalize_analysis_text(_compact(unit.get("education_implication"), 420)),
+                "industry_implication": _public_normalize_analysis_text(_compact(unit.get("industry_implication"), 420)),
+                "counter_reading": _public_normalize_analysis_text(_compact(unit.get("counter_reading"), 420)),
+            }
             evidence_basis = [
                 _public_normalize_analysis_text(_compact(item, 360))
                 for item in evidence_basis
@@ -5075,11 +5504,49 @@ def validate_llm_analysis_output(
                 if len(rejected_examples) < 5:
                     rejected_examples.append({**issue, "claim": claim_text})
                 continue
+            raw_mechanism_text = _public_normalize_analysis_text(_compact(unit.get("mechanism"), 500))
+            reasoning_text = "\n".join(reasoning_chain)
+            if raw_mechanism_text and _normalize_key(raw_mechanism_text) == _normalize_key(reasoning_text):
+                issues.append(
+                    {
+                        "type": "shallow_claim_reasoning",
+                        "chapter_id": chapter.get("chapter_id"),
+                        "claim_id": unit.get("claim_id") or unit.get("id"),
+                    }
+                )
             unit["claim"] = claim_text
             unit["evidence_basis"] = evidence_basis
+            unit["because_facts"] = evidence_basis
             unit["reasoning_chain"] = reasoning_chain
+            unit["mechanism_chain"] = mechanism_chain_detail
+            unit["interpretation_ids"] = interpretation_ids
+            for depth_key, depth_value in depth_text_fields.items():
+                unit[depth_key] = depth_value
+            if not str(unit.get("decision_implication") or "").strip():
+                unit["decision_implication"] = " ".join(
+                    item
+                    for item in [
+                        depth_text_fields.get("employment_implication", ""),
+                        depth_text_fields.get("education_implication", ""),
+                        depth_text_fields.get("industry_implication", ""),
+                    ]
+                    if item
+                ).strip()
+            unit["claim_depth_ready"] = bool(
+                (interpretation_ids or mechanism_chain_detail)
+                and depth_text_fields.get("what_evidence_reflects")
+                and depth_text_fields.get("why_it_matters")
+                and (
+                    depth_text_fields.get("employment_implication")
+                    or depth_text_fields.get("education_implication")
+                    or depth_text_fields.get("industry_implication")
+                )
+            )
+            unit["single_fact_claim"] = len(refs) == 1
             unit["limitation_boundary"] = limitation_boundary
+            unit["boundary"] = limitation_boundary
             unit["reasoning"] = "\n".join(reasoning_chain)
+            unit["mechanism"] = "\n".join(reasoning_chain)
             unit["counter_boundary"] = "\n".join(limitation_boundary)
             unit["claim_id"] = str(unit.get("claim_id") or unit.get("id") or f"{chapter.get('chapter_id') or 'chapter'}_claim_{unit_index}")
             unit["supporting_fact_refs"] = refs
@@ -5928,6 +6395,11 @@ def merge_llm_analysis_with_fallback(
                 for item in _as_list(unit.get("evidence_basis"))
                 if str(item or "").strip()
             ]
+            because_facts = [
+                _compact(item, 260)
+                for item in (_as_list(unit.get("because_facts")) or evidence_basis)
+                if str(item or "").strip()
+            ]
             block_affinity = str(unit.get("block_affinity") or "").strip()
             decision_implication = _compact(unit.get("decision_use") or chapter.get("decision_implication") or "", 360)
             if _has_internal_analysis_language(decision_implication):
@@ -5974,6 +6446,7 @@ def merge_llm_analysis_with_fallback(
                 "supporting_evidence": refs,
                 "evidence_refs": refs,
                 "evidence_basis": evidence_basis,
+                "because_facts": because_facts,
                 "supporting_facts": evidence_basis,
                 "block_type": block_affinity,
                 "claim_roles": _as_list(unit.get("claim_roles")),
@@ -5984,6 +6457,7 @@ def merge_llm_analysis_with_fallback(
                 "legacy_ref_fields": _as_dict(unit.get("legacy_ref_fields")),
                 "mechanism": reasoning,
                 "reasoning": reasoning,
+                "boundary": _as_list(unit.get("boundary") or unit.get("limitation_boundary")),
                 "counter_evidence": unit.get("counter_boundary") or "；".join(str(item) for item in _as_list(chapter.get("counter_evidence_boundary"))[:3]),
                 "decision_implication": decision_implication,
                 "confidence": chapter.get("confidence") or unit.get("confidence"),
@@ -6023,7 +6497,9 @@ def merge_llm_analysis_with_fallback(
                     "counter_evidence": claim_payload["counter_evidence"],
                     "decision_implication": claim_payload["decision_implication"],
                     "evidence_basis": evidence_basis,
+                    "because_facts": because_facts,
                     "supporting_facts": evidence_basis,
+                    "boundary": claim_payload["boundary"],
                     "block_type": block_affinity,
                     "output_type": block_affinity,
                     "layout_section_role": block_affinity,
@@ -6358,6 +6834,7 @@ def build_fallback_analysis(evidence_package: Dict[str, Any]) -> Dict[str, Any]:
             "evidence_gap_ledger_count": len(evidence_gap_ledger),
         },
     }
+    result = _enrich_fallback_claims_with_interpretations(result, evidence_package)
     result = _public_normalize_analysis_payload(result)
     result["analysis_depth_quality"] = analysis_depth_quality(result)
     result["claim_binding_feedback_summary"] = claim_binding_feedback_summary(result)

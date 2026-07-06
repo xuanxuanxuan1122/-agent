@@ -16,6 +16,7 @@ from rag_pipeline.agents.writer_agent_clean import (
     _expand_chapter_packages_for_body_target,
     _estimated_public_body_chars,
     _is_bad_expansion_fact,
+    _normalize_public_packages_for_contract,
 )
 from rag_pipeline.contracts.report_contract import build_report_contract_from_package
 
@@ -476,7 +477,7 @@ def test_composer_does_not_emit_generic_weak_boundary_sentences():
     combined = "".join(str(result.get(key) or "") for key in ("paragraph", "claim", "reasoning", "mechanism", "counter_evidence"))
     assert "不能外推为全行业确定结论" not in combined
     assert "继续观察同一变量" not in combined
-    assert result["counter_evidence"]
+    assert result["counter_evidence"] == ""
     assert "customer deployment" in combined or "workflow" in combined
 
 
@@ -959,6 +960,107 @@ def test_composer_does_not_promote_raw_evidence_basis_snippets():
     assert "电子工程专辑" not in combined
 
 
+def test_composer_public_paragraph_uses_industry_narrative_not_internal_caveat_scaffold(monkeypatch):
+    monkeypatch.setenv("REPORT_BLUEPRINT_SOURCE", "claim_first")
+    monkeypatch.setenv("REPORT_COMPOSER_EXPAND_TO_TARGET", "true")
+    monkeypatch.setenv("REPORT_COMPOSER_TARGET_SECTION_CHARS", "560")
+    card = EvidenceFactCard(
+        evidence_id="EV-ACCOUNTING-1",
+        chapter_id="ch_01",
+        subject="会计岗位能力",
+        variable="AI工具使用与数据分析能力",
+        distilled_fact="高校培养方案和招聘材料均开始增加智能财务、数据分析和AI工具应用要求。",
+        fact_type="case",
+        block_affinity=["integrated_signal"],
+        source_ref="[1]",
+        source_level="C",
+    )
+    claim = ClaimUnit(
+        claim_id="CL-ACCOUNTING-1",
+        chapter_id="ch_01",
+        claim="AI正在把会计岗位价值从基础核算推向数据解释、流程治理和风险判断。",
+        evidence_refs=["EV-ACCOUNTING-1"],
+        evidence_basis=["高校培养方案和招聘材料均开始增加智能财务、数据分析和AI工具应用要求。"],
+        reasoning_chain="课程和招聘要求同步变化，说明学校培养目标与企业筛选标准正在向复合型能力靠拢。",
+        paragraph_seed="AI工具对会计岗位的影响不只是替代基础核算，而是推动岗位价值转向数据解释、流程治理和风险判断。",
+        claim_strength="directional",
+    )
+
+    result = compose_section_paragraph(
+        fact_cards=[card],
+        claim_unit=claim,
+        block_type="integrated_signal",
+        chapter_question="AI如何改变会计学专业就业能力要求？",
+    )
+
+    paragraph = result["paragraph"]
+    assert "基础核算" in paragraph
+    assert "数据解释" in paragraph or "数据分析" in paragraph
+    for forbidden in (
+        "材料显示",
+        "公开材料提到",
+        "边界在于",
+        "后续应继续观察",
+        "方向性观察",
+        "单点事实",
+        "不能直接推出",
+        "不能直接代表",
+        "结论需要保留弹性",
+    ):
+        assert forbidden not in paragraph
+
+
+def test_composer_runtime_chinese_public_paragraph_has_no_internal_scaffold(monkeypatch):
+    monkeypatch.setenv("REPORT_BLUEPRINT_SOURCE", "claim_first")
+    monkeypatch.setenv("REPORT_COMPOSER_EXPAND_TO_TARGET", "true")
+    monkeypatch.setenv("REPORT_COMPOSER_TARGET_SECTION_CHARS", "560")
+    card = EvidenceFactCard(
+        evidence_id="EV-ACCOUNTING-2",
+        chapter_id="ch_01",
+        subject="\u4f1a\u8ba1\u5c97\u4f4d\u80fd\u529b",
+        variable="AI\u5de5\u5177\u4f7f\u7528\u4e0e\u6570\u636e\u5206\u6790\u80fd\u529b",
+        distilled_fact="\u9ad8\u6821\u57f9\u517b\u65b9\u6848\u548c\u62db\u8058\u6750\u6599\u5747\u5f00\u59cb\u589e\u52a0\u667a\u80fd\u8d22\u52a1\u3001\u6570\u636e\u5206\u6790\u548cAI\u5de5\u5177\u5e94\u7528\u8981\u6c42\u3002",
+        fact_type="case",
+        block_affinity=["integrated_signal"],
+        source_ref="[1]",
+        source_level="C",
+    )
+    claim = ClaimUnit(
+        claim_id="CL-ACCOUNTING-2",
+        chapter_id="ch_01",
+        claim="AI\u6b63\u5728\u628a\u4f1a\u8ba1\u5c97\u4f4d\u4ef7\u503c\u4ece\u57fa\u7840\u6838\u7b97\u63a8\u5411\u6570\u636e\u89e3\u91ca\u3001\u6d41\u7a0b\u6cbb\u7406\u548c\u98ce\u9669\u5224\u65ad\u3002",
+        evidence_refs=["EV-ACCOUNTING-2"],
+        evidence_basis=["\u9ad8\u6821\u57f9\u517b\u65b9\u6848\u548c\u62db\u8058\u6750\u6599\u5747\u5f00\u59cb\u589e\u52a0\u667a\u80fd\u8d22\u52a1\u3001\u6570\u636e\u5206\u6790\u548cAI\u5de5\u5177\u5e94\u7528\u8981\u6c42\u3002"],
+        reasoning_chain="\u8bfe\u7a0b\u548c\u62db\u8058\u8981\u6c42\u540c\u6b65\u53d8\u5316\uff0c\u8bf4\u660e\u5b66\u6821\u57f9\u517b\u76ee\u6807\u4e0e\u4f01\u4e1a\u7b5b\u9009\u6807\u51c6\u6b63\u5728\u5411\u590d\u5408\u578b\u80fd\u529b\u9760\u62e2\u3002",
+        paragraph_seed="AI\u5de5\u5177\u5bf9\u4f1a\u8ba1\u5c97\u4f4d\u7684\u5f71\u54cd\u4e0d\u53ea\u662f\u66ff\u4ee3\u57fa\u7840\u6838\u7b97\uff0c\u800c\u662f\u63a8\u52a8\u5c97\u4f4d\u4ef7\u503c\u8f6c\u5411\u6570\u636e\u89e3\u91ca\u3001\u6d41\u7a0b\u6cbb\u7406\u548c\u98ce\u9669\u5224\u65ad\u3002",
+        claim_strength="directional",
+    )
+
+    result = compose_section_paragraph(
+        fact_cards=[card],
+        claim_unit=claim,
+        block_type="integrated_signal",
+        chapter_question="AI\u5982\u4f55\u6539\u53d8\u4f1a\u8ba1\u5b66\u4e13\u4e1a\u5c31\u4e1a\u80fd\u529b\u8981\u6c42\uff1f",
+    )
+
+    paragraph = result["paragraph"]
+    assert "\u57fa\u7840\u6838\u7b97" in paragraph
+    assert "\u6570\u636e\u89e3\u91ca" in paragraph or "\u6570\u636e\u5206\u6790" in paragraph
+    assert "\u9ad8\u6821\u57f9\u517b\u65b9\u6848\u548c\u62db\u8058\u6750\u6599\u5747\u5f00\u59cb\u589e\u52a0\u667a\u80fd\u8d22\u52a1\u3001\u6570\u636e\u5206\u6790\u548cAI\u5de5\u5177\u5e94\u7528\u8981\u6c42\u3002" not in paragraph
+    for forbidden in (
+        "\u6750\u6599\u663e\u793a",
+        "\u516c\u5f00\u6750\u6599\u63d0\u5230",
+        "\u8fb9\u754c\u5728\u4e8e",
+        "\u540e\u7eed\u5e94\u7ee7\u7eed\u89c2\u5bdf",
+        "\u65b9\u5411\u6027\u89c2\u5bdf",
+        "\u5355\u70b9\u4e8b\u5b9e",
+        "\u4e0d\u80fd\u76f4\u63a5\u63a8\u51fa",
+        "\u4e0d\u80fd\u76f4\u63a5\u4ee3\u8868",
+        "\u7ed3\u8bba\u9700\u8981\u4fdd\u7559\u5f39\u6027",
+    ):
+        assert forbidden not in paragraph
+
+
 def test_web_ui_page_fragments_are_not_public_expansion_facts():
     fragment = (
         "中国人形机器人产业“加速跑”_时政要闻_上海市统计局：#### 字号 - 大 - 中 - 小 分享 "
@@ -1299,7 +1401,7 @@ def test_chapter_argument_does_not_render_boundary_as_standalone_public_paragrap
     public_blocks = [block for block in section["render_blocks"] if block.get("type") == "paragraph"]
     assert len(public_blocks) == 1
     assert "should not represent the whole market" not in public_blocks[0]["text"]
-    assert section["counter_evidence"]
+    assert section["counter_evidence"] == ""
 
 
 def test_chapter_argument_does_not_render_context_only_claim_as_public_section():
@@ -1684,7 +1786,7 @@ def test_final_writer_core_observation_uses_claim_not_generic_variable_explanati
 
     assert "[1]" in markdown
     assert claim.rstrip("。") in markdown
-    assert "财政部材料强调财务数据治理" in markdown
+    assert "财政部材料强调财务数据治理" not in markdown
     assert "会计学专业的能力要求" in summary or "数据治理" in summary
     for forbidden in ("需要结合来源范围、场景深度和时间窗口一起判断", "避免把背景信息直接外推为结论"):
         assert forbidden not in markdown
@@ -2051,6 +2153,34 @@ def test_body_expansion_does_not_append_template_sections_to_claim_backed_chapte
     assert not any(section.get("expansion_generated") for section in sections)
 
 
+def test_contract_normalizer_does_not_inject_generic_reasoning_or_counter_templates():
+    result = _normalize_public_packages_for_contract(
+        chapter_evidence_packages=[
+            {
+                "chapter_id": "ch_01",
+                "core_evidence": [{"evidence_id": "EV-1"}],
+            }
+        ],
+        micro_layouts=[],
+        table_packages=[],
+        argument_units=[
+            {
+                "chapter_id": "ch_01",
+                "section_id": "sec_1",
+                "claim": "AI Agent adoption is moving into customer-service workflows.",
+                "evidence_refs": ["EV-1"],
+            }
+        ],
+        chapter_packages=[],
+    )
+
+    unit = result["argument_units"][0]
+    assert unit.get("reasoning", "") == ""
+    assert unit.get("counter_evidence", "") == ""
+    assert "这一判断的价值" not in " ".join(str(value) for value in unit.values())
+    assert "样本仍可能受地区" not in " ".join(str(value) for value in unit.values())
+
+
 def test_public_evidence_digest_expands_claim_backed_chapter_without_internal_language(monkeypatch):
     monkeypatch.setenv("REPORT_ENABLE_BODY_EXPANSION", "true")
     monkeypatch.setenv("REPORT_ENABLE_PUBLIC_EVIDENCE_DIGEST", "true")
@@ -2129,7 +2259,64 @@ def test_public_evidence_digest_expands_claim_backed_chapter_without_internal_la
         assert forbidden not in text
 
 
-def test_body_expansion_defaults_to_public_digest_not_template_process_language(monkeypatch):
+def test_public_evidence_digest_filters_policy_boilerplate_from_supporting_facts(monkeypatch):
+    monkeypatch.setenv("REPORT_ENABLE_BODY_EXPANSION", "true")
+    monkeypatch.setenv("REPORT_ENABLE_PUBLIC_EVIDENCE_DIGEST", "true")
+    monkeypatch.setenv("REPORT_PUBLIC_EVIDENCE_DIGEST_MAX_SECTIONS_PER_CHAPTER", "1")
+
+    chapter = {
+        "chapter_id": "ch_policy",
+        "chapter_title": "会计人才培养政策",
+        "chapter_fact_digest": [
+            {
+                "distilled_fact": "附件1 会计改革与发展“十四五”规划纲要（征求意见稿）“十四五”时期是我国由全面建成小康社会向基本实现社会主义现代化迈进的关键时期。",
+                "evidence_id": "EV-noisy",
+                "source_ref": "[1]",
+            },
+            {
+                "distilled_fact": "政策文件与行业协会活动共同推动会计行业数字化转型，并影响高校专业设置与企业招聘能力标准。",
+                "evidence_id": "EV-clean",
+                "source_ref": "[2]",
+            },
+            {
+                "distilled_fact": "多所高校开始把智能财务、数据分析和业务系统协同纳入会计类课程训练。",
+                "evidence_id": "EV-clean-2",
+                "source_ref": "[3]",
+            },
+        ],
+        "sections": [
+            {
+                "section_id": "s1",
+                "section_title": "政策信号",
+                "claim": "政策与行业组织正在推动会计人才能力标准调整。",
+                "evidence_refs": ["EV-noisy", "EV-clean"],
+                "used_fact_refs": ["EV-noisy", "EV-clean"],
+                "citation_refs": ["[1]", "[2]"],
+                "supporting_facts": [
+                    "出货/部署: 11 《广东省加快推进人工智能全域全时全行业高水平应用行动方案》已经省人民政府同意，现印发给你们，请认真贯彻执行。",
+                    "政策文件与行业协会活动共同推动会计行业数字化转型，并影响高校专业设置与企业招聘能力标准。",
+                    "多所高校开始把智能财务、数据分析和业务系统协同纳入会计类课程训练。",
+                ],
+                "public_render": True,
+                "evidence_backed": True,
+            }
+        ],
+    }
+
+    expanded = _expand_chapter_packages_for_body_target([chapter], target_chars=5_000)
+    digest_sections = [section for section in expanded[0]["sections"] if section.get("public_digest_generated")]
+
+    assert digest_sections
+    text = " ".join(str(section.get(key) or "") for section in digest_sections for key in ("claim", "reasoning", "supporting_facts"))
+    assert "附件1" not in text
+    assert "征求意见稿" not in text
+    assert "现印发给你们" not in text
+    assert "请认真贯彻执行" not in text
+    assert "相关进展:" not in text
+    assert "会计行业数字化转型" in text
+
+
+def test_body_expansion_defaults_to_no_public_digest_or_template_expansion(monkeypatch):
     monkeypatch.setenv("REPORT_ENABLE_BODY_EXPANSION", "true")
     monkeypatch.delenv("REPORT_ENABLE_PUBLIC_EVIDENCE_DIGEST", raising=False)
     monkeypatch.delenv("REPORT_ENABLE_DETERMINISTIC_BODY_EXPANSION", raising=False)
@@ -2178,7 +2365,7 @@ def test_body_expansion_defaults_to_public_digest_not_template_process_language(
     expanded = _expand_chapter_packages_for_body_target([chapter], target_chars=5_000)
 
     digest_sections = [section for section in expanded[0]["sections"] if section.get("public_digest_generated")]
-    assert digest_sections
+    assert digest_sections == []
     assert not any(section.get("expansion_generated") for section in expanded[0]["sections"])
     text = " ".join(
         str(section.get(key) or "")
@@ -2419,3 +2606,70 @@ def test_chapter_argument_composed_sections_survive_public_rendering():
         assert f"Claim {index}:" in markdown
         assert f"[{index}]" in markdown
     assert "已引用来源覆盖" not in markdown
+
+
+def test_claim_builder_repetition_warning_does_not_omit_claim_unit():
+    from rag_pipeline.agents.claim_builder_agent import run_claim_builder_agent
+
+    claim_units = []
+    evidence_items = []
+    for index, suffix in enumerate(("岗位要求", "课程调整"), start=1):
+        ref = f"EV-{index}"
+        fact = f"会计教育和岗位能力变化的可追溯材料 {index}。"
+        claim_units.append(
+            {
+                "claim_id": f"CL-{index}",
+                "chapter_id": "ch_01",
+                "claim": "会计岗位能力正在从基础核算转向数据解释和流程治理。",
+                "reasoning": f"{suffix}材料说明变化已经进入具体场景。",
+                "mechanism": f"{suffix}会改变课程训练和企业用人要求。",
+                "evidence_refs": [ref],
+                "used_fact_refs": [ref],
+                "source_support_map": {"claim": [ref], "mechanism": [ref]},
+                "supporting_facts": [fact],
+                "claim_strength": "directional",
+                "public_render": True,
+            }
+        )
+        evidence_items.append(
+            {
+                "evidence_id": ref,
+                "source_ref": f"[{index}]",
+                "source_level": "C",
+                "fact": fact,
+                "public_fact_card": {
+                    "distilled_fact": fact,
+                    "fact_type": "general",
+                    "block_affinity": ["integrated_signal"],
+                },
+                "public_fact_quality": {"eligible_for_report": True},
+            }
+        )
+
+    units = run_claim_builder_agent(
+        structured_analysis={
+            "analysis_contract_status": {"should_force_strict_claim_building": True},
+            "claim_units": claim_units,
+        },
+        chapter_evidence_packages=[
+            {
+                "chapter_id": "ch_01",
+                "core_evidence": evidence_items,
+                "supporting_evidence": evidence_items,
+            }
+        ],
+    )
+
+    claim_unit_ids = {unit.get("claim_id") for unit in units}
+    assert {"CL-1", "CL-2"}.issubset(claim_unit_ids)
+    repeated = [unit for unit in units if unit.get("claim_id") == "CL-2"][0]
+    assert repeated.get("public_render") is True
+    assert repeated.get("omit_from_report") is False
+    assert repeated.get("observation_only") is not True
+    assert repeated.get("internal_reason") != "argument_unit_repetition_failed"
+    assert any(
+        issue.get("type") == "argument_unit_repetition_failed"
+        and issue.get("diagnostic_only") is True
+        and issue.get("must_not_render") is True
+        for issue in repeated.get("quality_issues") or []
+    )

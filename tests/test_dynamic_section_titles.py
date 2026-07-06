@@ -165,6 +165,34 @@ def test_dynamic_title_filters_internal_role_variables():
     assert "_" not in title
 
 
+def test_profession_report_does_not_use_player_competition_title():
+    item = _fact_card_item(
+        "E4",
+        subject="",
+        variable="\u7ade\u4e89\u5bf9\u6bd4",
+        block_type="competitive_positioning",
+        fact_type="case",
+        proof_role="case",
+    )
+    item["public_fact_card"]["subject"] = ""
+
+    payload = generate_dynamic_section_title(
+        {
+            "chapter_title": "\u4f1a\u8ba1\u5b66\u4e13\u4e1a\u5728AI\u65f6\u4ee3\u7684\u5c97\u4f4d\u80fd\u529b\u53d8\u5316",
+            "chapter_question": "\u4f1a\u8ba1\u5c97\u4f4d\u7684\u80fd\u529b\u8981\u6c42\u4f1a\u5982\u4f55\u5206\u5316\uff1f",
+            "research_object": "\u4f1a\u8ba1\u5b66\u4e13\u4e1a\u5c31\u4e1a\u53d8\u5316",
+            "report_family": "industry_deep_report",
+        },
+        "competitive_positioning",
+        [item],
+    )
+
+    title = payload.get("dynamic_section_title") or ""
+    assert title
+    assert "\u73a9\u5bb6" not in title
+    assert any(token in title for token in ["\u5c97\u4f4d", "\u80fd\u529b", "\u57f9\u517b", "\u5c31\u4e1a"])
+
+
 def test_dynamic_title_does_not_use_publisher_as_subject():
     item = _fact_card_item(
         "E5",

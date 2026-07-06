@@ -23,6 +23,21 @@ def _text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
+_LEADING_ARTIFACT_LABEL_RE = re.compile(
+    r"^(?:相关进展|出货/部署|出货量|数据指标|定性事实|指标|样本|事实)\s*[:：]\s*\d+\s*"
+)
+
+
+def _clean_public_fact_text(value: Any) -> str:
+    text = _text(value)
+    text = text.replace("出货/部署", "相关进展")
+    text = _LEADING_ARTIFACT_LABEL_RE.sub("", text)
+    text = re.sub(r"《[^》]{2,120}》已经[^。；;\n]{0,120}(?:现印发给你们，请认真贯彻执行|请认真贯彻执行)[。；;]?", "", text)
+    text = re.sub(r"附件\s*\d+[^。；;\n]{0,160}(?:征求意见稿|关键时期)[^。；;\n]{0,160}[。；;]?", "", text)
+    text = re.sub(r"\s+", " ", text).strip(" 。；;")
+    return text
+
+
 def _env_int(name: str, default: int, *, min_value: int = 0, max_value: int = 100) -> int:
     raw = os.getenv(name)
     try:
@@ -52,7 +67,7 @@ def _dedupe(values: Iterable[Any], *, limit: int = 12) -> List[str]:
 def _fact_text(item: Any) -> str:
     if isinstance(item, dict):
         card = _as_dict(item.get("public_fact_card")) or _as_dict(_as_dict(item.get("public_fact_quality")).get("public_fact_card"))
-        return _text(
+        return _clean_public_fact_text(
             card.get("distilled_fact")
             or item.get("distilled_fact")
             or item.get("public_fact")
@@ -61,7 +76,7 @@ def _fact_text(item: Any) -> str:
             or item.get("content")
             or item.get("text")
         )
-    return _text(item)
+    return _clean_public_fact_text(item)
 
 
 def _fact_refs(item: Any) -> List[str]:
@@ -105,6 +120,8 @@ def _usable_public_fact(text: str) -> bool:
     if not text or len(text) < 12:
         return False
     if INTERNAL_PUBLIC_TEXT_RE.search(text):
+        return False
+    if re.search(r"现印发给你们|请认真贯彻执行|附件\s*\d+|征求意见稿", text):
         return False
     lowered = text.lower()
     if any(token in lowered for token in ("login", "captcha", "403 forbidden", "404 not found", "http error")):

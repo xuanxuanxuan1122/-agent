@@ -3,6 +3,7 @@ from rag_pipeline.agents.brain_agent import (
     evaluate_coverage_fallback,
     expand_search_tasks_from_chapters,
 )
+from rag_pipeline.agents.dynamic_search_schema import normalize_research_plan
 from rag_pipeline.agents.evidence_binder import bind_evidence_to_chapters
 from rag_pipeline.agents.pre_layout_agent import run_pre_layout_agent
 from rag_pipeline.agents.problem_framing_agent import apply_problem_framing, run_problem_framing_agent
@@ -97,6 +98,286 @@ def test_academic_topic_search_tasks_do_not_use_commercial_query_terms():
         "\u4ea7\u54c1\u6807\u51c6",
     ]:
         assert forbidden not in text
+
+
+def test_problem_framing_preserves_specific_planner_chapters():
+    query = "\u4e2d\u56fd\u5de5\u4e1a\u8f6f\u4ef6MES/APS/PLM\u56fd\u4ea7\u66ff\u4ee3\uff1a\u79bb\u6563\u5236\u9020\u843d\u5730\u8def\u5f84\u3001\u91c7\u8d2d\u51b3\u7b56\u94fe\u4e0e\u5b9e\u65bd\u5931\u8d25\u98ce\u9669\u7814\u7a76"
+    plan = {
+        "query": query,
+        "research_object": "\u4e2d\u56fd\u5de5\u4e1a\u8f6f\u4ef6MES/APS/PLM\u56fd\u4ea7\u66ff\u4ee3",
+        "chapters": [
+            {
+                "chapter_id": "ch_01",
+                "chapter_title": "MES/APS/PLM\u5728\u79bb\u6563\u5236\u9020\u7684\u5e94\u7528\u73b0\u72b6\u4e0e\u66ff\u4ee3\u9700\u6c42",
+                "core_question": "\u79bb\u6563\u5236\u9020\u4f01\u4e1a\u7684\u771f\u5b9e\u66ff\u4ee3\u9700\u6c42\u662f\u4ec0\u4e48\uff1f",
+            },
+            {
+                "chapter_id": "ch_02",
+                "chapter_title": "\u79bb\u6563\u5236\u9020\u843d\u5730\u8def\u5f84\u4e0e\u5b9e\u65bd\u9636\u6bb5\u5206\u6790",
+                "core_question": "\u4e0d\u540c\u89c4\u6a21\u5236\u9020\u4f01\u4e1a\u5982\u4f55\u5206\u9636\u6bb5\u843d\u5730\uff1f",
+            },
+            {
+                "chapter_id": "ch_03",
+                "chapter_title": "\u91c7\u8d2d\u51b3\u7b56\u94fe\uff1a\u5173\u952e\u89d2\u8272\u3001\u6d41\u7a0b\u4e0e\u5f71\u54cd\u56e0\u7d20",
+                "core_question": "\u91c7\u8d2d\u51b3\u7b56\u7531\u54ea\u4e9b\u89d2\u8272\u4e3b\u5bfc\uff1f",
+            },
+            {
+                "chapter_id": "ch_04",
+                "chapter_title": "\u5b9e\u65bd\u5931\u8d25\u98ce\u9669\u8bc6\u522b\u4e0e\u5f52\u56e0\u5206\u6790",
+                "core_question": "\u5931\u8d25\u9879\u76ee\u7684\u6839\u672c\u539f\u56e0\u662f\u4ec0\u4e48\uff1f",
+            },
+        ],
+        "evidence_goals": [
+            {
+                "goal_id": "goal_purchase_chain",
+                "chapter_id": "ch_03",
+                "question": "\u91c7\u8d2d\u51b3\u7b56\u94fe\u4e2dIT\u3001\u751f\u4ea7\u3001\u8d22\u52a1\u4e0e\u7ba1\u7406\u5c42\u7684\u89d2\u8272\u5206\u5de5",
+                "proof_role": "case",
+            }
+        ],
+        "search_tasks": [
+            {
+                "task_id": "hypothesis_H3_case",
+                "chapter_id": "ch_01",
+                "dimension_id": "ch_01",
+                "query": "\u5de5\u4e1a\u8f6f\u4ef6 \u91c7\u8d2d\u51b3\u7b56\u94fe \u5ba2\u6237\u6848\u4f8b",
+                "proof_role": "case",
+            }
+        ],
+    }
+    framing = run_problem_framing_agent(query=query)
+
+    merged = apply_problem_framing(plan, framing)
+
+    titles = [chapter["chapter_title"] for chapter in merged["chapters"]]
+    assert "\u91c7\u8d2d\u51b3\u7b56\u94fe\uff1a\u5173\u952e\u89d2\u8272\u3001\u6d41\u7a0b\u4e0e\u5f71\u54cd\u56e0\u7d20" in titles
+    assert "\u5b9e\u65bd\u5931\u8d25\u98ce\u9669\u8bc6\u522b\u4e0e\u5f52\u56e0\u5206\u6790" in titles
+    assert merged["evidence_goals"][0]["chapter_id"] == "ch_03"
+    assert merged["search_tasks"][0]["chapter_id"] == "ch_03"
+    assert merged["search_tasks"][0]["dimension_id"] == "ch_03"
+    assert not any(
+        str(item.get("dimension_id") or "").startswith("hypothesis")
+        for item in merged.get("hypotheses") or []
+    )
+    assert merged["quality_rules"]["chapters_come_from_hypotheses"] is False
+    assert not any(
+        item.get("reason") == "replaced_by_problem_framing_hypotheses"
+        for item in merged.get("dropped_template_sections") or []
+    )
+
+
+def test_preserved_planner_search_tasks_are_compacted_when_lane_terms_leak():
+    query = "\u53bf\u57df\u65b0\u80fd\u6e90\u5546\u7528\u8f66\u5145\u6362\u7535\u7f51\u7edc\uff1a\u91cd\u5361\u7269\u6d41\u573a\u666f\u3001\u8d44\u4ea7\u5229\u7528\u7387\u4e0e\u8fd0\u8425\u5546\u76c8\u5229\u6a21\u578b\u7814\u7a76"
+    statement = "\u5728\u91cd\u5361\u9ad8\u9891\u7269\u6d41\u7ebf\u8def\u4e0a\uff0c\u6362\u7535\u6a21\u5f0f\u8d44\u4ea7\u5229\u7528\u7387\u9ad8\u4e8e\u5145\u7535\u6869\uff0c\u53ef\u5b9e\u73b0\u66f4\u4f18\u76c8\u5229"
+    plan = {
+        "query": query,
+        "chapters": [
+            {
+                "chapter_id": "ch_01",
+                "chapter_title": "\u53bf\u57df\u65b0\u80fd\u6e90\u91cd\u5361\u7269\u6d41\u573a\u666f\u4e0e\u5145\u6362\u7535\u9700\u6c42\u5206\u6790",
+                "core_question": "\u91cd\u5361\u7269\u6d41\u573a\u666f\u5bf9\u5145\u6362\u7535\u7f51\u7edc\u6709\u4ec0\u4e48\u9700\u6c42\uff1f",
+            },
+            {
+                "chapter_id": "ch_02",
+                "chapter_title": "\u8fd0\u8425\u5546\u76c8\u5229\u6a21\u578b\u6784\u5efa\u4e0e\u654f\u611f\u6027\u5206\u6790",
+                "core_question": "\u5145\u6362\u7535\u7f51\u7edc\u7684\u76c8\u5229\u95e8\u69db\u662f\u4ec0\u4e48\uff1f",
+            },
+            {
+                "chapter_id": "ch_03",
+                "chapter_title": "\u5178\u578b\u6848\u4f8b\u4e0e\u6295\u8d44\u56de\u62a5\u6d4b\u7b97",
+                "core_question": "\u54ea\u4e9b\u53bf\u57df\u9879\u76ee\u80fd\u8bc1\u660e\u6295\u8d44\u56de\u62a5\u6a21\u578b\uff1f",
+            }
+        ],
+        "search_tasks": [
+            {
+                "task_id": "task-1",
+                "chapter_id": "ch_01",
+                "dimension_id": "ch_01",
+                "hypothesis_id": "H1",
+                "proof_role": "metric",
+                "query": f"{query} {statement} official data market research evidence",
+            }
+        ],
+    }
+    framing = {
+        "hypotheses": [
+            {
+                "hypothesis_id": "H1",
+                "statement": statement,
+                "must_prove": ["\u8d44\u4ea7\u5229\u7528\u7387", "\u5355\u6b21\u8865\u80fd\u6210\u672c", "\u8fd0\u8425\u5546\u76c8\u5229"],
+            }
+        ]
+    }
+
+    merged = apply_problem_framing(plan, framing)
+    compact_task = merged["search_tasks"][0]
+    compact_query = compact_task["query"]
+
+    assert compact_task["task_id"] == "task-1"
+    assert compact_task["query_compacted_from_hypothesis"] is True
+    assert "official data" not in compact_query
+    assert "market research" not in compact_query
+    assert statement not in compact_query
+    assert "\u8d44\u4ea7\u5229\u7528\u7387" in compact_query
+
+
+def test_search_task_compaction_removes_repeated_topic_anchor_and_chinese_lane_terms():
+    query = "\u53bf\u57df\u65b0\u80fd\u6e90\u5546\u7528\u8f66\u5145\u6362\u7535\u7f51\u7edc\uff1a\u91cd\u5361\u7269\u6d41\u573a\u666f\u3001\u8d44\u4ea7\u5229\u7528\u7387\u4e0e\u8fd0\u8425\u5546\u76c8\u5229\u6a21\u578b\u7814\u7a76"
+    statement = "\u6362\u7535\u6a21\u5f0f\u5728\u91cd\u5361\u7269\u6d41\u573a\u666f\u4e2d\u6bd4\u5145\u7535\u6a21\u5f0f\u5177\u6709\u66f4\u9ad8\u7684\u8d44\u4ea7\u5229\u7528\u7387\u548c\u66f4\u5feb\u7684\u6295\u8d44\u56de\u62a5"
+    plan = {
+        "query": query,
+        "chapters": [
+            {"chapter_id": "ch_01", "chapter_title": "\u91cd\u5361\u7269\u6d41\u573a\u666f\u4e0e\u5145\u6362\u7535\u9700\u6c42", "core_question": "\u9700\u6c42\u5982\u4f55\uff1f"},
+            {"chapter_id": "ch_02", "chapter_title": "\u8d44\u4ea7\u5229\u7528\u7387\u5f71\u54cd\u56e0\u7d20", "core_question": "\u5229\u7528\u7387\u7531\u4ec0\u4e48\u51b3\u5b9a\uff1f"},
+            {"chapter_id": "ch_03", "chapter_title": "\u8fd0\u8425\u5546\u76c8\u5229\u6a21\u578b", "core_question": "\u5982\u4f55\u76c8\u5229\uff1f"},
+        ],
+        "search_tasks": [
+            {
+                "task_id": "counter-1",
+                "chapter_id": "ch_01",
+                "hypothesis_id": "H1",
+                "proof_role": "counter",
+                "must_have_terms": ["\u91cd\u5361\u7269\u6d41\u573a\u666f", "\u8d44\u4ea7\u5229\u7528\u7387", "\u8fd0\u8425\u5546\u76c8\u5229\u6a21\u578b"],
+                "query": f"{query} \u53bf\u57df\u65b0\u80fd\u6e90\u5546\u7528\u8f66\u5145\u6362\u7535\u7f51\u7edc \u91cd\u5361\u7269\u6d41\u573a\u666f \u8d44\u4ea7\u5229\u7528\u7387 \u8fd0\u8425\u5546\u76c8\u5229\u6a21\u578b \u53cd\u8bc1 \u98ce\u9669 \u5931\u8d25\u6848\u4f8b \u8d1f\u9762 \u66ff\u4ee3\u65b9\u6848 \u5ba2\u6237\u4e0d\u4e70\u8d26",
+            }
+        ],
+    }
+    framing = {"hypotheses": [{"hypothesis_id": "H1", "statement": statement, "must_disprove": ["\u5229\u7528\u7387\u4e0d\u8db3", "\u76c8\u5229\u56f0\u96be"]}]}
+
+    merged = apply_problem_framing(plan, framing)
+    compact_query = merged["search_tasks"][0]["query"]
+
+    assert compact_query.count("\u53bf\u57df\u65b0\u80fd\u6e90\u5546\u7528\u8f66\u5145\u6362\u7535\u7f51\u7edc") <= 1
+    assert "\u5ba2\u6237\u4e0d\u4e70\u8d26" not in compact_query
+    assert "\u53cd\u8bc1 \u98ce\u9669 \u5931\u8d25\u6848\u4f8b" not in compact_query
+
+
+def test_normalized_search_tasks_add_role_specific_query_hints():
+    query = "\u53bf\u57df\u65b0\u80fd\u6e90\u5546\u7528\u8f66\u5145\u6362\u7535\u7f51\u7edc\uff1a\u91cd\u5361\u7269\u6d41\u573a\u666f\u3001\u8d44\u4ea7\u5229\u7528\u7387\u4e0e\u8fd0\u8425\u5546\u76c8\u5229\u6a21\u578b\u7814\u7a76"
+    base_query = "\u53bf\u57df\u65b0\u80fd\u6e90\u5546\u7528\u8f66\u5145\u6362\u7535\u7f51\u7edc \u91cd\u5361\u7269\u6d41\u573a\u666f \u8d44\u4ea7\u5229\u7528\u7387 \u8fd0\u8425\u5546"
+    plan = normalize_research_plan(
+        {
+            "query": query,
+            "research_object": "\u53bf\u57df\u65b0\u80fd\u6e90\u5546\u7528\u8f66\u5145\u6362\u7535\u7f51\u7edc",
+            "chapters": [
+                {
+                    "chapter_id": "ch_01",
+                    "chapter_title": "\u91cd\u5361\u7269\u6d41\u573a\u666f\u4e0e\u5145\u6362\u7535\u9700\u6c42",
+                    "core_question": "\u9700\u6c42\u5982\u4f55\uff1f",
+                }
+            ],
+            "search_tasks": [
+                {"task_id": "m", "chapter_id": "ch_01", "proof_role": "metric", "query": base_query},
+                {"task_id": "c", "chapter_id": "ch_01", "proof_role": "case", "query": base_query},
+                {"task_id": "r", "chapter_id": "ch_01", "proof_role": "counter", "query": base_query},
+            ],
+        },
+        query=query,
+    )
+    by_role = {task["proof_role"]: task["query"] for task in plan["search_tasks"]}
+
+    assert "\u6307\u6807" in by_role["metric"] or "\u6570\u636e" in by_role["metric"]
+    assert "\u6848\u4f8b" in by_role["case"] or "\u9879\u76ee" in by_role["case"]
+    assert "\u5931\u8d25" in by_role["counter"] or "\u98ce\u9669" in by_role["counter"]
+    assert len({by_role["metric"], by_role["case"], by_role["counter"]}) == 3
+
+
+def test_problem_framing_search_task_queries_are_field_oriented():
+    query = "\u53bf\u57df\u65b0\u80fd\u6e90\u5546\u7528\u8f66\u5145\u6362\u7535\u7f51\u7edc\uff1a\u91cd\u5361\u7269\u6d41\u573a\u666f\u3001\u8d44\u4ea7\u5229\u7528\u7387\u4e0e\u8fd0\u8425\u5546\u76c8\u5229\u6a21\u578b\u7814\u7a76"
+    framing = {
+        "hypotheses": [
+            {
+                "hypothesis_id": "H1",
+                "statement": "\u53bf\u57df\u91cd\u5361\u5145\u6362\u7535\u7f51\u7edc\u8d44\u4ea7\u5229\u7528\u7387\u4e0d\u8db3\u662f\u8fd0\u8425\u5546\u76c8\u5229\u56f0\u96be\u7684\u4e3b\u8981\u539f\u56e0",
+                "must_prove": ["\u8d44\u4ea7\u5229\u7528\u7387", "\u5355\u7ad9\u6536\u5165", "\u7535\u4ef7\u6210\u672c"],
+                "must_disprove": ["\u9ad8\u5229\u7528\u7387\u76c8\u5229\u9879\u76ee", "\u5229\u7528\u7387\u4e0d\u8db3\u4f46\u76c8\u5229\u6848\u4f8b"],
+                "evidence_bundle": {
+                    "metric": ["\u8d44\u4ea7\u5229\u7528\u7387", "\u5355\u7ad9\u6536\u5165", "\u5145\u7535\u91cf"],
+                    "case": ["\u53bf\u57df\u91cd\u5361\u6362\u7535\u7ad9\u6848\u4f8b", "\u8fd0\u8425\u5546\u9879\u76ee"],
+                    "counter": ["\u9ad8\u5229\u7528\u7387\u76c8\u5229\u9879\u76ee", "\u5931\u8d25\u9879\u76ee"],
+                },
+                "counter_evidence_required": True,
+            }
+        ]
+    }
+
+    plan = apply_problem_framing({"query": query, "research_object": query, "chapters": []}, framing)
+    queries = [str(task.get("query") or "") for task in plan.get("search_tasks") or []]
+
+    assert queries
+    assert all(len(item) <= 96 for item in queries)
+    assert all("official data" not in item and "market research" not in item for item in queries)
+    assert all(
+        "\u8d44\u4ea7\u5229\u7528\u7387\u4e0d\u8db3\u662f\u8fd0\u8425\u5546\u76c8\u5229\u56f0\u96be\u7684\u4e3b\u8981\u539f\u56e0" not in item
+        for item in queries
+    )
+    assert any("\u8d44\u4ea7\u5229\u7528\u7387" in item and "\u5355\u7ad9\u6536\u5165" in item for item in queries)
+    assert any("\u5931\u8d25\u9879\u76ee" in item or "\u76c8\u5229\u9879\u76ee" in item for item in queries)
+
+
+def test_problem_framing_uses_query_aspects_when_planner_chapters_missing():
+    query = "\u53bf\u57df\u65b0\u80fd\u6e90\u5546\u7528\u8f66\u5145\u6362\u7535\u7f51\u7edc\uff1a\u91cd\u5361\u7269\u6d41\u573a\u666f\u3001\u8d44\u4ea7\u5229\u7528\u7387\u4e0e\u8fd0\u8425\u5546\u76c8\u5229\u6a21\u578b\u7814\u7a76"
+    framing = {
+        "hypotheses": [
+            {
+                "hypothesis_id": "H1",
+                "statement": "\u9700\u6c42\u662f\u5426\u771f\u5b9e\u5b58\u5728",
+                "must_prove": ["\u9700\u6c42", "\u573a\u666f"],
+            },
+            {
+                "hypothesis_id": "H2",
+                "statement": "\u8d44\u4ea7\u5229\u7528\u7387\u662f\u76c8\u5229\u6a21\u578b\u7684\u5173\u952e\u53d8\u91cf",
+                "must_prove": ["\u8d44\u4ea7\u5229\u7528\u7387", "\u76c8\u5229\u6a21\u578b"],
+            },
+        ]
+    }
+
+    plan = apply_problem_framing({"query": query, "research_object": query, "chapters": []}, framing)
+    titles = [str(chapter.get("chapter_title") or "") for chapter in plan.get("chapters") or []]
+
+    assert plan["quality_rules"]["chapter_source"] == "query_aspect_chapters"
+    assert plan["quality_rules"]["chapters_come_from_hypotheses"] is False
+    assert any("\u91cd\u5361\u7269\u6d41\u573a\u666f" in title for title in titles)
+    assert any("\u8d44\u4ea7\u5229\u7528\u7387" in title for title in titles)
+    assert any("\u8fd0\u8425\u5546\u76c8\u5229\u6a21\u578b" in title for title in titles)
+
+
+def test_pre_layout_does_not_rewrite_specific_planner_chapters():
+    query = "\u4e2d\u56fd\u5de5\u4e1a\u8f6f\u4ef6MES/APS/PLM\u56fd\u4ea7\u66ff\u4ee3\uff1a\u79bb\u6563\u5236\u9020\u843d\u5730\u8def\u5f84\u3001\u91c7\u8d2d\u51b3\u7b56\u94fe\u4e0e\u5b9e\u65bd\u5931\u8d25\u98ce\u9669\u7814\u7a76"
+    blueprint = run_pre_layout_agent(
+        query=query,
+        research_plan={
+            "query": query,
+            "report_family": "industry_deep_report",
+            "research_object": "\u5de5\u4e1a\u8f6f\u4ef6MES/APS/PLM\u56fd\u4ea7\u66ff\u4ee3",
+            "quality_rules": {
+                "chapters_come_from_hypotheses": False,
+                "chapter_source": "llm_planner_with_problem_framing",
+            },
+            "chapters": [
+                {
+                    "chapter_id": "ch_01",
+                    "chapter_title": "\u79bb\u6563\u5236\u9020\u9700\u6c42\u7279\u70b9\u4e0e\u9009\u578b\u6807\u51c6",
+                    "core_question": "\u79bb\u6563\u5236\u9020\u5bf9MES/APS/PLM\u7684\u9700\u6c42\u548c\u9009\u578b\u6807\u51c6\u662f\u4ec0\u4e48\uff1f",
+                },
+                {
+                    "chapter_id": "ch_02",
+                    "chapter_title": "\u91c7\u8d2d\u51b3\u7b56\u94fe\u4e0e\u6d41\u7a0b",
+                    "core_question": "\u91c7\u8d2d\u51b3\u7b56\u7531\u54ea\u4e9b\u89d2\u8272\u548c\u6d41\u7a0b\u51b3\u5b9a\uff1f",
+                },
+                {
+                    "chapter_id": "ch_03",
+                    "chapter_title": "\u5b9e\u65bd\u5931\u8d25\u98ce\u9669\u8bc6\u522b\u4e0e\u7ba1\u63a7",
+                    "core_question": "\u5b9e\u65bd\u5931\u8d25\u4e3b\u8981\u6765\u81ea\u54ea\u4e9b\u7ec4\u7ec7\u548c\u6280\u672f\u56e0\u7d20\uff1f",
+                },
+            ],
+        },
+    )
+
+    titles = [chapter["chapter_title"] for chapter in blueprint["chapters"]]
+    assert "\u91c7\u8d2d\u51b3\u7b56\u94fe\u4e0e\u6d41\u7a0b" in titles
+    assert "\u5b9e\u65bd\u5931\u8d25\u98ce\u9669\u8bc6\u522b\u4e0e\u7ba1\u63a7" in titles
+    assert not any("\u653f\u7b56\u3001\u76d1\u7ba1\u6216\u5916\u90e8\u89c4\u5219" in title for title in titles)
 
 
 def test_pre_layout_rewrites_legacy_titles_and_keeps_chapter_contract():

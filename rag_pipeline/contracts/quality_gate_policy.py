@@ -128,6 +128,28 @@ def quality_gates_isolated(default: bool = False) -> bool:
     return _env_flag("REPORT_ISOLATE_QUALITY_GATES", default)
 
 
+def main_chain_only_mode(default: bool = False) -> bool:
+    """Run the report pipeline as a straight analysis -> writer chain.
+
+    In this mode review, QA, sanitizer, final audit, source gates, reformatter,
+    and table/render quality logic may still emit diagnostics, but they must not
+    edit public markdown or block delivery.
+    """
+
+    if _env_flag("REPORT_MAIN_CHAIN_ONLY", default):
+        return True
+    mode = quality_gate_mode("main_chain" if default else "blocking")
+    return mode in {
+        "main_chain",
+        "main_chain_only",
+        "straight_chain",
+        "writer_only",
+        "no_quality_gates",
+        "no_review",
+        "no_gates",
+    }
+
+
 def quality_gate_diagnostic(payload: Any) -> Any:
     """Marker helper for callers that preserve diagnostics without enforcement."""
 

@@ -59,6 +59,23 @@ def _evidence(ref="EV-1", *, chapter_id="ch_01", level="B", allowed_use="core_cl
     }
 
 
+def test_llm_analysis_input_uses_analysis_candidate_fact_pool_before_clean_fallback():
+    payload = build_llm_analysis_input(
+        {
+            "analysis_ready_evidence": [],
+            "clean_evidence_list": [],
+            "analysis_candidate_facts": [_evidence("EV-CAND", allowed_use="supporting_context")],
+            "claim_support_facts": [_evidence("EV-CLAIM", allowed_use="supporting")],
+            "chapter_evidence_diagnostics": {"ch_01": {"chapter_id": "ch_01", "chapter_title": "Demand"}},
+        },
+        {"query": "AI Agent demand"},
+    )
+
+    ids = [item["evidence_id"] for item in payload["fact_cards"]]
+    assert "EV-CLAIM" in ids
+    assert "EV-CAND" in ids
+
+
 def test_llm_analysis_input_uses_more_curated_evidence_per_chapter_by_default(monkeypatch):
     monkeypatch.delenv("BRAIN_LLM_ANALYSIS_MAX_FACTS_PER_CHAPTER", raising=False)
     curated = [
@@ -1251,6 +1268,18 @@ def test_llm_analysis_prompts_request_typed_claims_without_two_to_three_cap(monk
     assert "2-3 claim_units" not in global_prompt
 
 
+def test_llm_analysis_prompt_requires_industry_research_interpretation_not_fact_rewrite():
+    prompt = analysis_agent._llm_chapter_system_prompt()
+
+    assert "中文行业研究报告" in prompt
+    assert "解释层" in prompt or "解释单元" in prompt or "interpretation_units" in prompt
+    assert "不要停留在单条证据复述" in prompt
+    assert "paragraph_seed" in prompt
+    assert "supporting_facts" not in prompt
+    for forbidden in ("公开材料提到", "边界在于", "后续应继续观察", "方向性观察进入正文"):
+        assert forbidden not in prompt
+
+
 def test_analysis_public_fallback_text_has_no_mojibake():
     fallback_dimensions = analysis_agent._analysis_dimensions({})
     chapter_prompt = analysis_agent._llm_chapter_system_prompt()
@@ -2245,6 +2274,64 @@ def test_fallback_analysis_deduplicates_same_chapter_same_evidence_claims(monkey
     assert identities == [("ch_03_fallback", ("EV-LOCAL",))]
 
 
+def test_fallback_analysis_enriches_claims_with_interpretation_units(monkeypatch):
+    monkeypatch.setenv("REPORT_EVIDENCE_MODE", "advisory_weight")
+    facts = []
+    for index, text in enumerate(
+        [
+            "AI tools are being used to automate invoice processing and routine bookkeeping in accounting workflows.",
+            "Accounting employers are asking graduates to understand data analysis, process governance, and AI-assisted audit tools.",
+            "University accounting programs are adding digital finance, audit analytics, and practical AI tool training.",
+        ],
+        start=1,
+    ):
+        item = _evidence(f"EV-DEPTH-{index}", chapter_id="ch_depth", level="C", allowed_use="supporting_context")
+        item["fact"] = text
+        item["requirement_id"] = "REQ-depth"
+        item["source_id"] = f"SRC-DEPTH-{index}"
+        item["source"]["source_id"] = f"SRC-DEPTH-{index}"
+        item["topic_fit"] = "direct"
+        facts.append(item)
+
+    structured = analysis_agent.build_fallback_analysis(
+        {
+            "query": "会计学专业在AI时代的就业变化",
+            "chapter_evidence_packages": [
+                {
+                    "chapter_id": "ch_depth",
+                    "chapter_title": "会计岗位能力变化",
+                    "core_evidence": facts,
+                }
+            ],
+            "chapter_evidence_diagnostics": {
+                "ch_depth": {"chapter_id": "ch_depth", "chapter_title": "会计岗位能力变化"}
+            },
+        }
+    )
+
+    units = structured["claim_units"]
+    assert structured.get("interpretation_units")
+    assert units
+    assert units[0].get("interpretation_ids")
+    assert units[0].get("mechanism_chain")
+    assert units[0].get("claim_depth_ready") is True
+    assert structured["analysis_stage_diagnostics"]["interpretation_unit_count"] > 0
+    assert structured["analysis_stage_diagnostics"]["claims_with_mechanism_chain_rate"] > 0
+    assert structured["analysis_stage_diagnostics"]["shallow_claim_reasoning_count"] == 0
+
+
+def test_fallback_claim_from_public_fact_uses_public_report_judgment_language():
+    strong = analysis_agent._claim_from_public_fact("会计岗位能力变化", "AI 工具进入财务流程", "moderate")
+    directional = analysis_agent._claim_from_public_fact("会计教育培养调整", "高校增加数字财务课程", "directional")
+    joined = "\n".join([strong, directional])
+
+    assert "公开资料信号" not in joined
+    assert "后续判断" not in joined
+    assert "样本边界" not in joined
+    assert "后续分析" not in joined
+    assert "会计" in joined
+
+
 def test_llm_input_uses_chapter_aliases_for_fact_cards():
     evidence_package = {
         "chapter_evidence_diagnostics": {
@@ -2589,7 +2676,10 @@ def test_llm_validator_accepts_string_basis_reasoning_and_boundary():
     assert validation["status"] == "valid"
     unit = validation["chapter_synthesis"][0]["claim_units"][0]
     assert unit["evidence_basis"] == ["The source describes enterprise workflow automation deployments."]
+    assert unit["because_facts"] == ["The source describes enterprise workflow automation deployments."]
     assert unit["reasoning"] == "Workflow deployments indicate operational adoption rather than tool trials."
+    assert unit["mechanism"] == "Workflow deployments indicate operational adoption rather than tool trials."
+    assert unit["boundary"] == ["The claim is limited to disclosed deployment samples."]
     assert unit["counter_boundary"] == "The claim is limited to disclosed deployment samples."
 
 
@@ -3797,3 +3887,137 @@ def test_anchor_mismatch_defers_to_judge_partial_observation_by_default(monkeypa
     assert issue_counts["llm_claim_semantic_judge_partial_observed"] == 1
     assert "claim_support_anchor_mismatch_downgraded" not in issue_counts
     assert unit["claim_review_suggestions"][0]["issue_type"] == "llm_claim_semantic_judge_partial"
+
+
+def test_llm_analysis_input_v2_includes_evidence_interpretation_units(monkeypatch):
+    monkeypatch.setenv("BRAIN_LLM_ANALYSIS_MAX_CHAPTERS", "1")
+    monkeypatch.setenv("BRAIN_LLM_ANALYSIS_MAX_FACTS_PER_CHAPTER", "8")
+    payload = build_llm_analysis_input_v2(
+        {
+            "query": "会计学专业在AI时代的就业变化",
+            "analysis_ready_evidence": [
+                _evidence("EV-A", chapter_id="ch_01", proof_role="metric")
+                | {
+                    "fact": "代账场景中AI工具使单人服务户数提升10倍以上。",
+                    "distilled_fact": "代账场景中AI工具使单人服务户数提升10倍以上。",
+                    "requirement_id": "REQ-job",
+                    "topic_fit": "direct",
+                },
+                _evidence("EV-B", chapter_id="ch_01", proof_role="metric")
+                | {
+                    "fact": "审计数字化调研显示83%的受访者已在审计中应用数字化技术。",
+                    "distilled_fact": "审计数字化调研显示83%的受访者已在审计中应用数字化技术。",
+                    "requirement_id": "REQ-job",
+                    "topic_fit": "direct",
+                },
+                _evidence("EV-C", chapter_id="ch_01", proof_role="case")
+                | {
+                    "fact": "高校会计专业开始增加AI审计与数据分析课程。",
+                    "distilled_fact": "高校会计专业开始增加AI审计与数据分析课程。",
+                    "requirement_id": "REQ-job",
+                    "topic_fit": "direct",
+                },
+            ],
+            "chapter_evidence_diagnostics": {
+                "ch_01": {"chapter_id": "ch_01", "chapter_title": "就业变化"}
+            },
+        },
+        {"query": "会计学专业在AI时代的就业变化"},
+    )
+
+    chapter = payload["chapters"][0]
+    units = chapter["interpretation_units"]
+    assert units
+    assert units[0]["interpretation_id"].startswith("INT-ch_01")
+    assert units[0]["what_evidence_reflects"]
+    assert units[0]["mechanism_chain"]
+    assert units[0]["education_implication"]
+
+
+def test_validate_llm_analysis_preserves_interpretation_fields_and_marks_shallow_reasoning():
+    evidence_package = {
+        "analysis_ready_evidence": [
+            _evidence("EV-1", chapter_id="ch_01")
+            | {
+                "fact": "代账场景中AI工具使单人服务户数提升10倍以上。",
+                "distilled_fact": "代账场景中AI工具使单人服务户数提升10倍以上。",
+                "requirement_id": "REQ-job",
+            },
+            _evidence("EV-2", chapter_id="ch_01")
+            | {
+                "fact": "审计数字化调研显示83%的受访者已在审计中应用数字化技术。",
+                "distilled_fact": "审计数字化调研显示83%的受访者已在审计中应用数字化技术。",
+                "requirement_id": "REQ-job",
+            },
+        ]
+    }
+    payload = {
+        "chapter_synthesis": [
+            {
+                "chapter_id": "ch_01",
+                "claim_units": [
+                    {
+                        "claim_id": "CL-1",
+                        "claim": "AI工具正在推动会计岗位从基础核算转向数据解释和流程治理。",
+                        "used_evidence_ids": ["EV-1", "EV-2"],
+                        "evidence_basis": ["代账和审计证据共同显示AI正在替代重复处理环节。"],
+                        "reasoning_chain": ["重复处理被工具接管后，岗位价值转向解释和治理。"],
+                        "mechanism": "重复处理被工具接管后，岗位价值转向解释和治理。",
+                        "interpretation_ids": ["INT-ch_01-001"],
+                        "what_evidence_reflects": "证据共同显示AI先影响重复处理环节。",
+                        "why_it_matters": "这会改变岗位能力排序。",
+                        "mechanism_chain": ["工具接管重复处理。", "人力转向解释和治理。"],
+                        "employment_implication": "就业机会向复合型财务分析岗位集中。",
+                        "education_implication": "培养体系需要加入AI工具和数据治理训练。",
+                        "industry_implication": "服务机构竞争焦点转向工具化交付能力。",
+                        "counter_reading": "公开样本不能推出所有岗位同步变化。",
+                        "claim_strength": "directional",
+                    }
+                ],
+            }
+        ]
+    }
+
+    validation = validate_llm_analysis_output(payload, evidence_package)
+    unit = validation["chapter_synthesis"][0]["claim_units"][0]
+
+    assert unit["interpretation_ids"] == ["INT-ch_01-001"]
+    assert unit["what_evidence_reflects"]
+    assert unit["employment_implication"]
+    assert unit["education_implication"]
+    assert unit["claim_depth_ready"] is True
+    assert validation["llm_validation_issue_counts"]["shallow_claim_reasoning"] == 1
+
+
+def test_analysis_conversion_diagnostics_reports_depth_and_interpretation_metrics():
+    structured = {
+        "claim_units": [
+            {
+                "claim_id": "CL-1",
+                "fact_ids": ["EV-1", "EV-2", "EV-3"],
+                "interpretation_ids": ["INT-1"],
+                "mechanism_chain": ["工具接管重复处理。", "岗位转向解释和治理。"],
+                "employment_implication": "就业机会向复合型岗位集中。",
+            },
+            {
+                "claim_id": "CL-2",
+                "fact_ids": ["EV-4"],
+                "single_fact_claim": True,
+                "reasoning": "单条证据只能支持谨慎判断。",
+                "mechanism": "单条证据只能支持谨慎判断。",
+            },
+        ]
+    }
+
+    diagnostics = analysis_agent._analysis_conversion_diagnostics(
+        {"analysis_ready_evidence": [_evidence(f"EV-{idx}") for idx in range(1, 6)]},
+        structured,
+        input_evidence_card_count=5,
+    )
+
+    assert diagnostics["interpretation_unit_count"] == 1
+    assert diagnostics["avg_facts_per_claim"] == 2.0
+    assert diagnostics["single_fact_claim_rate"] == 0.5
+    assert diagnostics["claims_with_mechanism_chain_rate"] == 0.5
+    assert diagnostics["claims_with_implication_rate"] == 0.5
+    assert diagnostics["shallow_claim_reasoning_count"] == 1

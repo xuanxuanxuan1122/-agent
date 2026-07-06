@@ -83,6 +83,50 @@ def _text_blob(package: Dict[str, Any]) -> str:
     return " ".join(str(part or "") for part in parts)
 
 
+_PROFESSION_EDUCATION_CONTEXT_RE = re.compile(
+    r"会计|审计|财务|就业|岗位|职业|招聘|人力资源|人才|教育|课程|培养|专业|高校|学生|能力要求|春招|"
+    r"accounting|employment|job|career|education|curriculum|talent",
+    flags=re.I,
+)
+
+
+def _profession_education_context_blob(package: Dict[str, Any]) -> str:
+    parts = [
+        package.get("chapter_title"),
+        package.get("chapter_question"),
+        package.get("core_question"),
+        package.get("research_object"),
+        package.get("report_family"),
+        package.get("report_profile"),
+        package.get("query"),
+        package.get("user_query"),
+        _text_blob(package),
+    ]
+    return " ".join(str(part or "") for part in parts if part)
+
+
+def _is_profession_education_context(package: Dict[str, Any]) -> bool:
+    return bool(_PROFESSION_EDUCATION_CONTEXT_RE.search(_profession_education_context_blob(package)))
+
+
+def _adapt_profession_education_title(title: str, package: Dict[str, Any], block_type: str) -> str:
+    if not title or not _is_profession_education_context(package):
+        return title
+    if re.search(r"玩家|竞争|格局|入口|变现|收入", title):
+        if block_type == "metric_reconciliation":
+            return "岗位变化能否量化"
+        if block_type == "unit_economics":
+            return "能力升级如何影响就业"
+        if block_type in {"case_comparison", "customer_painpoint_matrix"}:
+            return "岗位变化在哪里发生"
+        if block_type in {"risk_trigger", "verification_checklist", "scenario_analysis"}:
+            return "能力转型有什么边界"
+        if block_type == "technology_maturity":
+            return "工具能力卡在哪里"
+        return "岗位能力如何分化"
+    return title
+
+
 def _evidence_shape(package: Dict[str, Any], chapter_blueprint: Optional[Dict[str, Any]] = None) -> set[str]:
     chapter_blueprint = _as_dict(chapter_blueprint)
     values: set[str] = set()
@@ -800,6 +844,7 @@ def _naturalize_title(title: str, package: Dict[str, Any], block_type: str) -> s
     if not title or title in GENERIC_SECTION_TITLES or _title_has_forbidden_terms(title):
         variable = _chapter_context_variable(package) or _analysis_variable(package, block_type, _items_for_block(package, block_type))
         title = _title_from_variable(variable, block_type)
+    title = _adapt_profession_education_title(title, package, block_type)
     title = _compact(title, 24).strip(" ：:，,。")
     if _title_has_forbidden_terms(title):
         title = ""

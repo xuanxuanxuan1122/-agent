@@ -298,6 +298,163 @@ def _strip_generic_bridge_sentences(text: str) -> str:
     return "".join(kept).strip()
 
 
+PUBLIC_BOUNDARY_NOTE_PATTERNS = [
+    r"边界在于",
+    r"结论需要保留弹性",
+    r"后续应继续观察",
+    r"后续判断.*继续观察",
+    r"需结合后续.*观察",
+    r"长期.*需结合后续.*观察",
+    r"公开样本仍有限",
+    r"样本仍有限",
+    r"数据主要反映.*未覆盖",
+    r"人效数据基于.*招聘增速反映",
+    r"数据口径限定于.*外推",
+    r"调研样本集中于.*未覆盖",
+    r"未覆盖.*全行业",
+    r"未直接拆分.*细分",
+    r"未直接披露.*结论适用于判断",
+    r"适用于判断.*方向",
+    r"结论基于.*需",
+    r"结论基于.*具体.*而异",
+    r"结论基于.*未包含.*适用于",
+    r"结论主要基于.*适用于判断",
+    r"结论适用于.*需",
+    r"证据聚焦于.*结论适用于判断",
+    r"风险判断基于.*需",
+    r"政策信号具有.*局限性",
+    r"全国性统一标准尚未",
+    r"渠道渗透存在.*差异",
+    r"需结合.*校准",
+    r"需结合.*验证",
+    r"需结合.*量化",
+    r"需结合.*进一步细化",
+    r"需要结合.*进一步",
+    r"外推至全国需考虑",
+    r"进一步量化",
+    r"进一步验证",
+    r"需更多.*样本",
+    r"单一.*案例.*不能代表",
+    r"尚未覆盖",
+    r"不足以代表整体变化",
+    r"不能直接代表",
+    r"不能直接替代",
+    r"仅适用于",
+    r"只适用于",
+    r"适用于观察",
+    r"政策为宏观指导性文件",
+    r"需待.*配套方案出台",
+    r"案例集中于.*尚未形成",
+    r"案例集中于.*存在显著梯度差异",
+    r"仍在演进.*存在局限",
+    r"需审慎视角",
+    r"仍需.*复核",
+    r"仍需要.*复核",
+    r"仍需要.*确认",
+    r"避免把.*外推",
+    r"不能.*外推",
+    r"这类风险信号会影响",
+    r"岗位能力变化一旦扩大",
+    r"风险事实会直接影响机会判断",
+    r"风险只有在真实流程中",
+    r"风险提示只有进入",
+    r"后续差异会体现在",
+    r"行业含义在于.*任务边界",
+    r"如果这种变化持续进入",
+    r"变化路径更可能表现为",
+    r"会首先影响.*先后顺序",
+    r"会首先影响",
+    r"只有这些变化进入",
+    r"开始同时影响供给端能力建设",
+    r"解释力取决于.*统计范围",
+    r"更适合作为判断.*依据",
+    r"这些条件越清楚",
+    r"相关变化已经出现具体动作",
+    r"可继续观察",
+    r"之所以重要",
+    r"如果类似动作持续增加",
+    r"如果样本停留",
+    r"结论仍需保持审慎",
+    r"实际影响取决于",
+    r"这些条件决定相关能力能否",
+    r"技术能力本身只是入口",
+    r"相关投入只有转化为",
+    r"投入规模本身不是终点",
+    r"真正影响来自",
+    r"从技术扩散看",
+    r"从风险约束看",
+    r"正在影响.*之间的边界",
+]
+
+PUBLIC_BOUNDARY_NOTE_RE = re.compile("|".join(f"(?:{pattern})" for pattern in PUBLIC_BOUNDARY_NOTE_PATTERNS))
+
+PUBLIC_BOUNDARY_NOTE_STARTERS = (
+    "结论基于",
+    "证据聚焦于",
+    "案例集中于",
+    "调研样本集中于",
+    "证据来源于",
+    "数据口径限定于",
+    "人效数据基于",
+    "投入数据仅反映",
+    "市场增速为宏观预测值",
+    "招生热度反映的是",
+    "政策导向明确但具体",
+    "政策导向明确，但具体",
+)
+
+PUBLIC_BOUNDARY_NOTE_MARKERS = (
+    "适用于",
+    "需结合",
+    "未覆盖",
+    "未包含",
+    "未直接披露",
+    "尚未",
+    "存在显著",
+    "存在局限",
+    "具体",
+    "而异",
+    "受",
+    "制约",
+    "代表性",
+    "后续",
+    "观察",
+    "验证",
+)
+
+
+def _strip_citation_suffix(value: str) -> str:
+    return re.sub(r"(?:\[\d{1,5}\])+\s*$", "", str(value or "")).strip()
+
+
+def _looks_like_public_boundary_note(value: Any) -> bool:
+    text = _strip_citation_suffix(str(value or "").strip())
+    if not text:
+        return False
+    compacted = re.sub(r"\s+", "", text)
+    if not compacted:
+        return False
+    if compacted.startswith(PUBLIC_BOUNDARY_NOTE_STARTERS) and any(
+        marker in compacted for marker in PUBLIC_BOUNDARY_NOTE_MARKERS
+    ):
+        return True
+    return bool(PUBLIC_BOUNDARY_NOTE_RE.search(compacted))
+
+
+def _strip_public_boundary_note_sentences(text: str) -> str:
+    value = str(text or "").strip()
+    if not value:
+        return ""
+    value = re.sub(r"[，,]?\s*这一事实用于校准[^。；;\n]*(?=[。；;]|$)", "", value)
+    parts = [item.strip() for item in re.split(r"(?<=[。！？；;])\s*", value) if item.strip()]
+    if not parts:
+        return "" if _looks_like_public_boundary_note(value) else value
+    kept = [item for item in parts if not _looks_like_public_boundary_note(item)]
+    if len(kept) != len(parts):
+        return "".join(kept).strip()
+    return value
+
+
 def _public_text(value: Any, max_chars: int = 500) -> str:
     normalized = _insert_sentence_boundaries_before_bridge_phrases(
         _naturalize_mechanical_transition_prefixes(_normalize_public_text(value))
@@ -317,6 +474,7 @@ def _public_text(value: Any, max_chars: int = 500) -> str:
     text = _strip_generic_bridge_sentences(text)
     text = remove_hard_industry_templates(text)
     text = _strip_public_template_language(text)
+    text = _strip_public_boundary_note_sentences(text)
     text = re.sub(r"\s{2,}", " ", text)
     text = re.sub(r"([。；]){2,}", r"\1", text)
     text = text.strip(" \t\r\n，；")
@@ -594,6 +752,11 @@ _HEADING_CONNECTOR_RE = re.compile(
 )
 
 
+_FACT_SENTENCE_HEADING_RE = re.compile(
+    r"(?:表明|显示|指出|提到|披露|反映|说明|印证|确认|明确|同步|催生|推动|提及)$"
+)
+
+
 def _looks_like_incomplete_heading(value: Any) -> bool:
     text = str(value or "").strip()
     if not text:
@@ -602,7 +765,9 @@ def _looks_like_incomplete_heading(value: Any) -> bool:
         return True
     if text.count("“") > text.count("”") or text.count("《") > text.count("》"):
         return True
-    if text.endswith(("和", "与", "及", "或", "、", "的", "在", "向", "从", "以", "把", "被", "+")):
+    if text.endswith(("和", "与", "及", "或", "、", "的", "在", "向", "从", "以", "把", "被", "正", "正在", "通过", "将", "已", "为", "对", "+")):
+        return True
+    if _FACT_SENTENCE_HEADING_RE.search(text):
         return True
     if re.search(r"[A-Z]$", text) and not text.endswith(("AI", "API", "SaaS")):
         return True
@@ -712,6 +877,19 @@ def _title_from_section_claim(section: Dict[str, Any], *, max_chars: int = 24, a
     text = _public_text(source, 120)
     if not text:
         return ""
+    action_title = re.search(
+        r"^(.{4,22}?)(?:正通过|正在通过|正围绕|正在围绕|通过).{0,36}?推动(.{2,24}?)(?:[，。；\[\n]|$)",
+        text,
+    )
+    if action_title:
+        subject = action_title.group(1).strip(" ，。；：:")
+        object_text = re.split(r"[与和及、，。；]", action_title.group(2).strip(" ，。；：:"), 1)[0]
+        candidate = f"{subject}推动{object_text}".strip()
+        if len(candidate) > max_chars:
+            candidate = f"{subject}推动"
+        title = _compact_public_heading(candidate, max_chars=max(28, max_chars))
+        if title and not _looks_like_incomplete_heading(title) and not _is_internal_section_title(title):
+            return title
     head = re.split(r"[\u3002\uff1b\uff0c\uff1a;,:，。；：]", text, 1)[0].strip()
     head = re.sub(r"^(?:机会判断|方向性判断|核心判断)\s*[:：]\s*", "", head).strip()
     avoid = _compact_public_heading(avoid_prefix, max_chars=max_chars).strip() if avoid_prefix else ""
@@ -847,9 +1025,151 @@ def _line_key(value: Any) -> str:
     return "".join(re.findall(r"[0-9A-Za-z\u4e00-\u9fff]+", text)).lower()
 
 
+def _split_public_sentences(value: Any) -> List[str]:
+    return [item.strip() for item in re.split(r"(?<=[。！？；;.!?])\s*", str(value or "")) if item.strip()]
+
+
+def _sentences_with_attached_citations(value: Any) -> List[str]:
+    sentences: List[str] = []
+    for sentence in _split_public_sentences(value):
+        if re.fullmatch(r"(?:\[\d{1,5}\])+", sentence) and sentences:
+            sentences[-1] = f"{sentences[-1]}{sentence}"
+            continue
+        sentences.append(sentence)
+    return sentences
+
+
+def _append_missing_refs_to_text(text: str, refs: Sequence[str]) -> str:
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return ""
+    missing_refs: List[str] = []
+    seen_refs: set[str] = set()
+    for ref in refs:
+        if ref in seen_refs or ref in cleaned:
+            continue
+        missing_refs.append(ref)
+        seen_refs.add(ref)
+    if missing_refs:
+        cleaned = f"{cleaned}{''.join(missing_refs[:4])}"
+    return cleaned
+
+
+def _dedupe_repeated_sentences_in_line(value: str) -> str:
+    text = str(value or "").strip()
+    sentences = _sentences_with_attached_citations(text)
+    if len(sentences) <= 1:
+        return text
+    seen: set[str] = set()
+    kept: List[str] = []
+    carried_refs: List[str] = []
+    for sentence in sentences:
+        key = _line_key(sentence)
+        if len(key) >= 18 and key in seen:
+            carried_refs.extend(re.findall(r"\[\d{1,5}\]", sentence))
+            continue
+        if len(key) >= 18:
+            seen.add(key)
+        kept.append(sentence)
+    if len(kept) == len(sentences):
+        return text
+    return _append_missing_refs_to_text("".join(kept).strip(), carried_refs)
+
+
+_EVIDENCE_TRANSCRIPTION_SENTENCE_RE = re.compile(
+    r"^(?:"
+    r"调研|研究|报告|材料|公开材料|政策文件|文件|通知|意见|规划|目录|"
+    r"财政部|教育部|人社部|工信部|国家统计局|地方|官方渠道|媒体"
+    r").{0,60}?"
+    r"(?:强调|明确|指出|提到|显示|披露|响应|聚焦|推动|提供|指向|确认|同步|提出)"
+)
+
+_ANALYTICAL_SENTENCE_RE = re.compile(
+    r"意味着|表明|说明|导致|促使|推动|重塑|改变|要求|成为|决定|影响|约束|"
+    r"转向|迁移|因此|从而|核心|关键|价值|机制|路径|结构|能力|风险|成本|利润|"
+    r"不只是|而是|不能只|要把|需要把"
+)
+
+
+def _drop_redundant_evidence_transcription_sentences(value: str) -> str:
+    text = str(value or "").strip()
+    sentences = _sentences_with_attached_citations(text)
+    if len(sentences) < 3:
+        return text
+    candidate_indexes = [
+        index
+        for index, sentence in enumerate(sentences)
+        if _EVIDENCE_TRANSCRIPTION_SENTENCE_RE.search(re.sub(r"^\s+", "", sentence))
+    ]
+    if not candidate_indexes:
+        return text
+    kept = [sentence for index, sentence in enumerate(sentences) if index not in set(candidate_indexes)]
+    if len(kept) < 2:
+        return text
+    if not any(_ANALYTICAL_SENTENCE_RE.search(sentence) for sentence in kept):
+        return text
+    carried_refs: List[str] = []
+    for index in candidate_indexes:
+        carried_refs.extend(re.findall(r"\[\d{1,5}\]", sentences[index]))
+    return _append_missing_refs_to_text("".join(kept).strip(), carried_refs)
+
+
+def _drop_sentences_repeated_in_previous_lines(value: str, previous_lines: Sequence[str]) -> str:
+    text = str(value or "").strip()
+    if not text or not previous_lines:
+        return text
+    previous_blob_key = _line_key("。".join(str(line or "") for line in previous_lines[-10:]))
+    if not previous_blob_key:
+        return text
+    sentences = _sentences_with_attached_citations(text)
+    if len(sentences) <= 1:
+        return text
+    kept: List[str] = []
+    carried_refs: List[str] = []
+    removed = False
+    for sentence in sentences:
+        key = _line_key(sentence)
+        if len(key) >= 18 and key in previous_blob_key:
+            carried_refs.extend(re.findall(r"\[\d{1,5}\]", sentence))
+            removed = True
+            continue
+        kept.append(sentence)
+    if not removed:
+        return text
+    if not kept:
+        return text
+    return _append_missing_refs_to_text("".join(kept).strip(), carried_refs)
+
+
+def _strip_leading_repeated_sentences(value: str, previous_lines: Sequence[str]) -> str:
+    text = str(value or "").strip()
+    if not text or not previous_lines:
+        return text
+    previous_blob_key = _line_key("。".join(str(line or "") for line in previous_lines[-6:]))
+    if not previous_blob_key:
+        return text
+    sentences = _sentences_with_attached_citations(text)
+    if len(sentences) <= 1:
+        return text
+    drop_count = 0
+    for sentence in sentences:
+        key = _line_key(sentence)
+        if len(key) >= 24 and key in previous_blob_key:
+            drop_count += 1
+            continue
+        break
+    if not drop_count:
+        return text
+    kept = "".join(sentences[drop_count:]).strip()
+    if not _line_key(kept):
+        return text
+    return kept or ""
+
+
 def _dedupe_narrative_lines(lines: Sequence[str]) -> List[str]:
     result: List[str] = []
     seen = set()
+    seen_prefixes = set()
     for line in lines:
         text = str(line or "")
         stripped = text.strip()
@@ -857,18 +1177,79 @@ def _dedupe_narrative_lines(lines: Sequence[str]) -> List[str]:
             if result and result[-1].strip():
                 result.append(text)
             continue
-        if stripped.startswith(("#", "|", "**", "- [")) or re.match(r"^\|?\s*-{3,}", stripped):
+        if stripped.startswith(("#", "|", "**", "- ")) or re.match(r"^\|?\s*-{3,}", stripped):
             result.append(text)
+            continue
+        stripped = _strip_leading_repeated_sentences(stripped, result)
+        if not stripped:
+            continue
+        stripped = _drop_sentences_repeated_in_previous_lines(stripped, result)
+        if not stripped:
+            continue
+        stripped = _dedupe_repeated_sentences_in_line(stripped)
+        if not stripped:
+            continue
+        stripped = _drop_redundant_evidence_transcription_sentences(stripped)
+        if not stripped:
+            continue
+        text = stripped
+        key = _line_key(stripped)
+        if len(key) >= 24 and key in seen:
+            continue
+        prefix_key = key[:96] if len(key) >= 128 else ""
+        if prefix_key and prefix_key in seen_prefixes:
+            continue
+        if len(key) >= 24:
+            seen.add(key)
+        if prefix_key:
+            seen_prefixes.add(prefix_key)
+        result.append(text)
+    while result and not result[-1].strip():
+        result.pop()
+    return result
+
+
+def dedupe_public_markdown_paragraphs(markdown: str) -> str:
+    """Remove repeated public body paragraphs after chapter assembly.
+
+    Chapter-level rendering cannot see repeated paragraphs that land in later
+    chapters. This pass runs before the source appendix is appended, so it only
+    touches public body prose and leaves source rows intact.
+    """
+    result: List[str] = []
+    seen = set()
+    for raw_line in str(markdown or "").splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            if result and result[-1].strip():
+                result.append(raw_line)
+            continue
+        if re.fullmatch(r"(?:\[\d{1,5}\])+", stripped):
+            continue
+        if stripped.startswith(("#", "|", "**", "- ")) or re.match(r"^\|?\s*-{3,}", stripped):
+            result.append(raw_line)
+            continue
+        stripped = _strip_leading_repeated_sentences(stripped, result)
+        if not stripped:
+            continue
+        stripped = _drop_sentences_repeated_in_previous_lines(stripped, result)
+        if not stripped:
+            continue
+        stripped = _dedupe_repeated_sentences_in_line(stripped)
+        if not stripped:
+            continue
+        stripped = _drop_redundant_evidence_transcription_sentences(stripped)
+        if not stripped:
             continue
         key = _line_key(stripped)
         if len(key) >= 24 and key in seen:
             continue
         if len(key) >= 24:
             seen.add(key)
-        result.append(text)
+        result.append(stripped)
     while result and not result[-1].strip():
         result.pop()
-    return result
+    return "\n".join(result)
 
 
 def strip_internal_layout_language(text: str) -> str:
@@ -1427,28 +1808,29 @@ def _public_section_expansion_sentences(section: Dict[str, Any]) -> List[str]:
     title = _public_text(section.get("section_title") or section.get("title"), 80) or "这一判断"
     block_type = str(section.get("block_type") or "").strip().lower()
     if block_type in {"case_comparison", "customer_painpoint_matrix", "integrated_signal"}:
-        mechanism = "从机制上看，这类材料的价值不在于单点案例本身，而在于它是否呈现明确主体、具体场景、责任分工和可复核结果。"
-        implication = "进一步看，相关变化如果从孤立样本扩展到更多场景，就会更适合解释主题变化；如果只停留在单次披露，就只能作为早期观察。"
+        mechanism = "这些信号放在一起看，企业不只是调整单个岗位，而是在重新分配工具使用、数据校验、流程协同和业务解释的责任。"
+        implication = "这种变化会把岗位竞争从单一操作熟练度，推向对业务场景、系统输出和风险责任的综合理解。"
     elif block_type == "metric_reconciliation":
-        mechanism = "从机制上看，指标只有放回主体、范围、期间和口径中解释，才适合支撑趋势判断；孤立数值只能说明局部变化，不能直接推出整体结论。"
-        implication = "进一步看，口径越清晰，越能区分长期变化、短期波动和单一来源估算之间的差异，也越能判断相关结论是否具备持续验证价值。"
+        mechanism = "指标放回主体、范围和期间中观察后，可以帮助区分长期变化、短期波动和单一来源估算之间的差异。"
+        implication = "对行业主体而言，口径越清楚，越容易把资源投入、岗位调整和课程更新对应到具体业务环节。"
     elif block_type in {"risk_trigger", "boundary"}:
-        mechanism = "从机制上看，风险信号的作用不是否定全部机会，而是指出结论失效的触发条件；当安全、成本、责任或可靠性约束放大时，原有增长判断需要随之降级。"
-        implication = "行业含义在于，边界条件越清楚，越能区分已经被事实支撑的机会和仍停留在假设层面的机会，从而避免把局部乐观样本写成确定性趋势。"
+        mechanism = "风险信号不会否定技术应用本身，但会改变企业部署AI工具时对安全、成本、责任和可靠性的排序。"
+        implication = "当这些约束上升为管理要求，财务岗位的价值会更多体现在权限治理、异常识别和结果复核上。"
     elif block_type == "technology_maturity":
-        mechanism = "从机制上看，技术成熟度会同时影响可靠性、权限治理、安全边界和集成成本；这些变量决定相关能力能否从演示环境进入生产流程。"
-        implication = "进一步看，技术事实只有与使用深度、流程变化和持续运行要求相连，才能真正解释实际影响，而不是只停留在功能展示层面。"
+        mechanism = "技术成熟度会同时影响可靠性、权限治理、安全边界和集成成本，决定AI工具能否从演示环境进入真实生产流程。"
+        implication = "一旦工具进入稳定流程，岗位要求就会从会不会使用软件，进一步转向能否理解流程改造和结果责任。"
     else:
-        mechanism = "从公开事实看，相关变化需要和具体业务、时间范围、执行条件放在一起理解；这些关系越连续，判断越有支撑。"
-        implication = "进一步看，同一事实在不同场景下可能对应不同强度的结论，可确认部分、方向性部分和仍需保留的边界需要分别呈现。"
+        mechanism = "公开事实显示，相关变化需要放到具体业务、时间范围和执行条件中理解，才能看清它对岗位、组织和教育供给的影响。"
+        implication = "这会让分析重点从单点事件转向连续变化：哪些任务先变化，哪些能力被放大，哪些组织环节需要同步调整。"
     return [
-        f"对“{title}”这一判断而言，关键不只是事实是否出现，而是它如何改变具体业务、资源安排、执行条件或后续选择。",
+        f"围绕“{title}”，关键不只是事实是否出现，而是它如何改变具体业务、资源安排、执行条件和后续选择。",
         mechanism,
         implication,
-        "较稳妥的写法是先确认事实能够支撑的最低结论，再讨论它向更大范围外推时需要满足的关键条件。",
-        "据此可以区分三类内容：已经被材料直接支撑的事实、需要继续观察的变化方向，以及不应被过早放大的外推判断。",
-        "变化信号和约束条件需要同时出现：前者说明为什么值得关注，后者说明为什么不能把局部样本直接写成整体定论。",
-        "因此，这一段应保持边界清楚：它可以提高判断密度，也需要说明适用对象和时间窗口，并和同章其他来源共同构成论证，避免单一材料承担过强结论。",
+        "沿着这一变化继续展开，可以看到企业端、教育端和个人能力端会形成联动：企业重新配置流程，学校调整训练内容，个体则需要把专业判断和工具能力结合起来。",
+        "这类变化进入更多业务场景后，会逐步影响招聘标准、课程设置、职业培训和服务机构的竞争方式。",
+        "从企业端看，影响最先体现在岗位分工和管理流程上：原本由人工完成的重复环节被工具吸收，留下来的工作更强调异常处理、跨系统协同和业务解释。",
+        "从人才端看，专业知识仍是基础，但单纯掌握规则和凭证处理已经不够，能否把工具输出转化为可被管理层使用的判断，会成为新的区分度。",
+        "从教育端看，课程和实训需要更贴近真实业务流程，让学生在财务规则、数据处理、智能工具和风险控制之间建立连续能力。",
     ]
 
 
@@ -1657,6 +2039,38 @@ def _slot_matches_section(slot: str, section: Dict[str, Any]) -> bool:
     return False
 
 
+def _first_public_section_text_blob(chapter: Dict[str, Any]) -> str:
+    for section in _as_list(chapter.get("sections")):
+        section = _as_dict(section)
+        if _section_should_skip(section):
+            continue
+        parts: List[str] = []
+        for key in ("claim", "reasoning", "mechanism", "decision_implication", "actionable"):
+            value = _clean_render_text(section.get(key), 1200)
+            if value:
+                parts.append(value)
+        for block in _as_list(section.get("render_blocks")):
+            block = _as_dict(block)
+            if str(block.get("type") or "").strip() != "paragraph":
+                continue
+            value = _clean_render_text(block.get("text"), 1600)
+            if value:
+                parts.append(value)
+        return " ".join(parts)
+    return ""
+
+
+def _lead_repeats_first_section(lead: str, chapter: Dict[str, Any]) -> bool:
+    lead_key = _line_key(lead)
+    if len(lead_key) < 24:
+        return False
+    first_blob_key = _line_key(_first_public_section_text_blob(chapter))
+    if not first_blob_key:
+        return False
+    shorter, longer = (lead_key, first_blob_key) if len(lead_key) <= len(first_blob_key) else (first_blob_key, lead_key)
+    return len(shorter) >= 24 and shorter in longer
+
+
 def _compact_chapter_heading(value: Any, *, max_chars: int = 28) -> str:
     if re.search(r"(?:\. ?){2,}|…", str(value or "")):
         return ""
@@ -1708,6 +2122,9 @@ def _section_addition_already_covered(text: str, existing_blob: str) -> bool:
 def _augment_render_blocks_with_section_fields(section: Dict[str, Any]) -> Dict[str, Any]:
     copied = dict(section)
     blocks = [dict(block) for block in _as_list(copied.get("render_blocks")) if isinstance(block, dict)]
+    if not _env_flag("REPORT_RENDER_APPEND_SECTION_FIELDS", False):
+        copied["render_blocks"] = blocks
+        return copied
     existing_blob = " ".join(str(block.get("text") or "") for block in blocks)
     decision_source = copied.get("decision_implication")
     if not decision_source and not copied.get("actionable_is_fallback"):
@@ -1775,7 +2192,7 @@ def render_chapter_package(
     flow_intro = _chapter_flow_intro(chapter, index=index, previous_chapter=previous_chapter)
     if flow_intro:
         lines.append(flow_intro)
-    if lead and lead != flow_intro:
+    if lead and lead != flow_intro and not _lead_repeats_first_section(lead, chapter):
         lines.append(lead)
         _append_citation_to_last_paragraph(lines, _first_section_citation_refs(chapter))
     chapter_tables = [

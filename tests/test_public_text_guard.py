@@ -16,6 +16,17 @@ def test_public_text_guard_rejects_web_chrome_artifacts():
     assert "next_static_asset" in result["reasons"]
 
 
+def test_public_text_guard_rejects_spaced_markdown_image_and_portal_chrome():
+    dirty = "西浦君谋AI 学习超市 图书馆 IT 融合门户 --- ! [Xi'an Jiaotong-Liverpool University logo]"
+
+    result = public_text_quality(dirty)
+
+    assert result["ok"] is False
+    assert result["severity"] == "reject"
+    assert "markdown_image" in result["reasons"]
+    assert "navigation_chrome" in result["reasons"]
+
+
 def test_public_text_guard_rejects_eastmoney_navigation_chrome():
     dirty = (
         "[](/newstatic/images/logo.gif)](//www.eastmoney.com/) "

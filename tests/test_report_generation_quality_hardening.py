@@ -192,6 +192,29 @@ def test_public_sanitizer_removes_soft_internal_narrative_language():
     assert public_narrative_leak_audit(cleaned)["blocker_count"] == 0
 
 
+def test_public_sanitizer_drops_review_boundary_sentence_but_keeps_analysis_and_citation():
+    markdown = (
+        "# \u62a5\u544a\n\n"
+        "## 1. \u6559\u80b2\u57f9\u517b\u8c03\u6574\n"
+        "\u56fd\u5bb6\u804c\u4e1a\u6559\u80b2\u6539\u9769\u5bfc\u5411\u4e0e\u884c\u4e1a\u8c03\u7814\u5171\u540c\u63a8\u52a8\u4f1a\u8ba1\u4e13\u4e1a\u57f9\u517b\u65b9\u6848\u5411\u201c\u5927\u6570\u636e+\u5408\u89c4\u98ce\u63a7\u201d\u65b9\u5411\u8fed\u4ee3\u3002"
+        "\u8fd9\u8868\u660e\u6559\u80b2\u7aef\u5df2\u8bc6\u522b\u5230\u4f20\u7edf\u4f1a\u8ba1\u6280\u80fd\u4e0eAI\u65f6\u4ee3\u9700\u6c42\u7684\u65ad\u5c42\u3002"
+        "\u4ec5\u53cd\u6620\u804c\u4e1a\u6559\u80b2\u4f53\u7cfb\u5185\u7684\u89c4\u5212\u52a8\u5411\uff0c"
+        "\u672a\u8986\u76d6\u672c\u79d1\u53ca\u4ee5\u4e0a\u5b66\u672f\u578b\u4f1a\u8ba1\u6559\u80b2\u7684\u540c\u6b65\u8c03\u6574\u8282\u594f\u3002[1]\n\n"
+        "## \u6765\u6e90\u9644\u5f55\n"
+        "- [1] \u6765\u6e90 | https://example.com/source\n"
+    )
+
+    cleaned = sanitize_public_markdown(markdown, mode="enforce")
+    body = cleaned.split("## \u6765\u6e90\u9644\u5f55", 1)[0]
+
+    assert "\u5927\u6570\u636e+\u5408\u89c4\u98ce\u63a7" in body
+    assert "\u9700\u6c42\u7684\u65ad\u5c42" in body
+    assert "\u4ec5\u53cd\u6620" not in body
+    assert "\u672a\u8986\u76d6" not in body
+    assert "[1]" in body
+    assert public_narrative_leak_audit(cleaned)["blocker_count"] == 0
+
+
 def test_final_writer_excludes_diagnostic_global_blocks_from_public_report():
     result = run_final_writer_agent(
         query="AI Agent企业级落地与商业化验证",

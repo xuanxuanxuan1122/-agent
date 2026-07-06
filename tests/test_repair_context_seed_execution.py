@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from rag_pipeline.agents import brain_agent as brain_agent_module
+from rag_pipeline.context.context_view_builder import _repair_task_seed
 
 
 def test_analysis_repair_priorities_sync_back_to_evidence_package():
@@ -103,6 +104,25 @@ def test_repair_context_seeds_become_sanitized_followup_tasks():
     assert "origin_payload" not in tasks[0]
     assert "raw_page" not in tasks[0]
     assert "Forbidden cached fact text" not in str(tasks[0])
+
+
+def test_repair_task_seed_query_does_not_leak_internal_diagnostic_gap_type():
+    seed = _repair_task_seed(
+        {
+            "gap_id": "gap-claim-1",
+            "gap_type": "claim_semantic_support_mismatch",
+            "claim": "运营商盈利模型取决于换电站资产利用率和车辆周转密度。",
+            "chapter_title": "资产利用率与成本结构分析",
+            "required_fields": ["source", "metric", "value"],
+            "proof_role": "support",
+            "status": "still_insufficient",
+        },
+        {},
+    )
+
+    assert "claim_semantic_support_mismatch" not in seed["query"]
+    assert "资产利用率" in seed["query"]
+    assert "运营商盈利模型" in seed["query"]
 
 
 def test_repair_context_schedule_tasks_are_preferred_and_keep_cache_scope():

@@ -5,6 +5,16 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Sequence
 
+from rag_pipeline.contracts.report_intent import (
+    PROFESSION_EDUCATION_DOMAIN,
+    PROFESSION_EDUCATION_INTENT,
+    contains_commercial_frame_term,
+    is_profession_education_employment_topic,
+    profession_chapter_frames,
+    profession_forbidden_terms,
+    unique_text,
+)
+
 
 HIGH_STAKES_RE = re.compile(
     r"投资|尽调|并购|IPO|估值|买入|卖出|市场进入|进入|布局|值得|优先级|回报|投资价值|"
@@ -148,6 +158,7 @@ class SearchTask:
     chapter_focus_status: str = ""
     chapter_focus_repaired: bool = False
     chapter_focus_missing_before_repair: bool = False
+    report_intent: str = ""
 
 
 @dataclass
@@ -518,6 +529,48 @@ def normalize_chapter(raw: Dict[str, Any], *, fallback_index: int = 1, query: st
     }
 
 
+def _profession_chapters_from_frames(query: str) -> List[Dict[str, Any]]:
+    chapters: List[Dict[str, Any]] = []
+    for index, frame in enumerate(profession_chapter_frames(query), start=1):
+        chapters.append(
+            normalize_chapter(
+                {
+                    **frame,
+                    "chapter_role": "profession_education_frame",
+                    "reason_to_include": "该章节服务于就业变化、岗位能力和教育培养调整类报告的主线判断。",
+                    "required_evidence_mix": ["official_data", "market_research", "case", "counter_evidence"],
+                    "source_template_keys": ["employment_signal", "education_policy", "curriculum_case", "recruitment_signal"],
+                    "min_total_sources": 4,
+                    "min_ab_sources": 0,
+                    "min_counter_sources": 1,
+                },
+                fallback_index=index,
+                query=query,
+            )
+        )
+        chapters[-1]["chapter_role"] = "profession_education_frame"
+        chapters[-1]["final_outline_locked"] = False
+    return chapters
+
+
+def _profession_chapters_need_rewrite(chapters: Sequence[Dict[str, Any]]) -> bool:
+    if not chapters:
+        return True
+    text = " ".join(
+        str(chapter.get(field) or "")
+        for chapter in chapters
+        for field in ("chapter_title", "core_question", "chapter_question")
+    )
+    if contains_commercial_frame_term(text):
+        return True
+    core_hits = sum(
+        1
+        for chapter in chapters
+        if re.search(r"就业|岗位|能力|培养|课程|高校|招聘|职业", str(chapter.get("chapter_title") or chapter.get("core_question") or ""))
+    )
+    return core_hits < max(2, min(4, len(chapters)))
+
+
 def normalize_hypothesis(raw: Dict[str, Any], *, fallback_index: int = 1, query: str = "") -> Dict[str, Any]:
     payload = _as_dict(raw)
     hypothesis_id = str(payload.get("hypothesis_id") or payload.get("id") or f"H{fallback_index}").strip()
@@ -665,7 +718,7 @@ def normalize_search_task(raw: Dict[str, Any], *, fallback_index: int = 1) -> Di
         "intent": intent,
         "search_options": _as_dict(task.get("search_options")),
         "must_have_terms": _compact_search_terms(task.get("must_have_terms"), limit=5),
-        "forbidden_terms": _compact_search_terms(task.get("forbidden_terms"), limit=5),
+        "forbidden_terms": _compact_search_terms(task.get("forbidden_terms"), limit=24),
         "source_priority": _compact_search_terms(task.get("source_priority"), limit=5),
         "retriever": str(task.get("retriever") or task.get("source_type") or "").strip(),
         "hypothesis_id": str(task.get("hypothesis_id") or "").strip(),
@@ -707,6 +760,7 @@ def normalize_search_task(raw: Dict[str, Any], *, fallback_index: int = 1) -> Di
         "chapter_focus_status": str(task.get("chapter_focus_status") or "").strip(),
         "chapter_focus_repaired": _as_bool(task.get("chapter_focus_repaired"), False),
         "chapter_focus_missing_before_repair": _as_bool(task.get("chapter_focus_missing_before_repair"), False),
+        "report_intent": str(task.get("report_intent") or "").strip(),
     }
 
 
@@ -1161,6 +1215,24 @@ def normalize_research_plan(raw: Dict[str, Any], *, query: str = "") -> Dict[str
         payload,
         _PLAN_EVIDENCE_DIMENSION_TERMS,
     )
+    raw_research_domain = str(payload.get("research_domain") or _as_dict(payload.get("problem_framing")).get("research_domain") or "").strip()
+    raw_report_intent = str(payload.get("report_intent") or _as_dict(payload.get("problem_framing")).get("report_intent") or "").strip()
+    profession_plan = is_profession_education_employment_topic(
+        plan_query,
+        plan_research_object,
+        plan_global_required_terms,
+        raw_research_domain,
+        raw_report_intent,
+        payload.get("chapters"),
+        payload.get("dimensions"),
+        payload.get("evidence_goals"),
+        payload.get("search_tasks"),
+    )
+    plan_research_domain = PROFESSION_EDUCATION_DOMAIN if profession_plan else raw_research_domain
+    plan_report_intent = PROFESSION_EDUCATION_INTENT if profession_plan else raw_report_intent
+    plan_global_forbidden_terms = _string_list(payload.get("global_forbidden_terms"))
+    if profession_plan:
+        plan_global_forbidden_terms = unique_text([*plan_global_forbidden_terms, *profession_forbidden_terms()], limit=80)
     raw_chapters = [item for item in _as_list(payload.get("chapters")) if isinstance(item, dict)]
     nested_tasks: List[Dict[str, Any]] = []
     nested_goals: List[Dict[str, Any]] = []
@@ -1211,6 +1283,12 @@ def normalize_research_plan(raw: Dict[str, Any], *, query: str = "") -> Dict[str
         for index, item in enumerate(raw_chapters, start=1)
         if isinstance(item, dict)
     ]
+    profession_rewritten_chapters = False
+    legacy_profession_chapters: List[Dict[str, Any]] = []
+    if profession_plan and _profession_chapters_need_rewrite(chapters):
+        legacy_profession_chapters = [dict(item) for item in chapters]
+        chapters = _profession_chapters_from_frames(plan_query)
+        profession_rewritten_chapters = True
     if not chapters and dimensions:
         chapters = [
             normalize_chapter(
@@ -1375,6 +1453,51 @@ def normalize_research_plan(raw: Dict[str, Any], *, query: str = "") -> Dict[str
                     merged_terms.append(term)
             if merged_terms:
                 item["must_have_terms"] = merged_terms[:8]
+        query_text = str(item.get("query") or "").strip()
+        role = str(item.get("proof_role") or item.get("intent") or "").strip().lower()
+        role_hints = {
+            "support": ["行业研究", "案例", "趋势"],
+            "data": ["行业研究", "案例", "趋势"],
+            "metric": ["指标", "数据", "统计"],
+            "case": ["案例", "项目", "客户"],
+            "counter": ["失败", "风险", "反向案例"],
+            "source_check": ["原文", "来源", "口径"],
+            "technology_product": ["技术路线", "产品方案", "标准"],
+            "expert": ["研报", "白皮书", "专家"],
+        }.get(role, ["行业研究", "案例", "趋势"])
+        if query_text:
+            repeated_anchor = bool(topic_anchor and query_text.count(str(topic_anchor)) >= 2)
+            leaky_lane = bool(
+                re.search(
+                    r"official data|market research|market size price|official filing|customer certification|"
+                    r"product docs|brokerage association|industry research expert|"
+                    r"反证\s*风险\s*失败案例|客户不买账|替代方案|负面",
+                    query_text,
+                    flags=re.I,
+                )
+            )
+            if repeated_anchor or leaky_lane or len(query_text) > 72 or (re.search(r"[:：]", query_text) and len(query_text) > 56):
+                compact_terms = _dedupe_limited_terms(
+                    [
+                        topic_anchor,
+                        *role_hints[:2],
+                        *[
+                            term
+                            for term in _string_list(item.get("must_have_terms"))
+                            if term and term != topic_anchor and len(term) <= 18 and not re.search(r"[:：]", term)
+                        ],
+                    ],
+                    limit=7,
+                    max_chars=18,
+                )
+                if compact_terms:
+                    item["query"] = " ".join(compact_terms)
+                    item["query_compacted_after_topic_anchor"] = True
+            elif role_hints and not any(hint in query_text for hint in role_hints):
+                item["query"] = " ".join([query_text, *role_hints[:2]]).strip()
+                if len(item["query"]) > 96:
+                    item["query"] = item["query"][:95].rstrip() + "…"
+                item["query_role_hints_added"] = True
         return item
 
     tasks = [_attach_plan_topic(_inherit_hypothesis(_inherit_chapter(task))) for task in tasks]
@@ -1424,9 +1547,10 @@ def normalize_research_plan(raw: Dict[str, Any], *, query: str = "") -> Dict[str
         "report_title": report_title,
         "report_subtitle": report_subtitle,
         "research_type": str(payload.get("research_type") or "generic_topic").strip(),
-        "research_domain": str(payload.get("research_domain") or _as_dict(payload.get("problem_framing")).get("research_domain") or "").strip(),
+        "research_domain": plan_research_domain,
+        "report_intent": plan_report_intent,
         "decision_context": str(payload.get("decision_context") or "").strip(),
-        "report_family": str(payload.get("report_family") or "briefing_note").strip(),
+        "report_family": str(payload.get("report_family") or "dynamic_research_report").strip(),
         "research_object": plan_research_object,
         "topic_anchor_terms": plan_topic_anchor_terms,
         "generic_dimensions": plan_generic_dimensions,
@@ -1445,12 +1569,16 @@ def normalize_research_plan(raw: Dict[str, Any], *, query: str = "") -> Dict[str
         "evidence_coverage_requirements": _as_dict(payload.get("evidence_coverage_requirements")),
         "report_depth_target": str(payload.get("report_depth_target") or "standard").strip(),
         "output_format": str(payload.get("output_format") or "brief").strip(),
-        "global_forbidden_terms": _string_list(payload.get("global_forbidden_terms")),
+        "global_forbidden_terms": plan_global_forbidden_terms,
         "global_required_terms": plan_global_required_terms,
         "quality_rules": _as_dict(payload.get("quality_rules")),
         "topic_repaired_from_query": topic_repaired_from_query,
+        "profession_chapters_rewritten": profession_rewritten_chapters,
         "original_query_anchor_terms": original_query_anchor_terms,
-        "legacy_planner_chapters": [dict(item) for item in _as_list(payload.get("legacy_planner_chapters")) if isinstance(item, dict)],
+        "legacy_planner_chapters": [
+            *legacy_profession_chapters,
+            *[dict(item) for item in _as_list(payload.get("legacy_planner_chapters")) if isinstance(item, dict)],
+        ],
         "legacy_planner_dimensions": [dict(item) for item in _as_list(payload.get("legacy_planner_dimensions")) if isinstance(item, dict)],
         "legacy_planner_search_tasks": [dict(item) for item in _as_list(payload.get("legacy_planner_search_tasks")) if isinstance(item, dict)],
         "dropped_template_sections": [dict(item) for item in _as_list(payload.get("dropped_template_sections")) if isinstance(item, dict)],

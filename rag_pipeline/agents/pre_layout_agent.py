@@ -451,7 +451,15 @@ def run_pre_layout_agent(
     del llm_client
     plan = _as_dict(research_plan)
     report_plan = _as_dict(report_plan)
-    if str(os.getenv("REPORT_ENABLE_LAYOUT_COMPILER", "true")).strip().lower() in {"1", "true", "yes", "on"}:
+    quality_rules = _as_dict(plan.get("quality_rules"))
+    preserve_planner_chapters = (
+        str(quality_rules.get("chapter_source") or "").strip() == "llm_planner_with_problem_framing"
+        or bool(plan.get("planner_chapters_preserved"))
+    )
+    if (
+        not preserve_planner_chapters
+        and str(os.getenv("REPORT_ENABLE_LAYOUT_COMPILER", "true")).strip().lower() in {"1", "true", "yes", "on"}
+    ):
         try:
             compiled = compile_report_layout(query=query, research_plan=plan, report_plan=report_plan)
             if _as_list(compiled.get("chapters")):
@@ -467,7 +475,6 @@ def run_pre_layout_agent(
                 "layout_compiler_error": str(exc),
             }
     explicit_chapters = [dict(item) for item in _as_list(plan.get("chapters")) if isinstance(item, dict)]
-    quality_rules = _as_dict(plan.get("quality_rules"))
     if quality_rules.get("chapters_come_from_hypotheses"):
         raw_chapters = (
             _chapters_from_hypotheses(plan)
@@ -485,7 +492,7 @@ def run_pre_layout_agent(
             or _chapters_from_dimensions(plan)
             or _fallback_single_chapter(query)
         )
-        chapter_source = "planner_chapters"
+        chapter_source = str(quality_rules.get("chapter_source") or "planner_chapters").strip() or "planner_chapters"
 
     chapters: List[Dict[str, Any]] = []
     used_ids = set()

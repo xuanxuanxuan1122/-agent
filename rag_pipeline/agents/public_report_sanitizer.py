@@ -277,6 +277,11 @@ STRICT_PUBLICATION_BLOCKERS = [
 
 
 PUBLIC_BODY_REWRITES = [
+    (r"已有可观察的公开资料信号[，,]?", "已经出现可观察变化，"),
+    (r"已有方向性公开资料信号[，,]?", "开始出现可观察变化，"),
+    (r"后续判断需结合来源范围、样本边界和时间窗口校准。?", ""),
+    (r"后续判断需要结合来源范围、样本边界和时间窗口校准。?", ""),
+    (r"仍需避免把单一材料外推为确定性结论。?", ""),
     (r"这些信号仍受来源覆盖范围和公开披露充分性的限制，应作为方向性观察进入正文。?", "公开披露通常更容易呈现已经启动的事项，实际进展仍会受到资金、审批、执行成本和使用门槛的共同影响。"),
     (r"后续应继续观察同类主体、同类场景和相同口径信息是否重复出现。?", ""),
     (r"以及后续判断需要继续观察哪些约束条件，而不是被简单处理成孤立材料。?", "并进一步说明这些变化如何影响具体业务、资源安排和执行节奏。"),
@@ -493,7 +498,47 @@ PUBLIC_NARRATIVE_BLOCK_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"可核验内容适合|可复核内容适合|局部变化的入口|暂时缺少覆盖的外推|待验证问题处理|相邻来源重复情况", "review_style_bridge_language"),
     (r"这张表显示|后续影响\s*[:：]|使用边界\s*[:：]|表内信号", "diagnostic_table_commentary"),
     (r"需要按连续指标|避免把单点信号直接外推|更适合作为背景条件|结论强度取决", "analysis_scaffold_language"),
+    (
+        r"仅反映|未覆盖|单点披露|单点信号|尚不足以代表|结论(?:需要|仍需|仍应)保留|"
+        r"不能直接推出全行业|不能直接替代更大范围",
+        "review_boundary_sentence",
+    ),
 )
+
+_PUBLIC_REVIEW_BOUNDARY_SENTENCE_RE = re.compile(
+    r"仅反映|未覆盖|单点披露|单点信号|尚不足以代表|结论(?:需要|仍需|仍应)保留|"
+    r"不能直接推出全行业|不能直接替代更大范围|需要保留的边界|当前材料能够说明.*但"
+)
+_PUBLIC_SENTENCE_RE = re.compile(r"[^。！？!?]+[。！？!?](?:\s*\[\d{1,5}\])*|[^。！？!?]+$")
+_PUBLIC_CITATION_RE = re.compile(r"\[\d{1,5}\]")
+
+
+def _drop_public_review_boundary_sentences(line: str) -> str:
+    raw = str(line or "")
+    if not _PUBLIC_REVIEW_BOUNDARY_SENTENCE_RE.search(raw):
+        return raw
+    citations = _PUBLIC_CITATION_RE.findall(raw)
+    kept: List[str] = []
+    removed = False
+    for match in _PUBLIC_SENTENCE_RE.finditer(raw):
+        sentence = match.group(0)
+        if not sentence:
+            continue
+        if _PUBLIC_REVIEW_BOUNDARY_SENTENCE_RE.search(sentence):
+            removed = True
+            continue
+        kept.append(sentence)
+    cleaned = "".join(kept).strip()
+    if removed and cleaned and citations and not _PUBLIC_CITATION_RE.search(cleaned):
+        refs: List[str] = []
+        seen: set[str] = set()
+        for ref in citations:
+            if ref in seen:
+                continue
+            refs.append(ref)
+            seen.add(ref)
+        cleaned = f"{cleaned}{''.join(refs[:4])}"
+    return cleaned
 
 _PUBLIC_NARRATIVE_DROP_HEADING_RE = re.compile(
     r"^#{1,4}\s*(?:政策摘要|执行风险|监测指标|验证清单|尽调清单|关键事实与判断依据|ch_\d{1,3})\s*$",
@@ -555,6 +600,9 @@ def _line_without_public_narrative_leak(line: str) -> str:
     if re.search(r"这张表显示|后续影响\s*[:：]|使用边界\s*[:：]|表内信号", raw):
         return ""
     if re.search(r"需要按连续指标|避免把单点信号直接外推|更适合作为背景条件|结论强度取决", raw):
+        return ""
+    raw = _drop_public_review_boundary_sentences(raw)
+    if not raw.strip():
         return ""
     raw = re.sub(r"可复核材料指向\s*[:：]\s*", "公开材料显示，", raw)
     for pattern, replacement in _PUBLIC_NARRATIVE_RETITLE_RULES:

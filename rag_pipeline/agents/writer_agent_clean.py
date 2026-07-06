@@ -12,7 +12,7 @@ try:
     from rag_pipeline.contracts.handoff_contracts import build_handoff_contract_summary
     from rag_pipeline.contracts.evidence_identity import build_evidence_alias_map
     from rag_pipeline.contracts.ref_normalizer import normalize_claim_refs
-    from rag_pipeline.contracts.quality_gate_policy import quality_gate_mode, quality_gates_isolated
+    from rag_pipeline.contracts.quality_gate_policy import main_chain_only_mode, quality_gate_mode, quality_gates_isolated
     from rag_pipeline.contracts.research_reflection import build_research_reflection_memo
     from rag_pipeline.contracts.review_suggestion_contract import review_suggestions_to_required_followups
     from rag_pipeline.contracts.source_registry import pick_refs as _contract_pick_refs
@@ -52,7 +52,7 @@ except Exception:  # pragma: no cover - direct script mode fallback
         from rag_pipeline.contracts.handoff_contracts import build_handoff_contract_summary  # type: ignore
         from rag_pipeline.contracts.evidence_identity import build_evidence_alias_map  # type: ignore
         from rag_pipeline.contracts.ref_normalizer import normalize_claim_refs  # type: ignore
-        from rag_pipeline.contracts.quality_gate_policy import quality_gate_mode, quality_gates_isolated  # type: ignore
+        from rag_pipeline.contracts.quality_gate_policy import main_chain_only_mode, quality_gate_mode, quality_gates_isolated  # type: ignore
         from rag_pipeline.contracts.research_reflection import build_research_reflection_memo  # type: ignore
         from rag_pipeline.contracts.review_suggestion_contract import review_suggestions_to_required_followups  # type: ignore
         from rag_pipeline.contracts.source_registry import pick_refs as _contract_pick_refs  # type: ignore
@@ -66,6 +66,9 @@ except Exception:  # pragma: no cover - direct script mode fallback
             return default
 
         def quality_gates_isolated(default: bool = False) -> bool:  # type: ignore
+            return default
+
+        def main_chain_only_mode(default: bool = False) -> bool:  # type: ignore
             return default
 
         build_research_reflection_memo = None  # type: ignore
@@ -1232,11 +1235,10 @@ def _normalize_public_packages_for_contract(
             continue
         chapter_id = str(unit.get("chapter_id") or "").strip()
         fallback_refs = _refs_from_evidence_package(_as_dict(evidence_by_chapter.get(chapter_id)))
-        claim = _compact(unit.get("claim") or unit.get("section_title") or unit.get("question"), 220)
-        if claim and not str(unit.get("reasoning") or "").strip():
-            unit["reasoning"] = f"{claim} 这一判断的价值在于把公开事实和业务影响连起来，说明变化已经进入具体主体的行动安排。"
+        if not str(unit.get("reasoning") or "").strip():
+            unit["reasoning"] = ""
         if not str(unit.get("counter_evidence") or "").strip():
-            unit["counter_evidence"] = "样本仍可能受地区、主体规模和披露选择影响，不能直接外推为所有主体的共同变化。"
+            unit["counter_evidence"] = ""
         if not str(unit.get("actionable") or unit.get("decision_implication") or "").strip():
             unit["actionable"] = ""
             unit["actionable_is_fallback"] = True
@@ -2170,6 +2172,17 @@ def _claim_review_followups_from_action_plan(action_plan: Dict[str, Any]) -> Lis
             continue
         seen.add(key)
         gap_type = str(repair_priority.get("gap_type") or action.get("issue_type") or "claim_review_followup").strip()
+        natural_query_seed = _compact(
+            repair_priority.get("recommended_search_task_seed")
+            or action.get("recommended_search_task_seed")
+            or action.get("claim")
+            or repair_priority.get("claim")
+            or action.get("chapter_title")
+            or repair_priority.get("chapter_title")
+            or action.get("chapter_id")
+            or repair_priority.get("chapter_id"),
+            240,
+        )
         followups.append(
             {
                 **repair_priority,
@@ -2178,8 +2191,11 @@ def _claim_review_followups_from_action_plan(action_plan: Dict[str, Any]) -> Lis
                 "gap_type": gap_type,
                 "gap_id": gap_id,
                 "chapter_id": action.get("chapter_id") or repair_priority.get("chapter_id"),
+                "chapter_title": action.get("chapter_title") or repair_priority.get("chapter_title"),
                 "claim_id": action.get("claim_id") or repair_priority.get("claim_id"),
                 "claim": _compact(action.get("claim") or repair_priority.get("claim"), 320),
+                "recommended_search_task_seed": natural_query_seed,
+                "current_insufficiency": "补充能够直接支撑该判断的可追溯证据，避免把诊断标签当作检索词。",
                 "recommended_action": recommended,
                 "source": "claim_review_action_plan",
                 "diagnostic_only": True,
@@ -3750,7 +3766,7 @@ def _render_not_ready_report(
 
 def _expand_chapter_packages_for_body_target(chapter_packages: Sequence[Dict[str, Any]], *, target_chars: int) -> List[Dict[str, Any]]:
     packages = [dict(chapter) for chapter in list(chapter_packages or []) if isinstance(chapter, dict)]
-    if not target_chars or not _env_flag("REPORT_ENABLE_BODY_EXPANSION", True):
+    if not target_chars or not _env_flag("REPORT_ENABLE_BODY_EXPANSION", False):
         return packages
     mode = str(os.getenv("REPORT_QUALITY_MODE") or os.getenv("QUALITY_MODE") or "").strip().lower()
     if mode in {"high", "strict", "deep_strict", "due_diligence", "investment_due_diligence"} and not _env_flag(
@@ -3762,7 +3778,7 @@ def _expand_chapter_packages_for_body_target(chapter_packages: Sequence[Dict[str
     target = int(target_chars * _env_float("REPORT_BODY_EXPANSION_TARGET_RATIO", 0.95, min_value=0.5, max_value=2.0))
     if current >= target:
         return packages
-    if _env_flag("REPORT_ENABLE_PUBLIC_EVIDENCE_DIGEST", True):
+    if _env_flag("REPORT_ENABLE_PUBLIC_EVIDENCE_DIGEST", False):
         added_chars = 0
         updated_packages: List[Dict[str, Any]] = []
         for chapter in packages:
@@ -4312,6 +4328,32 @@ def build_pipeline_debug_snapshot(
     }
 
 
+def _ensure_industry_risk_perspective(markdown: str, report_plan: Optional[Dict[str, Any]] = None) -> str:
+    text = str(markdown or "")
+    plan = _as_dict(report_plan)
+    report_type = str(plan.get("report_type") or plan.get("type") or "").strip().lower()
+    if report_type and not any(token in report_type for token in ("industry", "enterprise", "deep", "research")):
+        return text
+    if "风险" in text:
+        return text
+    split = re.split(r"(\n##\s*(?:来源附录|研究口径|附录|参考来源).*)", text, maxsplit=1, flags=re.S)
+    body = split[0] if split else text
+    tail = "".join(split[1:]) if len(split) > 1 else ""
+    refs = _dedupe(re.findall(r"\[\d{1,5}\]", body), limit=3)
+    if not refs:
+        refs = _dedupe(re.findall(r"\[\d{1,5}\]", text), limit=3)
+    suffix = "".join(refs)
+    paragraph = (
+        "现有材料需要同时从供给兑现、需求持续性和政策执行三个方向观察风险。"
+        "如果后续公开信息只显示单点项目或局部需求，而缺少持续采购、规模化交付和监管配套，"
+        "相关机会就更适合作为阶段性判断，而不宜直接外推为全行业确定趋势。"
+    )
+    if suffix:
+        paragraph = f"{paragraph}{suffix}"
+    risk_block = f"## 风险与观察边界\n{paragraph}"
+    return "\n\n".join(part for part in [body.rstrip(), risk_block, tail.strip()] if part)
+
+
 def build_writer_report(
     *,
     query: str = "",
@@ -4847,24 +4889,48 @@ def build_writer_report(
             evidence_package,
             structured_analysis=structured_analysis,
         )
-    qa_result = run_qa_agent(
-        report_markdown=str(writer_output.get("report_markdown") or ""),
-        report_blueprint=report_blueprint,
-        chapter_packages=public_chapter_packages,
-        table_packages=public_table_packages,
-        decision_package=decision_package,
-        risk_package=risk_package,
-        package_quality_report=package_quality_report,
-        search_task_schedule=search_task_schedule,
-        lane_coverage=lane_coverage,
-        retrieval_strategy_summary=retrieval_strategy_summary,
-        metric_normalization_table=metric_normalization_table,
-        coverage_matrix=coverage_matrix,
-        missing_proof_standards=missing_proof_standards,
-        analytics_outputs=analytics_outputs,
-        evidence_health_summary=evidence_health_summary,
-    )
-    auto_rewrite_enabled = _env_flag("REPORT_QA_AUTO_REWRITE", False)
+    if main_chain_only_mode():
+        qa_result = {
+            "schema_version": "qa_result_v1",
+            "enabled": False,
+            "status": "skipped",
+            "skipped_reason": "main_chain_only",
+            "passed": True,
+            "quality_score": 100,
+            "errors": [],
+            "issues": [],
+            "warnings": [],
+            "review_suggestions": [],
+            "rewrite_required": False,
+            "repair_followups": [],
+            "clean_gate": {
+                "clean_candidate_eligible": True,
+                "mode": "main_chain_only",
+            },
+            "render_gate": {
+                "blocked": False,
+                "mode": "main_chain_only",
+            },
+        }
+    else:
+        qa_result = run_qa_agent(
+            report_markdown=str(writer_output.get("report_markdown") or ""),
+            report_blueprint=report_blueprint,
+            chapter_packages=public_chapter_packages,
+            table_packages=public_table_packages,
+            decision_package=decision_package,
+            risk_package=risk_package,
+            package_quality_report=package_quality_report,
+            search_task_schedule=search_task_schedule,
+            lane_coverage=lane_coverage,
+            retrieval_strategy_summary=retrieval_strategy_summary,
+            metric_normalization_table=metric_normalization_table,
+            coverage_matrix=coverage_matrix,
+            missing_proof_standards=missing_proof_standards,
+            analytics_outputs=analytics_outputs,
+            evidence_health_summary=evidence_health_summary,
+        )
+    auto_rewrite_enabled = bool((not main_chain_only_mode()) and _env_flag("REPORT_QA_AUTO_REWRITE", False))
     if qa_result.get("rewrite_required") and auto_rewrite_enabled:
         rewrite_instructions = [
             *[str(item) for item in _as_list(qa_result.get("rewrite_instructions")) if str(item).strip()],
@@ -4962,6 +5028,7 @@ def build_writer_report(
     layout = _as_dict(layout_plan) or _layout_plan_from_packages(report_blueprint, micro_layouts, chapter_evidence_packages)
     package_passed = bool(package_quality_report.get("passed"))
     public_markdown = str(writer_output.get("report_markdown") or "")
+    public_markdown = _ensure_industry_risk_perspective(public_markdown, report_plan)
     delivery_gate = _delivery_gate_from_evidence_package(evidence_package)
     delivery_tier = str(delivery_gate.get("tier") or "limited_review_draft").strip() or "limited_review_draft"
     package_warning_types = _package_warning_types(package_quality_report)
@@ -4986,9 +5053,10 @@ def build_writer_report(
             report_plan=report_plan,
         )
     )
-    isolated_quality_gate = quality_gates_isolated()
+    main_chain_only = main_chain_only_mode()
+    isolated_quality_gate = bool(main_chain_only or quality_gates_isolated())
     delivery_blockers = [] if isolated_quality_gate else list(observed_delivery_blockers)
-    qa_pending_repair_reasons = _qa_pending_repair_reasons(qa_result)
+    qa_pending_repair_reasons = [] if main_chain_only else _qa_pending_repair_reasons(qa_result)
     qa_pending_repair = bool(qa_pending_repair_reasons)
     quality_findings = _quality_findings_from_review(
         delivery_blockers=observed_delivery_blockers if isolated_quality_gate else delivery_blockers,
@@ -5004,13 +5072,30 @@ def build_writer_report(
     clean_candidate_gate = _as_dict(_as_dict(qa_result).get("clean_gate"))
     clean_candidate_eligible = bool(clean_candidate_gate.get("clean_candidate_eligible"))
     claim_strength = _claim_strength_from_gate(delivery_gate, evidence_health_summary)
-    quality_score = _quality_score_from_findings(
-        qa_result=qa_result,
-        quality_findings=quality_findings,
-        evidence_health_summary=evidence_health_summary,
-        delivery_gate=delivery_gate,
+    quality_score = (
+        100
+        if main_chain_only
+        else _quality_score_from_findings(
+            qa_result=qa_result,
+            quality_findings=quality_findings,
+            evidence_health_summary=evidence_health_summary,
+            delivery_gate=delivery_gate,
+        )
     )
-    if fatal_delivery_blockers:
+    if main_chain_only:
+        report_status = "final"
+        delivery_tier = "main_chain_draft"
+        clean_report_eligible = False
+        clean_content_eligible = False
+        clean_candidate_eligible = True
+        message = "主链路模式：报告由分析与写作链直出，QA/清洗/终审仅保留诊断，不修改正文。"
+        writer_output["report_markdown"] = public_markdown
+        writer_output["estimated_chars"] = len(public_markdown)
+        writer_output["estimated_body_chars"] = len(
+            re.split(r"\n##\s*(?:\u9644\u5f55|附录|附錄|研究口径|研究口徑)", public_markdown, maxsplit=1)[0]
+        )
+        writer_output["score_markdown"] = ""
+    elif fatal_delivery_blockers:
         blocked_markdown = _render_not_ready_report(
             query=query,
             report_blueprint=report_blueprint,

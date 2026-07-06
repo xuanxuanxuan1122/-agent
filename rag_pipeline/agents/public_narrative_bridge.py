@@ -66,7 +66,7 @@ def _evidence_context_bridge(head: str, family: str, facts: Sequence[str]) -> st
     if not cleaned:
         return ""
     fact_text = "；".join(cleaned)
-    return f"公开材料提到，{fact_text}。"
+    return f"已引用证据显示，{fact_text}。"
 
 
 def _block_family(block_type: Any) -> str:

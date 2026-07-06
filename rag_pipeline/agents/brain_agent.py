@@ -36,6 +36,14 @@ from rag_pipeline.cache.stage_execution_guard import (
 from rag_pipeline.cache.trusted_source_cache import lookup_trusted_sources
 from rag_pipeline.contracts.query_builder import build_query_package
 from rag_pipeline.contracts.repair_dispatcher import dispatch_repair_seed
+from rag_pipeline.contracts.report_intent import (
+    PROFESSION_EDUCATION_INTENT,
+    filter_profession_terms,
+    is_profession_education_employment_topic,
+    preferred_profession_query_terms,
+    profession_forbidden_terms,
+    sanitize_profession_query,
+)
 from .analysis_agent import run_analysis_agent
 from .article_brief import normalize_article_brief, planning_query_from_brief
 from .dynamic_search_schema import normalize_search_task
@@ -964,6 +972,21 @@ def _intent_for_proof_role(proof_role: str) -> str:
 
 
 _SEARCH_TERM_HINTS = (
+    "会计学",
+    "会计专业",
+    "数字财务",
+    "智能财税",
+    "财务共享",
+    "就业",
+    "岗位能力",
+    "能力要求",
+    "人才培养",
+    "教育培养",
+    "培养方案",
+    "课程",
+    "高校",
+    "职业教育",
+    "招聘",
     "低空经济",
     "eVTOL",
     "无人机",
@@ -1411,6 +1434,14 @@ def _contains_cjk(*values: Any) -> bool:
 def _is_academic_or_professional_research_plan(research_plan: Dict[str, Any]) -> bool:
     framing = _as_dict(research_plan.get("problem_framing"))
     quality_rules = _as_dict(research_plan.get("quality_rules"))
+    explicit_intent = str(
+        research_plan.get("report_intent")
+        or framing.get("report_intent")
+        or quality_rules.get("report_intent")
+        or ""
+    ).strip()
+    if explicit_intent == PROFESSION_EDUCATION_INTENT:
+        return True
     domain = str(
         research_plan.get("research_domain")
         or framing.get("research_domain")
@@ -1419,9 +1450,29 @@ def _is_academic_or_professional_research_plan(research_plan: Dict[str, Any]) ->
     ).strip()
     if domain == "academic_or_professional_field":
         return True
-    subject = re.sub(r"\s+", "", str(research_plan.get("research_object") or research_plan.get("query") or "")).strip()
+    subject = re.sub(
+        r"\s+",
+        "",
+        " ".join(
+            str(value or "")
+            for value in [
+                research_plan.get("query"),
+                research_plan.get("planning_query"),
+                research_plan.get("research_object"),
+                research_plan.get("core_question"),
+                research_plan.get("article_direction"),
+                *[
+                    item.get("chapter_title") or item.get("core_question") or ""
+                    for item in _as_list(research_plan.get("chapters"))
+                    if isinstance(item, dict)
+                ],
+            ]
+        ),
+    ).strip()
     if not subject:
         return False
+    if is_profession_education_employment_topic(research_plan, subject):
+        return True
     if re.search(r"行业|产业|市场|公司|产品|商业化|投资|供应链|机会|风险|竞争格局|客户|订单|采购", subject):
         return False
     return bool(len(subject) <= 16 and re.search(r"(?:学|学科|专业)$|课程|就业|职业|证书", subject))
@@ -1441,7 +1492,7 @@ def _academic_query_terms_for_role(proof_role: str, existing_terms: Sequence[Any
         _append_unique_text(terms, term, max_items=7)
     for term in existing_terms:
         cleaned = str(term or "").strip()
-        if cleaned and cleaned not in {"客户案例", "财报", "招股书", "投资者关系", "产品标准"}:
+        if cleaned and cleaned not in {"客户案例", "财报", "招股书", "投资者关系", "产品标准", "市场规模", "主要玩家", "资本流向"}:
             _append_unique_text(terms, cleaned, max_items=7)
     return terms[:7]
 
@@ -1712,6 +1763,22 @@ def build_search_tasks_for_goal(
     research_object = str(research_plan.get("research_object") or "").strip()
     global_required_terms = _as_list(research_plan.get("global_required_terms"))
     academic_plan = _is_academic_or_professional_research_plan(research_plan)
+    if academic_plan:
+        lanes = _academic_lane_targets_for_role(proof_role)
+        source_priority = filter_profession_terms(
+            source_priority or _academic_source_priority_for_role(proof_role),
+            fallback_terms=_academic_source_priority_for_role(proof_role),
+        )
+        profession_fallback_terms = preferred_profession_query_terms(
+            query,
+            research_object,
+            title,
+            core_question,
+            goal_text,
+            limit=6,
+        )
+        terms = filter_profession_terms(terms, fallback_terms=profession_fallback_terms)
+        global_required_terms = filter_profession_terms(global_required_terms, fallback_terms=profession_fallback_terms[:3])
     query_hint = (
         {
             "metric": "数据 统计 就业 岗位 证书",
@@ -1734,7 +1801,17 @@ def build_search_tasks_for_goal(
         }
     )[proof_role]
     topic_anchor_terms = _topic_anchor_terms_for_search(research_plan=research_plan, chapter=chapter, goal=goal)[:4]
+    if academic_plan:
+        topic_anchor_terms = filter_profession_terms(
+            topic_anchor_terms,
+            fallback_terms=preferred_profession_query_terms(query, research_object, goal_text, limit=4),
+        )[:4]
     topic_terms = topic_anchor_terms[:3] or _topic_seed_terms(query, chapter, goal)[:3]
+    if academic_plan:
+        topic_terms = filter_profession_terms(
+            topic_terms,
+            fallback_terms=preferred_profession_query_terms(query, research_object, goal_text, limit=4),
+        )[:3]
     required_fields = _as_list(goal.get("required_fields")) or _required_fields_for_proof_role(proof_role)
     localized_query_terms = _contains_cjk(query, research_object, title, core_question, goal_text)
     query_contract = _search_query_contract_terms(
@@ -1755,6 +1832,11 @@ def build_search_tasks_for_goal(
         goal=goal,
         topic_anchor_terms=topic_anchor_terms,
     )
+    if academic_plan:
+        chapter_focus_terms = filter_profession_terms(
+            chapter_focus_terms,
+            fallback_terms=preferred_profession_query_terms(core_question, goal_text, limit=4),
+        )[:4]
     query_focus = _compact_iqs_terms([research_object, *global_required_terms, *terms], max_terms=2, max_chars=16)
     base_query = _compose_iqs_query(
         [
@@ -1765,6 +1847,11 @@ def build_search_tasks_for_goal(
             query_hint,
         ]
     )
+    if academic_plan:
+        base_query = sanitize_profession_query(base_query)
+    forbidden_terms = _as_list(goal.get("forbidden_terms")) + _as_list(research_plan.get("global_forbidden_terms"))
+    if academic_plan:
+        forbidden_terms = list(dict.fromkeys([*forbidden_terms, *profession_forbidden_terms()]))
     task = {
         "task_id": f"{chapter_id}_{str(goal.get('goal_id') or proof_role).replace(' ', '_')}_{proof_role}",
         "agent": "iqs",
@@ -1778,7 +1865,7 @@ def build_search_tasks_for_goal(
         "evidence_goal": goal_text,
         "intent": _intent_for_proof_role(proof_role),
         "must_have_terms": terms,
-        "forbidden_terms": _as_list(goal.get("forbidden_terms")) + _as_list(research_plan.get("global_forbidden_terms")),
+        "forbidden_terms": forbidden_terms,
         "source_priority": source_priority,
         "lane_targets": lanes,
         "min_source_level": _as_list(goal.get("required_source_levels")) or ["A", "B"],
@@ -1805,6 +1892,7 @@ def build_search_tasks_for_goal(
         "proof_standard": goal.get("proof_standard") or "medium",
         "decision_use": goal.get("decision_use") or research_plan.get("decision_context") or "research",
         "evidence_type": goal.get("evidence_type") or proof_role,
+        "report_intent": PROFESSION_EDUCATION_INTENT if academic_plan else research_plan.get("report_intent"),
     }
     task = _ensure_search_query_topic_anchor(task, topic_anchor_terms)
     task = _ensure_search_query_chapter_focus(task, chapter_focus_terms)
@@ -1845,7 +1933,7 @@ def build_search_tasks_for_goal(
         deep_task = {
             **task,
             "task_id": f"{task['task_id']}_deep",
-            "query": _compose_iqs_query([base_query, deep_hint]),
+            "query": sanitize_profession_query(_compose_iqs_query([base_query, deep_hint])) if academic_plan else _compose_iqs_query([base_query, deep_hint]),
             "evidence_goal": f"{goal_text}；补充交叉验证、反证和原始口径",
             "deep_search_variant": True,
             "prefer_deep": True,

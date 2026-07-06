@@ -4,7 +4,7 @@ import re
 from typing import Any, Dict, List
 
 
-MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*]\([^)]+\)|!\([^)]+\)")
+MARKDOWN_IMAGE_RE = re.compile(r"!\s*\[[^\]]*](?:\([^)]+\))?|!\s*\([^)]+\)")
 MARKDOWN_LINK_RE = re.compile(r"\[[^\]]{0,80}\]\((?:https?:)?//[^)]+|/[^)]+\)")
 STATIC_ASSET_RE = re.compile(r"(?:^|/|\\)(?:_next/static|static/media|assets?/(?:img|image|logo))", re.I)
 URL_RE = re.compile(r"https?://\S+|www\.\S+", re.I)
@@ -17,7 +17,8 @@ WEB_CHROME_NAV_RE = re.compile(
     r"homepage|data\s+center|market\s+center|quote\s+center|choice\s+data|"
     r"\u9996\u9875|\u767b\u5f55|\u6ce8\u518c|\u6570\u636e\u4e2d\u5fc3|"
     r"\u5168\u7403\u8d22\u7ecf\u5feb\u8baf|\u8d22\u7ecf\u5feb\u8baf|\u884c\u60c5\u4e2d\u5fc3|"
-    r"Choice\s*\u6570\u636e|\u4e1c\u65b9\u8d22\u5bcc|\u81ea\u9009\u80a1|\u80a1\u5427",
+    r"Choice\s*\u6570\u636e|\u4e1c\u65b9\u8d22\u5bcc|\u81ea\u9009\u80a1|\u80a1\u5427|"
+    r"\u5b66\u4e60\u8d85\u5e02|\u878d\u5408\u95e8\u6237|IT\s*\u878d\u5408\u95e8\u6237",
     re.I,
 )
 NAVIGATION_RE = re.compile(

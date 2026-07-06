@@ -4,6 +4,12 @@ import re
 from collections import defaultdict
 from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
+from rag_pipeline.contracts.report_intent import (
+    PROFESSION_EDUCATION_INTENT,
+    contains_commercial_frame_term,
+    is_profession_education_employment_topic,
+    profession_cluster_title,
+)
 from .public_report_sanitizer import remove_hard_industry_templates
 
 CLUSTER_TITLE_HINTS = {
@@ -16,7 +22,22 @@ CLUSTER_TITLE_HINTS = {
     "customer": "用户需求与使用约束",
     "financial": "资金投入与结果验证",
     "ecosystem": "生态协作与基础条件",
+    "contextual_claim": "背景变化与外部信号",
+    "metric_claim": "量化信号与需求验证",
+    "case_claim": "场景样本与落地进展",
+    "core_claim": "核心判断与方向选择",
+    "mechanism_claim": "传导机制与能力重构",
+    "counter_boundary_claim": "风险边界与反向约束",
     "limitations": "限制与待验证问题",
+}
+
+ROLE_CLUSTER_TITLE_KEYS = {
+    "contextual_claim",
+    "metric_claim",
+    "case_claim",
+    "core_claim",
+    "mechanism_claim",
+    "counter_boundary_claim",
 }
 
 STRENGTH_RANK = {
@@ -325,9 +346,20 @@ def _cluster_title_with_plan(
     units: Sequence[Dict[str, Any]],
     *,
     plan_title_by_id: Mapping[str, str],
+    report_intent: str = "",
 ) -> str:
+    if report_intent == PROFESSION_EDUCATION_INTENT:
+        fallback_text = " ".join(
+            _text(unit.get(field))
+            for unit in units
+            for field in ("claim", "recommended_chapter", "chapter_title", "section_title", "question", "dimension")
+        )
+        return profession_cluster_title(key, fallback_text)
     if key == "limitations":
         return CLUSTER_TITLE_HINTS["limitations"]
+    source_plan_ids = _dedupe((_text(unit.get("chapter_id")) for unit in units if _text(unit.get("chapter_id"))), limit=8)
+    if key in ROLE_CLUSTER_TITLE_KEYS and key in CLUSTER_TITLE_HINTS and len(source_plan_ids) != 1:
+        return CLUSTER_TITLE_HINTS[key]
     for unit in units:
         for field in ("recommended_chapter", "chapter_title", "section_title", "question", "dimension"):
             title = _text(unit.get(field))
@@ -378,6 +410,7 @@ def build_claim_clusters(
     claim_units: Sequence[Mapping[str, Any]],
     *,
     plan_blueprint: Mapping[str, Any] | None = None,
+    report_intent: str = "",
 ) -> List[Dict[str, Any]]:
     plan_chapters = _chapter_list(_as_dict(plan_blueprint))
     plan_ids = {_text(chapter.get("chapter_id")) for chapter in plan_chapters}
@@ -402,6 +435,18 @@ def build_claim_clusters(
         if not _can_anchor(payload):
             continue
         key = _cluster_key(payload)
+        explicit_key = _norm_key(payload.get("cluster_key"))
+        chapter_id = _text(payload.get("chapter_id"))
+        recommended = _text(payload.get("recommended_chapter") or payload.get("chapter_title"))
+        plan_title = _text(plan_title_by_id.get(chapter_id))
+        if (
+            explicit_key in ROLE_CLUSTER_TITLE_KEYS
+            and chapter_id in plan_ids
+            and recommended
+            and plan_title
+            and _public_title_key(recommended) == _public_title_key(plan_title)
+        ):
+            key = _norm_key(chapter_id)
         payload["cluster_key"] = key
         grouped[key].append(payload)
 
@@ -422,10 +467,13 @@ def build_claim_clusters(
         for offset, unit in enumerate(units, start=1):
             refs = _refs_for_claim(unit)
             boundary_section = bool(unit.get("must_not_use_as_core_view"))
+            section_title = _claim_section_title(unit)
+            if report_intent == PROFESSION_EDUCATION_INTENT and contains_commercial_frame_term(section_title):
+                section_title = profession_cluster_title(key, unit.get("claim") or unit.get("judgment") or unit.get("conclusion"))
             claim_sections.append(
                 {
                     "claim_id": unit.get("claim_id"),
-                    "section_title": _claim_section_title(unit),
+                    "section_title": section_title,
                     "required_evidence_refs": refs["fact_ids"] or refs["source_ids"],
                     "must_not_use_as_core_view": boundary_section,
                     "writing_mode": unit.get("writing_mode_hint") or mode,
@@ -450,7 +498,7 @@ def build_claim_clusters(
             {
                 "cluster_id": f"cluster_{key or index}",
                 "cluster_key": key,
-                "cluster_title": _cluster_title_with_plan(key, units, plan_title_by_id=plan_title_by_id),
+                "cluster_title": _cluster_title_with_plan(key, units, plan_title_by_id=plan_title_by_id, report_intent=report_intent),
                 "claim_ids": _dedupe((unit.get("claim_id") for unit in units)),
                 "fact_ids": fact_ids,
                 "source_ids": source_ids,
@@ -531,6 +579,8 @@ def _merge_duplicate_title_clusters(clusters: Sequence[Dict[str, Any]]) -> List[
         item = dict(cluster)
         source_plan_ids = _dedupe(_as_list(item.get("source_plan_chapter_ids")), limit=4)
         key = f"plan:{source_plan_ids[0]}" if len(source_plan_ids) == 1 else ""
+        if not key and _text(item.get("cluster_key")):
+            key = f"cluster:{_text(item.get('cluster_key'))}"
         if not key:
             key = _public_title_key(item.get("cluster_title") or item.get("cluster_id"))
         if not key:
@@ -682,8 +732,13 @@ def recompose_chapters_from_claims(
 ) -> Dict[str, Any]:
     del evidence_package
     plan = mark_plan_blueprint(_as_dict(plan_blueprint))
+    report_intent = (
+        PROFESSION_EDUCATION_INTENT
+        if is_profession_education_employment_topic(query, plan)
+        else _text(plan.get("report_intent"))
+    )
     units = normalize_claim_units(_claim_units(_as_dict(structured_analysis)))
-    clusters = build_claim_clusters(units, plan_blueprint=plan)
+    clusters = build_claim_clusters(units, plan_blueprint=plan, report_intent=report_intent)
     final_chapters = _final_chapters_from_clusters(clusters)
     plan_ids = [_text(chapter.get("chapter_id")) for chapter in _chapter_list(plan)]
     covered_plan_ids = {
@@ -707,6 +762,7 @@ def recompose_chapters_from_claims(
             "plan_chapters_are_research_reference": True,
         },
         "research_object": plan.get("research_object") or _text(query),
+        "report_intent": report_intent,
         "claim_clusters": clusters,
         "final_chapters": final_chapters,
         "chapters": final_chapters if final_chapters else _chapter_list(plan),

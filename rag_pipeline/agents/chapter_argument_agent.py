@@ -860,6 +860,7 @@ def _fact_cards_from_unit_basis(
                     "claim_strength_hint": unit.get("claim_strength") or "",
                 },
                 "public_fact_quality": {"eligible_for_report": True},
+                "synthetic_from_unit_basis": True,
             }
         )
         if card.is_valid_for_report:

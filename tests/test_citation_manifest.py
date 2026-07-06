@@ -1764,8 +1764,8 @@ def test_final_writer_backfill_uses_analysis_reasoning_boundary_and_actionable(m
 
     markdown = output["report_markdown"]
     assert "Pilot disclosure gives a concrete deployment signal" in markdown
-    assert "single-source and should be treated as directional" in markdown
     assert "Track follow-up customer deployments" in markdown
+    assert "single-source and should be treated as directional" not in markdown
 
 
 def test_final_writer_backfill_drops_internal_analysis_fields_from_public_body(monkeypatch):
@@ -1938,9 +1938,8 @@ def test_final_writer_backfill_uses_evidence_basis_to_thicken_public_section(mon
     ):
         assert forbidden not in markdown
     assert "repeatable workflow with owners, budgets" in markdown
-    assert "do not prove broad paid adoption" in markdown
     assert "Track repeat deployment announcements" in markdown
-    assert markdown.count("do not prove broad paid adoption") == 1
+    assert "do not prove broad paid adoption" not in markdown
     assert markdown.count("Track repeat deployment announcements") == 1
     body = markdown.split("## 来源附录", 1)[0]
     assert len(body) >= 650

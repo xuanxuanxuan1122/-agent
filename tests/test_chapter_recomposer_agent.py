@@ -119,6 +119,49 @@ def test_recomposer_orders_final_chapters_by_plan_order_not_claim_arrival_order(
     assert [chapter["chapter_id"] for chapter in result["final_chapters"]] == ["ch_01", "ch_02"]
 
 
+def test_recomposer_does_not_turn_claim_roles_into_industry_report_chapters():
+    result = recompose_chapters_from_claims(
+        plan_blueprint={
+            "chapters": [
+                {"chapter_id": "ch_01", "chapter_title": "政策环境与行业背景"},
+                {"chapter_id": "ch_04", "chapter_title": "资产利用率与成本结构分析"},
+            ]
+        },
+        structured_analysis={
+            "claim_units": [
+                {
+                    "claim_id": "CL-policy",
+                    "claim": "县域充换电网络正在被纳入地方产业规划。",
+                    "chapter_id": "ch_01",
+                    "recommended_chapter": "政策环境与行业背景",
+                    "cluster_key": "core_claim",
+                    "fact_ids": ["F-policy"],
+                    "source_ids": ["S-policy"],
+                    "claim_strength": "moderate",
+                },
+                {
+                    "claim_id": "CL-utilization",
+                    "claim": "运营商盈利模型取决于换电站资产利用率和车辆周转密度。",
+                    "chapter_id": "ch_04",
+                    "recommended_chapter": "资产利用率与成本结构分析",
+                    "cluster_key": "mechanism_claim",
+                    "fact_ids": ["F-util"],
+                    "source_ids": ["S-util"],
+                    "claim_strength": "moderate",
+                },
+            ]
+        },
+        evidence_package={},
+        query="县域新能源商用车充换电网络：重卡物流场景、资产利用率与运营商盈利模型研究",
+    )
+
+    titles = [chapter["chapter_title"] for chapter in result["final_chapters"]]
+    assert "政策环境与行业背景" in titles
+    assert "资产利用率与成本结构分析" in titles
+    assert "核心判断与方向选择" not in titles
+    assert "传导机制与能力重构" not in titles
+
+
 def test_recomposer_moves_single_thin_cluster_to_limitations_when_core_exists():
     result = recompose_chapters_from_claims(
         plan_blueprint={"chapters": [{"chapter_id": "plan_market", "chapter_title": "Market"}]},
@@ -274,6 +317,140 @@ def test_recomposer_merges_clusters_that_resolve_to_same_public_chapter_title():
     assert chapter["claim_ids"] == ["CL-metric", "CL-case"]
     assert set(chapter["fact_ids"]) == {"EV-1", "EV-2"}
     assert chapter["recomposition_action"] == "merged"
+
+
+def test_recomposer_keeps_distinct_cluster_keys_when_generic_titles_match_without_single_plan_anchor():
+    repeated_title = "会计学专业在AI时代的就业变化"
+    structured_analysis = {
+        "claim_units": [
+            {
+                "claim_id": "CL-context",
+                "claim": "AI adoption changes accounting employment through workflow restructuring.",
+                "recommended_chapter": repeated_title,
+                "chapter_id": "ch_01",
+                "cluster_key": "contextual_claim",
+                "fact_ids": ["EV-1"],
+                "source_ids": ["S1"],
+                "claim_strength": "directional",
+            },
+            {
+                "claim_id": "CL-context-2",
+                "claim": "Accounting education is responding to the same employment shift.",
+                "recommended_chapter": repeated_title,
+                "chapter_id": "ch_02",
+                "cluster_key": "contextual_claim",
+                "fact_ids": ["EV-1b"],
+                "source_ids": ["S1b"],
+                "claim_strength": "directional",
+            },
+            {
+                "claim_id": "CL-risk",
+                "claim": "Compliance constraints limit how fast accounting tasks can be automated.",
+                "recommended_chapter": repeated_title,
+                "chapter_id": "ch_02",
+                "cluster_key": "counter_boundary_claim",
+                "fact_ids": ["EV-2"],
+                "source_ids": ["S2"],
+                "claim_strength": "directional",
+            },
+            {
+                "claim_id": "CL-risk-2",
+                "claim": "Audit responsibility keeps human review in the loop.",
+                "recommended_chapter": repeated_title,
+                "chapter_id": "ch_03",
+                "cluster_key": "counter_boundary_claim",
+                "fact_ids": ["EV-2b"],
+                "source_ids": ["S2b"],
+                "claim_strength": "directional",
+            },
+            {
+                "claim_id": "CL-mechanism",
+                "claim": "Curriculum updates need to connect AI tools with audit judgment.",
+                "recommended_chapter": repeated_title,
+                "chapter_id": "ch_03",
+                "cluster_key": "mechanism_claim",
+                "fact_ids": ["EV-3"],
+                "source_ids": ["S3"],
+                "claim_strength": "directional",
+            },
+            {
+                "claim_id": "CL-mechanism-2",
+                "claim": "Training providers are packaging AI tools with accounting practice cases.",
+                "recommended_chapter": repeated_title,
+                "chapter_id": "ch_01",
+                "cluster_key": "mechanism_claim",
+                "fact_ids": ["EV-3b"],
+                "source_ids": ["S3b"],
+                "claim_strength": "directional",
+            },
+        ]
+    }
+
+    result = recompose_chapters_from_claims(
+        plan_blueprint={
+            "chapters": [
+                {"chapter_id": "ch_01", "chapter_title": "就业变化"},
+                {"chapter_id": "ch_02", "chapter_title": "合规边界"},
+                {"chapter_id": "ch_03", "chapter_title": "培养调整"},
+            ]
+        },
+        structured_analysis=structured_analysis,
+        evidence_package={},
+        query="会计学专业在AI时代的就业变化",
+    )
+
+    assert len(result["claim_clusters"]) == 3
+    assert len(result["final_chapters"]) == 3
+    assert all(len(chapter["claim_ids"]) == 2 for chapter in result["final_chapters"])
+
+
+def test_recomposer_uses_role_titles_for_repeated_generic_recommended_chapters():
+    repeated_title = "会计学专业在AI时代的就业变化"
+    result = recompose_chapters_from_claims(
+        plan_blueprint={"chapters": []},
+        structured_analysis={
+            "claim_units": [
+                {
+                    "claim_id": "CL-context",
+                    "claim": "Policy and market background shape accounting employment changes.",
+                    "recommended_chapter": repeated_title,
+                    "cluster_key": "contextual_claim",
+                    "fact_ids": ["EV-1"],
+                    "source_ids": ["S1"],
+                    "claim_strength": "directional",
+                },
+                {
+                    "claim_id": "CL-mechanism",
+                    "claim": "AI tools shift accounting work from data entry to judgment and control.",
+                    "recommended_chapter": repeated_title,
+                    "cluster_key": "mechanism_claim",
+                    "fact_ids": ["EV-2"],
+                    "source_ids": ["S2"],
+                    "claim_strength": "directional",
+                },
+                {
+                    "claim_id": "CL-boundary",
+                    "claim": "Audit accountability limits full automation in accounting roles.",
+                    "recommended_chapter": repeated_title,
+                    "cluster_key": "counter_boundary_claim",
+                    "fact_ids": ["EV-3"],
+                    "source_ids": ["S3"],
+                    "claim_strength": "directional",
+                },
+            ]
+        },
+        evidence_package={},
+        query=repeated_title,
+    )
+
+    titles = [chapter["chapter_title"] for chapter in result["final_chapters"]]
+
+    assert len(titles) == 3
+    assert len(set(titles)) == 3
+    assert repeated_title not in titles
+    assert "就业与培养环境变化" in titles
+    assert "AI工具推动的能力重构" in titles
+    assert "就业风险与培养边界" in titles
 
 
 def test_recomposer_keeps_semantic_adjacent_claim_as_boundary_section_not_core_view():

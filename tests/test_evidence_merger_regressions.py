@@ -877,7 +877,7 @@ def test_source_only_metadata_line_stays_out_of_analysis_ready(monkeypatch):
     assert package["analysis_ready_evidence"] == []
 
 
-def test_answer_lines_are_skipped_when_structured_raw_points_exist(monkeypatch):
+def test_answer_nav_fragments_are_skipped_when_structured_raw_points_exist(monkeypatch):
     monkeypatch.delenv("EVIDENCE_MERGER_SKIP_ANSWER_LINES_WHEN_RAW_POINTS", raising=False)
     evidence_pool = [
         {
@@ -915,7 +915,113 @@ def test_answer_lines_are_skipped_when_structured_raw_points_exist(monkeypatch):
     assert "锂电池行业报告目录" not in contents
     assert "low-altitude economy applications" in contents
     assert metadata["skipped_answer_line_count"] == 2
-    assert metadata["skip_answer_lines_with_raw_points"] is True
+    assert metadata["skip_answer_lines_with_raw_points"] is False
+
+
+def test_useful_answer_lines_are_kept_when_raw_points_exist_by_default(monkeypatch):
+    monkeypatch.delenv("EVIDENCE_MERGER_SKIP_ANSWER_LINES_WHEN_RAW_POINTS", raising=False)
+    evidence_pool = [
+        {
+            "agent": "iqs_lane_1_agent",
+            "answer": (
+                "1. A 2026 official policy says low-altitude logistics and emergency response "
+                "applications are expanding from pilots into routine city operations.[1]"
+            ),
+            "key_sources": [
+                {
+                    "title": "Low-altitude economy policy source",
+                    "url": "https://gov.example/low-altitude-policy",
+                    "source_type": "official",
+                }
+            ],
+            "raw_data_points": [
+                {
+                    "evidence": "The 2026 policy says low-altitude economy applications are expanding into logistics.",
+                    "metric": "policy signal",
+                    "value": "2026",
+                    "source_title": "Low-altitude economy policy source",
+                    "source_url": "https://gov.example/low-altitude-policy",
+                    "source_type": "official",
+                }
+            ],
+        }
+    ]
+
+    normalized, metadata = normalize_evidence_items(evidence_pool)
+
+    evidence_ids = {str(item.get("evidence_id") or "") for item in normalized}
+    contents = "\n".join(str(item.get("content") or "") for item in normalized)
+    assert any("-L" in evidence_id for evidence_id in evidence_ids)
+    assert "routine city operations" in contents
+    assert metadata["skipped_answer_line_count"] == 0
+    assert metadata["skip_answer_lines_with_raw_points"] is False
+
+
+def test_evidence_package_exposes_analysis_claim_and_public_fact_pools():
+    package = build_evidence_package(
+        evidence_items=[
+            {
+                "evidence_id": "EV-POLICY",
+                "dimension": "policy",
+                "fact": "Central policy defines intelligent agents in 2026 and encourages regulated adoption.",
+                "clean_fact": "Central policy defines intelligent agents in 2026 and encourages regulated adoption.",
+                "metric": "policy signal",
+                "value": "2026",
+                "period": "2026",
+                "source": {"title": "Central policy", "url": "https://gov.example/policy", "source_type": "official"},
+                "source_level": "A",
+                "confidence": 0.8,
+                "evidence_role": "supporting",
+                "allowed_use": "supporting",
+                "semantic_status": "weak_relevance",
+                "proof_role": "source_check",
+            },
+            {
+                "evidence_id": "EV-CONTEXT",
+                "dimension": "market",
+                "fact": "Vertical media reports that several local pilots have begun testing agent workflows in 2026.",
+                "clean_fact": "Vertical media reports that several local pilots have begun testing agent workflows in 2026.",
+                "metric": "case signal",
+                "value": "2026",
+                "period": "2026",
+                "source": {"title": "Industry media", "url": "https://media.example/agent", "source_type": "media"},
+                "source_level": "C",
+                "confidence": 0.58,
+                "evidence_role": "supporting",
+                "allowed_use": "supporting_context",
+                "semantic_status": "context_support",
+                "proof_role": "case",
+            },
+            {
+                "evidence_id": "EV-DIAG",
+                "dimension": "market",
+                "fact": "login sign in cookie policy request a demo",
+                "clean_fact": "login sign in cookie policy request a demo",
+                "metric": "source_check",
+                "value": "200",
+                "source": {"title": "Login page", "url": "https://example.com/login", "source_type": "web"},
+                "source_level": "D",
+                "confidence": 0.2,
+                "evidence_role": "supporting",
+                "allowed_use": "supporting",
+                "semantic_status": "weak_relevance",
+            },
+        ],
+        top_k=4,
+    )
+
+    analysis_ids = {item["evidence_id"] for item in package["analysis_candidate_facts"]}
+    claim_ids = {item["evidence_id"] for item in package["claim_support_facts"]}
+    citation_ids = {item["evidence_id"] for item in package["public_citation_facts"]}
+    assert {"EV-POLICY", "EV-CONTEXT"} <= analysis_ids
+    assert {"EV-POLICY", "EV-CONTEXT"} <= claim_ids
+    assert "EV-POLICY" in citation_ids
+    assert "EV-DIAG" not in analysis_ids
+    assert "EV-DIAG" not in claim_ids
+    assert "EV-DIAG" not in citation_ids
+    assert package["summary"]["analysis_candidate_fact_count"] == len(package["analysis_candidate_facts"])
+    assert package["summary"]["claim_support_fact_count"] == len(package["claim_support_facts"])
+    assert package["summary"]["public_citation_fact_count"] == len(package["public_citation_facts"])
 
 
 def test_missing_china_scope_anchor_does_not_reject_core_topic_fact(monkeypatch):

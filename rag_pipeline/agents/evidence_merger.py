@@ -2808,6 +2808,21 @@ def _filter_source_pool_for_merge(source_pool: Sequence[Dict[str, Any]]) -> Tupl
     }
 
 
+def _answer_line_blocking_shape_reason(line: str) -> str:
+    if re.search(r"(目录|章节列表|相关阅读|会议议程|导航|更多阅读|related\s+reading|table\s+of\s+contents)", str(line or ""), re.I):
+        return "answer_nav_fragment"
+    if evidence_content_shape_issues is None:
+        return ""
+    try:
+        issues = evidence_content_shape_issues({"fact": line, "content": line})
+    except Exception:
+        return ""
+    for issue in issues:
+        if issue in BLOCKING_CONTENT_SHAPE_ISSUES:
+            return str(issue)
+    return ""
+
+
 def normalize_evidence_items(
     evidence_pool: Sequence[Dict[str, Any]],
     *,
@@ -2823,7 +2838,7 @@ def normalize_evidence_items(
     skipped_answer_line_count = 0
     skip_answer_lines_with_raw_points = _as_bool(
         os.getenv("EVIDENCE_MERGER_SKIP_ANSWER_LINES_WHEN_RAW_POINTS"),
-        True,
+        False,
     )
     score_candidates = list(_iter_retrieval_score_candidates(evidence_pool))
     source_pool_rerank_input_count = len(score_candidates)
@@ -2901,6 +2916,9 @@ def normalize_evidence_items(
             continue
         for line_index, line in enumerate(answer_lines, start=1):
             if raw_points and not _citation_ids_from_text(line):
+                continue
+            if raw_points and _answer_line_blocking_shape_reason(line):
+                skipped_answer_line_count += 1
                 continue
             source = _source_from_item(item, citation_text=line)
             raw_count += 1
@@ -4659,6 +4677,38 @@ def _non_claim_status_reason(fact: Dict[str, Any]) -> str:
     return ""
 
 
+def _has_fact_text(fact: Dict[str, Any]) -> bool:
+    return bool(str(fact.get("fact") or fact.get("clean_fact") or fact.get("content") or "").strip())
+
+
+def _is_analysis_candidate_fact(fact: Dict[str, Any]) -> bool:
+    if not _has_fact_text(fact):
+        return False
+    if _analysis_ready_exclusion_reason(fact):
+        return False
+    if _non_claim_status_reason(fact):
+        return False
+    role = _canonical_role(fact.get("evidence_role"))
+    status = str(fact.get("semantic_status") or "").strip().lower()
+    return role != "rejected" and status not in REJECTED_STATUSES
+
+
+def _is_claim_support_fact(fact: Dict[str, Any]) -> bool:
+    if not _is_analysis_candidate_fact(fact):
+        return False
+    role = _canonical_role(fact.get("evidence_role"))
+    return role in {"core", "supporting"} and not fact.get("appendix_only")
+
+
+def _is_public_citation_fact(fact: Dict[str, Any]) -> bool:
+    if not _is_claim_support_fact(fact):
+        return False
+    source = _as_dict(fact.get("source"))
+    if not str(source.get("url") or source.get("title") or fact.get("source_url") or fact.get("source_title") or "").strip():
+        return False
+    return bool(_source_traceable_for_fact(fact) or str(source.get("url") or "").strip())
+
+
 def _mark_fact_diagnostic_only(fact: Dict[str, Any], reason: str) -> None:
     fact["analysis_ready_exclusion_reason"] = reason
     fact["allowed_use"] = "diagnostic_only"
@@ -5725,6 +5775,9 @@ def build_evidence_package(
     chapter_evidence = build_chapter_evidence(clean_evidence_list, chapter_dim_mapping=chapter_dim_mapping)
     analysis_ready_observe_only = quality_gates_isolated()
     analysis_ready_evidence: List[Dict[str, Any]] = []
+    analysis_candidate_facts: List[Dict[str, Any]] = []
+    claim_support_facts: List[Dict[str, Any]] = []
+    public_citation_facts: List[Dict[str, Any]] = []
     for fact in clean_evidence_list:
         if not str(fact.get("fact") or "").strip():
             continue
@@ -5737,6 +5790,13 @@ def build_evidence_package(
             if not fact.get("analysis_ready_exclusion_reason"):
                 fact["analysis_ready_exclusion_reason"] = non_claim_reason
             continue
+        public_payload = _public_fact_payload(fact)
+        if _is_analysis_candidate_fact(fact):
+            analysis_candidate_facts.append(public_payload)
+        if _is_claim_support_fact(fact):
+            claim_support_facts.append(public_payload)
+        if _is_public_citation_fact(fact):
+            public_citation_facts.append(public_payload)
         if analysis_ready_observe_only:
             eligible = _canonical_role(fact.get("evidence_role")) != "rejected" and str(fact.get("semantic_status") or "").strip().lower() not in REJECTED_STATUSES
         else:
@@ -5750,7 +5810,7 @@ def build_evidence_package(
                 in analysis_allowed_uses
             )
         if eligible:
-            analysis_ready_evidence.append(_public_fact_payload(fact))
+            analysis_ready_evidence.append(public_payload)
     rerank_diagnostics = build_rerank_diagnostics(
         _as_dict(metadata),
         evidence_items=evidence_items,
@@ -5908,6 +5968,9 @@ def build_evidence_package(
         "appendix_evidence": layered_evidence["appendix_evidence"],
         "rejected_evidence_sample": _rejected_evidence_sample(evidence_items),
         "analysis_ready_evidence": analysis_ready_evidence,
+        "analysis_candidate_facts": analysis_candidate_facts,
+        "claim_support_facts": claim_support_facts,
+        "public_citation_facts": public_citation_facts,
         "normalized_evidence": list(evidence_items or []),
         "raw_data_points": raw_data_points,
         "source_registry": source_registry,
@@ -5934,6 +5997,9 @@ def build_evidence_package(
             "evidence_count": len(evidence_items),
             "clean_fact_count": len(clean_evidence_list),
             "analysis_ready_count": len(analysis_ready_evidence),
+            "analysis_candidate_fact_count": len(analysis_candidate_facts),
+            "claim_support_fact_count": len(claim_support_facts),
+            "public_citation_fact_count": len(public_citation_facts),
             "analysis_ready_ab_count": analysis_ready_ab_count,
             "analysis_ready_metric_count": analysis_ready_metric_count,
             "claim_ready_evidence_count": evidence_analysis_summary.get("total_claim_ready_evidence_count"),

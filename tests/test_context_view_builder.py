@@ -512,12 +512,16 @@ def test_repair_context_view_prioritizes_section_audit_gaps(tmp_path, monkeypatc
     assert "section_audit" in metric_seed["repair_priority_reason"]
     assert metric_seed["required_field_focus"] == "period"
     assert metric_seed["repair_route"] == "metric_source_search"
-    assert "metric_scope_period_unit_incomplete" in metric_seed["query"]
+    assert "metric_scope_period_unit_incomplete" not in metric_seed["query"]
+    assert "metric" in metric_seed["query"]
+    assert "period" in metric_seed["query"]
     assert counter_seed["proof_role"] == "counter"
     assert counter_seed["repair_route"] == "counter_evidence_search"
     assert "counter_evidence" in counter_seed["source_priority"]
     assert "support_only_counter_missing" in counter_seed["reject_if"]
-    assert "counter_boundary_missing" in counter_seed["query"]
+    assert "counter_boundary_missing" not in counter_seed["query"]
+    assert "counter" in counter_seed["query"]
+    assert "failure" in counter_seed["query"]
     assert view["repair_task_seeds"][-1]["gap_id"] == "GAP-old-generic"
 
 

@@ -5,6 +5,8 @@ from rag_pipeline.agents.final_writer_agent import (
 )
 from rag_pipeline.agents.markdown_renderer import (
     _compact_chapter_heading,
+    _title_from_section_claim,
+    dedupe_public_markdown_paragraphs,
     render_appendix,
     render_chapter_deep_synthesis,
     render_chapter_package,
@@ -46,6 +48,17 @@ def test_analysis_framework_narration_is_stripped_from_body():
     assert "国产化率超90%" in out
     assert "任务分工" not in out
     assert "可解释的分析材料" not in out
+
+
+def test_news_fact_sentence_is_not_used_as_section_title():
+    section = {
+        "claim": (
+            "\u6625\u62db\u5e02\u573aAI\u5c97\u4f4d\u9700\u6c42\u5347\u6e29\u4e0e\u65b0\u5174\u8d5b\u9053\u6d8c\u73b0\u8868\u660e\uff0c"
+            "\u4f1a\u8ba1\u5c97\u4f4d\u4ef7\u503c\u6b63\u4ece\u4f20\u7edf\u57fa\u7840\u6838\u7b97\u5411AI\u5de5\u5177\u534f\u540c\u8fc1\u79fb\u3002"
+        )
+    }
+
+    assert _title_from_section_claim(section) == ""
 
 
 def test_framework_strip_does_not_blank_an_all_framework_paragraph():
@@ -111,6 +124,57 @@ def test_core_observation_ignores_bridge_sentences_and_keeps_concrete_facts():
     assert summary.count("\u65e0\u9521\u5e022023\u5e74\u4e09\u5b63\u5ea6") == 1
 
 
+def test_core_observation_insertion_removes_exact_body_echo():
+    signal = (
+        "\u4f1a\u8ba1\u6559\u80b2\u57f9\u517b\u4f53\u7cfb\u6b63\u7ecf\u5386\u4ece\u51c6\u5219\u5bfc\u5411"
+        "\u5411\u5de5\u5177\u4e0e\u573a\u666f\u5bfc\u5411\u7684\u7ed3\u6784\u6027\u91cd\u6784\u3002[1]"
+    )
+    markdown = (
+        "# \u4f1a\u8ba1\u5b66\u4e13\u4e1a\u5c31\u4e1a\u7814\u7a76\u62a5\u544a\n\n"
+        "## 1. \u4f1a\u8ba1\u5c31\u4e1a\u53d8\u5316\n"
+        f"{signal}\u8fd9\u79cd\u91cd\u6784\u4f1a\u4f7f\u8bfe\u7a0b\u548c\u5b9e\u8bad\u66f4\u9760\u8fd1\u771f\u5b9e\u8d22\u52a1\u6d41\u7a0b\u3002[1]\n"
+    )
+
+    updated = _ensure_public_core_observation_block(markdown)
+
+    assert "\u6838\u5fc3\u89c2\u5bdf" in updated
+    assert updated.count(signal) == 1
+    assert "\u8bfe\u7a0b\u548c\u5b9e\u8bad" in updated
+
+
+def test_core_observation_insertion_removes_mid_paragraph_body_echo():
+    signal = "\u6559\u80b2\u7aef\u5fc5\u987b\u5f15\u5165\u771f\u5b9e\u4e1a\u52a1\u573a\u666f\u4e0e\u6570\u5b57\u5316\u5de5\u5177\u8bad\u7ec3\u3002[1][2]"
+    markdown = (
+        "# \u4f1a\u8ba1\u5b66\u4e13\u4e1a\u5c31\u4e1a\u7814\u7a76\u62a5\u544a\n\n"
+        "## 1. \u4f1a\u8ba1\u5c31\u4e1a\u53d8\u5316\n"
+        "\u4f1a\u8ba1\u6559\u80b2\u57f9\u517b\u4f53\u7cfb\u6b63\u5728\u7ed3\u6784\u6027\u91cd\u6784\u3002"
+        f"{signal}"
+        "\u8fd9\u4f1a\u7f29\u77ed\u6bd5\u4e1a\u751f\u80fd\u529b\u4e0e\u4f01\u4e1a\u9700\u6c42\u7684\u9519\u914d\u5468\u671f\u3002\n"
+    )
+
+    updated = _ensure_public_core_observation_block(markdown)
+
+    assert "\u6838\u5fc3\u89c2\u5bdf" in updated
+    assert updated.count(signal) == 1
+    assert "\u7ed3\u6784\u6027\u91cd\u6784" in updated
+    assert "\u9519\u914d\u5468\u671f" in updated
+
+
+def test_core_observation_excludes_methodology_transition_sentences():
+    markdown = (
+        "# \u4f1a\u8ba1\u5b66\u4e13\u4e1a\u5c31\u4e1a\u7814\u7a76\u62a5\u544a\n\n"
+        "## 1. \u4f1a\u8ba1\u5c31\u4e1a\u53d8\u5316\n"
+        "\u5224\u65ad\u4e0d\u80fd\u505c\u5728\u5355\u4e2a\u4e8b\u4ef6\u672c\u8eab\uff0c\u800c\u8981\u770b\u5b83\u662f\u5426\u6301\u7eed\u6539\u53d8\u8bfe\u7a0b\u3001\u5de5\u5177\u3001\u5c97\u4f4d\u548c\u4e1a\u52a1\u6d41\u7a0b\u4e4b\u95f4\u7684\u8fde\u63a5\u3002[1][2]\n"
+        "\u6559\u80b2\u90e8\u4e13\u4e1a\u76ee\u5f55\u548c\u884c\u4e1a\u4eba\u624d\u89c4\u5212\u5171\u540c\u663e\u793a\uff0c\u4f1a\u8ba1\u4eba\u624d\u57f9\u517b\u6b63\u5728\u4ece\u6838\u7b97\u80fd\u529b\u6269\u5c55\u5230\u6570\u636e\u5206\u6790\u3001\u4e1a\u52a1\u7cfb\u7edf\u534f\u540c\u548c\u667a\u80fd\u5de5\u5177\u5e94\u7528\u3002[1][2]\n"
+    )
+
+    updated = _ensure_public_core_observation_block(markdown)
+    summary = updated.split("## 1.", 1)[0]
+
+    assert "\u5224\u65ad\u4e0d\u80fd\u505c\u5728\u5355\u4e2a\u4e8b\u4ef6\u672c\u8eab" not in summary
+    assert "\u6559\u80b2\u90e8\u4e13\u4e1a\u76ee\u5f55\u548c\u884c\u4e1a\u4eba\u624d\u89c4\u5212" in summary
+
+
 def test_core_observation_dedupes_boundary_already_embedded_in_claim():
     boundary = "\u9884\u6d4b\u6570\u636e\u57fa\u4e8e\u4e0d\u540c\u7814\u7a76\u673a\u6784\u7684\u6a21\u578b\u5047\u8bbe\uff0c\u7edf\u8ba1\u53e3\u5f84\u6db5\u76d6\u8303\u56f4\uff08\u662f\u5426\u5305\u542b\u4f20\u7edf\u5de5\u4e1a\u673a\u5668\u4eba\u6216\u6cdbAI\u786c\u4ef6\uff09\u672a\u5b8c\u5168\u7edf\u4e00\uff0c\u9700\u4ee5\u5b9e\u9645\u4ea4\u4ed8\u4e0e\u8425\u6536\u6570\u636e\u4e3a\u51c6\u3002[1]"
     markdown = (
@@ -152,6 +216,25 @@ def test_core_observation_dedupes_metric_fact_and_evidence_context():
     assert len(bullets) == 2
     assert "宏观市场规模数据直接反映" in bullets[0]
     assert "头部企业正在围绕工业、物流和服务场景" in bullets[1]
+
+
+
+def test_dedupe_public_markdown_removes_redundant_evidence_transcription_sentence():
+    markdown = (
+        "## 1. AI\u5bf9\u4f1a\u8ba1\u5c97\u4f4d\u7684\u5f71\u54cd\n"
+        "AI\u5de5\u5177\u5bf9\u4f1a\u8ba1\u5c97\u4f4d\u7684\u5f71\u54cd\u4e0d\u53ea\u662f\u66ff\u4ee3\u57fa\u7840\u6838\u7b97\uff0c\u800c\u662f\u628a\u5c97\u4f4d\u4ef7\u503c\u63a8\u5411\u6570\u636e\u89e3\u91ca\u3001\u6d41\u7a0b\u6cbb\u7406\u548c\u98ce\u9669\u5224\u65ad\u3002"
+        "\u8c03\u7814\u5f3a\u8c03\uff0c\u4f01\u4e1a\u6b63\u5728\u63a8\u8fdb\u8d22\u52a1\u5171\u4eab\u3001\u667a\u80fd\u62a5\u9500\u548c\u7535\u5b50\u51ed\u8bc1\u8bd5\u70b9\u3002[1]"
+        "\u8fd9\u610f\u5473\u7740\u4f1a\u8ba1\u6559\u80b2\u4e0d\u80fd\u53ea\u589e\u52a0AI\u5de5\u5177\u8bfe\uff0c\u800c\u8981\u628a\u6570\u636e\u6cbb\u7406\u3001\u5185\u63a7\u5224\u65ad\u548c\u4e1a\u52a1\u573a\u666f\u8bad\u7ec3\u5d4c\u5165\u6838\u5fc3\u8bfe\u7a0b\u3002[2]\n"
+    )
+
+    cleaned = dedupe_public_markdown_paragraphs(markdown)
+
+    assert "\u8c03\u7814\u5f3a\u8c03" not in cleaned
+    assert "\u4f01\u4e1a\u6b63\u5728\u63a8\u8fdb\u8d22\u52a1\u5171\u4eab" not in cleaned
+    assert "\u6570\u636e\u89e3\u91ca\u3001\u6d41\u7a0b\u6cbb\u7406\u548c\u98ce\u9669\u5224\u65ad" in cleaned
+    assert "\u6570\u636e\u6cbb\u7406\u3001\u5185\u63a7\u5224\u65ad\u548c\u4e1a\u52a1\u573a\u666f\u8bad\u7ec3" in cleaned
+    assert "[1]" in cleaned
+    assert "[2]" in cleaned
 
 
 def test_core_observation_excludes_verification_caveats_from_opening():
@@ -927,7 +1010,107 @@ def test_short_cited_section_expands_for_longform_mode(monkeypatch):
     assert "\u4ed8\u8d39\u8f6c\u5316" in body or "\u90e8\u7f72" in body
 
 
-def test_chapter_render_augments_render_blocks_with_reasoning_boundary_and_actionable():
+def test_render_chapter_package_trims_repeated_leading_sentence_but_keeps_new_evidence():
+    repeated = "代账场景下AI工具实现10倍以上的服务户数跃升，验证了技术对基础会计劳动的替代与增效作用。"
+    markdown = render_chapter_package(
+        {
+            "chapter_title": "就业变化",
+            "sections": [
+                {
+                    "section_title": "服务人效变化",
+                    "evidence_backed": True,
+                    "citation_refs": ["[1]"],
+                    "render_blocks": [
+                        {
+                            "type": "paragraph",
+                            "text": f"AI智能体与自动化工具的规模化应用显著提升会计服务人效。{repeated}[1]",
+                        },
+                        {
+                            "type": "paragraph",
+                            "text": f"{repeated}2026年春招AI智能体相关职位数同比增速达455%。[1]",
+                        },
+                    ],
+                }
+            ],
+        },
+        1,
+    )
+
+    assert markdown.count("代账场景下AI工具实现10倍以上") == 1
+    assert "同比增速达455%" in markdown
+
+
+def test_render_chapter_package_skips_lead_when_first_section_repeats_it():
+    lead = (
+        "\u4f1a\u8ba1\u6559\u80b2\u57f9\u517b\u4f53\u7cfb\u6b63\u7ecf\u5386\u4ece\u51c6\u5219\u5bfc\u5411"
+        "\u5411\u5de5\u5177\u4e0e\u573a\u666f\u5bfc\u5411\u7684\u7ed3\u6784\u6027\u91cd\u6784"
+    )
+    markdown = render_chapter_package(
+        {
+            "chapter_title": "\u5c31\u4e1a\u53d8\u5316",
+            "lead": lead,
+            "sections": [
+                {
+                    "section_title": "\u57f9\u517b\u4f53\u7cfb\u8f6c\u5411",
+                    "evidence_backed": True,
+                    "citation_refs": ["[1]"],
+                    "render_blocks": [
+                        {
+                            "type": "paragraph",
+                            "text": f"{lead}\uff0c\u8fd9\u4f7f\u8bfe\u7a0b\u8bbe\u7f6e\u548c\u5b9e\u8bad\u73af\u8282\u66f4\u8d34\u8fd1\u4f01\u4e1a\u8d22\u52a1\u6d41\u7a0b\u3002",
+                        }
+                    ],
+                }
+            ],
+        },
+        1,
+    )
+
+    assert markdown.count(lead) == 1
+    assert "\u8bfe\u7a0b\u8bbe\u7f6e\u548c\u5b9e\u8bad\u73af\u8282" in markdown
+
+
+def test_report_level_dedupe_removes_repeated_paragraphs_and_orphan_refs():
+    paragraph = "高校会计教育体系正加速对接产业数智化需求，通过引入AI审计工具与跨学科课程重构人才培养方案。[11][12][13]"
+    markdown = "\n".join(
+        [
+            "# 报告",
+            "",
+            "## 1. 传导机制",
+            paragraph,
+            "西交利物浦大学针对AI在审计中的广泛应用升级会计系培养体系。[11]",
+            "",
+            "## 2. 量化信号",
+            paragraph,
+            "[10]",
+            "全球审计服务市场预计以4.20%的复合年增长率持续扩张。[4]",
+        ]
+    )
+
+    cleaned = dedupe_public_markdown_paragraphs(markdown)
+
+    assert cleaned.count("高校会计教育体系正加速对接产业数智化需求") == 1
+    assert "\n[10]\n" not in f"\n{cleaned}\n"
+    assert "全球审计服务市场预计" in cleaned
+
+
+def test_report_level_dedupe_removes_repeated_sentences_inside_paragraph_and_preserves_refs():
+    repeated = "政策文件明确职业教育需服务产业发展与就业导向。"
+    markdown = (
+        "# 报告\n\n"
+        "## 1. 培养体系\n"
+        f"{repeated}这表明教育端正通过课程重构回应AI时代的岗位能力变化。{repeated}[1][2]\n"
+    )
+
+    cleaned = dedupe_public_markdown_paragraphs(markdown)
+
+    assert cleaned.count(repeated) == 1
+    assert "[1][2]" in cleaned
+    assert "课程重构" in cleaned
+
+
+def test_chapter_render_augments_render_blocks_with_reasoning_boundary_and_actionable(monkeypatch):
+    monkeypatch.setenv("REPORT_RENDER_APPEND_SECTION_FIELDS", "true")
     markdown = render_chapter_package(
         {
             "chapter_title": "Demand validation",
@@ -958,7 +1141,8 @@ def test_chapter_render_augments_render_blocks_with_reasoning_boundary_and_actio
     assert "Track repeat deployments" in markdown
 
 
-def test_chapter_render_skips_fallback_actionable_text():
+def test_chapter_render_skips_fallback_actionable_text(monkeypatch):
+    monkeypatch.setenv("REPORT_RENDER_APPEND_SECTION_FIELDS", "true")
     markdown = render_chapter_package(
         {
             "chapter_title": "Demand validation",
@@ -1761,6 +1945,34 @@ def test_sanitize_public_markdown_rewrites_review_style_directional_language():
     assert "相关主体、组织安排和后续决策" not in cleaned
 
 
+def test_sanitize_public_markdown_rewrites_fallback_signal_language_without_dropping_fact():
+    markdown = (
+        "# 行业研究报告\n\n"
+        "## 1. 岗位变化\n"
+        "会计岗位能力变化已有可观察的公开资料信号，后续判断需结合来源范围、样本边界和时间窗口校准。"
+        "高校会计专业培养方案开始增加数字财务、智能财税和数据分析课程。[1]\n"
+        "会计教育调整已有方向性公开资料信号，仍需避免把单一材料外推为确定性结论。"
+        "企业招聘要求开始强调数据分析、流程治理和系统配置能力。[2]\n\n"
+        "## 数据来源\n"
+        "- [1] 高校培养方案 | https://example.org/program\n"
+        "- [2] 招聘需求观察 | https://example.org/jobs\n"
+    )
+
+    cleaned = sanitize_public_markdown(markdown, mode="enforce")
+
+    for phrase in (
+        "已有可观察的公开资料信号",
+        "已有方向性公开资料信号",
+        "后续判断需结合来源范围",
+        "样本边界",
+        "时间窗口校准",
+        "仍需避免把单一材料外推为确定性结论",
+    ):
+        assert phrase not in cleaned
+    assert "高校会计专业培养方案开始增加数字财务、智能财税和数据分析课程" in cleaned
+    assert "企业招聘要求开始强调数据分析、流程治理和系统配置能力" in cleaned
+
+
 def test_sanitize_public_markdown_repairs_count_metrics_mislabeled_as_cost():
     markdown = (
         "## 风险边界\n"
@@ -1940,3 +2152,46 @@ def test_render_table_package_keeps_investment_diagnostic_table_score_only():
     )
 
     assert markdown == ""
+
+
+def test_render_chapter_does_not_append_bare_supporting_fact_as_public_paragraph():
+    from rag_pipeline.agents.markdown_renderer import render_chapter_package
+
+    chapter = {
+        "chapter_id": "ch_depth",
+        "chapter_title": "就业变化",
+        "sections": [
+            {
+                "section_id": "sec_depth",
+                "section_title": "岗位能力迁移",
+                "claim": "AI工具正在推动会计岗位从基础核算转向数据解释和流程治理。",
+                "reasoning": "工具接管重复处理环节后，企业会把人力投入转向系统配置和结果解释。",
+                "mechanism": "当审计和代账环节都出现效率提升，教育端就需要调整课程训练重点。",
+                "supporting_facts": [
+                    "代账场景中AI工具使单人服务户数提升10倍以上。",
+                    "审计数字化调研显示83%的受访者已在审计中应用数字化技术。",
+                ],
+                "evidence_basis": [
+                    "代账场景中AI工具使单人服务户数提升10倍以上。",
+                ],
+                "citation_refs": ["1", "2"],
+                "evidence_refs": ["1", "2"],
+                "render_blocks": [
+                    {
+                        "type": "paragraph",
+                        "text": (
+                            "AI工具正在推动会计岗位从基础核算转向数据解释和流程治理。"
+                            "代账和审计两个场景的公开信号共同说明，重复处理环节被工具接管后，"
+                            "岗位价值会转向系统配置、结果解释和风险判断。"
+                        ),
+                    }
+                ],
+            }
+        ],
+    }
+
+    rendered = render_chapter_package(chapter, 1)
+
+    assert "AI工具正在推动会计岗位" in rendered
+    assert "代账场景中AI工具使单人服务户数提升10倍以上。" not in rendered
+    assert "审计数字化调研显示83%的受访者已在审计中应用数字化技术。" not in rendered

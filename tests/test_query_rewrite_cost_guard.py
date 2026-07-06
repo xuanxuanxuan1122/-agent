@@ -195,6 +195,30 @@ def test_task_acceptance_filter_rejects_missing_topic_anchor():
     assert accepted["accepted"] is True
 
 
+def test_task_acceptance_filter_keeps_indirect_numeric_context_from_traceable_source():
+    search_task = {
+        "task_id": "task-agent-demand",
+        "query": "AI Agent 企业落地 市场空间",
+        "must_have_terms": ["市场空间"],
+        "topic_anchor_terms": ["AI Agent", "智能体"],
+        "source_priority": ["gov.cn"],
+    }
+    item = {
+        "title": "官方统计年鉴披露软件和信息服务业收入",
+        "snippet": "2025年软件和信息服务业收入同比增长，为企业数字化投入提供背景口径。",
+        "summary": "该指标不能直接证明 AI Agent 需求，但可以作为数字化预算和行业景气度的背景材料。",
+        "url": "https://www.gov.cn/example/statistics",
+        "credibility_score": 0.8,
+    }
+
+    result = web.task_acceptance_filter(item, {"search_task": search_task})
+
+    assert result["accepted"] is True
+    assert result["role_hint"] == "metric_context_fact"
+    assert result["reason"] == "topic_anchor_missing_context_fact"
+    assert result["context_only"] is True
+
+
 def test_llm_query_rewrite_call_cap_and_cache(monkeypatch):
     _ready_query_rewrite(monkeypatch)
     calls = {"count": 0}
